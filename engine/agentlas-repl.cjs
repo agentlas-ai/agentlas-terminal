@@ -693,6 +693,37 @@ function startRepl(opts) {
       case "runtime":
         setRuntime(arg);
         return true;
+      case "storm": {
+        if (!arg) return ui.warn("usage: /storm <goal>  [--research]"), true;
+        let goal = arg;
+        let research = false;
+        if (/\s--research(-evidence)?\b/.test(" " + goal)) {
+          research = true;
+          goal = goal.replace(/\s?--research(-evidence)?\b/g, "").trim();
+        }
+        await H.stormRun(db, goal, { ui, cwd: state.cwd, research });
+        return true;
+      }
+      case "swarm": {
+        if (!arg) return ui.warn("usage: /swarm <goal>  [--parallel N]"), true;
+        let goal = arg;
+        let concurrency;
+        const m = goal.match(/\s--parallel\s+(\d+)\b/);
+        if (m) {
+          concurrency = Number(m[1]);
+          goal = goal.replace(m[0], "").trim();
+        }
+        await H.swarmRun(db, goal, {
+          ui,
+          cwd: state.cwd,
+          permission: state.permission,
+          runtime: state.runtime,
+          concurrency,
+          agent: state.subject && state.subject.capAgent,
+          projectPath: state.projectPath,
+        });
+        return true;
+      }
       case "model":
         // CLI(claude/codex/gemini)와 BYOK/Ollama 모두 지원 — 각 런타임의 모델 플래그로 전달.
         state.runtime.model = arg || null;

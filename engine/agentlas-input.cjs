@@ -102,6 +102,8 @@ const SLASH_COMMAND_META = [
   { command: "/import", description: "Import a local agent or team folder", category: "Files", usage: "/import <path>", detail: "Install a local agent or team into Agentlas." },
   { command: "/marketplace", description: "Browse/install marketplace agents", category: "Routing", usage: "/marketplace", detail: "Show how to install agents from the Agentlas cloud marketplace or a local folder.", aliases: ["/market"] },
   { command: "/install", description: "Install a cloud agent by slug", category: "Routing", usage: "/install <slug>", detail: "Download and install an agent from the Agentlas cloud marketplace by slug." },
+  { command: "/storm", description: "Run a force-robust Stormbreaker pipeline on a goal", category: "Engine", usage: "/storm <goal> [--research]", detail: "Route the goal through Hephaestus Stormbreaker and execute the verified pipeline; --research grounds it with Research Engine evidence." },
+  { command: "/swarm", description: "Fan out an emergent agent swarm on a goal", category: "Engine", usage: "/swarm <goal> [--parallel N]", detail: "Parallel workers share a blackboard and spawn subtasks with ## Spawn; a synthesizer merges results into one answer." },
   { command: "/doctor", description: "Check runtimes and local data", category: "Health", usage: "/doctor", detail: "Run local checks for runtimes, data, credentials, and setup." },
   { command: "/exit", description: "Quit Agentlas", category: "Session", usage: "/exit", detail: "Close the terminal session.", aliases: ["/quit"] },
 ];

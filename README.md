@@ -47,7 +47,13 @@ agentlas run <agent> "프롬프트"     # 1회 실행 (prompt 없으면 stdin)
 agentlas firm <firm> "프롬프트"     # 회사(팀) 실행
 agentlas cd <agent>                # 에이전트 폴더 경로 → cd "$(agentlas cd seo)" && claude
 agentlas import <폴더>             # 로컬 에이전트/팀 임포트
+agentlas storm "목표"               # Stormbreaker 파이프라인 (라우팅→검증→실행) [--research]
+agentlas swarm "목표"               # emergent 에이전트 스웜 (병렬+블랙보드+종합) [--parallel N]
+agentlas automation list|add|on|off|runs   # 자동화 등록/관리 (실행은 앱 스케줄러)
+agentlas cloud search "찾는 일"     # 마켓플레이스 검색 (로그인 불필요)
 agentlas cloud install <slug>      # 마켓플레이스에서 에이전트 설치
+agentlas usage                     # 로컬 사용 현황 (실행/메시지/자동화)
+agentlas telegram                  # 텔레그램 바인딩 현황 (읽기 전용)
 agentlas creds / env               # 자격증명 · env
 agentlas multimodal                # 이미지/영상/음성 provider
 agentlas doctor                    # 런타임/데이터 점검

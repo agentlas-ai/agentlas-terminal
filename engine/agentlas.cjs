@@ -819,11 +819,16 @@ async function cmdCloud(db, args, runtimeOverride) {
       "  publish <path> [--dry-run] [--llm-review] [--slug name]",
       "                                      register with submitter-paid local review",
       "  install <slug>                      download/install from Agentlas Cloud marketplace",
+      "  search \"<what you need>\" [--limit 10]",
+      "                                      search the marketplace (no sign-in needed)",
       "",
       "Model cost rule: Agentlas Cloud does not run a platform-owned LLM here.",
       "--llm-review uses only this machine's active CLI/BYOK/Ollama runtime.",
     ].join("\n"));
     return;
+  }
+  if (sub === "search") {
+    return parity().cloudSearch(db, args.slice(1));
   }
   const cloudRuntime = require("./agentlas-cloud-runtime.cjs");
   if (sub === "wizard") {
@@ -6078,6 +6083,9 @@ function buildHelpers(db) {
     sessionsSave: (list) => {
       try { fs.writeFileSync(path.join(userDataDir(), "cli-sessions.json"), JSON.stringify((list || []).slice(0, 30), null, 2), "utf8"); } catch { /* ignore */ }
     },
+    // 패리티: REPL의 /storm·/swarm 이 그대로 호출한다.
+    stormRun: (db_, goal, ctx) => parity().stormRun(db_, goal, ctx),
+    swarmRun: (db_, goal, ctx) => parity().swarmRun(db_, goal, ctx),
     ontologyCommand: (text, ctx) => runOntologyNaturalCli(text, {
       cwd: (ctx && ctx.cwd) || projectCwd(),
       projectPath: (ctx && ctx.cwd) || projectCwd(),
@@ -6200,6 +6208,34 @@ function captureRuntime(kind, systemPrompt, prompt, opts) {
       resolve(stdout.trim() || stderr.trim());
     });
   });
+}
+
+// ── 패리티 모듈 (storm/swarm/automation/usage/telegram/cloud search) ──
+// 데스크탑 앱 전용이던 기능의 터미널 구현 — 헬퍼를 주입해 지연 생성한다.
+function parity() {
+  if (!parity._i) {
+    parity._i = require("./agentlas-parity.cjs").create({
+      captureRuntime,
+      runApi,
+      resolveRuntime,
+      buildChildEnvCli,
+      projectCwd,
+      runCwd,
+      userDataDir,
+      resolveAgent,
+      resolveFirm,
+      listAgents,
+      autoRouteAgent,
+      prefsLang,
+      cloudSessionCookieCli,
+      out,
+      fail,
+      RUNTIME_BIN,
+      which,
+      apiKey,
+    });
+  }
+  return parity._i;
 }
 
 // ── 명령 구현 ──────────────────────────────────────────────
@@ -7175,6 +7211,11 @@ function cmdHelp() {
       "  multimodal            image/video/audio fallback providers",
       "  oberon <sub>          AI film render from the terminal (scaffold|render|list) — see: oberon help",
       "  ontology              project-local ontology status/list/add; inside REPL use /ontology",
+      "  storm <goal>          Stormbreaker force-robust pipeline (route → verify → execute) [--research]",
+      "  swarm <goal>          emergent agent swarm — parallel workers + blackboard + synthesizer [--parallel N]",
+      "  automation <sub>      list|add|on|off|remove|runs — app scheduler executes them",
+      "  usage                 local usage summary (runs, messages, automations)",
+      "  telegram              telegram binding status (pairing lives in the app)",
       "  cloud wizard <path>   create/repair agentlas.json for Cloud MCP calls",
       "  cloud security scan <path>",
       "                        risk-screen an agent folder before run/publish",
@@ -7275,6 +7316,18 @@ async function main() {
       return cmdCloud(db, rest.slice(1), runtimeOverride);
     case "creds":
       return cmdCreds(db, rest.slice(1));
+    case "storm":
+      return parity().cmdStorm(db, rest.slice(1), runtimeOverride);
+    case "swarm":
+      return parity().cmdSwarm(db, rest.slice(1), runtimeOverride);
+    case "automation":
+    case "automations":
+      return parity().cmdAutomation(db, rest.slice(1));
+    case "usage":
+      return parity().cmdUsage(db);
+    case "telegram":
+    case "tg":
+      return parity().cmdTelegram(db, rest.slice(1));
     case "doctor":
       return cmdDoctor(db);
     case "setup": {
