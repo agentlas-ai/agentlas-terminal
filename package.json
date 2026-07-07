@@ -1,13 +1,12 @@
 {
   "name": "agentlas",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Agentlas agent terminal — chat with your installed AI agents and teams from the terminal, Claude Code style. Standalone: no desktop app required.",
   "bin": {
     "agentlas": "bin/agentlas.cjs"
   },
   "scripts": {
-    "smoke": "sh test/smoke.sh",
-    "sync-engine": "node scripts/sync-engine.mjs"
+    "smoke": "sh test/smoke.sh"
   },
   "engines": {
     "node": ">=20"
@@ -20,6 +19,7 @@
     "bin/",
     "engine/",
     "scripts/",
+    "test/",
     "install.sh",
     "install.ps1",
     "README.md"

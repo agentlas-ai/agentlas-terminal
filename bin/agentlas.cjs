@@ -2,24 +2,16 @@
 /*
  * agentlas — Agentlas를 터미널에서 쓰는 독립 CLI (Claude Code 방식).
  *
- * `npm install -g` 후 `agentlas` 하나로 완결된다. 데스크탑 앱은 필요 없다:
+ * `npm install -g agentlas` 후 `agentlas` 하나로 완결된다. 데스크탑 앱은 필요 없다:
  * 엔진(engine/agentlas.cjs — REPL·라우팅·클라우드·자격증명 포함 전체 터미널
- * 클라이언트)이 패키지에 번들되어 있고, 첫 실행 시 앱과 동일한 SQLite 스키마를
- * 직접 부트스트랩한 뒤 빌트인 에이전트를 시드한다. 앱이 설치돼 있으면 같은
- * userData(SQLite/keychain)를 자동으로 공유한다 — 앱과 CLI가 한 몸으로 움직인다.
- *
- * 엔진 소스 (AGENTLAS_CLI_SOURCE=bundled|app|repo|auto, 기본 auto):
- *   bundled → 이 패키지의 engine/ (기본; 시스템 Node로 실행)
- *   app     → 설치 앱의 app.asar CLI를 앱 Electron(ELECTRON_RUN_AS_NODE)으로 실행
- *   repo    → 개발 리포 agentlas_desktop/cli (개발용)
- *   auto    → bundled → app → repo 순서로 가능한 것
+ * 클라이언트)이 이 패키지에 들어 있고(정본), 첫 실행 시 앱과 동일한 SQLite 스키마를
+ * 직접 부트스트랩한 뒤 빌트인 에이전트를 시드한다. 데스크탑 앱이 설치돼 있으면
+ * 같은 userData(SQLite)를 자동으로 공유한다 — 별도 설정 없이 데이터가 한 몸이다.
  *
  * SQLite: better-sqlite3(optionalDependency, npm이 빌드해주면 네이티브) →
- * 실패 시 Node 22+의 node:sqlite 폴백. 앱 모드는 앱 번들 네이티브를 쓴다.
+ * 실패 시 Node 22+의 node:sqlite 폴백.
  *
  * env 오버라이드:
- *   AGENTLAS_APP_PATH      앱 경로(.app 번들, 설치 폴더, 또는 실행 파일)
- *   AGENTLAS_DESKTOP_REPO  개발 리포 루트
  *   AGENTLAS_USER_DATA_DIR 데이터 폴더 (기본: 앱과 동일한 userData)
  *
  * 런처 자체 명령: `agentlas --where` → 해석 결과 JSON 출력 후 종료.
@@ -35,6 +27,7 @@ const REAL_SELF = (() => {
   try { return fs.realpathSync(__filename); } catch { return __filename; }
 })();
 const PKG_ROOT = path.dirname(path.dirname(REAL_SELF));
+const ENGINE = path.join(PKG_ROOT, "engine", "agentlas.cjs");
 
 function exists(p) {
   try { fs.accessSync(p); return true; } catch { return false; }
@@ -54,70 +47,18 @@ function dbPath() {
   return path.join(userDataDir(), "agentlas.sqlite");
 }
 
-// ── 설치 앱 탐색 ─────────────────────────────────────────────
-function resolveAppFrom(base) {
-  if (!base || !exists(base)) return null;
-  let root = base;
-  try {
-    const st = fs.statSync(base);
-    if (st.isFile()) {
-      const dir = path.dirname(base);
-      root = path.basename(dir) === "MacOS" ? path.dirname(path.dirname(dir)) : dir;
-      if (process.platform === "darwin" && !root.endsWith(".app")) root = dir;
-    }
-  } catch { return null; }
-
-  if (process.platform === "darwin") {
-    const app = root.endsWith(".app") ? root : path.join(root, "Agentlas.app");
-    const exec = path.join(app, "Contents", "MacOS", "Agentlas");
-    const asar = path.join(app, "Contents", "Resources", "app.asar");
-    if (exists(exec) && exists(asar)) return { exec, asar };
-    return null;
-  }
-  const execNames = process.platform === "win32" ? ["Agentlas.exe"] : ["agentlas", "Agentlas"];
-  for (const name of execNames) {
-    const exec = path.join(root, name);
-    const asar = path.join(root, "resources", "app.asar");
-    if (exists(exec) && exists(asar)) return { exec, asar };
-  }
-  return null;
-}
-
-function findApp() {
-  const candidates = [];
-  if (process.env.AGENTLAS_APP_PATH) candidates.push(process.env.AGENTLAS_APP_PATH);
-  if (process.platform === "darwin") {
-    candidates.push("/Applications/Agentlas.app", path.join(os.homedir(), "Applications", "Agentlas.app"));
-  } else if (process.platform === "win32") {
-    const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
-    candidates.push(path.join(localAppData, "Programs", "Agentlas"));
-  } else {
-    candidates.push("/opt/Agentlas", "/usr/lib/agentlas", "/usr/local/lib/agentlas");
-  }
-  for (const c of candidates) {
-    const found = resolveAppFrom(c);
-    if (found) return found;
-  }
-  return null;
-}
-
-function findRepo() {
-  const candidates = [];
-  if (process.env.AGENTLAS_DESKTOP_REPO) candidates.push(process.env.AGENTLAS_DESKTOP_REPO);
-  candidates.push(path.join(PKG_ROOT, "..", "agentlas_desktop"));
-  for (const c of candidates) {
-    const script = path.join(c, "cli", "agentlas.cjs");
-    if (exists(script)) return { root: path.resolve(c), script };
-  }
-  return null;
-}
-
-function findBundled() {
-  const script = path.join(PKG_ROOT, "engine", "agentlas.cjs");
-  return exists(script) ? { script } : null;
-}
-
 // ── SQLite 로더 (부트스트랩용): better-sqlite3 → node:sqlite ──
+// require.resolve가 아니라 실제 로드로 판별한다 — ABI가 깨진 better-sqlite3나
+// node:sqlite가 아직 없는/플래그가 필요한 Node(≤22.4 등)를 정확히 걸러낸다.
+function probeSqliteDriver() {
+  try { require("better-sqlite3"); return "better-sqlite3"; } catch { /* absent or ABI-broken */ }
+  try {
+    const { DatabaseSync } = require("node:sqlite");
+    if (DatabaseSync) return "node:sqlite";
+  } catch { /* not available without a flag on this Node */ }
+  return null;
+}
+
 function openSqlite(p) {
   try {
     const Database = require("better-sqlite3");
@@ -157,102 +98,61 @@ function bootstrapDbIfMissing() {
   return { created: true, path: p };
 }
 
-// ── 엔진 선택 ────────────────────────────────────────────────
-function pickEngine() {
-  const source = (process.env.AGENTLAS_CLI_SOURCE || "auto").toLowerCase();
-  const bundled = findBundled();
-  const app = findApp();
-  const repo = findRepo();
-
-  // standalone(시스템 Node) 실행이 가능한가: better-sqlite3 로드 또는 Node 22+
-  const nodeMajor = Number(process.versions.node.split(".")[0]);
-  let nativeSqlite = false;
-  try { require.resolve("better-sqlite3"); nativeSqlite = true; } catch { /* absent */ }
-  const standaloneOk = nativeSqlite || nodeMajor >= 22;
-
-  const bundledEngine = bundled
-    ? { source: "bundled", exec: process.execPath, script: bundled.script, standalone: true }
-    : null;
-  const appEngine = app
-    ? { source: "app", exec: app.exec, script: path.join(app.asar, "cli", "agentlas.cjs"), standalone: false }
-    : null;
-  const repoEngine = repo
-    ? { source: "repo", exec: app ? app.exec : process.execPath, script: repo.script, standalone: !app }
-    : null;
-
-  const meta = { app, repo, bundled, nativeSqlite, standaloneOk };
-  if (source === "bundled") return { engine: bundledEngine, ...meta, error: bundledEngine ? null : "번들 엔진이 없습니다 (engine/agentlas.cjs). scripts/sync-engine.mjs 를 실행하세요." };
-  if (source === "app") return { engine: appEngine, ...meta, error: appEngine ? null : "설치된 Agentlas 앱을 찾지 못했습니다 (AGENTLAS_APP_PATH 로 지정 가능)." };
-  if (source === "repo") return { engine: repoEngine, ...meta, error: repoEngine ? null : "agentlas_desktop 리포를 찾지 못했습니다 (AGENTLAS_DESKTOP_REPO 로 지정 가능)." };
-
-  // auto: bundled(standalone 가능할 때) → app → repo
-  const ladder = [];
-  if (bundledEngine && standaloneOk) ladder.push(bundledEngine);
-  if (appEngine) ladder.push(appEngine);
-  if (bundledEngine && !standaloneOk) ladder.push(bundledEngine); // 마지막 시도라도 해 본다
-  if (repoEngine) ladder.push(repoEngine);
-  return {
-    engine: ladder[0] || null,
-    ...meta,
-    error: ladder[0] ? null : [
-      "Agentlas 엔진을 찾지 못했습니다.",
-      "  1) npm 설치가 손상됐다면 재설치: npm i -g agentlas-terminal",
-      "  2) 또는 데스크탑 앱 설치: https://agentlas.cloud",
-    ].join("\n"),
-  };
-}
-
 function main() {
   const args = process.argv.slice(2);
-  const picked = pickEngine();
+  const sqliteDriver = probeSqliteDriver();
+  const engineFound = exists(ENGINE);
+
+  let error = null;
+  if (!engineFound) {
+    error = "엔진이 없습니다 (engine/agentlas.cjs). 재설치: npm i -g agentlas";
+  } else if (!sqliteDriver) {
+    error = `Node ${process.version} — SQLite 드라이버가 없습니다. Node 22.5+ 로 올리거나 'npm i -g agentlas'로 재설치(better-sqlite3 빌드)하세요.`;
+  }
 
   if (args[0] === "--where" || args[0] === "terminal-where") {
     process.stdout.write(JSON.stringify({
       launcher: REAL_SELF,
       packageRoot: PKG_ROOT,
-      source: picked.engine ? picked.engine.source : null,
-      exec: picked.engine ? picked.engine.exec : null,
-      script: picked.engine ? picked.engine.script : null,
+      engine: ENGINE,
+      engineFound,
       db: dbPath(),
       dbExists: exists(dbPath()),
-      nativeSqlite: picked.nativeSqlite,
-      appFound: !!picked.app,
-      repoFound: !!picked.repo,
-      bundledFound: !!picked.bundled,
+      sqliteDriver,
       node: process.version,
-      error: picked.error || null,
+      error,
     }, null, 2) + "\n");
-    process.exit(picked.engine ? 0 : 1);
+    process.exit(error ? 1 : 0);
   }
 
-  if (!picked.engine) {
-    process.stderr.write(picked.error + "\n");
+  if (error) {
+    process.stderr.write(error + "\n");
     process.exit(1);
   }
 
-  // standalone 모드에서만 첫 실행 부트스트랩 (앱 모드는 앱이 DB를 만든다)
-  if (picked.engine.standalone) {
-    try {
-      const boot = bootstrapDbIfMissing();
-      if (boot.created) {
-        process.stderr.write(`첫 실행: Agentlas 데이터 초기화 완료 (${boot.path})\n`);
-      }
-    } catch (e) {
-      process.stderr.write(`${e.message}\n`);
-      process.exit(1);
+  try {
+    const boot = bootstrapDbIfMissing();
+    if (boot.created) {
+      process.stderr.write(`첫 실행: Agentlas 데이터 초기화 완료 (${boot.path})\n`);
     }
+  } catch (e) {
+    process.stderr.write(`${e.message}\n`);
+    process.exit(1);
   }
 
-  const child = spawn(picked.engine.exec, [picked.engine.script, ...args], {
-    stdio: "inherit",
-    env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
-  });
+  const child = spawn(process.execPath, [ENGINE, ...args], { stdio: "inherit" });
 
-  // Ctrl-C 등은 포그라운드 프로세스 그룹 전체에 전달된다 — 자식(REPL)이 처리하게
-  // 두고, 런처는 자식이 끝날 때까지 살아서 종료 코드를 그대로 넘긴다.
-  const forward = () => { /* child receives it via the shared process group */ };
-  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
-    try { process.on(sig, forward); } catch { /* win32 SIGHUP 등 */ }
+  // 시그널 처리:
+  //  - 터미널 Ctrl-C(SIGINT)는 포그라운드 프로세스 그룹으로 자식(REPL)에게 이미 전달된다.
+  //    런처가 한 번 더 전달하면 REPL의 "Ctrl-C 두 번이면 종료"가 오작동하므로 전달하지 않는다.
+  //  - PID로 직접 온 SIGTERM/SIGHUP(kill·프로세스 매니저·timeout(1))은 자식에게 전달한다.
+  try { process.on("SIGINT", () => { /* group delivery already reached the child */ }); } catch { /* ignore */ }
+  for (const sig of ["SIGTERM", "SIGHUP"]) {
+    try {
+      process.on(sig, () => {
+        try { child.kill(sig); } catch { /* already dead */ }
+      });
+    } catch { /* win32 SIGHUP 등 */ }
   }
 
   child.on("error", (err) => {
@@ -261,7 +161,13 @@ function main() {
   });
   child.on("exit", (code, signal) => {
     if (signal) {
-      try { process.kill(process.pid, signal); return; } catch { /* fall through */ }
+      // 자식의 시그널 종료를 그대로 전파 — 자체 핸들러를 걷어내야 재raise가 먹는다.
+      try {
+        process.removeAllListeners(signal);
+        process.kill(process.pid, signal);
+      } catch { /* fall through to numeric exit */ }
+      const num = os.constants.signals[signal];
+      process.exit(num ? 128 + num : 1);
     }
     process.exit(code == null ? 0 : code);
   });

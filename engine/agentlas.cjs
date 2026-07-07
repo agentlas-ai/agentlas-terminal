@@ -62,7 +62,7 @@ function dbPath() {
 function openDb() {
   const p = dbPath();
   if (!fs.existsSync(p)) {
-    fail(`Agentlas data was not found: ${p}\nOpen Agentlas Desktop once to install agents, then run this command again.`);
+    fail(`Agentlas data was not found: ${p}\nRun this through the 'agentlas' launcher (it bootstraps the data on first run), or reinstall: npm i -g agentlas`);
   }
   try {
     const Database = require("better-sqlite3");
@@ -72,7 +72,7 @@ function openDb() {
       return openNodeSqliteDb(p);
     } catch (fallbackError) {
       fail(
-        "SQLite 런타임을 불러올 수 없습니다. Agentlas 앱을 한 번 실행한 뒤 다시 시도하세요.\n" +
+        "SQLite 런타임을 불러올 수 없습니다. Node 22.5+ 로 올리거나 'npm i -g agentlas'로 재설치(better-sqlite3 빌드)하세요.\n" +
           String((fallbackError && fallbackError.message) || (e && e.message) || fallbackError),
       );
     }
@@ -5670,7 +5670,8 @@ const DEFAULT_API_MODEL = {
 async function apiKey(backend) {
   const keytar = readKeytar();
   if (!keytar) return null;
-  return keytar.getPassword(SERVICE, "byok:" + backend);
+  // 키체인 접근 거부(서명 안 된 standalone Node)는 "키 없음"으로 조용히 처리.
+  return keytar.getPassword(SERVICE, "byok:" + backend).catch(() => null);
 }
 async function runApi(backend, model, system, prompt) {
   model = model || DEFAULT_API_MODEL[backend];
@@ -6259,6 +6260,14 @@ function cmdList(db) {
     out(`\n${firms.length} company(ies):`);
     for (const f of firms) out(`  ${f.slug.padEnd(28)} ${nm(f)}  (CEO)`);
   }
+  if (!agents.length) {
+    // 신선 설치: 빌트인 오케스트레이션 에이전트는 background 라 목록에 안 뜬다 — 빈 설치로 오해 방지.
+    out(
+      lang === "ko"
+        ? "\n(빌트인 오케스트레이션 에이전트는 백그라운드로 동작합니다. `agentlas cloud search \"할 일\"` 로 에이전트를 찾아 설치하거나, 그냥 `agentlas` 를 열고 할 일을 입력하세요.)"
+        : "\n(Built-in orchestration agents run in the background. Find agents with `agentlas cloud search \"what you need\"`, or just open `agentlas` and type a task.)",
+    );
+  }
   out("\nRun: agentlas <agent>  ·  agentlas firm <firm>  ·  agentlas run <agent> \"...\"");
 }
 
@@ -6553,7 +6562,7 @@ async function cmdEnv(db) {
     out(`공유 env 키 ${keys.length}개 (값은 표시 안 함, credentials.env 기준):`);
     for (const k of keys) out(`  ${k}`);
     out("");
-    out("키체인 저장 키는 데스크탑 앱으로 실행할 때 보입니다:  AGENTLAS_CLI_SOURCE=app agentlas env");
+    out("키체인 저장 키는 데스크탑 앱의 설정 → 자격증명에서 보입니다.");
     return;
   }
   const keytar = readKeytar();
@@ -6746,9 +6755,38 @@ function formatUpdateSummary(status) {
   return lines.join("\n");
 }
 
+// standalone(npm 설치본): 데스크탑 DMG가 아니라 npm 레지스트리의 agentlas 최신판과 비교한다.
+// (자동 설치는 하지 않는다 — 전역 설치 권한/프리픽스가 제각각이라 명령만 안내.)
+async function cmdUpdateStandalone(flags) {
+  const currentVersion = readPackageVersion();
+  let latestVersion = null;
+  try {
+    const resp = await fetch("https://registry.npmjs.org/agentlas/latest", { headers: { accept: "application/json" } });
+    if (resp.ok) latestVersion = String((await resp.json()).version || "");
+  } catch { /* offline 등 — 아래에서 안내 */ }
+  if (flags.json) {
+    return out(JSON.stringify({ currentVersion, latestVersion, updateAvailable: latestVersion ? compareVersions(currentVersion, latestVersion) < 0 : null, channel: "npm" }, null, 2));
+  }
+  out(`현재 버전: ${currentVersion}`);
+  if (!latestVersion) {
+    out("npm 레지스트리에서 최신 버전을 확인하지 못했습니다 (오프라인이거나 아직 미발행).");
+    out("수동 업데이트:  npm i -g agentlas@latest");
+    return;
+  }
+  out(`최신 버전: ${latestVersion}`);
+  if (compareVersions(currentVersion, latestVersion) < 0) {
+    out("업데이트:  npm i -g agentlas@latest");
+  } else {
+    out("이미 최신 버전입니다.");
+  }
+}
+
 async function cmdUpdate(args) {
   const flags = parseUpdateFlags(args);
   if (flags.help) return cmdUpdateHelp();
+  // npm 설치본(비-Electron)은 데스크탑 앱 버전(0.7.x)과 비교하면 항상 "업데이트 가능"으로
+  // 오판해 데스크탑 앱을 설치해 버린다 — standalone은 npm 채널로 분기.
+  if (!isElectronRuntime()) return cmdUpdateStandalone(flags);
   const currentVersion = readPackageVersion();
   const release = await fetchDesktopRelease(flags.url);
   const latestVersion = String(release.version || "");

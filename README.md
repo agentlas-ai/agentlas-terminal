@@ -65,28 +65,23 @@ agentlas update                    # Desktop 최신 릴리스 확인/설치
 
 ## 동작 방식
 
-런처(`bin/agentlas.cjs`)가 엔진을 골라 실행한다 (`AGENTLAS_CLI_SOURCE`):
-
-| 소스 | 설명 |
-|------|------|
-| `bundled` (기본) | 패키지에 번들된 `engine/` — 시스템 Node로 실행, 앱 불필요 |
-| `app` | 설치 앱의 `app.asar` CLI를 앱 Electron(`ELECTRON_RUN_AS_NODE`)으로 실행 |
-| `repo` | 개발 리포 `agentlas_desktop/cli` (개발용) |
-| `auto` | bundled → app → repo |
+런처(`bin/agentlas.cjs`)가 이 패키지의 `engine/`(정본)을 시스템 Node로 실행한다 —
+데스크탑 앱과 완전히 독립이며, 앱이 설치돼 있으면 같은 userData(SQLite)를 써서
+데이터만 자연스럽게 공유된다. `engine/ENGINE_META.json`에 최초 임포트 출처가 기록돼 있다.
 
 SQLite는 `better-sqlite3`(optionalDependency, npm이 네이티브 빌드) → 실패 시
 Node 22+ `node:sqlite` 폴백. 데이터 폴더는 앱과 동일한 userData
 (macOS `~/Library/Application Support/Agentlas`)이며 `AGENTLAS_USER_DATA_DIR`로
 바꿀 수 있다.
 
-### 엔진 갱신 (데스크탑 리포에서 재벤더링)
+### 개발
+
+엔진 소스는 `engine/*.cjs` — 여기가 정본이므로 직접 수정한다.
+첫 실행용 스키마가 데스크탑 DB 마이그레이션과 어긋나면 재생성:
 
 ```sh
-node scripts/sync-engine.mjs [desktop-repo-root]   # engine/*.cjs 갱신
-sh scripts/gen-bootstrap-schema.sh [db-path]       # 첫 실행용 스키마 재생성
+sh scripts/gen-bootstrap-schema.sh [db-path]       # engine/bootstrap-schema.sql 재생성
 ```
-
-`engine/ENGINE_META.json`에 소스 버전/커밋이 기록된다.
 
 ### 진단
 

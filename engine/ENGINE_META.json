@@ -1,25 +1,8 @@
 {
-  "source": "agentlas-ai/agentlas-desktop/cli",
-  "desktopVersion": "0.7.18",
-  "commit": "bcfe0df",
-  "syncedAt": "2026-07-07T09:04:46.190Z",
-  "files": [
-    "agentlas-api-agent.cjs",
-    "agentlas-banner.cjs",
-    "agentlas-capabilities.cjs",
-    "agentlas-cloud-runtime.cjs",
-    "agentlas-composer.cjs",
-    "agentlas-config.cjs",
-    "agentlas-i18n.cjs",
-    "agentlas-input.cjs",
-    "agentlas-native-host.cjs",
-    "agentlas-onboard.cjs",
-    "agentlas-parity.cjs",
-    "agentlas-repl.cjs",
-    "agentlas-style.cjs",
-    "agentlas-tools.cjs",
-    "agentlas-ui.cjs",
-    "agentlas.cjs",
-    "architecture.data.json"
-  ]
+  "canonical": true,
+  "note": "이 engine/ 이 엔진 소스의 정본(canonical home)입니다. 데스크탑 앱에서 벤더링하지 않습니다 — 여기서 직접 유지보수합니다.",
+  "importedFrom": "agentlas-ai/agentlas-desktop/cli",
+  "importedAtDesktopVersion": "0.7.18",
+  "importedAtCommit": "bcfe0df",
+  "independentSince": "2026-07-07"
 }

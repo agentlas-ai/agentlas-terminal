@@ -28,7 +28,7 @@ check "doctor"  node "$BIN" doctor
 
 # 신선 환경 첫 실행 (표준: mktemp 사용, 검증 후 Trash로 이동)
 FRESH="$(mktemp -d "${TMPDIR:-/tmp}/agentlas-smoke-XXXXXX")"
-check "fresh-first-run" env AGENTLAS_USER_DATA_DIR="$FRESH" AGENTLAS_CLI_SOURCE=bundled node "$BIN" list
+check "fresh-first-run" env AGENTLAS_USER_DATA_DIR="$FRESH" node "$BIN" list
 if [ -f "$FRESH/agentlas.sqlite" ]; then
   echo "PASS fresh-db-created"
   pass=$((pass + 1))
