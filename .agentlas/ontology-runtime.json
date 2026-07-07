@@ -1,0 +1,29 @@
+{
+  "schemaVersion": "1.0",
+  "kind": "agentlas-ontology-runtime",
+  "state": "active",
+  "activation": "automatic",
+  "projectRoot": "/Users/mason/Documents/Agentlas_F/agentlas_terminal",
+  "projectName": "agentlas_terminal",
+  "dbPath": "/Users/mason/Documents/Agentlas_F/agentlas_terminal/.agentlas/ontology-runtime.sqlite",
+  "inboxPath": "/Users/mason/Documents/Agentlas_F/agentlas_terminal/.agentlas/ontology-inbox",
+  "sourceManifest": "/Users/mason/Documents/Agentlas_F/agentlas_terminal/.agentlas/ontology-sources.json",
+  "defaultScope": "internal",
+  "autoIngestPolicy": {
+    "mode": "inbox_and_registered_sources_only",
+    "neverScanHomeDirectory": true,
+    "neverScanSiblingProjects": true,
+    "crossProjectSearchDefault": "disabled",
+    "privateScopeDefaultSearch": "excluded"
+  },
+  "promotionMode": {
+    "operatorManagedLocal": true,
+    "securityGateMode": "context_folder_routing_only",
+    "blockingSecurityGate": false,
+    "notes": "Local promotion is blocked by missing project/folder/owner/evidence/rollback structure, not by a generic security gate."
+  },
+  "memoryPolicy": {
+    "durableWrites": "candidate-ticket-only",
+    "workingMemory": "runtime-cache-only"
+  }
+}

@@ -1,3 +1,15 @@
 node_modules/
 *.tgz
 .DS_Store
+
+# Agentlas local credentials
+.env
+.env.local
+.env.*.local
+._*
+signing/*
+!signing/
+!signing/README.md
+credentials/*
+!credentials/
+!credentials/README.md

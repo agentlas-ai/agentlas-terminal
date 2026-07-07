@@ -1205,6 +1205,8 @@ function printHelp(ui) {
     ["/resume [n]", ui.t("help.resume")],
     ["/compact", ui.t("help.compact")],
     ["/import <path>", ui.t("help.import")],
+    ["/storm <goal>", ui.t("help.storm")],
+    ["/swarm <goal>", ui.t("help.swarm")],
     ["/marketplace", ui.t("help.market")],
     ["/install <slug>", ui.t("help.install")],
     ["/clear", ui.t("help.clear")],

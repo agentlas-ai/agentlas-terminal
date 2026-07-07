@@ -5911,7 +5911,8 @@ function agentEnvDirCli(agentId) {
   return null;
 }
 function readVaultEnvValuesCli(keys, projectPath) {
-  const keytar = readKeytar();
+  // standalone에서는 키체인을 건너뛰고 credentials.env 파일 값만 쓴다(buildChildEnvCli가 합침).
+  const keytar = isElectronRuntime() ? readKeytar() : null;
   const result = {};
   if (!keytar || !keys.length) return Promise.resolve(result);
   return Promise.all(
@@ -6492,7 +6493,9 @@ async function cmdCreds(db, args) {
   }
 
   // 1) keychain vault — project-scoped when a project is active.
-  const keytar = readKeytar();
+  // standalone(비-Electron)에서는 키체인 쓰기가 프롬프트로 멈출 수 있어 건너뛴다;
+  // 값은 아래 .env/credentials.env 파일에 저장되므로 런타임 주입에 지장 없다.
+  const keytar = isElectronRuntime() ? readKeytar() : null;
   if (keytar) {
     const vaultKey = project ? projectScopedGlobalEnvKeyCli(project, key) : key;
     try { await keytar.setPassword(SERVICE, ENV_PREFIX + vaultKey, value); targets.push(project ? "project vault" : "vault"); }
@@ -6533,17 +6536,38 @@ async function cmdCreds(db, args) {
   out(`✓ connected ${provider} — saved ${key} to ${targets.join(", ") || "(nowhere — check keytar)"}.`);
 }
 
-function cmdEnv(db) {
+// keytar.findCredentials(전체 열거)는 서명 안 된 standalone Node에서 macOS 키체인이
+// 접근을 막으면 무한 대기하고, 그 네이티브 콜은 process.exit로도 안 죽는다.
+// → Electron(앱) 런타임에서만 keytar를 쓰고, standalone에서는 credentials.env 파일에서 열거한다.
+function isElectronRuntime() {
+  return !!(process.versions && process.versions.electron);
+}
+async function cmdEnv(db) {
+  // standalone(비-Electron): 파일 기반 열거 — keytar 접근이 막혀도 안전.
+  if (!isElectronRuntime()) {
+    const fromFiles = {
+      ...readDotEnvFileCli(path.join(userDataDir(), "credentials.env")),
+      ...readDotEnvFileCli(path.join(os.homedir(), ".agentlas", "credentials.env")),
+    };
+    const keys = Object.keys(fromFiles).sort();
+    out(`공유 env 키 ${keys.length}개 (값은 표시 안 함, credentials.env 기준):`);
+    for (const k of keys) out(`  ${k}`);
+    out("");
+    out("키체인 저장 키는 데스크탑 앱으로 실행할 때 보입니다:  AGENTLAS_CLI_SOURCE=app agentlas env");
+    return;
+  }
   const keytar = readKeytar();
   if (!keytar) fail("keytar 모듈을 불러올 수 없습니다(앱 런타임으로 실행 필요).");
-  keytar
-    .findCredentials(SERVICE)
-    .then((creds) => {
-      const keys = creds.map((c) => c.account).filter((a) => a.startsWith(ENV_PREFIX)).map((a) => a.slice(ENV_PREFIX.length));
-      out(`공유 env 키 ${keys.length}개 (값은 표시 안 함):`);
-      for (const k of keys.sort()) out(`  ${k}`);
-    })
-    .catch((e) => fail("env 조회 실패: " + e.message));
+  let creds;
+  try {
+    creds = await keytar.findCredentials(SERVICE);
+  } catch (e) {
+    fail("env 조회 실패: " + ((e && e.message) || e));
+    return;
+  }
+  const keys = creds.map((c) => c.account).filter((a) => a.startsWith(ENV_PREFIX)).map((a) => a.slice(ENV_PREFIX.length));
+  out(`공유 env 키 ${keys.length}개 (값은 표시 안 함):`);
+  for (const k of keys.sort()) out(`  ${k}`);
 }
 
 async function multimodalStatusCli(db) {
