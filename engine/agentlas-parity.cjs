@@ -186,6 +186,56 @@ function create(deps) {
     if (!r.ok) process.exitCode = 1;
   }
 
+  // ── Hephaestus 네이티브 패스스루 — 엔진 전 기능을 터미널 1급으로 노출 ──
+  // stdio inherit 로 돌려 색/프롬프트/스트리밍이 네이티브 그대로 나온다.
+  function runHephaestusInteractive(args, opts = {}) {
+    const found = hephaestusBin();
+    if (!found) {
+      process.stderr.write("Hephaestus 런타임이 없습니다 — 데스크탑 앱 설치 또는 Hephaestus 인스톨러 실행 후 다시 시도하세요.\n");
+      process.stderr.write("설치: https://agentlas.cloud  ·  또는 HEPHAESTUS_BIN=<경로> 지정\n");
+      return Promise.resolve(1);
+    }
+    const cwd = opts.cwd || D.runCwd();
+    const child =
+      found.kind === "bin"
+        ? spawn(found.exec, args, { cwd, stdio: "inherit" })
+        : spawn("python3", ["-c", PY_BOOTSTRAP, "agentlas_cloud", ...args], {
+            cwd,
+            stdio: "inherit",
+            env: { ...process.env, HEPHAESTUS_RUNTIME_ROOT: found.root },
+          });
+    return new Promise((resolve) => {
+      child.on("error", (e) => {
+        process.stderr.write(`Hephaestus 실행 실패: ${e.message}\n`);
+        resolve(1);
+      });
+      child.on("close", (code) => resolve(code == null ? 0 : code));
+    });
+  }
+
+  const HEP_USAGE = [
+    "agentlas hep <hephaestus 서브커맨드…>   — 엔진 전 기능 네이티브 패스스루",
+    "",
+    "  1급 별칭:",
+    "    agentlas build \"<요청>\"            에이전트/팀 빌드·수리·패키징 (hep-build)",
+    "    agentlas route \"<요청>\"            라우팅 미리보기 — 어떤 에이전트가 잡히는지",
+    "    agentlas research <sub…>           Research Engine (status|gather|search|read|plan…)",
+    "    agentlas network <sub…>            로컬 에이전트 네트워크 (init|status|reindex|add-source…)",
+    "    agentlas journal <sub…>            Stormbreaker 런 저널 (status|verify|repair|gate)",
+    "    agentlas call \"a,b\" \"<컨텍스트>\"    지정한 Hub/Cloud 에이전트 준비 (hep-call)",
+    "",
+    "  전체 서브커맨드: agentlas hep --help  (wizard·security·package·publish·cards·ao·plugins·meta-agent…)",
+  ].join("\n");
+
+  async function cmdHep(db, args) {
+    if (!args.length || args[0] === "help") {
+      D.out(HEP_USAGE);
+      return;
+    }
+    const code = await runHephaestusInteractive(args);
+    if (code !== 0) process.exitCode = code;
+  }
+
   // ── swarm — 앱 swarm-run.ts 프로토콜의 CLI 포트 ──
   function swarmProtocol(goal, tasks, task) {
     const doneList = tasks
@@ -693,6 +743,39 @@ function create(deps) {
     ui.info(ui.lang === "ko" ? "데몬 종료." : "daemon stopped.");
   }
 
+  // ── mcp / chats — 데스크탑 데이터 열람 ──
+  function cmdMcp(db) {
+    let rows = [];
+    try {
+      rows = db.prepare("SELECT id, name, name_en, transport, enabled FROM mcp_servers ORDER BY installed_at ASC").all();
+    } catch { /* 테이블 없음 */ }
+    if (!rows.length) return D.out("설치된 MCP 서버가 없습니다. (설치/설정은 데스크탑 앱 또는 에이전트 패키지가 관리)");
+    for (const r of rows) {
+      D.out(`${r.enabled ? "●" : "○"} ${String(r.name || r.name_en || r.id).padEnd(28).slice(0, 28)} ${String(r.transport || "stdio").padEnd(8)} ${String(r.id).slice(0, 12)}`);
+    }
+    D.out("");
+    D.out("write/full 턴에서 활성(●) stdio 서버가 런타임에 배선됩니다. REPL에서는 /mcp.");
+  }
+
+  function cmdChats(db, args) {
+    const limit = Math.max(1, Math.min(50, Number(args[0]) || 15));
+    let rows = [];
+    try {
+      rows = db.prepare(
+        `SELECT c.id, c.title, c.updated_at, a.name AS agent_name, a.name_en AS agent_name_en
+           FROM chats c LEFT JOIN installed_agents a ON a.id = c.agent_id
+          WHERE c.archived_at IS NULL AND c.kind = 'user'
+          ORDER BY c.updated_at DESC LIMIT ?`,
+      ).all(limit);
+    } catch { /* 스키마 차이 */ }
+    if (!rows.length) return D.out("채팅이 없습니다.");
+    for (const r of rows) {
+      D.out(`${String(r.updated_at || "").slice(0, 16).padEnd(17)} ${String(r.agent_name || r.agent_name_en || "-").slice(0, 18).padEnd(19)} ${String(r.title || "(제목 없음)").slice(0, 60)}`);
+    }
+    D.out("");
+    D.out("데스크탑 앱과 같은 대화 목록입니다 — 터미널 세션 이어하기는 REPL의 /resume.");
+  }
+
   // ── usage — 로컬 집계 ──
   async function cmdUsage(db) {
     const day = new Date(Date.now() - 86400000).toISOString();
@@ -901,7 +984,11 @@ function create(deps) {
     D.out("설치: agentlas cloud install <slug>");
   }
 
-  return { cmdStorm, stormRun, cmdSwarm, swarmRun, cmdAutomation, cmdUsage, cmdTelegram, cloudSearch, cmdLogin, cmdLogout, cmdWhoami, nextCronRun, parseSwarmOutput };
+  return {
+    cmdStorm, stormRun, cmdSwarm, swarmRun, cmdAutomation, cmdUsage, cmdTelegram, cloudSearch,
+    cmdLogin, cmdLogout, cmdWhoami, cmdHep, runHephaestusInteractive, cmdMcp, cmdChats,
+    nextCronRun, parseSwarmOutput,
+  };
 }
 
 module.exports = { create };

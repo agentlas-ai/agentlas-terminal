@@ -6102,9 +6102,10 @@ function buildHelpers(db) {
     sessionsSave: (list) => {
       try { fs.writeFileSync(path.join(userDataDir(), "cli-sessions.json"), JSON.stringify((list || []).slice(0, 30), null, 2), "utf8"); } catch { /* ignore */ }
     },
-    // 패리티: REPL의 /storm·/swarm 이 그대로 호출한다.
+    // 패리티: REPL의 /storm·/swarm·/build·/route·/research 가 그대로 호출한다.
     stormRun: (db_, goal, ctx) => parity().stormRun(db_, goal, ctx),
     swarmRun: (db_, goal, ctx) => parity().swarmRun(db_, goal, ctx),
+    hepRun: (args, opts) => parity().runHephaestusInteractive(args, opts),
     ontologyCommand: (text, ctx) => runOntologyNaturalCli(text, {
       cwd: (ctx && ctx.cwd) || projectCwd(),
       projectPath: (ctx && ctx.cwd) || projectCwd(),
@@ -7294,6 +7295,15 @@ function cmdHelp() {
       "  ontology              project-local ontology status/list/add; inside REPL use /ontology",
       "  storm <goal>          Stormbreaker force-robust pipeline (route → verify → execute) [--research]",
       "  swarm <goal>          emergent agent swarm — parallel workers + blackboard + synthesizer [--parallel N]",
+      "  build \"<request>\"     build/repair/package an agent or team (Hephaestus hep-build)",
+      "  route \"<request>\"     routing preview — which agent/pipeline would take this",
+      "  research <sub>        Research Engine: status|gather|search|read|plan …",
+      "  network <sub>         local agent network: init|status|reindex|add-source …",
+      "  journal <sub>         Stormbreaker run journal: status|verify|repair|gate",
+      "  call \"a,b\" \"<ctx>\"    prepare named Hub/Cloud agents (hep-call)",
+      "  hep <sub…>            full Hephaestus passthrough (wizard·security·cards·ao·plugins…)",
+      "  mcp                   installed MCP servers (shared with the app)",
+      "  chats [n]             recent app/terminal chats",
       "  automation <sub>      list|add|on|off|remove|run <id>|runs|daemon — local runner included",
       "  login | logout | whoami",
       "                        Agentlas Cloud sign-in (browser flow) — marketplace install/publish",
@@ -7406,6 +7416,31 @@ async function main() {
     case "automation":
     case "automations":
       return parity().cmdAutomation(db, rest.slice(1), runtimeOverride);
+    case "hep":
+    case "hephaestus":
+      return parity().cmdHep(db, rest.slice(1));
+    case "build":
+      // hep-build "<요청>" — 요청 전체를 한 인자로 (엔진이 딥인터뷰/빌더로 라우팅)
+      return parity().cmdHep(db, rest.length > 1 ? ["hep-build", rest.slice(1).join(" ")] : ["hep-build"]);
+    case "route":
+      return parity().cmdHep(
+        db,
+        rest.length > 1
+          ? ["route", rest.slice(1).join(" "), "--project", runCwd(), "--runtime", "terminal"]
+          : ["route"],
+      );
+    case "research":
+      return parity().cmdHep(db, ["research", ...rest.slice(1)]);
+    case "network":
+      return parity().cmdHep(db, ["network", ...rest.slice(1)]);
+    case "journal":
+      return parity().cmdHep(db, ["stormbreaker", "journal", ...rest.slice(1)]);
+    case "call":
+      return parity().cmdHep(db, ["hep-call", ...rest.slice(1)]);
+    case "mcp":
+      return parity().cmdMcp(db);
+    case "chats":
+      return parity().cmdChats(db, rest.slice(1));
     case "login":
       return parity().cmdLogin(rest.slice(1));
     case "logout":

@@ -704,6 +704,24 @@ function startRepl(opts) {
         await H.stormRun(db, goal, { ui, cwd: state.cwd, research });
         return true;
       }
+      case "build": {
+        if (!arg) return ui.warn("usage: /build <만들고 싶은 에이전트/팀 설명>"), true;
+        ui.line("");
+        await H.hepRun(["hep-build", arg], { cwd: state.cwd });
+        return true;
+      }
+      case "route": {
+        if (!arg) return ui.warn("usage: /route <요청>"), true;
+        ui.line("");
+        await H.hepRun(["route", arg, "--project", state.cwd, "--runtime", "terminal"], { cwd: state.cwd });
+        return true;
+      }
+      case "research": {
+        if (!arg) return ui.warn("usage: /research status|gather|search|read … (예: /research search \"쿼리\")"), true;
+        ui.line("");
+        await H.hepRun(["research", ...arg.split(/\s+/)], { cwd: state.cwd });
+        return true;
+      }
       case "swarm": {
         if (!arg) return ui.warn("usage: /swarm <goal>  [--parallel N]"), true;
         let goal = arg;
@@ -1207,6 +1225,9 @@ function printHelp(ui) {
     ["/import <path>", ui.t("help.import")],
     ["/storm <goal>", ui.t("help.storm")],
     ["/swarm <goal>", ui.t("help.swarm")],
+    ["/build <request>", ui.t("help.build")],
+    ["/route <request>", ui.t("help.route")],
+    ["/research <sub>", ui.t("help.research")],
     ["/marketplace", ui.t("help.market")],
     ["/install <slug>", ui.t("help.install")],
     ["/clear", ui.t("help.clear")],
