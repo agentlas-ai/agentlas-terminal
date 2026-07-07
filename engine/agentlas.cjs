@@ -1167,8 +1167,25 @@ async function registerCloudAgentCli(manifest, bundlePath, review, visibility) {
   };
 }
 
+// `agentlas login`이 저장하는 CLI 세션 파일 (평문·0600 — 데스크탑의 safeStorage 파일과 별개).
+function cliSessionPath() {
+  return path.join(userDataDir(), "auth", "cli-session.v1.json");
+}
+function readCliSessionValue() {
+  try {
+    const j = JSON.parse(fs.readFileSync(cliSessionPath(), "utf8"));
+    return (j && typeof j.value === "string" && j.value) || null;
+  } catch {
+    return null;
+  }
+}
+
 async function cloudSessionCookieCli() {
   if (process.env.AGENTLAS_SESSION) return `agentlas_session=${process.env.AGENTLAS_SESSION}`;
+  // 1) CLI 자체 로그인 세션 (agentlas login)
+  const fileValue = readCliSessionValue();
+  if (fileValue) return `agentlas_session=${fileValue}`;
+  // 2) (레거시) keytar 항목 — 데스크탑 앱은 세션을 keytar에 두지 않으므로 보통 비어 있다.
   const keytar = readKeytar();
   if (!keytar) return null;
   try {
@@ -6230,6 +6247,8 @@ function parity() {
       autoRouteAgent,
       prefsLang,
       cloudSessionCookieCli,
+      cliSessionPath,
+      firmSystemPrompt,
       out,
       fail,
       RUNTIME_BIN,
@@ -7275,7 +7294,9 @@ function cmdHelp() {
       "  ontology              project-local ontology status/list/add; inside REPL use /ontology",
       "  storm <goal>          Stormbreaker force-robust pipeline (route → verify → execute) [--research]",
       "  swarm <goal>          emergent agent swarm — parallel workers + blackboard + synthesizer [--parallel N]",
-      "  automation <sub>      list|add|on|off|remove|runs — app scheduler executes them",
+      "  automation <sub>      list|add|on|off|remove|run <id>|runs|daemon — local runner included",
+      "  login | logout | whoami",
+      "                        Agentlas Cloud sign-in (browser flow) — marketplace install/publish",
       "  usage                 local usage summary (runs, messages, automations)",
       "  telegram              telegram binding status (pairing lives in the app)",
       "  cloud wizard <path>   create/repair agentlas.json for Cloud MCP calls",
@@ -7384,7 +7405,13 @@ async function main() {
       return parity().cmdSwarm(db, rest.slice(1), runtimeOverride);
     case "automation":
     case "automations":
-      return parity().cmdAutomation(db, rest.slice(1));
+      return parity().cmdAutomation(db, rest.slice(1), runtimeOverride);
+    case "login":
+      return parity().cmdLogin(rest.slice(1));
+    case "logout":
+      return parity().cmdLogout();
+    case "whoami":
+      return parity().cmdWhoami();
     case "usage":
       return parity().cmdUsage(db);
     case "telegram":

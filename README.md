@@ -49,7 +49,10 @@ agentlas cd <agent>                # 에이전트 폴더 경로 → cd "$(agentl
 agentlas import <폴더>             # 로컬 에이전트/팀 임포트
 agentlas storm "목표"               # Stormbreaker 파이프라인 (라우팅→검증→실행) [--research]
 agentlas swarm "목표"               # emergent 에이전트 스웜 (병렬+블랙보드+종합) [--parallel N]
-agentlas automation list|add|on|off|runs   # 자동화 등록/관리 (실행은 앱 스케줄러)
+agentlas login | logout | whoami   # Agentlas Cloud 로그인 (브라우저 플로우)
+agentlas automation list|add|on|off|remove|runs   # 자동화 등록/관리
+agentlas automation run <id>       # 자동화 지금 1회 실행
+agentlas automation daemon         # 상주 실행기 — 앱 없이 예약 자동화 실행 (앱과 리스 공유)
 agentlas cloud search "찾는 일"     # 마켓플레이스 검색 (로그인 불필요)
 agentlas cloud install <slug>      # 마켓플레이스에서 에이전트 설치
 agentlas usage                     # 로컬 사용 현황 (실행/메시지/자동화)

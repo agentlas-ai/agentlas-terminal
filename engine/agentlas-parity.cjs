@@ -414,8 +414,8 @@ function create(deps) {
     return null;
   }
 
-  // ── automation — 등록/목록/토글 (실행은 앱 스케줄러) ──
-  function cmdAutomation(db, args) {
+  // ── automation — 등록/목록/토글/실행 (run·daemon은 로컬 실행기) ──
+  async function cmdAutomation(db, args, runtimeOverride) {
     const sub = args[0] || "list";
     const now = new Date().toISOString();
 
@@ -433,7 +433,8 @@ function create(deps) {
         );
       }
       D.out("");
-      D.out("실행 주체는 데스크탑 앱 스케줄러입니다 — 앱이 꺼져 있으면 다음 실행이 대기됩니다.");
+      D.out("지금 실행: agentlas automation run <id>  ·  상주 실행기: agentlas automation daemon");
+      D.out("(데스크탑 앱이 켜져 있으면 앱 스케줄러도 실행합니다 — 리스로 중복 실행은 방지됩니다.)");
       return;
     }
 
@@ -495,7 +496,7 @@ function create(deps) {
         "hub-allowed",
       );
       D.out(`등록됨: ${id.slice(0, 8)}  ${flags.name || targetLabel}  next=${next.toISOString().slice(0, 16)}`);
-      D.out("실행은 데스크탑 앱 스케줄러가 담당합니다 (60초 폴링).");
+      D.out(`지금 실행: agentlas automation run ${id.slice(0, 8)}  ·  예약 실행: agentlas automation daemon (또는 데스크탑 앱)`);
       return;
     }
 
@@ -539,7 +540,157 @@ function create(deps) {
       return;
     }
 
-    D.out("usage: agentlas automation list|add|on <id>|off <id>|remove <id>|runs");
+    if (sub === "run") {
+      const idPrefix = args[1];
+      if (!idPrefix) return D.fail("usage: agentlas automation run <id>");
+      const row = db.prepare("SELECT * FROM automations WHERE id LIKE ?").get(idPrefix + "%");
+      if (!row) return D.fail(`자동화를 찾을 수 없습니다: ${idPrefix}`);
+      const ui = newUi();
+      // run-now는 스케줄을 건드리지 않는다 (앱의 advanceSchedule=false와 동일).
+      const r = await runAutomationOnce(db, row, { ui, advanceSchedule: false, runtimeOverride });
+      if (!r.ok) process.exitCode = 1;
+      return;
+    }
+
+    if (sub === "daemon") {
+      let interval = 30;
+      for (let i = 1; i < args.length; i++) {
+        if (args[i] === "--interval") interval = Math.max(10, Number(args[++i]) || 30);
+      }
+      return automationDaemon(db, { intervalSec: interval });
+    }
+
+    D.out("usage: agentlas automation list|add|on <id>|off <id>|remove <id>|run <id>|runs|daemon");
+  }
+
+  // ── automation 실행기 — 앱 스케줄러와 같은 SQLite 리스(claimed_at TTL 15분)로 중복 실행 방지 ──
+  const AUTOMATION_LEASE_TTL_MS = 15 * 60 * 1000; // 앱 store/automations.ts LEASE_TTL_MS와 동일
+  const AUTOMATION_LEASE_OWNER = `cli:${os.hostname()}:${process.pid}`;
+
+  function claimAutomation(db, id, now = new Date()) {
+    const cutoff = new Date(now.getTime() - AUTOMATION_LEASE_TTL_MS).toISOString();
+    const result = db
+      .prepare(
+        "UPDATE automations SET claimed_at = ?, lease_owner = ? WHERE id = ? AND enabled = 1 AND (claimed_at IS NULL OR claimed_at < ?)",
+      )
+      .run(now.toISOString(), AUTOMATION_LEASE_OWNER, id, cutoff);
+    return (result.changes ?? result.rowsAffected ?? 0) > 0;
+  }
+
+  function releaseAutomation(db, id) {
+    try { db.prepare("UPDATE automations SET claimed_at = NULL, lease_owner = NULL WHERE id = ?").run(id); } catch { /* best-effort */ }
+  }
+
+  function recordAutomationRun(db, automationId, status, error, scheduledFor) {
+    try {
+      db.prepare(
+        "INSERT INTO run_history (id, automation_id, scheduled_for, ran_at, status, skipped_count, error) VALUES (?,?,?,?,?,0,?)",
+      ).run(crypto.randomUUID(), automationId, scheduledFor || null, new Date().toISOString(), status, error || null);
+    } catch { /* best-effort */ }
+  }
+
+  // 자동화 1건 실행: 타깃(agent/firm)의 시스템 프롬프트로 prompt_template을 활성 런타임에 태운다.
+  // ctx: { ui, advanceSchedule?, runtimeOverride?, scheduledFor? }
+  async function runAutomationOnce(db, row, ctx = {}) {
+    const ui = ctx.ui || newUi();
+    // run-now도 리스를 잡는다 — 앱 스케줄러가 같은 행을 동시에 돌리는 것을 방지.
+    if (!claimAutomation(db, row.id)) {
+      ui.warn(`다른 실행기가 이 자동화를 잡고 있습니다 (lease TTL 15분): ${row.name}`);
+      return { ok: false, skipped: true };
+    }
+    ui.line("");
+    ui.line(ui.c.paw("◤ ") + ui.c.bold(ui.c.text("automation")) + ui.c.dim(`  ${row.name}  (${String(row.id).slice(0, 8)})`));
+
+    try {
+      // 타깃 해석 (agent/firm) — background/비공개 포함 id 직접 조회.
+      let system;
+      let agentId = null;
+      if (row.target_type === "firm") {
+        const firm = db.prepare("SELECT * FROM firms WHERE id = ?").get(row.target_id);
+        if (!firm) throw new Error(`회사를 찾을 수 없습니다: ${row.target_id}`);
+        system = D.firmSystemPrompt(db, firm);
+      } else {
+        const agent = db.prepare("SELECT * FROM installed_agents WHERE id = ?").get(row.target_id);
+        if (!agent) throw new Error(`에이전트를 찾을 수 없습니다: ${row.target_id}`);
+        system = agent.system_prompt || `You are ${agent.name}.`;
+        agentId = agent.id;
+      }
+
+      const cwd = D.runCwd();
+      const env = await D.buildChildEnvCli(db, { projectPath: null, agentId, permission: "write", cwd, lang: ui.lang });
+      const runtime = D.resolveRuntime(db, ctx.runtimeOverride);
+      ui.info(`${runtime.mode === "cli" ? runtime.kind : runtime.backend} · write · ${cwd}`);
+      ui.startSpinner(ui.lang === "ko" ? "자동화 실행 중…" : "running automation…");
+
+      let text;
+      if (runtime.mode === "cli") {
+        text = await D.captureRuntime(runtime.kind, system, row.prompt_template, { cwd, env, permission: "write" });
+      } else {
+        const r = await D.runApi(runtime.backend, runtime.model, system, row.prompt_template);
+        text = typeof r === "string" ? r : (r && r.text) || "";
+      }
+      ui.stopSpinner();
+      ui.markdown(String(text).trim().slice(0, 4000));
+
+      recordAutomationRun(db, row.id, "ok", null, ctx.scheduledFor);
+      const advance = ctx.advanceSchedule && row.schedule ? nextCronRun(row.schedule) : null;
+      db.prepare(
+        "UPDATE automations SET last_run_at = ?, run_count = run_count + 1" + (advance ? ", next_run_at = ?" : "") + " WHERE id = ?",
+      ).run(...(advance ? [new Date().toISOString(), advance.toISOString(), row.id] : [new Date().toISOString(), row.id]));
+      // max_runs 도달 시 비활성화 (앱과 동일한 종료 조건).
+      if (row.max_runs && row.run_count + 1 >= row.max_runs) {
+        db.prepare("UPDATE automations SET enabled = 0 WHERE id = ?").run(row.id);
+        ui.info(ui.lang === "ko" ? "max_runs 도달 — 자동화를 비활성화했습니다." : "max_runs reached — automation disabled.");
+      }
+      return { ok: true };
+    } catch (e) {
+      ui.stopSpinner();
+      const msg = String((e && e.message) || e).slice(0, 500);
+      ui.error(msg);
+      recordAutomationRun(db, row.id, "error", msg, ctx.scheduledFor);
+      db.prepare("UPDATE automations SET last_run_at = ? WHERE id = ?").run(new Date().toISOString(), row.id);
+      return { ok: false };
+    } finally {
+      releaseAutomation(db, row.id);
+    }
+  }
+
+  // 상주 실행기 — 앱 없이도 자동화가 돌게 하는 포그라운드 데몬 (Ctrl-C로 종료).
+  async function automationDaemon(db, opts = {}) {
+    const ui = newUi();
+    const intervalSec = Math.max(10, opts.intervalSec || 30);
+    let stopping = false;
+    process.on("SIGINT", () => { stopping = true; ui.line(""); ui.info(ui.lang === "ko" ? "종료 중…" : "stopping…"); });
+    process.on("SIGTERM", () => { stopping = true; });
+
+    ui.line("");
+    ui.ok(`automation daemon — ${intervalSec}s 폴링 · owner ${AUTOMATION_LEASE_OWNER}`);
+    ui.info(ui.lang === "ko" ? "Ctrl-C로 종료. (데스크탑 앱 스케줄러와 리스를 공유해 중복 실행되지 않습니다.)" : "Ctrl-C to stop.");
+
+    while (!stopping) {
+      const nowIso = new Date().toISOString();
+      let due = [];
+      try {
+        due = db.prepare(
+          "SELECT * FROM automations WHERE enabled = 1 AND trigger_type = 'schedule' AND next_run_at IS NOT NULL AND next_run_at <= ? ORDER BY next_run_at ASC LIMIT 5",
+        ).all(nowIso);
+      } catch (e) {
+        ui.error("due 조회 실패: " + String((e && e.message) || e));
+      }
+      for (const row of due) {
+        if (stopping) break;
+        await runAutomationOnce(db, row, { ui, advanceSchedule: true, scheduledFor: row.next_run_at });
+        // 스케줄이 없는(1회성) 행이 남으면 재발화 방지.
+        if (!row.schedule || !nextCronRun(row.schedule)) {
+          db.prepare("UPDATE automations SET enabled = 0 WHERE id = ? AND (schedule IS NULL OR schedule = '')").run(row.id);
+        }
+      }
+      // interval 대기 (1초 단위로 stop 체크)
+      for (let i = 0; i < intervalSec && !stopping; i++) {
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+    ui.info(ui.lang === "ko" ? "데몬 종료." : "daemon stopped.");
   }
 
   // ── usage — 로컬 집계 ──
@@ -586,6 +737,118 @@ function create(deps) {
     }
     D.out("");
     D.out("페어링/봇 발급은 데스크탑 앱 Connect에서, 여기서는 현황만 봅니다.");
+  }
+
+  // ── login / logout / whoami — Agentlas Cloud 세션 (데스크탑과 동일한 loopback 브라우저 플로우) ──
+  function webBaseUrl() {
+    return (process.env.AGENTLAS_WEB_BASE_URL || "https://agentlas.cloud").replace(/\/$/, "");
+  }
+
+  function openInBrowser(url) {
+    const argv =
+      process.platform === "darwin" ? ["open", url]
+      : process.platform === "win32" ? ["cmd", "/c", "start", "", url]
+      : ["xdg-open", url];
+    try {
+      const child = spawn(argv[0], argv.slice(1), { stdio: "ignore", detached: true });
+      child.unref();
+    } catch { /* URL은 이미 출력됨 — 수동으로 열면 된다 */ }
+  }
+
+  async function fetchSessionMeta(cookie) {
+    const resp = await fetch(`${webBaseUrl()}/api/auth/session`, { headers: { cookie }, signal: AbortSignal.timeout(8000) });
+    if (!resp.ok) throw new Error(`세션 확인 응답 ${resp.status}`);
+    return resp.json();
+  }
+
+  async function cmdWhoami() {
+    const cookie = await D.cloudSessionCookieCli();
+    if (!cookie) {
+      D.out("로그아웃 상태입니다.  agentlas login 으로 로그인하세요.");
+      process.exitCode = 1;
+      return;
+    }
+    try {
+      const j = await fetchSessionMeta(cookie);
+      if (j && j.authenticated) {
+        const email = (j.user && j.user.email) || "?";
+        const ws = j.workspace || {};
+        D.out(`로그인됨: ${email}  ·  워크스페이스: ${ws.name || "?"} (${ws.plan || "free"})`);
+      } else {
+        D.out("세션이 만료되었거나 유효하지 않습니다.  agentlas login 으로 다시 로그인하세요.");
+        process.exitCode = 1;
+      }
+    } catch (e) {
+      D.fail("세션 확인 실패: " + String((e && e.message) || e));
+    }
+  }
+
+  // 웹 /account?desktop=1&callback=<loopback> 이 유효 세션이면 <callback>?session=<value> 로 302 —
+  // 데스크탑 signInWithBrowser(electron/auth.ts)와 동일한 프로토콜을 순수 Node http로 구현.
+  async function cmdLogin(args = []) {
+    const force = args.includes("--force");
+    if (!force) {
+      const existing = await D.cloudSessionCookieCli();
+      if (existing) {
+        try {
+          const j = await fetchSessionMeta(existing);
+          if (j && j.authenticated) {
+            D.out(`이미 로그인돼 있습니다 (${(j.user && j.user.email) || "?"}).  재로그인: agentlas login --force`);
+            return;
+          }
+        } catch { /* 확인 실패 — 새로 로그인 진행 */ }
+      }
+    }
+
+    const http = require("node:http");
+    let value;
+    try {
+      value = await new Promise((resolve, reject) => {
+        let settled = false;
+        const done = (fn, arg) => { if (!settled) { settled = true; fn(arg); } };
+        const server = http.createServer((req, res) => {
+          let u;
+          try { u = new URL(req.url, "http://127.0.0.1"); } catch { res.writeHead(400); res.end(); return; }
+          if (!u.pathname.startsWith("/callback")) { res.writeHead(404); res.end("not found"); return; }
+          const v = u.searchParams.get("session") || u.searchParams.get("token");
+          res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+          res.end("<html><body style=\"font-family:-apple-system,sans-serif;padding:40px\"><h3>Agentlas 로그인 완료</h3><p>터미널로 돌아가세요. 이 창은 닫아도 됩니다.</p></body></html>");
+          server.close();
+          if (v) done(resolve, v);
+          else done(reject, new Error("콜백에 session 값이 없습니다."));
+        });
+        server.on("error", (e) => done(reject, e));
+        server.listen(0, "127.0.0.1", () => {
+          const port = server.address().port;
+          const cb = encodeURIComponent(`http://127.0.0.1:${port}/callback`);
+          const url = `${webBaseUrl()}/account?desktop=1&callback=${cb}`;
+          D.out("브라우저에서 Agentlas에 로그인하세요 (자동으로 열립니다):");
+          D.out("  " + url);
+          openInBrowser(url);
+        });
+        const t = setTimeout(() => { try { server.close(); } catch { /* ignore */ } done(reject, new Error("로그인 대기 시간(180초)이 지났습니다. 다시 시도: agentlas login")); }, 180_000);
+        if (t.unref) t.unref();
+      });
+    } catch (e) {
+      return D.fail(String((e && e.message) || e));
+    }
+
+    const p = D.cliSessionPath();
+    fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(p, JSON.stringify({ version: 1, value, updatedAt: new Date().toISOString() }, null, 2) + "\n", { mode: 0o600 });
+    try { fs.chmodSync(p, 0o600); } catch { /* win32 */ }
+    D.out(`세션 저장됨: ${p}`);
+    await cmdWhoami();
+  }
+
+  function cmdLogout() {
+    const p = D.cliSessionPath();
+    if (fs.existsSync(p)) {
+      try { fs.rmSync(p); D.out("로그아웃 완료 (CLI 세션 삭제)."); } catch (e) { return D.fail("세션 파일 삭제 실패: " + e.message); }
+    } else {
+      D.out("저장된 CLI 세션이 없습니다.");
+    }
+    if (process.env.AGENTLAS_SESSION) D.out("주의: AGENTLAS_SESSION 환경변수가 여전히 설정돼 있어 로그인 상태로 보일 수 있습니다.");
   }
 
   // ── cloud search — 마켓플레이스 검색 ──
@@ -638,7 +901,7 @@ function create(deps) {
     D.out("설치: agentlas cloud install <slug>");
   }
 
-  return { cmdStorm, stormRun, cmdSwarm, swarmRun, cmdAutomation, cmdUsage, cmdTelegram, cloudSearch, nextCronRun, parseSwarmOutput };
+  return { cmdStorm, stormRun, cmdSwarm, swarmRun, cmdAutomation, cmdUsage, cmdTelegram, cloudSearch, cmdLogin, cmdLogout, cmdWhoami, nextCronRun, parseSwarmOutput };
 }
 
 module.exports = { create };
