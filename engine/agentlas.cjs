@@ -819,6 +819,7 @@ async function cmdCloud(db, args, runtimeOverride) {
       "  publish <path> [--dry-run] [--llm-review] [--slug name]",
       "                                      register with submitter-paid local review",
       "  install <slug>                      download/install from Agentlas Cloud marketplace",
+      "  delete <slug> [--json]              unpublish one of your cloud marketplace agents",
       "  search \"<what you need>\" [--limit 10]",
       "                                      search the marketplace (no sign-in needed)",
       "",
@@ -829,6 +830,14 @@ async function cmdCloud(db, args, runtimeOverride) {
   }
   if (sub === "search") {
     return parity().cloudSearch(db, args.slice(1));
+  }
+  if (sub === "delete" || sub === "unpublish") {
+    const flags = parseCloudFlags(args.slice(1));
+    const slug = flags._[0];
+    if (!slug) fail(`usage: agentlas cloud ${sub} <slug> [--json]`);
+    const result = await deleteCloudAgentCli(slug);
+    out(flags.json ? JSON.stringify(result, null, 2) : `✓ deleted ${result.slug || slug}`);
+    return;
   }
   const cloudRuntime = require("./agentlas-cloud-runtime.cjs");
   if (sub === "wizard") {
@@ -875,7 +884,7 @@ async function cmdCloud(db, args, runtimeOverride) {
     return;
   }
   if (sub === "install") return cmdCloudInstall(db, args[1]);
-  if (sub !== "package" && sub !== "publish") fail("usage: agentlas cloud <package|publish|install> ...");
+  if (sub !== "package" && sub !== "publish") fail("usage: agentlas cloud <package|publish|install|delete> ...");
   const flags = parseCloudFlags(args.slice(1));
   const root = flags._[0];
   if (!root) fail(`usage: agentlas cloud ${sub} <path>`);
@@ -1165,6 +1174,21 @@ async function registerCloudAgentCli(manifest, bundlePath, review, visibility) {
     registeredAt: json.registeredAt || new Date().toISOString(),
     dryRun: false,
   };
+}
+
+async function deleteCloudAgentCli(slug) {
+  const safeSlug = String(slug || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64);
+  if (!safeSlug) fail("usage: agentlas cloud delete <slug> [--json]");
+  const cookie = await cloudSessionCookieCli();
+  if (!cookie) fail("agentlas.cloud 로그인이 필요합니다. 데스크톱 앱에서 로그인하거나 AGENTLAS_SESSION을 설정하세요.");
+  if (typeof fetch !== "function") fail("이 런타임에 fetch가 없습니다(앱 런타임으로 실행 필요).");
+  const base = (process.env.AGENTLAS_WEB_BASE_URL || "https://agentlas.cloud").replace(/\/$/, "");
+  const resp = await fetch(`${base}/api/cloud-agents/v1/register?slug=${encodeURIComponent(safeSlug)}`, {
+    method: "DELETE",
+    headers: { "content-type": "application/json", cookie, origin: base },
+  });
+  if (!resp.ok) fail(`Agentlas Cloud 삭제 실패 ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 300)}`);
+  return resp.json();
 }
 
 // `agentlas login`이 저장하는 CLI 세션 파일 (평문·0600 — 데스크탑의 safeStorage 파일과 별개).
