@@ -25,6 +25,20 @@ check "where"   node "$BIN" --where
 check "version" node "$BIN" version
 check "list"    node "$BIN" list
 check "doctor"  node "$BIN" doctor
+check "help"    node "$BIN" help
+check "usage"   node "$BIN" usage
+check "mcp"     node "$BIN" mcp
+check "chats"   node "$BIN" chats
+
+# Agentlas OS 표면: 무인자 호출은 usage를 내고 exit 1 (프롬프트 오라우팅 방지 확인)
+guard() {
+  name="$1"; shift
+  if out="$("$@" 2>&1)"; then echo "FAIL $name (should exit non-zero)"; fail=$((fail + 1));
+  else echo "PASS $name"; pass=$((pass + 1)); fi
+}
+guard "guard-search"  node "$BIN" search
+guard "guard-install" node "$BIN" install
+guard "guard-upload"  node "$BIN" upload
 
 # 신선 환경 첫 실행 (표준: mktemp 사용, 검증 후 Trash로 이동)
 FRESH="$(mktemp -d "${TMPDIR:-/tmp}/agentlas-smoke-XXXXXX")"

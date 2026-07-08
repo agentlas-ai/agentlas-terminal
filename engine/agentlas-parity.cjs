@@ -981,7 +981,7 @@ function create(deps) {
       D.out(`${String(slug).padEnd(34).slice(0, 34)} ${String(name).slice(0, 26).padEnd(27)} ${String(kind).padEnd(14)} ${String(tagline).slice(0, 60)}`);
     }
     D.out("");
-    D.out("설치: agentlas cloud install <slug>");
+    D.out("설치: agentlas install <slug>");
   }
 
   return {

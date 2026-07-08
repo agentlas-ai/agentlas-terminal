@@ -1,17 +1,31 @@
 "use strict";
 /*
- * Agentlas terminal splash — small dinosaur mascot (Chrome-dino style) + wordmark + status.
+ * Agentlas terminal splash — AGENTLAS wordmark banner + status card.
  */
 const path = require("node:path");
 const os = require("node:os");
 
-// Small T-Rex (side view, facing right) — eye is ●.
-const DINO_ART = [
-  "          ▟████▙",
-  "          █●  ▜█▙",
-  "   ▖      ████████",
-  "   ▜█▄▄▄▄▄███",
-  "    ▀▀▀█▌ █▌",
+// AGENTLAS wordmark (block letters). Rendered with a brand gradient across columns.
+const WORDMARK = [
+  "  █████╗  ██████╗ ███████╗███╗   ██╗████████╗██╗      █████╗ ███████╗",
+  " ██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝██║     ██╔══██╗██╔════╝",
+  " ███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║   ██║     ███████║███████╗",
+  " ██╔══██║██║   ██║██╔══╝  ██║╚██╗██║   ██║   ██║     ██╔══██║╚════██║",
+  " ██║  ██║╚██████╔╝███████╗██║ ╚████║   ██║   ███████╗██║  ██║███████║",
+  " ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝   ╚══════╝╚═╝  ╚═╝╚══════╝",
+];
+
+// Compact single-line wordmark for narrow terminals.
+const WORDMARK_COMPACT = "▞▖ AGENTLAS";
+
+// Brand gradient (emerald → green → lime → blue) applied left-to-right across the wordmark.
+const GRADIENT = [
+  [110, 231, 183],
+  [52, 211, 153],
+  [16, 185, 129],
+  [45, 212, 191],
+  [56, 189, 248],
+  [147, 197, 253],
 ];
 
 function readVersion() {
@@ -28,16 +42,30 @@ function shorten(p) {
   return p.startsWith(home) ? "~" + p.slice(home.length) : p;
 }
 
-// Just the mascot lines (used by the onboarding wizard header).
+// AGENTLAS wordmark, per-column brand gradient. Falls back to plain / compact.
 function renderMascot(ui) {
   const c = ui.c;
+  const cols = (ui.out && ui.out.columns) || 80;
   if (!ui.enabled) {
-    ui.line("  Agentlas");
+    ui.line("  AGENTLAS");
     return;
   }
-  for (let i = 0; i < DINO_ART.length; i++) {
-    const row = DINO_ART[i];
-    ui.line("   " + (i === 1 ? c.text(row).split("●").join(c.emerald("●")) : c.text(row)));
+  // Narrow terminal → compact wordmark.
+  if (cols < 72) {
+    ui.line("  " + c.bold(c.emerald(WORDMARK_COMPACT)));
+    return;
+  }
+  const g = (rgb, s) => `\x1b[1;38;2;${rgb[0]};${rgb[1]};${rgb[2]}m${s}\x1b[0m`;
+  for (const rowStr of WORDMARK) {
+    let outLine = "";
+    const n = rowStr.length || 1;
+    for (let i = 0; i < rowStr.length; i++) {
+      const ch = rowStr[i];
+      if (ch === " ") { outLine += " "; continue; }
+      const idx = Math.min(GRADIENT.length - 1, Math.floor((i / n) * GRADIENT.length));
+      outLine += g(GRADIENT[idx], ch);
+    }
+    ui.line(outLine);
   }
 }
 
@@ -71,9 +99,12 @@ function renderStatusCard(ctx, opts = {}) {
   const cwd = ctx.cwd ? shorten(ctx.cwd) : process.cwd();
 
   ui.line("");
+  if (!opts.noWordmark) {
+    renderMascot(ui);
+    ui.line("  " + c.dim("the operating system for agents") + (version ? c.faint("   v" + version) : ""));
+  }
+  ui.line("");
   ui.line(c.faint("╭" + "─".repeat(width - 2) + "╮"));
-  row(ui, width, `>_ Agentlas${version ? " (v" + version + ")" : ""}`);
-  row(ui, width, "");
   row(ui, width, `model:       ${runtime}`);
   row(ui, width, `agent:       ${subject}`);
   row(ui, width, `directory:   ${cwd}`);
@@ -100,9 +131,9 @@ function renderBanner(ctx) {
   ctx.ui.line("");
 }
 
-// runtime · subject · permission · working folder
+// runtime · subject · permission · working folder (no wordmark — used for /status).
 function renderStatus(ctx) {
-  renderStatusCard(ctx, { noTip: true });
+  renderStatusCard(ctx, { noTip: true, noWordmark: true });
 }
 
-module.exports = { renderBanner, renderStatus, renderMascot, readVersion, shorten, DINO_ART, fit };
+module.exports = { renderBanner, renderStatus, renderMascot, readVersion, shorten, WORDMARK, fit };

@@ -1,7 +1,18 @@
 # agentlas
 
-**The Agentlas agent terminal.** Chat with your installed AI agents and teams
-from the terminal — Claude Code style. Standalone: no desktop app required.
+```
+  █████╗  ██████╗ ███████╗███╗   ██╗████████╗██╗      █████╗ ███████╗
+ ██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝██║     ██╔══██╗██╔════╝
+ ███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║   ██║     ███████║███████╗
+ ██╔══██║██║   ██║██╔══╝  ██║╚██╗██║   ██║   ██║     ██╔══██║╚════██║
+ ██║  ██║╚██████╔╝███████╗██║ ╚████║   ██║   ███████╗██║  ██║███████║
+ ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝   ╚══════╝╚═╝  ╚═╝╚══════╝
+```
+
+**The operating system for agents — in your terminal.** Chat with your AI
+agents and teams, build new ones, and run the full Agentlas OS surface
+(`build` · `search` · `install` · `storm` · `network` · …) from one command.
+Claude Code style, standalone: **no desktop app required.**
 
 ```sh
 npm install -g agentlas
@@ -40,31 +51,67 @@ Windows(미검증): `powershell -ExecutionPolicy Bypass -File install.ps1`
 ## 사용
 
 ```sh
-agentlas                           # 대화형 TUI (온보딩 → 에이전트 피커 → 스트리밍 REPL)
-agentlas list                      # 설치된 에이전트/회사 + 활성 런타임
-agentlas <agent>                   # 해당 에이전트와 대화형 세션
-agentlas run <agent> "프롬프트"     # 1회 실행 (prompt 없으면 stdin)
-agentlas firm <firm> "프롬프트"     # 회사(팀) 실행
-agentlas cd <agent>                # 에이전트 폴더 경로 → cd "$(agentlas cd seo)" && claude
+agentlas                           # 대화형 TUI (워드마크 → 할 일 입력 → 스트리밍 REPL)
+agentlas "할 일"                    # 자동 라우팅 후 1회 실행
+```
+
+**대화 & 실행**
+```sh
+agentlas <agent>                   # 해당 에이전트와 대화 (예: agentlas seo)
+agentlas run [agent] "프롬프트"      # 1회 실행 (agent 생략 시 자동 라우팅, prompt 없으면 stdin)
+agentlas firm <firm> "프롬프트"     # 회사(팀) CEO에 위임
+agentlas chats [n]                 # 최근 대화 목록
+```
+
+**에이전트 & 허브** (Agentlas OS 표면)
+```sh
+agentlas search "할 일"            # Hub에서 에이전트 발견            (hep-search)
+agentlas install <slug>            # Hub 에이전트 설치                (hep-cloud)
+agentlas build "요청"              # 에이전트/팀 빌드·수리·패키징     (hep-build)
+agentlas upload <경로>             # 에이전트 패키징+Hub 배포         (hep-upload)
+agentlas connect                   # Telegram/플랫폼 연결             (hep-connect)
 agentlas import <폴더>             # 로컬 에이전트/팀 임포트
-agentlas storm "목표"               # Stormbreaker 파이프라인 (라우팅→검증→실행) [--research]
-agentlas swarm "목표"               # emergent 에이전트 스웜 (병렬+블랙보드+종합) [--parallel N]
+agentlas list                      # 설치된 에이전트/회사 + 활성 런타임
+```
+
+**실행 엔진**
+```sh
+agentlas storm "목표"              # 견고 파이프라인 라우팅→검증→실행 (Stormbreaker) [--research]
+agentlas swarm "목표"              # emergent 에이전트 스웜 [--parallel N]
+agentlas network "요청"            # A2A 태스크포스로 분해            (hep-network)
+agentlas call "a,b" "컨텍스트"      # 지정 에이전트 호출               (hep-call)
+agentlas browser                   # 실제 브라우저 하드포인트          (hep-browser)
+agentlas route "요청"              # 라우팅 미리보기 (실행 없음)
+```
+
+**지식 & 리서치**
+```sh
+agentlas research <sub>            # Research Engine (status|gather|search|read|plan)
+agentlas ontology <sub>            # 프로젝트 지식 (status|list|add)
+agentlas journal <sub>             # Stormbreaker 저널 (status|verify|repair|gate)
+```
+
+**계정 & 운영**
+```sh
 agentlas login | logout | whoami   # Agentlas Cloud 로그인 (브라우저 플로우)
-agentlas automation list|add|on|off|remove|runs   # 자동화 등록/관리
-agentlas automation run <id>       # 자동화 지금 1회 실행
-agentlas automation daemon         # 상주 실행기 — 앱 없이 예약 자동화 실행 (앱과 리스 공유)
-agentlas cloud search "찾는 일"     # 마켓플레이스 검색 (로그인 불필요)
-agentlas cloud install <slug>      # 마켓플레이스에서 에이전트 설치
-agentlas usage                     # 로컬 사용 현황 (실행/메시지/자동화)
-agentlas telegram                  # 텔레그램 바인딩 현황 (읽기 전용)
-agentlas creds / env               # 자격증명 · env
+agentlas automation <sub>          # list|add|on|off|remove|run <id>|runs|daemon (로컬 스케줄러)
+agentlas creds <sub> · env         # 자격증명 볼트 · env
 agentlas multimodal                # 이미지/영상/음성 provider
+agentlas usage · telegram · mcp    # 사용 현황 · 텔레그램 · MCP 서버
 agentlas doctor                    # 런타임/데이터 점검
-agentlas setup                     # 온보딩(언어→런타임→권한) 다시 실행
-agentlas update                    # Desktop 최신 릴리스 확인/설치
+agentlas update                    # npm 최신판 확인
+agentlas setup                     # 온보딩 다시 실행
+```
+
+**고급**
+```sh
+agentlas hep <sub…>                # 전체 Hephaestus 패스스루 (wizard·security·cards·ao·plugins…)
+agentlas netadmin <sub>            # 로컬 네트워크 관리 (init|status|reindex|bench)
+agentlas cloud <sub>               # 에이전트 패키징 (wizard|security|bundle|package|publish)
 ```
 
 공통 옵션: `--runtime claude-code|codex|gemini` · `--permission read|write|full`
+REPL 안에서는 `/`로 명령 팔레트 (`/build` `/search` `/storm` `/network` …).
 
 ## 동작 방식
 

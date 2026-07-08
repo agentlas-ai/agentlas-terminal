@@ -722,6 +722,37 @@ function startRepl(opts) {
         await H.hepRun(["research", ...arg.split(/\s+/)], { cwd: state.cwd });
         return true;
       }
+      case "search": {
+        if (!arg) return ui.warn("usage: /search <할 일>"), true;
+        if (H.cloudSearch) await H.cloudSearch(db, [arg]);
+        else await H.hepRun(["hep-search", arg], { cwd: state.cwd });
+        return true;
+      }
+      case "install": {
+        if (!arg) return ui.warn("usage: /install <slug>  (/search 로 먼저 찾으세요)"), true;
+        if (H.cloudInstall) {
+          try { const r = await H.cloudInstall(db, arg.trim()); ui.ok((r && r.name) ? `설치됨: ${r.name}` : `설치됨: ${arg.trim()}`); }
+          catch (e) { ui.error((e && e.message) || String(e)); }
+        } else ui.warn("설치 기능을 사용할 수 없습니다.");
+        return true;
+      }
+      case "network":
+      case "taskforce": {
+        if (!arg) return ui.warn("usage: /network <요청>  (A2A 태스크포스)"), true;
+        ui.line("");
+        await H.hepRun(["hep-network", arg, "--project", state.cwd, "--runtime", "terminal"], { cwd: state.cwd });
+        return true;
+      }
+      case "browser": {
+        ui.line("");
+        await H.hepRun(["hep-browser", ...(arg ? arg.split(/\s+/) : [])], { cwd: state.cwd });
+        return true;
+      }
+      case "connect": {
+        ui.line("");
+        await H.hepRun(["hep-connect", ...(arg ? arg.split(/\s+/) : [])], { cwd: state.cwd });
+        return true;
+      }
       case "swarm": {
         if (!arg) return ui.warn("usage: /swarm <goal>  [--parallel N]"), true;
         let goal = arg;
@@ -1228,8 +1259,12 @@ function printHelp(ui) {
     ["/build <request>", ui.t("help.build")],
     ["/route <request>", ui.t("help.route")],
     ["/research <sub>", ui.t("help.research")],
-    ["/marketplace", ui.t("help.market")],
+    ["/search <task>", ui.t("help.search")],
     ["/install <slug>", ui.t("help.install")],
+    ["/network <req>", ui.t("help.network")],
+    ["/browser", ui.t("help.browser")],
+    ["/connect", ui.t("help.connect")],
+    ["/marketplace", ui.t("help.market")],
     ["/clear", ui.t("help.clear")],
     ["/doctor", ui.t("help.doctor")],
     ["/keybindings", ui.t("help.keybindings")],

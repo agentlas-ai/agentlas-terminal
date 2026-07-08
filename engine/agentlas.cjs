@@ -6130,6 +6130,7 @@ function buildHelpers(db) {
     stormRun: (db_, goal, ctx) => parity().stormRun(db_, goal, ctx),
     swarmRun: (db_, goal, ctx) => parity().swarmRun(db_, goal, ctx),
     hepRun: (args, opts) => parity().runHephaestusInteractive(args, opts),
+    cloudSearch: (db_, args) => parity().cloudSearch(db_, args),
     ontologyCommand: (text, ctx) => runOntologyNaturalCli(text, {
       cwd: (ctx && ctx.cwd) || projectCwd(),
       projectPath: (ctx && ctx.cwd) || projectCwd(),
@@ -7300,56 +7301,64 @@ async function cmdOberon(args) {
 }
 
 function cmdHelp() {
+  const H = (s) => `\n\x1b[1m${s}\x1b[0m`;
+  const useColor = process.stdout.isTTY && process.env.NO_COLOR == null;
+  const hdr = (s) => (useColor ? H(s) : "\n" + s);
   out(
     [
-      "agentlas — local agent terminal",
+      "agentlas — the operating system for agents, in your terminal",
       "",
-      "  agentlas              open the terminal (status card, then pick an agent)",
-      "  agentlas \"prompt\"     auto-route to the best agent, then run once",
-      "  agentlas <agent>      jump straight into a chat with one agent",
-      "  open <agent>          same as above (explicit)",
-      "  firm <firm> [cmd]     delegate to a company's CEO (interactive if no cmd)",
-      "  run [agent] [prompt]  one-shot — omit agent to auto-route (reads stdin if no prompt)",
-      "  import <path>         import a local folder (agent or team)",
-      "  cd <agent>            print the agent folder — cd \"$(agentlas cd seo)\" && claude",
-      "  list                  agents/companies + active runtime",
-      "  env                   shared env key names",
-      "  multimodal            image/video/audio fallback providers",
-      "  oberon <sub>          AI film render from the terminal (scaffold|render|list) — see: oberon help",
-      "  ontology              project-local ontology status/list/add; inside REPL use /ontology",
-      "  storm <goal>          Stormbreaker force-robust pipeline (route → verify → execute) [--research]",
-      "  swarm <goal>          emergent agent swarm — parallel workers + blackboard + synthesizer [--parallel N]",
-      "  build \"<request>\"     build/repair/package an agent or team (Hephaestus hep-build)",
-      "  route \"<request>\"     routing preview — which agent/pipeline would take this",
-      "  research <sub>        Research Engine: status|gather|search|read|plan …",
-      "  network <sub>         local agent network: init|status|reindex|add-source …",
-      "  journal <sub>         Stormbreaker run journal: status|verify|repair|gate",
-      "  call \"a,b\" \"<ctx>\"    prepare named Hub/Cloud agents (hep-call)",
-      "  hep <sub…>            full Hephaestus passthrough (wizard·security·cards·ao·plugins…)",
-      "  mcp                   installed MCP servers (shared with the app)",
-      "  chats [n]             recent app/terminal chats",
-      "  automation <sub>      list|add|on|off|remove|run <id>|runs|daemon — local runner included",
-      "  login | logout | whoami",
-      "                        Agentlas Cloud sign-in (browser flow) — marketplace install/publish",
-      "  usage                 local usage summary (runs, messages, automations)",
-      "  telegram              telegram binding status (pairing lives in the app)",
-      "  cloud wizard <path>   create/repair agentlas.json for Cloud MCP calls",
-      "  cloud security scan <path>",
-      "                        risk-screen an agent folder before run/publish",
-      "  cloud runtime bundle <path>",
-      "                        compile manifest-based runtime bundle",
-      "  cloud field-test      run local Cloud contract fixture test",
-      "  cloud package <path>  package + static security review for Agentlas Cloud",
-      "  cloud publish <path>  register after local review (submitter runtime only)",
-      "  cloud install <slug>  download/install a cloud marketplace agent",
-      "  creds save ...        save an issued key (project vault + project .env + project-scoped global env)",
-      "  creds file ...        copy a credential file into signing/credentials and set an env path",
-      "  update                check and install the latest Agentlas Desktop release",
-      "  doctor                check runtimes and data",
-      "  setup                 re-run first-launch setup (language · runtime · permission)",
-      "  version               print the Agentlas CLI version",
+      "  agentlas                 open the terminal (wordmark, then type a task)",
+      "  agentlas \"<task>\"        auto-route to the best agent and run once",
       "",
-      "Options: --runtime claude-code|codex|gemini  ·  --permission read|write|full (default write)  ·  --version",
+      hdr("TALK & RUN"),
+      "  <agent>                  jump into a chat with one agent (e.g. agentlas seo)",
+      "  run [agent] [prompt]     one-shot — omit agent to auto-route (reads stdin if no prompt)",
+      "  firm <firm> [cmd]        delegate to a company's CEO (interactive if no cmd)",
+      "  chats [n]                recent conversations   ·   chat resume in REPL: /resume",
+      "",
+      hdr("AGENTS & HUB   (Agentlas OS surface)"),
+      "  search \"<what you need>\" discover agents in the Hub + local            (hep-search)",
+      "  install <slug>           install an agent from the Hub                    (hep-cloud)",
+      "  build \"<request>\"        build/repair/package an agent or team           (hep-build)",
+      "  upload <path>            package + publish an agent to the Hub            (hep-upload)",
+      "  connect [<sub>]          wire Telegram / platforms to an agent team       (hep-connect)",
+      "  import <path>            import a local agent/team folder",
+      "  list                     installed agents/companies + active runtime",
+      "",
+      hdr("EXECUTE"),
+      "  storm <goal>             force-robust pipeline: route → verify → execute  (Stormbreaker) [--research]",
+      "  swarm <goal>             emergent agent swarm — parallel workers + synthesizer [--parallel N]",
+      "  network <request>        decompose a request into an A2A task force       (hep-network)",
+      "  call \"a,b\" \"<ctx>\"       invoke named Hub/Cloud agents                    (hep-call)",
+      "  browser [<sub>]          real browser execution hardpoint                 (hep-browser)",
+      "  route \"<request>\"        routing preview — which agent/pipeline would take this",
+      "",
+      hdr("KNOWLEDGE & RESEARCH"),
+      "  research <sub>           Research Engine: status|gather|search|read|plan",
+      "  ontology <sub>           project knowledge: status|list|add   (REPL: /ontology)",
+      "  journal <sub>            Stormbreaker run journal: status|verify|repair|gate",
+      "",
+      hdr("ACCOUNT & OPS"),
+      "  login | logout | whoami  Agentlas Cloud sign-in (browser flow)",
+      "  automation <sub>         list|add|on|off|remove|run <id>|runs|daemon (local scheduler)",
+      "  creds <sub> · env        credentials vault and shared env keys",
+      "  multimodal               image/video/audio provider settings",
+      "  usage · telegram · mcp   local usage · telegram bindings · MCP servers",
+      "  doctor                   check runtimes, data, credentials",
+      "  update                   check for a newer agentlas on npm",
+      "  setup                    re-run first-launch setup (language · runtime · permission)",
+      "  version                  print the Agentlas CLI version",
+      "",
+      hdr("ADVANCED"),
+      "  hep <sub…>               full Hephaestus passthrough (wizard·security·cards·ao·plugins·meta-agent…)",
+      "  netadmin <sub>           local network admin: init|status|reindex|bench|add-source",
+      "  cloud <sub>              agent packaging: wizard|security|bundle|package|publish|field-test",
+      "  cd <agent>               print the agent folder — cd \"$(agentlas cd seo)\" && claude",
+      "  oberon <sub>             AI film render (scaffold|render|list)",
+      "",
+      "Options: --runtime claude-code|codex|gemini  ·  --permission read|write|full (default write)",
+      "In the REPL, type / for the command palette (/build /route /research /storm /swarm …).",
     ].join("\n"),
   );
 }
@@ -7443,24 +7452,41 @@ async function main() {
     case "hep":
     case "hephaestus":
       return parity().cmdHep(db, rest.slice(1));
+    // ── Agentlas OS 정식 표면 (hep-*) 1급 노출 ──
     case "build":
-      // hep-build "<요청>" — 요청 전체를 한 인자로 (엔진이 딥인터뷰/빌더로 라우팅)
+      // hep-build "<요청>" — 에이전트/팀 빌드 (Meta-Agent Factory)
       return parity().cmdHep(db, rest.length > 1 ? ["hep-build", rest.slice(1).join(" ")] : ["hep-build"]);
-    case "route":
+    case "search": // hep-search — 에이전트 디렉터리 발견 (Hub + 로컬)
+      if (!rest[1]) return fail('usage: agentlas search "<찾는 일>" [--limit 10]');
+      return parity().cloudSearch(db, rest.slice(1));
+    case "install": // hep-cloud import — slug로 에이전트 설치
+      if (!rest[1]) return fail('usage: agentlas install <slug>   (먼저 agentlas search "할 일" 로 찾으세요)');
+      return cmdCloudInstall(db, rest[1]);
+    case "upload": // hep-upload — 컴파일된 에이전트를 Hub로 배포 (경로 필요)
+      if (!rest[1]) return fail("usage: agentlas upload <에이전트 폴더 경로>   (패키징 후 Hub 배포)");
+      return cmdCloud(db, ["publish", ...rest.slice(1)], runtimeOverride);
+    case "connect": // hep-connect — Telegram 등 플랫폼 연결
+      return parity().cmdHep(db, ["hep-connect", ...rest.slice(1)]);
+    case "browser": // hep-browser — 실제 브라우저 실행 하드포인트
+      return parity().cmdHep(db, ["hep-browser", ...rest.slice(1)]);
+    case "call": // hep-call — 지정 에이전트 호출/준비
+      return parity().cmdHep(db, ["hep-call", ...rest.slice(1)]);
+    case "network": // hep-network — A2A 태스크포스 분해/스케줄
+    case "taskforce":
+      return parity().cmdHep(db, ["hep-network", ...rest.slice(1)]);
+    case "route": // 라우팅 미리보기 (실행 없음)
       return parity().cmdHep(
         db,
         rest.length > 1
           ? ["route", rest.slice(1).join(" "), "--project", runCwd(), "--runtime", "terminal"]
           : ["route"],
       );
-    case "research":
+    case "research": // Research Engine
       return parity().cmdHep(db, ["research", ...rest.slice(1)]);
-    case "network":
+    case "netadmin": // 로컬 에이전트 네트워크 관리 (init|status|reindex|bench|add-source)
       return parity().cmdHep(db, ["network", ...rest.slice(1)]);
-    case "journal":
+    case "journal": // Stormbreaker 런 저널
       return parity().cmdHep(db, ["stormbreaker", "journal", ...rest.slice(1)]);
-    case "call":
-      return parity().cmdHep(db, ["hep-call", ...rest.slice(1)]);
     case "mcp":
       return parity().cmdMcp(db);
     case "chats":

@@ -107,6 +107,11 @@ const SLASH_COMMAND_META = [
   { command: "/build", description: "Build/repair/package an agent or team (Hephaestus)", category: "Engine", usage: "/build <what to build>", detail: "Runs Hephaestus hep-build natively — deep interview, scaffolding, packaging." },
   { command: "/route", description: "Preview which agent/pipeline would take a request", category: "Engine", usage: "/route <request>", detail: "Runs the Hephaestus router without executing — shows the selected agent, candidates, and reasons." },
   { command: "/research", description: "Run the Hephaestus Research Engine", category: "Engine", usage: "/research search \"query\"", detail: "status|gather|search|read|plan — evidence-grade web research from the terminal." },
+  { command: "/search", description: "Discover agents in the Hub", category: "Hub", usage: "/search <what you need>", detail: "Search the Agentlas Hub + local for an agent that fits the task (hep-search)." },
+  { command: "/install", description: "Install an agent from the Hub by slug", category: "Hub", usage: "/install <slug>", detail: "Install a marketplace agent into this terminal (hep-cloud)." },
+  { command: "/network", description: "Decompose a request into an A2A task force", category: "Engine", usage: "/network <request>", detail: "Runs Hephaestus hep-network — splits a composite request across agents.", aliases: ["/taskforce"] },
+  { command: "/browser", description: "Real browser execution hardpoint", category: "Engine", usage: "/browser [sub]", detail: "Runs the Agentlas browser hardpoint (hep-browser)." },
+  { command: "/connect", description: "Wire Telegram / platforms to an agent team", category: "Hub", usage: "/connect", detail: "Runs Hephaestus hep-connect for platform integration." },
   { command: "/doctor", description: "Check runtimes and local data", category: "Health", usage: "/doctor", detail: "Run local checks for runtimes, data, credentials, and setup." },
   { command: "/exit", description: "Quit Agentlas", category: "Session", usage: "/exit", detail: "Close the terminal session.", aliases: ["/quit"] },
 ];
