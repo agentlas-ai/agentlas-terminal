@@ -581,6 +581,23 @@ function runNativeTurn(req) {
         // claude `result` is_error 등 — 이전에 표시되지 않은 에러를 노출
         ui.error(String(st.error));
       } else if (code !== 0 && !text && !aborted) {
+        // Runtime Doctor — 아는 시스템 원인(미인증 OAuth MCP 플러그인 등)이면 즉시 수리하고
+        // 1회 자동 재시도한다(2026-07-08 notion@openai-curated가 codex 전멸시킨 사고).
+        if (!req._doctorRetried) {
+          try {
+            const { runRuntimeDoctor } = require("./agentlas-doctor.cjs");
+            const report = runRuntimeDoctor(`${kind} exited with code ${code}\n${stripAnsi(stderrBuf)}`);
+            if (report.repaired) {
+              ui.warn(`🩺 Runtime Doctor: ${report.summary}`);
+              for (const act of report.actions) ui.warn(`   🔧 ${act.title} — ${act.detail}`);
+              ui.warn("   자동 수리 완료 — 같은 요청을 다시 시도합니다.");
+              resolve(runNativeTurn({ ...req, _doctorRetried: true }));
+              return;
+            }
+          } catch {
+            /* 닥터 실패는 원래 에러 표출을 막지 않는다 */
+          }
+        }
         ui.error(`${kind} exited with code ${code}` + (errTail ? `\n  ${errTail.slice(-400)}` : ""));
       } else if (!text && !st.error && !aborted) {
         // 정상 종료인데 출력이 비어 있음(거부/차단 등) — 무음 실패 방지

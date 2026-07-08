@@ -38,6 +38,19 @@ else
 fi
 mv "$FRESH" "$HOME/.Trash/agentlas-smoke-$(date +%s)" 2>/dev/null || true
 
+# Runtime Doctor 3제품 패리티 게이트 — 데스크탑 TS ↔ 이 repo CJS ↔ system-optimizer
+# 플레이북이 어긋나면 여기서 FAIL. (형제 repo가 없는 CI/신선 클론에선 자동 스킵)
+SYNC="$(cd "$(dirname "$0")/.." && pwd)/../scripts/sync-runtime-doctor.sh"
+if [ -f "$SYNC" ]; then
+  if bash "$SYNC"; then
+    echo "PASS doctor-parity"
+    pass=$((pass + 1))
+  else
+    echo "FAIL doctor-parity"
+    fail=$((fail + 1))
+  fi
+fi
+
 echo ""
 echo "smoke: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

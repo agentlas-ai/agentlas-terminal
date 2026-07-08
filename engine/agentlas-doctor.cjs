@@ -1,0 +1,173 @@
+"use strict";
+/*
+ * agentlas-doctor: 런타임 CLI 실패의 "시스템 원인"을 결정론적으로 진단·수리한다.
+ *
+ * 데스크탑 앱 electron/system-agents/runtime-doctor.ts 와 로직 패리티를 유지해야 한다
+ * (3제품 싱크: 데스크탑 TS ↔ 터미널 CJS ↔ system-optimizer 패키지 플레이북).
+ * 패리티는 Agentlas_F/scripts/sync-runtime-doctor.sh 가 공유 픽스처로 검증한다 —
+ * 이 파일의 분류/수리 규칙을 바꾸면 반드시 그 스크립트를 PASS 시켜라.
+ *
+ * 사례(2026-07-08): codex CLI 업데이트가 openai-curated 플러그인(notion/figma)을 자동
+ * 활성화 → 미인증 OAuth 원격 MCP가 매 실행 AuthRequired fatal → codex exit 1.
+ * 수리: 에러 stderr의 호스트와 플러그인 캐시 .mcp.json url 호스트를 대조해 "정확히 그
+ * 플러그인만" config.toml에서 enabled=false (백업 필수, 인증돼 잘 도는 플러그인 오폭 금지).
+ */
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+function codexHome() {
+  return process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+}
+
+/** 에러 텍스트에서 실패 원인으로 지목된 원격 호스트들을 추출한다. */
+function extractHosts(error) {
+  const hosts = new Set();
+  const re = /https?:\/\/([a-z0-9][a-z0-9.-]*[a-z0-9])/gi;
+  let m;
+  while ((m = re.exec(error)) !== null) hosts.add(m[1].toLowerCase());
+  return [...hosts];
+}
+
+/** kind: mcp-oauth-unauthenticated | timeout | cli-exit | unknown (데스크탑 TS와 동일 규칙) */
+function classifyFailure(error) {
+  const text = error || "";
+  if (/authrequired|invalid_token|oauth-protected-resource|www_authenticate/i.test(text)) {
+    return { kind: "mcp-oauth-unauthenticated", hosts: extractHosts(text) };
+  }
+  if (/no response for \d+s|auto-aborted/i.test(text)) return { kind: "timeout", hosts: [] };
+  if (/CLI exit \d+|exited with code [1-9]/i.test(text)) return { kind: "cli-exit", hosts: extractHosts(text) };
+  return { kind: "unknown", hosts: [] };
+}
+
+/** 실패 호스트와 일치하는 OAuth MCP를 실은 플러그인 찾기(호스트가 에러에 등장한 것만). */
+function findOauthPluginsByHost(hosts) {
+  if (!hosts.length) return [];
+  const cacheRoot = path.join(codexHome(), "plugins", "cache");
+  const hits = [];
+  let marketplaces = [];
+  try {
+    marketplaces = fs.readdirSync(cacheRoot, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
+  } catch {
+    return [];
+  }
+  for (const marketplace of marketplaces) {
+    let plugins = [];
+    try {
+      plugins = fs.readdirSync(path.join(cacheRoot, marketplace), { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
+    } catch {
+      continue;
+    }
+    for (const plugin of plugins) {
+      let versions = [];
+      try {
+        versions = fs.readdirSync(path.join(cacheRoot, marketplace, plugin), { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
+      } catch {
+        continue;
+      }
+      for (const ver of versions) {
+        const mcpJson = path.join(cacheRoot, marketplace, plugin, ver, ".mcp.json");
+        if (!fs.existsSync(mcpJson)) continue;
+        try {
+          const parsed = JSON.parse(fs.readFileSync(mcpJson, "utf8"));
+          for (const server of Object.values(parsed.mcpServers || {})) {
+            if (!server || !server.url) continue;
+            let host = "";
+            try {
+              host = new URL(server.url).hostname.toLowerCase();
+            } catch {
+              continue;
+            }
+            if (hosts.some((h) => h === host || h.endsWith("." + host) || host.endsWith("." + h))) {
+              // cache 디렉토리 "openai-curated-remote"는 config 키에선 "openai-curated".
+              hits.push({ pluginKey: `${plugin}@${marketplace.replace(/-remote$/, "")}`, host });
+            }
+          }
+        } catch {
+          /* 손상된 .mcp.json은 건너뜀 */
+        }
+      }
+    }
+  }
+  const seen = new Set();
+  return hits.filter((h) => (seen.has(h.pluginKey) ? false : (seen.add(h.pluginKey), true)));
+}
+
+/** config.toml에서 해당 플러그인을 enabled=false로 내린다(백업 필수). 반환: 실제 변경 여부. */
+function disableCodexPlugin(pluginKey) {
+  const configPath = path.join(codexHome(), "config.toml");
+  if (!fs.existsSync(configPath)) return false;
+  const original = fs.readFileSync(configPath, "utf8");
+  const header = `[plugins."${pluginKey}"]`;
+  let next;
+  if (original.includes(header)) {
+    const idx = original.indexOf(header);
+    const after = original.slice(idx);
+    const replacedAfter = after.replace(/(\[plugins\."[^"]+"\]\s*\n)enabled\s*=\s*true/, "$1enabled = false");
+    if (replacedAfter === after) return false; // 이미 false거나 형태가 다름
+    next = original.slice(0, idx) + replacedAfter;
+  } else {
+    next = `${original.trimEnd()}\n\n${header}\nenabled = false\n`;
+  }
+  const backup = `${configPath}.bak-doctor-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  fs.copyFileSync(configPath, backup);
+  fs.writeFileSync(configPath, next);
+  return true;
+}
+
+/**
+ * 진단 + (아는 계열이면) 즉시 수리. 반환: { kind, summary, repaired, actions[] }
+ * 데스크탑 runtime-doctor.ts 의 runRuntimeDoctor 와 동일 계약.
+ */
+function runRuntimeDoctor(errorMessage) {
+  const { kind, hosts } = classifyFailure(errorMessage);
+  const actions = [];
+
+  if (kind === "mcp-oauth-unauthenticated") {
+    const hitList = findOauthPluginsByHost(hosts);
+    let repairedAny = false;
+    for (const hit of hitList) {
+      try {
+        if (disableCodexPlugin(hit.pluginKey)) {
+          repairedAny = true;
+          actions.push({
+            title: `codex plugin disabled: ${hit.pluginKey}`,
+            detail: `미인증 OAuth MCP(${hit.host})가 런타임을 죽여서 ~/.codex/config.toml에서 비활성화했습니다(백업 생성). 이 서비스를 쓰려면 인증 후 다시 켜세요.`,
+          });
+        }
+      } catch (err) {
+        actions.push({ title: `repair failed: ${hit.pluginKey}`, detail: err && err.message ? err.message : String(err) });
+      }
+    }
+    return {
+      kind,
+      summary: hitList.length
+        ? `런타임에 미인증 OAuth MCP 플러그인(${hitList.map((h) => h.pluginKey).join(", ")})이 붙어 있어 CLI가 죽었습니다.`
+        : `미인증 OAuth MCP(${hosts.join(", ") || "unknown host"})가 런타임을 죽였지만 어떤 플러그인인지 특정하지 못했습니다.`,
+      repaired: repairedAny,
+      actions,
+    };
+  }
+
+  if (kind === "timeout") {
+    return {
+      kind,
+      summary: "실행이 장시간 무응답이라 자동 중단됐습니다. 대화형 인증 대기·stdin 블록·원격 MCP 행이 흔한 원인입니다.",
+      repaired: false,
+      actions,
+    };
+  }
+
+  if (kind === "cli-exit") {
+    return {
+      kind,
+      summary: "런타임 CLI가 비정상 종료했지만 아는 수리 계열이 아닙니다.",
+      repaired: false,
+      actions,
+    };
+  }
+
+  return { kind: "unknown", summary: "", repaired: false, actions };
+}
+
+module.exports = { classifyFailure, extractHosts, findOauthPluginsByHost, disableCodexPlugin, runRuntimeDoctor };
