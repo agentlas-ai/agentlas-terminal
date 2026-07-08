@@ -537,7 +537,7 @@ function startRepl(opts) {
     const fmt = (e) => {
       const bits = [e.turns + (e.turns === 1 ? " turn" : " turns")];
       if (e.in || e.out) bits.push(e.in + "→" + e.out + " tok");
-      if (e.cost) bits.push("$" + e.cost.toFixed(4));
+      // 달러 비용 미표시 — 토큰 수만.
       if (e.ms) bits.push((e.ms / 1000).toFixed(1) + "s");
       return bits.join("  ·  ");
     };

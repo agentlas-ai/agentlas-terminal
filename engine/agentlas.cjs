@@ -913,7 +913,7 @@ async function packageCloudAgentCli(db, root, opts) {
   const routingCard = readCloudRoutingCardCli(rootPath);
   if (routingCard.finding) scan.findings.push(routingCard.finding);
   const name = cloudReadName(rootPath);
-  const slug = cloudSlug(opts.slug || name || path.basename(rootPath));
+  const slug = cloudSlug(opts.slug || cloudReadStableSlug(rootPath) || name || path.basename(rootPath));
   const packageHash = cloudHashPackage(scan.included);
   const manifest = {
     version: "0.1",
@@ -1332,17 +1332,61 @@ function printCloudPackageResult(result) {
 }
 
 function cloudReadName(rootPath) {
+  const manifest = cloudReadPackageJson(rootPath);
+  const explicit = stringFirstCli(
+    manifest.agentlas?.displayName,
+    manifest.agentlas?.name,
+    manifest.manifest?.name,
+    manifest.agentCard?.name,
+    manifest.routingCard?.name,
+  );
+  if (explicit) return explicit.replace(/\s+/g, " ").trim().slice(0, 80);
   const text = cloudReadFirst(rootPath, ["agent.md", "AGENT.md", "README.md", "CLAUDE.md", "AGENTS.md"], 2000);
   const heading = text.match(/^#\s+(.+)$/m);
   return (heading ? heading[1] : path.basename(rootPath)).replace(/\s+/g, " ").trim().slice(0, 80);
 }
 function cloudReadTagline(rootPath) {
+  const manifest = cloudReadPackageJson(rootPath);
+  const explicit = stringFirstCli(
+    manifest.agentlas?.summary,
+    manifest.agentlas?.description,
+    manifest.manifest?.description,
+    manifest.agentCard?.summary,
+    manifest.routingCard?.summary,
+  );
+  if (explicit) return explicit.replace(/\s+/g, " ").trim().slice(0, 160);
   const text = cloudReadFirst(rootPath, ["README.md", "agent.md", "AGENT.md"], 3000);
   for (const line of text.split(/\r?\n/)) {
     const t = line.trim();
     if (t && !t.startsWith("#") && !t.startsWith(">")) return t.slice(0, 160);
   }
   return "Portable Agentlas cloud agent package.";
+}
+function cloudReadStableSlug(rootPath) {
+  const manifest = cloudReadPackageJson(rootPath);
+  return stringFirstCli(
+    manifest.agentlas?.slug,
+    manifest.agentlas?.id,
+    manifest.manifest?.package,
+    manifest.manifest?.slug,
+    manifest.agentCard?.slug,
+    manifest.agentCard?.id,
+    manifest.routingCard?.agent_card_ref?.slug,
+  );
+}
+function cloudReadPackageJson(rootPath) {
+  return {
+    agentlas: readJsonObjectCli(path.join(rootPath, "agentlas.json"), {}),
+    manifest: readJsonObjectCli(path.join(rootPath, "manifest.json"), {}),
+    agentCard: readJsonObjectCli(path.join(rootPath, ".agentlas", "agent-card.json"), {}),
+    routingCard: readJsonObjectCli(path.join(rootPath, ".agentlas", "routing-card.json"), {}),
+  };
+}
+function stringFirstCli(...values) {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
 }
 function cloudReadFirst(rootPath, names, maxChars) {
   for (const name of names) {

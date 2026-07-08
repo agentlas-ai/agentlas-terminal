@@ -252,7 +252,7 @@ class Ui {
     if (usage.input_tokens != null || usage.output_tokens != null) {
       bits.push(`${usage.input_tokens ?? "?"}→${usage.output_tokens ?? "?"} tok`);
     }
-    if (usage.cost_usd != null) bits.push(`$${Number(usage.cost_usd).toFixed(4)}`);
+    // 달러 비용은 표시하지 않는다 — 토큰 수만 (사용자 결정 2026-07-09).
     if (usage.duration_ms != null) bits.push(`${(usage.duration_ms / 1000).toFixed(1)}s`);
     if (bits.length) this.line(this.c.faint("  " + bits.join("  ·  ")));
   }
