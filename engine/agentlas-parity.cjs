@@ -23,6 +23,13 @@ const { Ui } = require("./agentlas-ui.cjs");
 const SWARM_MAX_TASKS = 24;
 const SWARM_SPAWN_PER_TURN = 12;
 
+// Agentlas-OS/Hephaestus 내부 시스템 에이전트(마켓 제품 아님) — 검색/목록에서 숨긴다.
+// 데스크탑 electron/agents/hired-agents.ts isInternalAgentSlug 와 규칙 동일.
+function isInternalAgentSlug(slug) {
+  const s = String(slug || "").toLowerCase();
+  return /^researcher-\d+/.test(s) || s === "research-intelligence-desk" || s.startsWith("hephaestus-");
+}
+
 function create(deps) {
   const D = deps;
 
@@ -1008,7 +1015,9 @@ function create(deps) {
     const json = await resp.json();
     if (json.error) return D.fail(json.error.message || "marketplace error");
     const result = json.result || {};
-    const items = result.results || result.agents || result.items || (Array.isArray(result) ? result : null);
+    const rawItems = result.results || result.agents || result.items || (Array.isArray(result) ? result : null);
+    // 엔진 내부 에이전트(researcher-<n>, research-intelligence-desk, hephaestus-*)는 제품이 아니므로 숨긴다.
+    const items = Array.isArray(rawItems) ? rawItems.filter((it) => !isInternalAgentSlug(it && (it.slug || it.id))) : rawItems;
     if (!Array.isArray(items) || !items.length) {
       D.out(`검색 결과 없음: "${query}"`);
       return;
