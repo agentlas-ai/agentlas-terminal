@@ -1005,7 +1005,8 @@ function create(deps) {
         headers,
         body: JSON.stringify({
           method: "marketplace.search_agents",
-          params: { name: "marketplace.search_agents", arguments: { query, limit } },
+          // Hub는 파라미터 이름이 `q` — `query`만 보내면 무시하고 기본 목록을 준다(데스크탑 mcp-source.ts와 동일하게 둘 다 전송).
+          params: { name: "marketplace.search_agents", arguments: { q: query, query, limit } },
         }),
       });
     } catch (e) {
