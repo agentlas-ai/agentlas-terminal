@@ -75,6 +75,7 @@ const SLASH_COMMAND_META = [
   { command: "/help", description: "Show Agentlas terminal commands", category: "Help", usage: "/help", detail: "Open the command reference, shortcuts, and common flows." },
   { command: "/status", description: "Show model/runtime, agent, permission, and directory", category: "Session", usage: "/status", detail: "Print the current runtime, active agent or company, permission level, and cwd." },
   { command: "/skills", description: "List available Agentlas terminal skills", category: "Discovery", usage: "/skills", detail: "Show the slash-command skills Agentlas can run inside this terminal." },
+  { command: "/career-graph", description: "Show or add Career Graph source refs", category: "Knowledge", usage: "/career-graph add ./docs", detail: "Career Graph routes agents to source Markdown, JSONL ledgers, sitemap, and code map before broad scans.", examples: ["/career-graph status", "/career-graph add ./docs", "/career-graph open"] },
   { command: "/ontology", description: "Turn on, list, or add project ontology sources", category: "Knowledge", usage: "/ontology add ./docs", detail: "Also understands natural text like /ontology use ./docs as company knowledge.", examples: ["/ontology list", "/ontology use ./docs as company knowledge", "/ontology open"] },
   { command: "/agents", description: "List installed agents", category: "Routing", usage: "/agents", detail: "Show local agents and their routed runtime." },
   { command: "/team", description: "View or pin each agent runtime", category: "Routing", usage: "/team <agent> <runtime|auto>", detail: "Pin one agent to claude-code, codex, gemini, or automatic routing." },
@@ -411,6 +412,7 @@ function makeCompleter(ctx) {
         return [uniqStartsWith(RUNTIME_SPECS.concat(["auto"]), last), last];
       case "/cwd":
       case "/import":
+      case "/career-graph":
       case "/ontology":
         return [completePath(last, getCwd(), ""), last];
       default:

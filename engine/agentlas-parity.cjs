@@ -56,6 +56,35 @@ function create(deps) {
     return null;
   }
 
+  function careerGraphRuntime() {
+    const binCandidates = [
+      process.env.HEPHAESTUS_CAREER_GRAPH_BIN,
+      process.env.HEPHAESTUS_BIN ? path.join(path.dirname(process.env.HEPHAESTUS_BIN), "career-graph") : null,
+      path.join(os.homedir(), ".agentlas", "runtime", "current", "bin", "career-graph"),
+    ];
+    for (const c of binCandidates) {
+      try {
+        if (c && fs.existsSync(c)) {
+          fs.accessSync(c, fs.constants.X_OK);
+          return { kind: "bin", exec: c };
+        }
+      } catch { /* 다음 후보 */ }
+    }
+    const roots = [
+      process.env.HEPHAESTUS_RUNTIME_ROOT,
+      path.join(os.homedir(), ".agentlas", "runtime", "current"),
+    ];
+    if (process.resourcesPath) roots.push(path.join(process.resourcesPath, "Hephaestus"));
+    if (process.platform === "darwin") roots.push("/Applications/Agentlas.app/Contents/Resources/Hephaestus");
+    roots.push(path.resolve(__dirname, "..", "..", "agentlas_desktop", "Hephaestus"));
+    for (const root of roots) {
+      try {
+        if (root && fs.existsSync(path.join(root, "career_graph", "__main__.py"))) return { kind: "python", root };
+      } catch { /* 다음 후보 */ }
+    }
+    return null;
+  }
+
   const PY_BOOTSTRAP =
     "import os, runpy, sys; " +
     'cwd=os.getcwd(); root=os.environ["HEPHAESTUS_RUNTIME_ROOT"]; ' +
@@ -189,17 +218,28 @@ function create(deps) {
   // ── Hephaestus 네이티브 패스스루 — 엔진 전 기능을 터미널 1급으로 노출 ──
   // stdio inherit 로 돌려 색/프롬프트/스트리밍이 네이티브 그대로 나온다.
   function runHephaestusInteractive(args, opts = {}) {
-    const found = hephaestusBin();
+    const isCareerGraph = args[0] === "career-graph" || args[0] === "career_graph";
+    const found = isCareerGraph ? careerGraphRuntime() : hephaestusBin();
     if (!found) {
-      process.stderr.write("Hephaestus 런타임이 없습니다 — 데스크탑 앱 설치 또는 Hephaestus 인스톨러 실행 후 다시 시도하세요.\n");
-      process.stderr.write("설치: https://agentlas.cloud  ·  또는 HEPHAESTUS_BIN=<경로> 지정\n");
+      process.stderr.write(
+        isCareerGraph
+          ? "Career Graph 런타임이 없습니다 — 최신 Agentlas OS / Hephaestus 설치 후 다시 시도하세요.\n"
+          : "Hephaestus 런타임이 없습니다 — 데스크탑 앱 설치 또는 Hephaestus 인스톨러 실행 후 다시 시도하세요.\n",
+      );
+      process.stderr.write(
+        isCareerGraph
+          ? "설치 또는 지정: HEPHAESTUS_CAREER_GRAPH_BIN=<경로> 또는 HEPHAESTUS_RUNTIME_ROOT=<경로>\n"
+          : "설치: https://agentlas.cloud  ·  또는 HEPHAESTUS_BIN=<경로> 지정\n",
+      );
       return Promise.resolve(1);
     }
     const cwd = opts.cwd || D.runCwd();
+    const moduleName = found.kind === "python" && isCareerGraph ? "career_graph" : "agentlas_cloud";
+    const moduleArgs = moduleName === "career_graph" ? args.slice(1) : args;
     const child =
       found.kind === "bin"
-        ? spawn(found.exec, args, { cwd, stdio: "inherit" })
-        : spawn("python3", ["-c", PY_BOOTSTRAP, "agentlas_cloud", ...args], {
+        ? spawn(found.exec, isCareerGraph ? args.slice(1) : args, { cwd, stdio: "inherit" })
+        : spawn("python3", ["-c", PY_BOOTSTRAP, moduleName, ...moduleArgs], {
             cwd,
             stdio: "inherit",
             env: { ...process.env, HEPHAESTUS_RUNTIME_ROOT: found.root },

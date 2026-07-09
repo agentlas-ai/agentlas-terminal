@@ -1457,7 +1457,7 @@ function loadArch() {
   try {
     _arch = require("./architecture.data.json");
   } catch {
-    _arch = { version: "0", agents: [], emitterBlock: "", eventsHeading: "## Memory Events", memoryDir: ".agentlas", soulFile: "project-soul-memory.md", sitemapFile: "sitemap.json", logFile: "memory-log.jsonl", kinds: [], scopes: [] };
+    _arch = { version: "0", agents: [], emitterBlock: "", eventsHeading: "## Memory Events", memoryDir: ".agentlas", soulFile: "project-soul-memory.md", sitemapFile: "sitemap.json", logFile: "memory-log.jsonl", careerGraphConfigFile: "career-graph.json", careerGraphSourceManifestFile: "career-graph-sources.json", careerGraphInboxDir: "career-graph-inbox", careerGraphDbFile: "career-graph.sqlite", kinds: [], scopes: [] };
   }
   return _arch;
 }
@@ -1775,6 +1775,10 @@ function ensureProjectMemoryCli(projectPath, projectName) {
     const ontologySourceManifestFile = arch.ontologySourceManifestFile || "ontology-sources.json";
     const ontologyInboxDir = arch.ontologyInboxDir || "ontology-inbox";
     const ontologyDbFile = arch.ontologyDbFile || "ontology-runtime.sqlite";
+    const careerGraphConfigFile = arch.careerGraphConfigFile || "career-graph.json";
+    const careerGraphSourceManifestFile = arch.careerGraphSourceManifestFile || "career-graph-sources.json";
+    const careerGraphInboxDir = arch.careerGraphInboxDir || "career-graph-inbox";
+    const careerGraphDbFile = arch.careerGraphDbFile || "career-graph.sqlite";
     const superOntologyContractFile = arch.superOntologyContractFile || "super-ontology-contract.json";
     const superOntologyOpenWorldCoverageFile =
       arch.superOntologyOpenWorldCoverageFile || "super-ontology-open-world-coverage.json";
@@ -1916,6 +1920,38 @@ function ensureProjectMemoryCli(projectPath, projectName) {
       fs.writeFileSync(ontologySources, JSON.stringify({
         schemaVersion: "1.0",
         kind: "agentlas-ontology-source-manifest",
+        projectRoot: projectPath,
+        sources: [],
+      }, null, 2), "utf8");
+    }
+    const careerGraphInbox = path.join(dir, careerGraphInboxDir);
+    if (!fs.existsSync(careerGraphInbox)) fs.mkdirSync(careerGraphInbox, { recursive: true });
+    const careerGraphConfig = path.join(dir, careerGraphConfigFile);
+    if (!fs.existsSync(careerGraphConfig)) {
+      fs.writeFileSync(careerGraphConfig, JSON.stringify({
+        schemaVersion: "1.0",
+        kind: "agentlas-career-graph",
+        state: "active",
+        model: "ledger_first_derived_index",
+        projectRoot: projectPath,
+        projectName: name,
+        dbPath: path.join(dir, careerGraphDbFile),
+        inboxPath: careerGraphInbox,
+        sourceManifest: path.join(dir, careerGraphSourceManifestFile),
+        canonicalSourcePolicy: {
+          sourceOfTruth: "markdown_jsonl_json",
+          graphIsRebuildable: true,
+          fallbackWhenStale: "read_canonical_files",
+          neverScanHomeDirectory: true,
+          neverScanSiblingProjects: true,
+        },
+      }, null, 2), "utf8");
+    }
+    const careerGraphSources = path.join(dir, careerGraphSourceManifestFile);
+    if (!fs.existsSync(careerGraphSources)) {
+      fs.writeFileSync(careerGraphSources, JSON.stringify({
+        schemaVersion: "1.0",
+        kind: "agentlas-career-graph-source-manifest",
         projectRoot: projectPath,
         sources: [],
       }, null, 2), "utf8");
@@ -5509,6 +5545,182 @@ function runOntologyNaturalCli(text, opts) {
   return runOntologyCli(parseOntologyNaturalArgsCli(text, cwd), { ...(opts || {}), cwd });
 }
 
+function careerGraphPathsForCli(projectPath) {
+  const arch = loadArch();
+  const root = path.resolve(projectPath || process.cwd());
+  const memoryDir = path.join(root, arch.memoryDir || ".agentlas");
+  return {
+    root,
+    memoryDir,
+    configPath: path.join(memoryDir, arch.careerGraphConfigFile || "career-graph.json"),
+    sourceManifestPath: path.join(memoryDir, arch.careerGraphSourceManifestFile || "career-graph-sources.json"),
+    inboxPath: path.join(memoryDir, arch.careerGraphInboxDir || "career-graph-inbox"),
+    dbPath: path.join(memoryDir, arch.careerGraphDbFile || "career-graph.sqlite"),
+  };
+}
+
+function careerGraphSourceManifestSkeletonCli(root) {
+  return {
+    schemaVersion: "1.0",
+    kind: "agentlas-career-graph-source-manifest",
+    projectRoot: root,
+    sources: [],
+  };
+}
+
+function ensureCareerGraphCli(projectPath) {
+  const paths = careerGraphPathsForCli(projectPath);
+  ensureProjectMemoryCli(paths.root, path.basename(paths.root) || "Project");
+  fs.mkdirSync(paths.inboxPath, { recursive: true });
+  if (!fs.existsSync(paths.sourceManifestPath)) {
+    writeJsonSafeCli(paths.sourceManifestPath, careerGraphSourceManifestSkeletonCli(paths.root));
+  }
+  return paths;
+}
+
+function readCareerGraphSourcesCli(sourceManifestPath) {
+  const manifest = readJsonSafeCli(sourceManifestPath, { sources: [] });
+  return Array.isArray(manifest.sources) ? manifest.sources : [];
+}
+
+function careerGraphUsageLinesCli() {
+  return [
+    "Career Graph commands:",
+    "  career-graph status               show source-routing files and index state",
+    "  career-graph list                 list inbox files and registered source refs",
+    "  career-graph open                 open the project career graph inbox",
+    "  career-graph add ./docs           register a folder as private source material",
+    "",
+    "Full graph index commands live in Agentlas OS / Hephaestus:",
+    "  hephaestus career-graph ingest --project .",
+    "  hephaestus career-graph query \"release failures\" --project .",
+    "  hephaestus career-graph verify --project .",
+    "",
+    "Safety: the graph is rebuildable. Markdown, JSONL ledgers, sitemap, and code map stay source of truth.",
+  ];
+}
+
+function existingCareerGraphCanonicalRefsCli(root) {
+  return [
+    ".agentlas/project-soul-memory.md",
+    ".agentlas/memory-log.jsonl",
+    ".agentlas/curator-decisions.jsonl",
+    ".agentlas/sitemap.json",
+    ".agentlas/code-map/project-map.json",
+    ".agentlas/ledgers/routing-decisions.jsonl",
+    ".agentlas/ledgers/executions.jsonl",
+    ".agentlas/ledgers/agent-evolution-proposals.jsonl",
+  ].filter((rel) => fs.existsSync(path.join(root, rel)));
+}
+
+function formatCareerGraphStatusCli(paths) {
+  const sources = readCareerGraphSourcesCli(paths.sourceManifestPath);
+  const inbox = listOntologyInboxCli(paths.inboxPath);
+  const canonical = existingCareerGraphCanonicalRefsCli(paths.root);
+  const lines = [
+    "Career Graph: active",
+    `  project: ${paths.root}`,
+    `  inbox:  ${paths.inboxPath}`,
+    `  db:     ${paths.dbPath}`,
+    `  index:  ${fs.existsSync(paths.dbPath) ? "present" : "pending"}`,
+    "  policy: ledger_first_derived_index",
+    "  source of truth: Markdown / JSONL / JSON files",
+    "",
+    `Canonical source refs (${canonical.length}):`,
+  ];
+  for (const rel of canonical) lines.push(`  ${rel}`);
+  if (!canonical.length) lines.push("  (none yet)");
+  lines.push("", `Inbox (${inbox.length}):`);
+  for (const item of inbox) lines.push(`  ${item.supported ? "ok" : "!"} ${item.name}  ${item.supported ? "supported" : "adapter pending"}`);
+  if (!inbox.length) lines.push("  (empty)");
+  lines.push("", `Registered source refs (${sources.length}):`);
+  for (const source of sources) {
+    const sourcePath = path.resolve(String(source.path || ""));
+    lines.push(`  ${fs.existsSync(sourcePath) ? "ok" : "!"} ${sourcePath}  ${source.kind || "project"} / ${source.scope || "private"}`);
+  }
+  if (!sources.length) lines.push("  (none)");
+  lines.push(
+    "",
+    "Build the derived index with Agentlas OS:",
+    `  hephaestus career-graph ingest --project ${JSON.stringify(paths.root)}`,
+  );
+  return lines;
+}
+
+function registerCareerGraphSourceCli(paths, source, kind, scope, cwd) {
+  if (!source) throw new Error("usage: career-graph add <path>");
+  const sourcePath = resolveOntologyPathCli(source, cwd || paths.root);
+  if (!fs.existsSync(sourcePath)) throw new Error(`source not found: ${sourcePath}`);
+  const manifest = readJsonSafeCli(paths.sourceManifestPath, careerGraphSourceManifestSkeletonCli(paths.root));
+  const nextSources = (Array.isArray(manifest.sources) ? manifest.sources : [])
+    .filter((item) => path.resolve(String(item.path || "")) !== sourcePath);
+  nextSources.push({ path: sourcePath, kind, scope, registeredAt: new Date().toISOString() });
+  manifest.schemaVersion = "1.0";
+  manifest.kind = "agentlas-career-graph-source-manifest";
+  manifest.projectRoot = paths.root;
+  manifest.sources = nextSources;
+  writeJsonSafeCli(paths.sourceManifestPath, manifest);
+  return [
+    `Registered Career Graph source: ${sourcePath}`,
+    `  kind:  ${kind}`,
+    `  scope: ${scope}`,
+    "  copy:  no",
+    "  scan:  only this registered folder, not home/sibling projects",
+  ];
+}
+
+function runCareerGraphCli(args, opts) {
+  opts = opts || {};
+  const cwd = path.resolve(opts.cwd || process.cwd());
+  const projectPath = path.resolve(opts.projectPath || cwd);
+  const normalizedArgs = Array.isArray(args) ? args : [];
+  const sub = normalizedArgs[0] || "status";
+  const paths = ensureCareerGraphCli(projectPath);
+  if (sub === "status" || sub === "list") {
+    return formatCareerGraphStatusCli(paths);
+  }
+  if (sub === "open") {
+    if (!opts.noOpen) openLocalPathCli(paths.inboxPath);
+    return [`Opened Career Graph inbox: ${paths.inboxPath}`];
+  }
+  if (sub === "help" || sub === "--help" || sub === "-h") {
+    return careerGraphUsageLinesCli();
+  }
+  if (sub === "add") {
+    const flags = parseCloudFlags(normalizedArgs.slice(1));
+    const source = flags._[0];
+    const kind = inferOntologyKindCli(flags.kind || flags._[1], normalizedArgs.join(" "));
+    const scope = inferOntologyScopeCli(flags.scope || flags._[2], normalizedArgs.join(" "), kind);
+    return registerCareerGraphSourceCli(paths, source, kind, scope, cwd);
+  }
+  if (["ingest", "query", "verify", "trace"].includes(String(sub))) {
+    return [
+      "Career Graph index execution is provided by Agentlas OS / Hephaestus.",
+      `Run: hephaestus career-graph ${normalizedArgs.join(" ")} --project ${JSON.stringify(paths.root)}`,
+    ];
+  }
+  return runCareerGraphCli(parseOntologyNaturalArgsCli(normalizedArgs.join(" "), cwd), opts);
+}
+
+function runCareerGraphNaturalCli(text, opts) {
+  const cwd = path.resolve((opts && opts.cwd) || process.cwd());
+  return runCareerGraphCli(parseOntologyNaturalArgsCli(text, cwd), { ...(opts || {}), cwd });
+}
+
+async function cmdCareerGraph(args) {
+  const sub = String((args && args[0]) || "status");
+  if (["ingest", "query", "verify", "trace", "public-card"].includes(sub)) {
+    const code = await parity().runHephaestusInteractive(["career-graph", ...args], { cwd: process.cwd() });
+    if (code !== 0) process.exitCode = code;
+    return;
+  }
+  try {
+    for (const line of runCareerGraphCli(args, { cwd: process.cwd(), projectPath: process.cwd() })) out(line);
+  } catch (e) {
+    fail((e && e.message) || String(e));
+  }
+}
+
 function cmdOntology(args) {
   try {
     for (const line of runOntologyCli(args, { cwd: process.cwd(), projectPath: process.cwd() })) out(line);
@@ -6175,6 +6387,10 @@ function buildHelpers(db) {
     swarmRun: (db_, goal, ctx) => parity().swarmRun(db_, goal, ctx),
     hepRun: (args, opts) => parity().runHephaestusInteractive(args, opts),
     cloudSearch: (db_, args) => parity().cloudSearch(db_, args),
+    careerGraphCommand: (text, ctx) => runCareerGraphNaturalCli(text, {
+      cwd: (ctx && ctx.cwd) || projectCwd(),
+      projectPath: (ctx && ctx.cwd) || projectCwd(),
+    }),
     ontologyCommand: (text, ctx) => runOntologyNaturalCli(text, {
       cwd: (ctx && ctx.cwd) || projectCwd(),
       projectPath: (ctx && ctx.cwd) || projectCwd(),
@@ -7380,6 +7596,7 @@ function cmdHelp() {
       "",
       hdr("KNOWLEDGE & RESEARCH"),
       "  research <sub>           Research Engine: status|gather|search|read|plan",
+      "  career-graph <sub>       source routing index: status|list|add",
       "  ontology <sub>           project knowledge: status|list|add   (REPL: /ontology)",
       "  journal <sub>            Stormbreaker run journal: status|verify|repair|gate",
       "",
@@ -7482,6 +7699,10 @@ async function main() {
       return cmdOberon(rest.slice(1));
     case "ontology":
       return cmdOntology(rest.slice(1));
+    case "career-graph":
+    case "career_graph":
+    case "graph":
+      return cmdCareerGraph(rest.slice(1));
     case "cloud":
       return cmdCloud(db, rest.slice(1), runtimeOverride);
     case "creds":

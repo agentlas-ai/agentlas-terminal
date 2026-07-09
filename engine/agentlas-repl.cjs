@@ -849,6 +849,18 @@ function startRepl(opts) {
         }
         return true;
       }
+      case "career-graph":
+      case "graph": {
+        if (!H.careerGraphCommand) return ui.warn("career graph command unavailable"), true;
+        try {
+          const lines = H.careerGraphCommand(arg, { cwd: state.cwd, projectPath: state.projectPath });
+          ui.line("");
+          for (const item of lines || []) ui.line("  " + ui.c.text(String(item)));
+        } catch (e) {
+          ui.error((e && e.message) || String(e));
+        }
+        return true;
+      }
       case "side":
       case "btw":
         if (!arg) return ui.warn(ui.t("sideUsage")), true;
@@ -1243,6 +1255,7 @@ function printHelp(ui) {
     ["/setup", ui.t("help.setup")],
     ["/cwd [path]", ui.t("help.cwd")],
     ["/memory", ui.t("help.memory")],
+    ["/career-graph [text]", ui.t("help.careerGraph")],
     ["/ontology [text]", ui.t("help.ontology")],
     ["/side <question>", ui.t("help.side")],
     ["/status", ui.t("help.status")],
