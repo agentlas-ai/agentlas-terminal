@@ -132,9 +132,46 @@ function loadManifest(root) {
   return JSON.parse(fs.readFileSync(path.join(path.resolve(root), "agentlas.json"), "utf8"));
 }
 
+function globRegex(pattern) {
+  const source = String(pattern || "").replace(/\\/g, "/");
+  let out = "";
+  for (let i = 0; i < source.length; i += 1) {
+    const ch = source[i];
+    if (ch === "*") {
+      if (source[i + 1] === "*") {
+        i += 1;
+        // `**/` includes zero directory levels, so **/secrets/** also
+        // protects a root-level secrets directory.
+        if (source[i + 1] === "/") {
+          i += 1;
+          out += "(?:.*/)?";
+        } else {
+          out += ".*";
+        }
+      } else {
+        out += "[^/]*";
+      }
+      continue;
+    }
+    out += /[.+^${}()|[\]\\]/.test(ch) ? `\\${ch}` : ch;
+  }
+  return new RegExp(`^${out}$`, "i");
+}
+
 function matches(filePath, pattern) {
-  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*\*/g, ".*").replace(/\*/g, "[^/]*");
-  return new RegExp(`^${escaped}$`, "i").test(filePath);
+  return globRegex(pattern).test(String(filePath || "").replace(/\\/g, "/"));
+}
+
+function normalizeRequestedPath(requestedPath) {
+  const raw = typeof requestedPath === "string" ? requestedPath.replace(/\\/g, "/") : "";
+  if (!raw || raw.includes("\0") || raw.startsWith("/") || /^[A-Za-z]:\//.test(raw)) return null;
+  const parts = [];
+  for (const segment of raw.split("/")) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") return null;
+    parts.push(segment);
+  }
+  return parts.length > 0 ? parts.join("/") : null;
 }
 
 function compileBundle(root) {
@@ -160,17 +197,25 @@ function compileBundle(root) {
 
 function readAgentFile(root, requestedPath) {
   const manifest = loadManifest(root);
-  if ((manifest.denyRead || []).some((pattern) => matches(requestedPath, pattern))) {
-    return { status: "denied", path: requestedPath, reason: "Denied by agentlas.json denyRead.", redacted: true };
+  const safePath = normalizeRequestedPath(requestedPath);
+  if (!safePath) {
+    return { status: "denied", path: String(requestedPath || ""), reason: "Invalid or escaping path.", redacted: true };
   }
-  if (!(manifest.allowRead || []).some((pattern) => matches(requestedPath, pattern))) {
-    return { status: "denied", path: requestedPath, reason: "Path is not in agentlas.json allowRead.", redacted: false };
+  if ((manifest.denyRead || []).some((pattern) => matches(safePath, pattern))) {
+    return { status: "denied", path: safePath, reason: "Denied by agentlas.json denyRead.", redacted: true };
   }
-  const abs = path.join(path.resolve(root), requestedPath);
-  if (!fs.existsSync(abs)) return { status: "missing", path: requestedPath, reason: "File not found." };
+  if (!(manifest.allowRead || []).some((pattern) => matches(safePath, pattern))) {
+    return { status: "denied", path: safePath, reason: "Path is not in agentlas.json allowRead.", redacted: false };
+  }
+  const base = path.resolve(root);
+  const abs = path.resolve(base, safePath);
+  if (abs !== base && !abs.startsWith(base + path.sep)) {
+    return { status: "denied", path: safePath, reason: "Path escapes the agent package.", redacted: true };
+  }
+  if (!fs.existsSync(abs)) return { status: "missing", path: safePath, reason: "File not found." };
   const raw = fs.readFileSync(abs, "utf8");
   const content = redact(raw);
-  return { status: "allowed", path: requestedPath, content, redacted: content !== raw };
+  return { status: "allowed", path: safePath, content, redacted: content !== raw };
 }
 
 function runFieldTest() {
@@ -196,4 +241,13 @@ function runFieldTest() {
   return report;
 }
 
-module.exports = { buildManifest, scanFolder, runWizard, compileBundle, readAgentFile, runFieldTest };
+module.exports = {
+  buildManifest,
+  scanFolder,
+  runWizard,
+  compileBundle,
+  readAgentFile,
+  runFieldTest,
+  matches,
+  normalizeRequestedPath,
+};

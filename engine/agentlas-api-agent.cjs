@@ -300,7 +300,7 @@ async function runOpenAILoop(req) {
 // ── Ollama (openai 스타일 tools, /api/chat) ──────────────
 async function runOllamaLoop(req) {
   const { ctx, ui } = req;
-  const host = process.env.OLLAMA_HOST || "http://127.0.0.1:11434";
+  const host = (req.ctx.env && req.ctx.env.OLLAMA_HOST) || process.env.OLLAMA_HOST || "http://127.0.0.1:11434";
   const messages = req.messages.slice();
   if (!messages.length || messages[0].role !== "system") messages.unshift({ role: "system", content: req.system });
   const toolDefs = tools.openaiTools(ctx.permission);

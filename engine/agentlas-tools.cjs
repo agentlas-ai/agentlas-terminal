@@ -129,7 +129,7 @@ const TOOLS = [
         encoding: "utf8",
         timeout,
         maxBuffer: 8 * 1024 * 1024,
-        env: process.env,
+        env: ctx.env || process.env,
       });
       const parts = [];
       if (res.stdout) parts.push(res.stdout);

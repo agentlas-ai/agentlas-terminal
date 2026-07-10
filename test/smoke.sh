@@ -29,6 +29,17 @@ check "help"    node "$BIN" help
 check "usage"   node "$BIN" usage
 check "mcp"     node "$BIN" mcp
 check "chats"   node "$BIN" chats
+check "run-api-regression" node "$SCRIPT_DIR/run-api-regression.cjs"
+check "cloud-runtime-paths" node "$SCRIPT_DIR/cloud-runtime-paths.cjs"
+check "runtime-env-protection" node "$SCRIPT_DIR/runtime-env-protection.cjs"
+check "credential-env-regression" node "$SCRIPT_DIR/credential-env-regression.cjs"
+check "mcp-config-isolation" node "$SCRIPT_DIR/mcp-config-isolation.cjs"
+check "bootstrap-race" node "$SCRIPT_DIR/bootstrap-race.cjs"
+check "login-loopback-security" node "$SCRIPT_DIR/login-loopback-security.cjs"
+check "timeout-regression" node "$SCRIPT_DIR/timeout-regression.cjs"
+check "capture-runtime-guard" node "$SCRIPT_DIR/capture-runtime-guard.cjs"
+check "update-safety" node "$SCRIPT_DIR/update-safety.cjs"
+check "semver-precedence" node "$SCRIPT_DIR/semver-precedence.cjs"
 
 # Agentlas OS 표면: 무인자 호출은 usage를 내고 exit 1 (프롬프트 오라우팅 방지 확인)
 guard() {

@@ -86,16 +86,34 @@ function bootstrapDbIfMissing() {
   }
   fs.mkdirSync(path.dirname(p), { recursive: true });
   const sql = fs.readFileSync(schemaFile, "utf8");
-  const db = openSqlite(p);
+  // DB를 정식 경로에서 직접 만들면 두 첫 실행이 모두 exists=false를 본 뒤 한 프로세스의
+  // 실패 cleanup이 다른 프로세스의 정상 DB까지 지울 수 있다. 각자 같은 볼륨의 임시 DB를
+  // 완성하고 hard-link(EEXIST=다른 프로세스 승리)로만 정식 이름을 원자 획득한다.
+  const temp = `${p}.bootstrap-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`;
+  const db = openSqlite(temp);
   try {
     db.exec(sql);
   } catch (e) {
     db.close();
-    try { fs.rmSync(p); } catch { /* leave partial for inspection */ }
+    try { fs.rmSync(temp, { force: true }); } catch { /* leave temp for inspection */ }
     throw new Error(`DB 부트스트랩 실패: ${e.message}`);
   }
   db.close();
-  return { created: true, path: p };
+  let created = false;
+  try {
+    fs.linkSync(temp, p);
+    created = true;
+  } catch (e) {
+    if (!e || e.code !== "EEXIST") {
+      throw new Error(`DB 원자 부트스트랩 전환 실패: ${e && e.message ? e.message : e}`);
+    }
+  } finally {
+    try { fs.rmSync(temp, { force: true }); } catch { /* noop */ }
+    try { fs.rmSync(temp + "-journal", { force: true }); } catch { /* noop */ }
+    try { fs.rmSync(temp + "-wal", { force: true }); } catch { /* noop */ }
+    try { fs.rmSync(temp + "-shm", { force: true }); } catch { /* noop */ }
+  }
+  return { created, path: p };
 }
 
 function main() {
@@ -173,4 +191,6 @@ function main() {
   });
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { bootstrapDbIfMissing, dbPath, userDataDir };

@@ -13,9 +13,47 @@
  * 스키마는 실측으로 확인됨 (cli/agentlas.cjs 상단 주석 참고).
  */
 const { spawn } = require("node:child_process");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+
+const NATIVE_TIMEOUT_DEFAULTS = Object.freeze({
+  idleMs: 10 * 60_000,
+  totalMs: 4 * 60 * 60_000,
+  killGraceMs: 3_000,
+});
+
+function finiteTimeoutMs(value, fallback, min, max) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(parsed)));
+}
+
+function nativeTimeoutConfig(env = process.env) {
+  const totalMs = finiteTimeoutMs(env.AGENTLAS_NATIVE_TOTAL_TIMEOUT_MS, NATIVE_TIMEOUT_DEFAULTS.totalMs, 30_000, 12 * 60 * 60_000);
+  return {
+    idleMs: Math.min(totalMs, finiteTimeoutMs(env.AGENTLAS_NATIVE_IDLE_TIMEOUT_MS, NATIVE_TIMEOUT_DEFAULTS.idleMs, 5_000, 60 * 60_000)),
+    totalMs,
+    killGraceMs: finiteTimeoutMs(env.AGENTLAS_NATIVE_KILL_GRACE_MS, NATIVE_TIMEOUT_DEFAULTS.killGraceMs, 100, 15_000),
+  };
+}
+
+// Programmatic override is used by the deterministic regression harness; user env always uses the safer bounds above.
+function directNativeTimeoutConfig(value = {}) {
+  const totalMs = finiteTimeoutMs(value.totalMs, NATIVE_TIMEOUT_DEFAULTS.totalMs, 10, 12 * 60 * 60_000);
+  return {
+    idleMs: Math.min(totalMs, finiteTimeoutMs(value.idleMs, NATIVE_TIMEOUT_DEFAULTS.idleMs, 10, 60 * 60_000)),
+    totalMs,
+    killGraceMs: finiteTimeoutMs(value.killGraceMs, NATIVE_TIMEOUT_DEFAULTS.killGraceMs, 10, 15_000),
+  };
+}
+
+function nativeTimeoutMessage(kind, ms) {
+  return kind === "idle"
+    ? `native runtime idle timeout: ${ms}ms 동안 출력이 없습니다.`
+    : `native runtime total timeout: 전체 실행 시간이 ${ms}ms를 초과했습니다.`;
+}
 
 function userDataDir() {
   const override = process.env.AGENTLAS_USER_DATA_DIR;
@@ -36,14 +74,29 @@ function mcpStdioArgs(s) {
 // claude --mcp-config 파일을 쓴다. playwright(항상) + DB에 enabled 된 stdio MCP 서버들.
 function cliMcpConfigPath(servers) {
   const dir = path.join(userDataDir(), "mcp");
-  fs.mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, "agentlas-cli-mcp.json");
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(dir, 0o700); } catch { /* Windows/best-effort */ }
   const mcpServers = { playwright: { command: "npx", args: ["-y", "@playwright/mcp@latest"] } };
   for (const s of servers || []) {
     if (!s || s.enabled === 0 || s.transport !== "stdio" || !s.command) continue;
     mcpServers[mcpKey(s)] = { command: s.command, args: mcpStdioArgs(s) };
   }
-  fs.writeFileSync(file, JSON.stringify({ mcpServers }, null, 2), "utf8");
+  const body = JSON.stringify({ mcpServers }, null, 2);
+  // 서로 다른 동시 실행이 하나의 agentlas-cli-mcp.json을 덮어쓰지 않도록 내용 주소 파일을 쓴다.
+  const digest = crypto.createHash("sha256").update(body).digest("hex").slice(0, 20);
+  const file = path.join(dir, `agentlas-cli-mcp-${digest}.json`);
+  let current = null;
+  try { current = fs.readFileSync(file, "utf8"); } catch { /* first write */ }
+  if (current !== body) {
+    const temp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
+    try {
+      fs.writeFileSync(temp, body, { encoding: "utf8", mode: 0o600, flag: "wx" });
+      fs.renameSync(temp, file);
+    } finally {
+      try { fs.rmSync(temp, { force: true }); } catch { /* noop */ }
+    }
+  }
+  try { fs.chmodSync(file, 0o600); } catch { /* Windows/best-effort */ }
   return { file, names: Object.keys(mcpServers) };
 }
 // codex -c mcp_servers.<key>.command/args — playwright(항상) + DB stdio 서버들.
@@ -83,11 +136,12 @@ function summarizeToolInput(name, input) {
   );
 }
 
-// child.stdout → 줄 단위 콜백. 종료 시 잔여 버퍼 flush.
-function lineReader(stream, onLine) {
+// child.stdout → 줄 단위 콜백. 종료 시 잔여 버퍼 flush. cleanup 반환.
+function lineReader(stream, onLine, onActivity) {
   let buf = "";
   stream.setEncoding("utf8");
-  stream.on("data", (chunk) => {
+  const onData = (chunk) => {
+    if (onActivity) onActivity();
     buf += chunk;
     let nl;
     while ((nl = buf.indexOf("\n")) >= 0) {
@@ -95,10 +149,16 @@ function lineReader(stream, onLine) {
       buf = buf.slice(nl + 1);
       if (line.trim()) onLine(line);
     }
-  });
-  stream.on("end", () => {
+  };
+  const onEnd = () => {
     if (buf.trim()) onLine(buf);
-  });
+  };
+  stream.on("data", onData);
+  stream.on("end", onEnd);
+  return () => {
+    stream.removeListener("data", onData);
+    stream.removeListener("end", onEnd);
+  };
 }
 
 // ── claude-code ──────────────────────────────────────────
@@ -517,11 +577,13 @@ function runNativeTurn(req) {
     return Promise.resolve({ text: "", session: st.session, error: `unknown runtime: ${kind}` });
   }
 
+  const timeout = req.timeoutConfig ? directNativeTimeoutConfig(req.timeoutConfig) : nativeTimeoutConfig(req.env || process.env);
   return new Promise((resolve) => {
     ui.status(`starting ${kind === "claude-code" ? "claude" : kind}…`);
     let child;
     try {
-      child = spawn(bin, args, {
+      const spawnImpl = req.spawn || spawn;
+      child = spawnImpl(bin, args, {
         cwd,
         stdio: ["ignore", "pipe", "pipe"],
         env: req.env || process.env,
@@ -531,56 +593,113 @@ function runNativeTurn(req) {
       return resolve({ text: "", session: st.session, error: e.message });
     }
 
-    // Ctrl-C → 자식 종료
-    const onAbort = () => {
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        /* ignore */
-      }
+    let settled = false;
+    let termination = null;
+    let idleTimer = null;
+    let totalTimer = null;
+    let killTimer = null;
+    let forceTimer = null;
+    let removeLineReader = () => {};
+    let stderrBuf = "";
+    const clearWatchdogs = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      if (totalTimer) clearTimeout(totalTimer);
+      if (killTimer) clearTimeout(killTimer);
+      if (forceTimer) clearTimeout(forceTimer);
+      idleTimer = totalTimer = killTimer = forceTimer = null;
     };
-    if (req.signal) {
-      if (req.signal.aborted) onAbort();
-      else req.signal.addEventListener("abort", onAbort, { once: true });
-    }
+    const cleanup = () => {
+      clearWatchdogs();
+      removeLineReader();
+      child.stderr?.removeListener("data", onStderr);
+      if (req.signal) req.signal.removeEventListener?.("abort", onAbort);
+    };
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(result);
+    };
+    const terminationResult = () => {
+      ui.streamEnd();
+      ui.stopSpinner();
+      const text = (st.finalText || st.text || "").trim();
+      if (st.usage) ui.cost(st.usage);
+      finish({ text, session: st.session, usage: st.usage, error: termination ? termination.message : "native runtime stopped" });
+    };
+    const requestStop = (reason) => {
+      if (termination || settled) return;
+      const message = reason === "abort" ? "aborted" : nativeTimeoutMessage(reason, reason === "idle" ? timeout.idleMs : timeout.totalMs);
+      termination = { reason, message };
+      st.error = message;
+      st.errorShown = true;
+      if (reason !== "abort") ui.error(message);
+      if (idleTimer) clearTimeout(idleTimer);
+      if (totalTimer) clearTimeout(totalTimer);
+      idleTimer = totalTimer = null;
+      try { child.kill("SIGTERM"); } catch { /* ignore */ }
+      if (settled) return;
+      killTimer = setTimeout(() => {
+        if (settled) return;
+        try { child.kill("SIGKILL"); } catch { /* ignore */ }
+        if (settled) return;
+        forceTimer = setTimeout(terminationResult, Math.max(250, Math.min(1_000, timeout.killGraceMs)));
+      }, timeout.killGraceMs);
+    };
+    const onAbort = () => requestStop("abort");
+    const armIdle = () => {
+      if (settled || termination) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => requestStop("idle"), timeout.idleMs);
+    };
+    const markActivity = () => armIdle();
 
     if (plainStream) {
       let plainStarted = false;
-      lineReader(child.stdout, (l) => {
+      removeLineReader = lineReader(child.stdout, (l) => {
         if (!plainStarted) {
           ui.streamStart();
           plainStarted = true;
         }
         ui.streamDelta(l + "\n");
         st.text += l + "\n";
-      });
+      }, markActivity);
     } else {
-      lineReader(child.stdout, lineHandler);
+      removeLineReader = lineReader(child.stdout, lineHandler, markActivity);
     }
 
-    let stderrBuf = "";
     child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (d) => {
+    const onStderr = (d) => {
+      markActivity();
       stderrBuf += d;
       if (stderrBuf.length > 4000) stderrBuf = stderrBuf.slice(-4000);
-    });
+    };
+    child.stderr.on("data", onStderr);
 
     child.on("error", (err) => {
+      if (settled) return;
+      if (termination) {
+        terminationResult();
+        return;
+      }
       ui.stopSpinner();
       ui.error(`failed to run ${kind}: ${err.message}`);
-      resolve({ text: "", session: st.session, error: err.message });
+      finish({ text: "", session: st.session, error: err.message });
     });
     child.on("close", (code) => {
-      if (req.signal) req.signal.removeEventListener?.("abort", onAbort);
+      if (settled) return;
+      if (termination) {
+        terminationResult();
+        return;
+      }
       ui.streamEnd();
       ui.stopSpinner();
       const text = (st.finalText || st.text || "").trim();
-      const aborted = req.signal && req.signal.aborted;
       const errTail = stripAnsi(stderrBuf).replace(/\s+/g, " ").trim(); // ANSI 제거 + 한 줄로
       if (st.error && !st.errorShown) {
         // claude `result` is_error 등 — 이전에 표시되지 않은 에러를 노출
         ui.error(String(st.error));
-      } else if (code !== 0 && !text && !aborted) {
+      } else if (code !== 0 && !text) {
         // Runtime Doctor — 아는 시스템 원인(미인증 OAuth MCP 플러그인 등)이면 즉시 수리하고
         // 1회 자동 재시도한다(2026-07-08 notion@openai-curated가 codex 전멸시킨 사고).
         if (!req._doctorRetried) {
@@ -591,6 +710,8 @@ function runNativeTurn(req) {
               ui.warn(`🩺 Runtime Doctor: ${report.summary}`);
               for (const act of report.actions) ui.warn(`   🔧 ${act.title} — ${act.detail}`);
               ui.warn("   자동 수리 완료 — 같은 요청을 다시 시도합니다.");
+              settled = true;
+              cleanup();
               resolve(runNativeTurn({ ...req, _doctorRetried: true }));
               return;
             }
@@ -599,14 +720,30 @@ function runNativeTurn(req) {
           }
         }
         ui.error(`${kind} exited with code ${code}` + (errTail ? `\n  ${errTail.slice(-400)}` : ""));
-      } else if (!text && !st.error && !aborted) {
+      } else if (!text && !st.error) {
         // 정상 종료인데 출력이 비어 있음(거부/차단 등) — 무음 실패 방지
         ui.warn(`${kind}: no output` + (errTail ? ` (${errTail.slice(-200)})` : ""));
       }
       if (st.usage) ui.cost(st.usage);
-      resolve({ text, session: st.session, usage: st.usage, error: st.error });
+      finish({ text, session: st.session, usage: st.usage, error: st.error });
     });
+
+    armIdle();
+    totalTimer = setTimeout(() => requestStop("total"), timeout.totalMs);
+    if (req.signal) {
+      if (req.signal.aborted) onAbort();
+      else req.signal.addEventListener("abort", onAbort, { once: true });
+    }
   });
 }
 
-module.exports = { runNativeTurn, summarizeToolInput, claudeArgs, codexArgs };
+module.exports = {
+  runNativeTurn,
+  summarizeToolInput,
+  claudeArgs,
+  codexArgs,
+  cliMcpConfigPath,
+  codexMcpArgs,
+  nativeTimeoutConfig,
+  directNativeTimeoutConfig,
+};

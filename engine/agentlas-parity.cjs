@@ -30,6 +30,93 @@ function isInternalAgentSlug(slug) {
   return /^researcher-\d+/.test(s) || s === "research-intelligence-desk" || s.startsWith("hephaestus-");
 }
 
+const LOGIN_CALLBACK_PATH = "/callback";
+const LOGIN_TIMEOUT_MS = 180_000;
+const MAX_LOGIN_SESSION_BYTES = 16 * 1024;
+
+function createLoginState(randomBytes = crypto.randomBytes) {
+  const bytes = Buffer.from(randomBytes(32));
+  if (bytes.length !== 32) throw new Error("로그인 state 생성에 실패했습니다.");
+  return bytes.toString("base64url");
+}
+
+function loginStatesMatch(actual, expected) {
+  const left = Buffer.from(String(actual || ""), "utf8");
+  const right = Buffer.from(String(expected || ""), "utf8");
+  return left.length === right.length && left.length > 0 && crypto.timingSafeEqual(left, right);
+}
+
+/**
+ * OAuth loopback callback의 1회용 state guard. `/callback` GET이 도착하면 성공/실패와
+ * 무관하게 transaction을 소비한다. 따라서 잘못된 state 뒤에 공격자 세션을 재주입하거나,
+ * 성공 URL을 재생해 다른 세션으로 덮어쓸 수 없다.
+ */
+function createLoginCallbackGuard(expectedState) {
+  let consumed = false;
+  return {
+    consume(rawUrl, method = "GET") {
+      let url;
+      try {
+        url = new URL(String(rawUrl || "/"), "http://127.0.0.1");
+      } catch {
+        return { handled: true, final: false, ok: false, statusCode: 400, message: "잘못된 로그인 콜백입니다." };
+      }
+      if (url.pathname !== LOGIN_CALLBACK_PATH) {
+        return { handled: false, final: false, ok: false, statusCode: 404, message: "not found" };
+      }
+      if (method !== "GET") {
+        return { handled: true, final: false, ok: false, statusCode: 405, message: "method not allowed" };
+      }
+      if (consumed) {
+        return { handled: true, final: false, ok: false, statusCode: 410, message: "이미 사용된 로그인 콜백입니다." };
+      }
+      consumed = true;
+
+      if (!loginStatesMatch(url.searchParams.get("state"), expectedState)) {
+        return {
+          handled: true,
+          final: true,
+          ok: false,
+          statusCode: 400,
+          message: "로그인 콜백 state 검증에 실패했습니다. agentlas login을 다시 실행하세요.",
+        };
+      }
+      const oauthError = url.searchParams.get("error");
+      if (oauthError) {
+        const safeCode = /^[A-Za-z0-9_.-]{1,80}$/.test(oauthError) ? oauthError : "oauth_error";
+        return {
+          handled: true,
+          final: true,
+          ok: false,
+          statusCode: 400,
+          message: `Agentlas 로그인 거부: ${safeCode}`,
+        };
+      }
+      const value = url.searchParams.get("session") || url.searchParams.get("token") || "";
+      if (!value) {
+        return {
+          handled: true,
+          final: true,
+          ok: false,
+          statusCode: 400,
+          message: "콜백에 session 값이 없습니다.",
+        };
+      }
+      if (Buffer.byteLength(value, "utf8") > MAX_LOGIN_SESSION_BYTES) {
+        return {
+          handled: true,
+          final: true,
+          ok: false,
+          statusCode: 400,
+          message: "로그인 session 값이 허용 크기를 초과했습니다.",
+        };
+      }
+      return { handled: true, final: true, ok: true, statusCode: 200, value, message: "Agentlas 로그인 완료" };
+    },
+    isConsumed() { return consumed; },
+  };
+}
+
 function create(deps) {
   const D = deps;
 
@@ -484,7 +571,45 @@ function create(deps) {
     return set;
   }
 
-  function nextCronRun(cron, from = new Date()) {
+  const WEEKDAY_INDEX = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  const zonedFormatterCache = new Map();
+
+  function zonedDateParts(date, timezone) {
+    if (!timezone) {
+      return {
+        minute: date.getMinutes(),
+        hour: date.getHours(),
+        day: date.getDate(),
+        month: date.getMonth() + 1,
+        weekday: date.getDay(),
+      };
+    }
+    let formatter = zonedFormatterCache.get(timezone);
+    if (!formatter) {
+      formatter = new Intl.DateTimeFormat("en-US", {
+        timeZone: timezone,
+        hourCycle: "h23",
+        minute: "2-digit",
+        hour: "2-digit",
+        day: "2-digit",
+        month: "2-digit",
+        weekday: "short",
+      });
+      zonedFormatterCache.set(timezone, formatter);
+    }
+    const parts = Object.fromEntries(
+      formatter.formatToParts(date).filter((part) => part.type !== "literal").map((part) => [part.type, part.value]),
+    );
+    return {
+      minute: Number(parts.minute),
+      hour: Number(parts.hour),
+      day: Number(parts.day),
+      month: Number(parts.month),
+      weekday: WEEKDAY_INDEX[parts.weekday],
+    };
+  }
+
+  function nextCronRun(cron, from = new Date(), timezone = null) {
     const parts = String(cron).trim().split(/\s+/);
     if (parts.length !== 5) return null;
     const [minS, hourS, domS, monS, dowS] = parts;
@@ -495,18 +620,89 @@ function create(deps) {
     const dows = cronField(dowS, 0, 7);
     if (!mins || !hours || !doms || !mons || !dows) return null;
     if (dows.has(7)) dows.add(0);
+    try {
+      if (timezone) zonedDateParts(from, timezone);
+    } catch {
+      return null;
+    }
     const t = new Date(from.getTime());
     t.setSeconds(0, 0);
     t.setMinutes(t.getMinutes() + 1);
     for (let i = 0; i < 366 * 24 * 60; i++) {
-      const domOk = doms.has(t.getDate());
-      const dowOk = dows.has(t.getDay());
+      const local = zonedDateParts(t, timezone);
+      const domOk = doms.has(local.day);
+      const dowOk = dows.has(local.weekday);
       // 표준 cron: dom/dow 둘 다 제한이면 OR, 아니면 AND
       const domRestricted = domS !== "*";
       const dowRestricted = dowS !== "*";
       const dayOk = domRestricted && dowRestricted ? domOk || dowOk : domOk && dowOk;
-      if (mons.has(t.getMonth() + 1) && dayOk && hours.has(t.getHours()) && mins.has(t.getMinutes())) return t;
+      if (mons.has(local.month) && dayOk && hours.has(local.hour) && mins.has(local.minute)) return t;
       t.setMinutes(t.getMinutes() + 1);
+    }
+    return null;
+  }
+
+  function localTimezone() {
+    try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"; } catch { return "UTC"; }
+  }
+
+  function legacyScheduleSpec(raw, timezone) {
+    const value = String(raw || "").trim();
+    if (!value) return null;
+    if (value.startsWith("cron:")) {
+      const expr = value.slice(5).trim();
+      return expr ? { kind: "cron", expr, tz: timezone } : null;
+    }
+    if (value.split(/\s+/).length === 5) return { kind: "cron", expr: value, tz: timezone };
+    if (value === "hourly") return { kind: "interval", everyMs: 60 * 60 * 1000, anchor: "lastRun" };
+    const every = value.match(/^every-(\d+)(m|h)$/);
+    if (every) {
+      const amount = Number(every[1]);
+      if (amount > 0) return { kind: "interval", everyMs: amount * (every[2] === "h" ? 3600000 : 60000), anchor: "lastRun" };
+    }
+    let match = value.match(/^daily-(\d{1,2}):(\d{2})$/);
+    if (match) return { kind: "cron", expr: `${Number(match[2])} ${Number(match[1])} * * *`, tz: timezone };
+    match = value.match(/^weekday-(\d{1,2}):(\d{2})$/);
+    if (match) return { kind: "cron", expr: `${Number(match[2])} ${Number(match[1])} * * 1-5`, tz: timezone };
+    match = value.match(/^weekly-(sun|mon|tue|wed|thu|fri|sat)-(\d{1,2}):(\d{2})$/i);
+    if (match) {
+      const dow = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 }[match[1].toLowerCase()];
+      return { kind: "cron", expr: `${Number(match[3])} ${Number(match[2])} * * ${dow}`, tz: timezone };
+    }
+    match = value.match(/^monthly-(\d{1,2})-(\d{1,2}):(\d{2})$/);
+    if (match && Number(match[1]) >= 1 && Number(match[1]) <= 31) {
+      return { kind: "cron", expr: `${Number(match[3])} ${Number(match[2])} ${Number(match[1])} * *`, tz: timezone };
+    }
+    return null;
+  }
+
+  /** Desktop schedule_json + legacy mirror token parity, including IANA timezone. */
+  function nextAutomationRun(row, from = new Date()) {
+    const timezone = row.timezone || localTimezone();
+    let spec = null;
+    if (row.schedule_json && String(row.schedule_json).trim()) {
+      try {
+        const parsed = JSON.parse(row.schedule_json);
+        if (parsed && typeof parsed.kind === "string") spec = parsed;
+      } catch { /* fall through to legacy schedule */ }
+    }
+    if (!spec) spec = legacyScheduleSpec(row.schedule, timezone);
+    if (!spec) {
+      // Desktop computeNextRun preserves unknown legacy schedules with a 24h
+      // fallback. More importantly, never leave a due row at the same instant.
+      return row.schedule ? new Date(from.getTime() + 24 * 3600 * 1000) : null;
+    }
+    if (spec.kind === "cron") return nextCronRun(spec.expr, from, spec.tz || timezone);
+    if (spec.kind === "interval") {
+      const every = Number(spec.everyMs);
+      if (!Number.isFinite(every) || every <= 0) return null;
+      return spec.anchor === "wallclock"
+        ? new Date(Math.ceil((from.getTime() + 1) / every) * every)
+        : new Date(from.getTime() + every);
+    }
+    if (spec.kind === "once") {
+      const at = new Date(spec.atIso);
+      return at.getTime() > from.getTime() ? at : null;
     }
     return null;
   }
@@ -569,7 +765,7 @@ function create(deps) {
         targetId = f.id;
         targetLabel = f.name;
       }
-      const next = nextCronRun(flags.cron);
+      const next = nextCronRun(flags.cron, new Date(), flags.tz || null);
       if (!next) return D.fail(`cron 표현식을 해석할 수 없습니다: "${flags.cron}" (5필드: 분 시 일 월 요일)`);
       const id = crypto.randomUUID();
       db.prepare(
@@ -600,10 +796,10 @@ function create(deps) {
     if (sub === "on" || sub === "off") {
       const idPrefix = args[1];
       if (!idPrefix) return D.fail(`usage: agentlas automation ${sub} <id>`);
-      const row = db.prepare("SELECT id, name, schedule FROM automations WHERE id LIKE ?").get(idPrefix + "%");
+      const row = db.prepare("SELECT id, name, schedule, schedule_json, timezone FROM automations WHERE id LIKE ?").get(idPrefix + "%");
       if (!row) return D.fail(`자동화를 찾을 수 없습니다: ${idPrefix}`);
       if (sub === "on") {
-        const next = nextCronRun(row.schedule) || null;
+        const next = nextAutomationRun(row) || null;
         db.prepare("UPDATE automations SET enabled=1, next_run_at=? WHERE id=?").run(next ? next.toISOString() : null, row.id);
       } else {
         db.prepare("UPDATE automations SET enabled=0 WHERE id=?").run(row.id);
@@ -730,10 +926,17 @@ function create(deps) {
       ui.markdown(String(text).trim().slice(0, 4000));
 
       recordAutomationRun(db, row.id, "ok", null, ctx.scheduledFor);
-      const advance = ctx.advanceSchedule && row.schedule ? nextCronRun(row.schedule) : null;
-      db.prepare(
-        "UPDATE automations SET last_run_at = ?, run_count = run_count + 1" + (advance ? ", next_run_at = ?" : "") + " WHERE id = ?",
-      ).run(...(advance ? [new Date().toISOString(), advance.toISOString(), row.id] : [new Date().toISOString(), row.id]));
+      const ranAt = new Date();
+      const shouldAdvance = !!ctx.advanceSchedule && (row.trigger_type || "schedule") === "schedule";
+      const advance = shouldAdvance ? nextAutomationRun(row, ranAt) : null;
+      if (shouldAdvance) {
+        db.prepare(
+          "UPDATE automations SET last_run_at = ?, run_count = run_count + 1, next_run_at = ?, enabled = ? WHERE id = ?",
+        ).run(ranAt.toISOString(), advance ? advance.toISOString() : null, advance ? row.enabled : 0, row.id);
+      } else {
+        db.prepare("UPDATE automations SET last_run_at = ?, run_count = run_count + 1 WHERE id = ?")
+          .run(ranAt.toISOString(), row.id);
+      }
       // max_runs 도달 시 비활성화 (앱과 동일한 종료 조건).
       if (row.max_runs && row.run_count + 1 >= row.max_runs) {
         db.prepare("UPDATE automations SET enabled = 0 WHERE id = ?").run(row.id);
@@ -745,7 +948,15 @@ function create(deps) {
       const msg = String((e && e.message) || e).slice(0, 500);
       ui.error(msg);
       recordAutomationRun(db, row.id, "error", msg, ctx.scheduledFor);
-      db.prepare("UPDATE automations SET last_run_at = ? WHERE id = ?").run(new Date().toISOString(), row.id);
+      const ranAt = new Date();
+      const shouldAdvance = !!ctx.advanceSchedule && (row.trigger_type || "schedule") === "schedule";
+      const advance = shouldAdvance ? nextAutomationRun(row, ranAt) : null;
+      if (shouldAdvance) {
+        db.prepare("UPDATE automations SET last_run_at = ?, next_run_at = ?, enabled = ? WHERE id = ?")
+          .run(ranAt.toISOString(), advance ? advance.toISOString() : null, advance ? row.enabled : 0, row.id);
+      } else {
+        db.prepare("UPDATE automations SET last_run_at = ? WHERE id = ?").run(ranAt.toISOString(), row.id);
+      }
       return { ok: false };
     } finally {
       releaseAutomation(db, row.id);
@@ -778,7 +989,7 @@ function create(deps) {
         if (stopping) break;
         await runAutomationOnce(db, row, { ui, advanceSchedule: true, scheduledFor: row.next_run_at });
         // 스케줄이 없는(1회성) 행이 남으면 재발화 방지.
-        if (!row.schedule || !nextCronRun(row.schedule)) {
+        if (!row.schedule || !nextAutomationRun(row)) {
           db.prepare("UPDATE automations SET enabled = 0 WHERE id = ? AND (schedule IS NULL OR schedule = '')").run(row.id);
         }
       }
@@ -891,6 +1102,91 @@ function create(deps) {
     return resp.json();
   }
 
+  function loginCallbackHtml(ok) {
+    const title = ok ? "Agentlas 로그인 완료" : "Agentlas 로그인 실패";
+    const body = ok
+      ? "터미널로 돌아가세요. 이 창은 닫아도 됩니다."
+      : "터미널로 돌아가 agentlas login을 다시 실행하세요.";
+    return `<!doctype html><html><head><meta charset="utf-8"><title>Agentlas</title></head><body style="font-family:-apple-system,system-ui,sans-serif;padding:40px"><h3>${title}</h3><p>${body}</p></body></html>`;
+  }
+
+  function waitForLoopbackSession(options = {}) {
+    const http = options.http || require("node:http");
+    const timeoutCandidate = Number(options.timeoutMs);
+    const timeoutMs = Number.isFinite(timeoutCandidate) && timeoutCandidate > 0 ? timeoutCandidate : LOGIN_TIMEOUT_MS;
+    const state = createLoginState(options.randomBytes || crypto.randomBytes);
+    const guard = createLoginCallbackGuard(state);
+    const onLoginUrl = options.onLoginUrl || ((url) => {
+      D.out("브라우저에서 Agentlas에 로그인하세요 (자동으로 열립니다):");
+      D.out("  " + url);
+      openInBrowser(url);
+    });
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let timer = null;
+      let server;
+      const finish = (error, value) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        try { if (server) server.close(); } catch { /* ignore */ }
+        if (error) reject(error);
+        else resolve(value);
+      };
+
+      server = http.createServer((req, res) => {
+        const result = guard.consume(req.url, req.method || "GET");
+        const headers = {
+          "content-type": result.handled ? "text/html; charset=utf-8" : "text/plain; charset=utf-8",
+          "cache-control": "no-store",
+          "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'",
+          "x-content-type-options": "nosniff",
+          connection: "close",
+        };
+        if (result.statusCode === 405) headers.allow = "GET";
+        res.writeHead(result.statusCode, headers);
+        res.end(result.handled ? loginCallbackHtml(result.ok) : result.message);
+        if (!result.final) return;
+        if (result.ok) finish(null, result.value);
+        else finish(new Error(result.message));
+      });
+      server.on("error", (error) => finish(error));
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address();
+        const port = address && typeof address === "object" ? address.port : 0;
+        if (!port) {
+          finish(new Error("로그인 loopback 포트를 열지 못했습니다."));
+          return;
+        }
+        const callback = new URL(`http://127.0.0.1:${port}${LOGIN_CALLBACK_PATH}`);
+        callback.searchParams.set("state", state);
+        let loginUrl;
+        try {
+          loginUrl = new URL("/account", `${options.baseUrl || webBaseUrl()}/`);
+        } catch {
+          finish(new Error("Agentlas 로그인 URL이 올바르지 않습니다."));
+          return;
+        }
+        loginUrl.searchParams.set("desktop", "1");
+        loginUrl.searchParams.set("callback", callback.toString());
+        timer = setTimeout(
+          () => finish(new Error(`로그인 대기 시간(${Math.ceil(timeoutMs / 1000)}초)이 지났습니다. 다시 시도: agentlas login`)),
+          timeoutMs,
+        );
+        if (timer.unref) timer.unref();
+        try {
+          const notified = onLoginUrl(loginUrl.toString());
+          if (notified && typeof notified.then === "function") {
+            void notified.catch((error) => finish(error));
+          }
+        } catch (error) {
+          finish(error);
+        }
+      });
+    });
+  }
+
   async function cmdWhoami() {
     const cookie = await D.cloudSessionCookieCli();
     if (!cookie) {
@@ -913,8 +1209,8 @@ function create(deps) {
     }
   }
 
-  // 웹 /account?desktop=1&callback=<loopback> 이 유효 세션이면 <callback>?session=<value> 로 302 —
-  // 데스크탑 signInWithBrowser(electron/auth.ts)와 동일한 프로토콜을 순수 Node http로 구현.
+  // 웹 /account?desktop=1&callback=<loopback+state> 이 유효 세션이면 callback의 state를
+  // 보존한 채 session을 추가해 302한다. Terminal은 state를 1회 검증한 뒤에만 저장한다.
   async function cmdLogin(args = []) {
     const force = args.includes("--force");
     if (!force) {
@@ -930,35 +1226,9 @@ function create(deps) {
       }
     }
 
-    const http = require("node:http");
     let value;
     try {
-      value = await new Promise((resolve, reject) => {
-        let settled = false;
-        const done = (fn, arg) => { if (!settled) { settled = true; fn(arg); } };
-        const server = http.createServer((req, res) => {
-          let u;
-          try { u = new URL(req.url, "http://127.0.0.1"); } catch { res.writeHead(400); res.end(); return; }
-          if (!u.pathname.startsWith("/callback")) { res.writeHead(404); res.end("not found"); return; }
-          const v = u.searchParams.get("session") || u.searchParams.get("token");
-          res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-          res.end("<html><body style=\"font-family:-apple-system,sans-serif;padding:40px\"><h3>Agentlas 로그인 완료</h3><p>터미널로 돌아가세요. 이 창은 닫아도 됩니다.</p></body></html>");
-          server.close();
-          if (v) done(resolve, v);
-          else done(reject, new Error("콜백에 session 값이 없습니다."));
-        });
-        server.on("error", (e) => done(reject, e));
-        server.listen(0, "127.0.0.1", () => {
-          const port = server.address().port;
-          const cb = encodeURIComponent(`http://127.0.0.1:${port}/callback`);
-          const url = `${webBaseUrl()}/account?desktop=1&callback=${cb}`;
-          D.out("브라우저에서 Agentlas에 로그인하세요 (자동으로 열립니다):");
-          D.out("  " + url);
-          openInBrowser(url);
-        });
-        const t = setTimeout(() => { try { server.close(); } catch { /* ignore */ } done(reject, new Error("로그인 대기 시간(180초)이 지났습니다. 다시 시도: agentlas login")); }, 180_000);
-        if (t.unref) t.unref();
-      });
+      value = await waitForLoopbackSession();
     } catch (e) {
       return D.fail(String((e && e.message) || e));
     }
@@ -1037,8 +1307,8 @@ function create(deps) {
   return {
     cmdStorm, stormRun, cmdSwarm, swarmRun, cmdAutomation, cmdUsage, cmdTelegram, cloudSearch,
     cmdLogin, cmdLogout, cmdWhoami, cmdHep, runHephaestusInteractive, cmdMcp, cmdChats,
-    nextCronRun, parseSwarmOutput,
+    nextCronRun, nextAutomationRun, runAutomationOnce, parseSwarmOutput, waitForLoopbackSession,
   };
 }
 
-module.exports = { create };
+module.exports = { create, _test: { createLoginState, createLoginCallbackGuard } };

@@ -279,7 +279,6 @@ function startRepl(opts) {
     const rt = state.runtime;
     const costLabel = runtimeLabel(rt);
     const runEnv = H.buildChildEnv ? await H.buildChildEnv(db, { ...ctx, cwd: state.cwd }) : process.env;
-    Object.assign(process.env, runEnv);
     ui._lastUsage = null;
     const assistantUi = makeStyleGuard(ui);
     const thinkingText = i18n.t(targetLang, "thinkingWith", costLabel);
@@ -341,7 +340,7 @@ function startRepl(opts) {
           apiKey,
           system: sys,
           messages,
-          ctx,
+          ctx: { ...ctx, env: runEnv },
           ui: guard,
           signal,
         });

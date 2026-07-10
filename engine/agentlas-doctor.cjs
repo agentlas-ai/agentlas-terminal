@@ -20,12 +20,28 @@ function codexHome() {
   return process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 }
 
-/** 에러 텍스트에서 실패 원인으로 지목된 원격 호스트들을 추출한다. */
+/**
+ * 에러 텍스트에서 OAuth 자원 메타데이터로 명시된 호스트만 추출한다.
+ * stderr의 모든 URL을 수집하면 도움말·문서 링크와 관련된 정상 플러그인까지
+ * 수리 대상이 될 수 있다. 자동 수리는 구조화된 증거가 있을 때만 실행한다.
+ */
 function extractHosts(error) {
   const hosts = new Set();
-  const re = /https?:\/\/([a-z0-9][a-z0-9.-]*[a-z0-9])/gi;
-  let m;
-  while ((m = re.exec(error)) !== null) hosts.add(m[1].toLowerCase());
+  const addUrlHost = (rawUrl) => {
+    try {
+      hosts.add(new URL(rawUrl.replace(/[\]}>),.;]+$/g, "")).hostname.toLowerCase());
+    } catch {
+      /* 잘못된 메타데이터 URL은 자동 수리 증거로 쓰지 않음 */
+    }
+  };
+  const patterns = [
+    /resource_metadata(?:_url)?\s*[:=]\s*\\?["']?(https?:\/\/[^\s"'\\)>,]+)/gi,
+    /(https?:\/\/[^\s"'\\)>,]+\/\.well-known\/oauth-protected-resource(?:[/?#][^\s"'\\)>,]*)?)/gi,
+  ];
+  for (const re of patterns) {
+    let m;
+    while ((m = re.exec(error || "")) !== null) addUrlHost(m[1]);
+  }
   return [...hosts];
 }
 
@@ -47,7 +63,7 @@ function classifyFailure(error) {
     return { kind: "codex-config-invalid", hosts: [], badServer: extractBadMcpServer(text) };
   }
   if (/no response for \d+s|auto-aborted/i.test(text)) return { kind: "timeout", hosts: [] };
-  if (/CLI exit \d+|exited with code [1-9]/i.test(text)) return { kind: "cli-exit", hosts: extractHosts(text) };
+  if (/(?:CLI exit|exited with code)\s+[1-9]\d*/i.test(text)) return { kind: "cli-exit", hosts: extractHosts(text) };
   return { kind: "unknown", hosts: [] };
 }
 
@@ -89,7 +105,9 @@ function findOauthPluginsByHost(hosts) {
             } catch {
               continue;
             }
-            if (hosts.some((h) => h === host || h.endsWith("." + host) || host.endsWith("." + h))) {
+            // 호스트가 정확히 같을 때만 자동 수리한다. 부모/자식 도메인 관계만으로는
+            // 어느 플러그인이 실패했는지 증명할 수 없다.
+            if (hosts.includes(host)) {
               // cache 디렉토리 "openai-curated-remote"는 config 키에선 "openai-curated".
               hits.push({ pluginKey: `${plugin}@${marketplace.replace(/-remote$/, "")}`, host });
             }
@@ -111,12 +129,22 @@ function disableCodexPlugin(pluginKey) {
   const original = fs.readFileSync(configPath, "utf8");
   const header = `[plugins."${pluginKey}"]`;
   let next;
-  if (original.includes(header)) {
-    const idx = original.indexOf(header);
-    const after = original.slice(idx);
-    const replacedAfter = after.replace(/(\[plugins\."[^"]+"\]\s*\n)enabled\s*=\s*true/, "$1enabled = false");
-    if (replacedAfter === after) return false; // 이미 false거나 형태가 다름
-    next = original.slice(0, idx) + replacedAfter;
+  const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const headerMatch = new RegExp(`^[ \\t]*${escapeRegExp(header)}[ \\t]*(?:#.*)?\\r?$`, "m").exec(original);
+  if (headerMatch) {
+    const headerLineEnd = headerMatch.index + headerMatch[0].length;
+    const newlineIndex = original.indexOf("\n", headerLineEnd);
+    const bodyStart = newlineIndex === -1 ? original.length : newlineIndex + 1;
+    const remaining = original.slice(bodyStart);
+    const nextSection = /^[ \t]*\[[^\r\n]+\][ \t]*(?:#.*)?\r?$/m.exec(remaining);
+    const sectionEnd = nextSection ? bodyStart + nextSection.index : original.length;
+    const section = original.slice(headerMatch.index, sectionEnd);
+    const replacedSection = section.replace(
+      /^([ \t]*enabled[ \t]*=[ \t]*)true([ \t]*(?:#.*)?)(?=\r?$)/m,
+      "$1false$2",
+    );
+    if (replacedSection === section) return false; // 이미 false거나 해당 섹션에 enabled=true가 없음
+    next = original.slice(0, headerMatch.index) + replacedSection + original.slice(sectionEnd);
   } else {
     next = `${original.trimEnd()}\n\n${header}\nenabled = false\n`;
   }

@@ -28,6 +28,7 @@ const os = require("node:os");
 const fs = require("node:fs");
 const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
+const { compareSemVer, normalizeSemVer, parseSemVer } = require("./semver.cjs");
 
 // ── 앱과 동일한 userData 경로 (electron app.getPath('userData')와 일치) ──
 function userDataDir() {
@@ -783,6 +784,140 @@ const CLOUD_SECRET_RE = [
   ["generic-secret", /\b(?:api[_-]?key|secret|token|password)\s*[:=]\s*['"][^'"]{8,}['"]/i, "hard-coded credential"],
 ];
 
+const HUB_RESPONSE_MAX_BYTES = 16 * 1024 * 1024;
+const HUB_TIMEOUT_DEFAULTS = Object.freeze({ connectMs: 15_000, idleMs: 30_000, totalMs: 180_000 });
+
+function finiteTimeoutMs(value, fallback, min, max) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(parsed)));
+}
+
+function hubTimeoutConfig(env = process.env) {
+  const totalMs = finiteTimeoutMs(env.AGENTLAS_HUB_TOTAL_TIMEOUT_MS, HUB_TIMEOUT_DEFAULTS.totalMs, 5_000, 900_000);
+  return {
+    connectMs: Math.min(totalMs, finiteTimeoutMs(env.AGENTLAS_HUB_CONNECT_TIMEOUT_MS, HUB_TIMEOUT_DEFAULTS.connectMs, 1_000, 120_000)),
+    idleMs: Math.min(totalMs, finiteTimeoutMs(env.AGENTLAS_HUB_IDLE_TIMEOUT_MS, HUB_TIMEOUT_DEFAULTS.idleMs, 1_000, 300_000)),
+    totalMs,
+  };
+}
+
+function directHubTimeoutConfig(value = {}) {
+  const totalMs = finiteTimeoutMs(value.totalMs, HUB_TIMEOUT_DEFAULTS.totalMs, 10, 900_000);
+  return {
+    connectMs: Math.min(totalMs, finiteTimeoutMs(value.connectMs, HUB_TIMEOUT_DEFAULTS.connectMs, 10, 120_000)),
+    idleMs: Math.min(totalMs, finiteTimeoutMs(value.idleMs, HUB_TIMEOUT_DEFAULTS.idleMs, 10, 300_000)),
+    totalMs,
+  };
+}
+
+function hubTimeoutError(kind, ms) {
+  const message = kind === "connect"
+    ? `Hub 연결 제한 시간(${ms}ms)을 초과했습니다.`
+    : kind === "idle"
+      ? `Hub 응답이 ${ms}ms 동안 멈췄습니다.`
+      : `Hub 요청 전체 제한 시간(${ms}ms)을 초과했습니다.`;
+  const error = new Error(message);
+  error.code = `AGENTLAS_HUB_${kind.toUpperCase()}_TIMEOUT`;
+  return error;
+}
+
+/** Hub/Cloud fetch + body reader. Headers 전 connect, chunk 사이 idle, 전 구간 total timeout. */
+async function fetchHubCli(url, init = {}, options = {}) {
+  const fetchImpl = options.fetch || globalThis.fetch;
+  if (typeof fetchImpl !== "function") throw new Error("이 런타임에 fetch가 없습니다.");
+  const timeout = options.timeoutConfig ? directHubTimeoutConfig(options.timeoutConfig) : hubTimeoutConfig(options.env || process.env);
+  const controller = new AbortController();
+  const upstreamSignal = init.signal;
+  let connectTimer = null;
+  let idleTimer = null;
+  let totalTimer = null;
+  let reader = null;
+  let terminalError = null;
+  let rejectTerminal;
+  const terminal = new Promise((_, reject) => { rejectTerminal = reject; });
+  const stop = (error) => {
+    if (terminalError) return;
+    terminalError = error;
+    try { controller.abort(error); } catch { controller.abort(); }
+    rejectTerminal(error);
+  };
+  const onUpstreamAbort = () => {
+    const reason = upstreamSignal && upstreamSignal.reason;
+    const error = reason instanceof Error ? reason : new Error("Hub 요청이 취소되었습니다.");
+    if (!error.code) error.code = "ABORT_ERR";
+    stop(error);
+  };
+  const armIdle = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => stop(hubTimeoutError("idle", timeout.idleMs)), timeout.idleMs);
+  };
+
+  if (upstreamSignal) {
+    if (upstreamSignal.aborted) onUpstreamAbort();
+    else upstreamSignal.addEventListener("abort", onUpstreamAbort, { once: true });
+  }
+  connectTimer = setTimeout(() => stop(hubTimeoutError("connect", timeout.connectMs)), timeout.connectMs);
+  totalTimer = setTimeout(() => stop(hubTimeoutError("total", timeout.totalMs)), timeout.totalMs);
+
+  try {
+    const response = await Promise.race([
+      Promise.resolve().then(() => fetchImpl(url, { ...init, signal: controller.signal })),
+      terminal,
+    ]);
+    if (connectTimer) clearTimeout(connectTimer);
+    connectTimer = null;
+    const chunks = [];
+    let bytes = 0;
+    armIdle();
+    if (response.body && typeof response.body.getReader === "function") {
+      reader = response.body.getReader();
+      while (true) {
+        const part = await Promise.race([reader.read(), terminal]);
+        if (part.done) break;
+        armIdle();
+        const chunk = Buffer.from(part.value || []);
+        bytes += chunk.length;
+        if (bytes > HUB_RESPONSE_MAX_BYTES) {
+          const error = new Error(`Hub 응답이 허용 크기(${HUB_RESPONSE_MAX_BYTES} bytes)를 초과했습니다.`);
+          error.code = "AGENTLAS_HUB_RESPONSE_TOO_LARGE";
+          stop(error);
+          throw error;
+        }
+        chunks.push(chunk);
+      }
+    } else {
+      const raw = Buffer.from(await Promise.race([response.arrayBuffer(), terminal]));
+      bytes = raw.length;
+      if (bytes > HUB_RESPONSE_MAX_BYTES) throw new Error(`Hub 응답이 허용 크기(${HUB_RESPONSE_MAX_BYTES} bytes)를 초과했습니다.`);
+      chunks.push(raw);
+    }
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = null;
+    const text = Buffer.concat(chunks, bytes).toString("utf8");
+    return { ok: response.ok, status: response.status, headers: response.headers, text };
+  } catch (error) {
+    if (terminalError) throw terminalError;
+    throw error;
+  } finally {
+    if (connectTimer) clearTimeout(connectTimer);
+    if (idleTimer) clearTimeout(idleTimer);
+    if (totalTimer) clearTimeout(totalTimer);
+    if (upstreamSignal) upstreamSignal.removeEventListener?.("abort", onUpstreamAbort);
+    if (reader && terminalError) {
+      try { await reader.cancel(terminalError); } catch { /* ignore */ }
+    }
+  }
+}
+
+function parseHubJsonCli(response, label) {
+  try {
+    return JSON.parse(response.text || "null");
+  } catch {
+    throw new Error(`${label} 응답 JSON 형식이 올바르지 않습니다.`);
+  }
+}
+
 function parseCloudFlags(args) {
   const flags = { _: [] };
   for (let i = 0; i < args.length; i++) {
@@ -1159,13 +1294,13 @@ async function registerCloudAgentCli(manifest, bundlePath, review, visibility) {
   if (typeof fetch !== "function") fail("이 런타임에 fetch가 없습니다(앱 런타임으로 실행 필요).");
   const base = (process.env.AGENTLAS_WEB_BASE_URL || "https://agentlas.cloud").replace(/\/$/, "");
   const bundle = JSON.parse(fs.readFileSync(bundlePath, "utf8"));
-  const resp = await fetch(`${base}/api/cloud-agents/v1/register`, {
+  const resp = await fetchHubCli(`${base}/api/cloud-agents/v1/register`, {
     method: "POST",
     headers: { "content-type": "application/json", cookie, origin: base },
     body: JSON.stringify({ manifest, bundle, review, visibility, billing: { modelCallsPaidBy: review.costOwner, localRuntime: review.runtimeLabel || null } }),
   });
-  if (!resp.ok) fail(`Agentlas Cloud 등록 실패 ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 300)}`);
-  const json = await resp.json();
+  if (!resp.ok) fail(`Agentlas Cloud 등록 실패 ${resp.status}: ${resp.text.slice(0, 300)}`);
+  const json = parseHubJsonCli(resp, "Agentlas Cloud 등록");
   return {
     cloudId: json.cloudId || crypto.randomUUID(),
     slug: json.slug || manifest.slug,
@@ -1183,12 +1318,12 @@ async function deleteCloudAgentCli(slug) {
   if (!cookie) fail("agentlas.cloud 로그인이 필요합니다. 데스크톱 앱에서 로그인하거나 AGENTLAS_SESSION을 설정하세요.");
   if (typeof fetch !== "function") fail("이 런타임에 fetch가 없습니다(앱 런타임으로 실행 필요).");
   const base = (process.env.AGENTLAS_WEB_BASE_URL || "https://agentlas.cloud").replace(/\/$/, "");
-  const resp = await fetch(`${base}/api/cloud-agents/v1/register?slug=${encodeURIComponent(safeSlug)}`, {
+  const resp = await fetchHubCli(`${base}/api/cloud-agents/v1/register?slug=${encodeURIComponent(safeSlug)}`, {
     method: "DELETE",
     headers: { "content-type": "application/json", cookie, origin: base },
   });
-  if (!resp.ok) fail(`Agentlas Cloud 삭제 실패 ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 300)}`);
-  return resp.json();
+  if (!resp.ok) fail(`Agentlas Cloud 삭제 실패 ${resp.status}: ${resp.text.slice(0, 300)}`);
+  return parseHubJsonCli(resp, "Agentlas Cloud 삭제");
 }
 
 // `agentlas login`이 저장하는 CLI 세션 파일 (평문·0600 — 데스크탑의 safeStorage 파일과 별개).
@@ -1235,13 +1370,13 @@ async function fetchCloudManifestCli(slug) {
   const headers = { "content-type": "application/json" };
   const cookie = await cloudSessionCookieCli();
   if (cookie) headers.cookie = cookie;
-  const resp = await fetch(`${base.replace(/\/$/, "")}/tools/call`, {
+  const resp = await fetchHubCli(`${base.replace(/\/$/, "")}/tools/call`, {
     method: "POST",
     headers,
     body: JSON.stringify({ method: "marketplace.get_manifest", params: { name: "marketplace.get_manifest", arguments: { kind: "agent", slug } } }),
   });
   if (!resp.ok) fail(`marketplace.get_manifest 실패 ${resp.status}`);
-  const json = await resp.json();
+  const json = parseHubJsonCli(resp, "marketplace.get_manifest");
   if (json.error) fail(`marketplace.get_manifest: ${json.error.message || "unknown error"}`);
   return json.result || null;
 }
@@ -5958,67 +6093,154 @@ function resolveRuntime(db, override) {
 
 // ── API 러너 (BYOK / Ollama) — 비스트리밍, 최종 텍스트 반환 ──
 const DEFAULT_API_MODEL = {
-  anthropic: "claude-sonnet-4-5",
+  anthropic: "claude-sonnet-4-6",
   openai: "gpt-4o-mini",
   google: "gemini-1.5-flash",
   ollama: "llama3.1",
   upstage: "solar-pro2",
+  custom: "deepseek-chat",
+  glm: "glm-4.6",
+  kimi: "kimi-k2-0711-preview",
+  deepseek: "deepseek-chat",
 };
+const ANTHROPIC_COMPAT_API = {
+  glm: { label: "GLM", baseUrl: "https://api.z.ai/api/anthropic" },
+  kimi: { label: "Kimi", baseUrl: "https://api.moonshot.ai/anthropic" },
+  deepseek: { label: "DeepSeek", baseUrl: "https://api.deepseek.com/anthropic" },
+};
+const DEFAULT_CUSTOM_API_BASE_URL = "https://api.openai.com/v1";
+
 async function apiKey(backend) {
   const keytar = readKeytar();
   if (!keytar) return null;
   // 키체인 접근 거부(서명 안 된 standalone Node)는 "키 없음"으로 조용히 처리.
   return keytar.getPassword(SERVICE, "byok:" + backend).catch(() => null);
 }
-async function runApi(backend, model, system, prompt) {
+
+/**
+ * Custom BYOK 키가 전송될 origin을 Terminal에서도 다시 검증한다.
+ * Desktop IPC와 동일하게 공개 주소는 HTTPS만, HTTP는 localhost/LAN만 허용한다.
+ */
+function normalizeCustomApiBaseUrl(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return DEFAULT_CUSTOM_API_BASE_URL;
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error("Custom API base URL이 올바르지 않습니다.");
+  }
+  const host = parsed.hostname.toLowerCase();
+  const isLoopback = host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]";
+  const isPrivateLan =
+    /^10\./.test(host) || /^192\.168\./.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host);
+  if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && (isLoopback || isPrivateLan))) {
+    throw new Error("Custom API base URL은 HTTPS 또는 localhost/LAN의 HTTP여야 합니다.");
+  }
+  return value.replace(/\/+$/, "");
+}
+
+/** Desktop과 공유하는 SQLite meta에서 Custom OpenAI base URL을 읽는다. */
+function readCustomApiBaseUrl() {
+  const p = dbPath();
+  if (!fs.existsSync(p)) return DEFAULT_CUSTOM_API_BASE_URL;
+  let db = null;
+  let raw = "";
+  try {
+    try {
+      const Database = require("better-sqlite3");
+      db = new Database(p, { readonly: true, fileMustExist: true });
+    } catch {
+      db = openNodeSqliteDb(p);
+    }
+    try {
+      const row = db.prepare("SELECT value FROM meta WHERE key = 'custom_base_url'").get();
+      raw = row && row.value ? row.value : "";
+    } catch {
+      // 구버전 DB에 meta 테이블/키가 없으면 Desktop과 동일하게 OpenAI 기본 URL.
+      raw = "";
+    }
+  } catch (e) {
+    throw new Error(`Custom API base URL을 공유 DB에서 읽지 못했습니다: ${(e && e.message) || e}`);
+  } finally {
+    try { if (db && typeof db.close === "function") db.close(); } catch { /* ignore close failure */ }
+  }
+  return normalizeCustomApiBaseUrl(raw);
+}
+
+/**
+ * BYOK/Ollama 한 턴. 재사용 경로(swarm/automation)이므로 절대 process.exit하지 않고
+ * 오류를 throw해 호출자의 catch/finally가 리스 해제·부분 실패를 처리하게 한다.
+ * options는 회귀 테스트의 fetch/키 주입용이며 상용 호출자는 사용하지 않는다.
+ */
+async function runApi(backend, model, system, prompt, options) {
+  options = options || {};
   model = model || DEFAULT_API_MODEL[backend];
-  if (typeof fetch !== "function") fail("이 런타임에 fetch가 없습니다(앱 런타임으로 실행 필요).");
+  const fetchImpl = options.fetch || globalThis.fetch;
+  if (typeof fetchImpl !== "function") throw new Error("이 런타임에 fetch가 없습니다(앱 런타임으로 실행 필요).");
   if (backend === "ollama") {
-    const resp = await fetch("http://127.0.0.1:11434/api/chat", {
+    const resp = await fetchImpl("http://127.0.0.1:11434/api/chat", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ model, stream: false, messages: [{ role: "system", content: system }, { role: "user", content: prompt }] }),
     });
-    if (!resp.ok) fail(`Ollama ${resp.status} — 'ollama serve' 실행/모델 확인`);
+    if (!resp.ok) throw new Error(`Ollama ${resp.status} — 'ollama serve' 실행/모델 확인`);
     const j = await resp.json();
     return (j.message && j.message.content) || "";
   }
-  const key = await apiKey(backend);
-  if (!key) fail(`${backend} API 키가 없습니다. 앱 설정 → BYOK에서 키를 등록하세요.`);
-  if (backend === "anthropic") {
-    const resp = await fetch("https://api.anthropic.com/v1/messages", {
+  const supported = backend === "anthropic" || backend === "openai" || backend === "google" ||
+    backend === "upstage" || backend === "custom" || !!ANTHROPIC_COMPAT_API[backend];
+  if (!supported) throw new Error("지원하지 않는 backend: " + backend);
+  const key = Object.prototype.hasOwnProperty.call(options, "apiKey") ? options.apiKey : await apiKey(backend);
+  if (!key) throw new Error(`${backend} API 키가 없습니다. 앱 설정 → BYOK에서 키를 등록하세요.`);
+
+  const anthropicCompat = ANTHROPIC_COMPAT_API[backend];
+  if (backend === "anthropic" || anthropicCompat) {
+    const label = anthropicCompat ? anthropicCompat.label : "Anthropic";
+    const base = anthropicCompat ? anthropicCompat.baseUrl : "https://api.anthropic.com";
+    const authHeaders = anthropicCompat
+      ? { "x-api-key": key, authorization: "Bearer " + key }
+      : { "x-api-key": key };
+    const resp = await fetchImpl(`${base}/v1/messages`, {
       method: "POST",
-      headers: { "content-type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
+      headers: { "content-type": "application/json", ...authHeaders, "anthropic-version": "2023-06-01" },
       body: JSON.stringify({ model, max_tokens: 4096, system, messages: [{ role: "user", content: prompt }] }),
     });
-    if (!resp.ok) fail(`Anthropic ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 200)}`);
+    if (!resp.ok) throw new Error(`${label} ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 200)}`);
     const j = await resp.json();
     return (j.content && j.content[0] && j.content[0].text) || "";
   }
-  if (backend === "openai" || backend === "upstage") {
-    const base = backend === "upstage" ? "https://api.upstage.ai/v1" : "https://api.openai.com/v1";
-    const resp = await fetch(`${base}/chat/completions`, {
+  if (backend === "openai" || backend === "upstage" || backend === "custom") {
+    const base = backend === "upstage"
+      ? "https://api.upstage.ai/v1"
+      : backend === "custom"
+        ? normalizeCustomApiBaseUrl(Object.prototype.hasOwnProperty.call(options, "customBaseUrl")
+          ? options.customBaseUrl
+          : readCustomApiBaseUrl())
+        : "https://api.openai.com/v1";
+    const label = backend === "custom" ? "Custom API" : backend === "upstage" ? "Upstage" : "OpenAI";
+    const resp = await fetchImpl(`${base}/chat/completions`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: "Bearer " + key },
       body: JSON.stringify({ model, messages: [{ role: "system", content: system }, { role: "user", content: prompt }] }),
     });
-    if (!resp.ok) fail(`OpenAI ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 200)}`);
+    if (!resp.ok) throw new Error(`${label} ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 200)}`);
     const j = await resp.json();
     return (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || "";
   }
   if (backend === "google") {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`;
-    const resp = await fetch(url, {
+    const resp = await fetchImpl(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: [{ role: "user", parts: [{ text: prompt }] }] }),
     });
-    if (!resp.ok) fail(`Google ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 200)}`);
+    if (!resp.ok) throw new Error(`Google ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 200)}`);
     const j = await resp.json();
     const c = j.candidates && j.candidates[0];
     return (c && c.content && c.content.parts && c.content.parts[0] && c.content.parts[0].text) || "";
   }
-  fail("지원하지 않는 backend: " + backend);
+  throw new Error("지원하지 않는 backend: " + backend);
 }
 
 // 1회 실행 — CLI면 spawn(스트리밍 stdout), API면 호출 후 텍스트 출력. 종료코드 반환.
@@ -6134,25 +6356,10 @@ function runCwd() {
 }
 
 function cliMcpConfigPath() {
-  const dir = path.join(userDataDir(), "mcp");
-  fs.mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, "agentlas-cli-mcp.json");
-  fs.writeFileSync(
-    file,
-    JSON.stringify({
-      mcpServers: {
-        playwright: { command: "npx", args: ["-y", "@playwright/mcp@latest"] },
-      },
-    }, null, 2),
-    "utf8",
-  );
-  return file;
+  return require("./agentlas-native-host.cjs").cliMcpConfigPath([]).file;
 }
 
-const CODEX_PLAYWRIGHT_MCP_ARGS = [
-  "-c", 'mcp_servers.playwright.command="npx"',
-  "-c", 'mcp_servers.playwright.args=["-y","@playwright/mcp@latest"]',
-];
+const CODEX_PLAYWRIGHT_MCP_ARGS = require("./agentlas-native-host.cjs").codexMcpArgs([]);
 
 // 에이전트가 실제로 실행될 작업 폴더 = 사용자가 명령을 친 현재 디렉터리(= 대상 프로젝트).
 // 단, home/userData/agent-cwd 같은 "프로젝트 아님" 위치면 안전한 전용 폴더로 폴백한다.
@@ -6231,14 +6438,39 @@ function readVaultEnvValuesCli(keys, projectPath) {
     ),
   ).then(() => result);
 }
+
+// 프로젝트/에이전트 dotenv는 일반 API 키 우선순위를 유지하되, 호스트 CLI의 신원·설치·
+// 플러그인 탐색 루트는 바꾸지 못한다. Windows 환경변수도 안전하게 대소문자 무관 비교한다.
+const PROTECTED_CHILD_ENV_KEYS_CLI = new Set([
+  "HOME", "PATH", "PATHEXT", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+  "XDG_CONFIG_HOME", "XDG_DATA_HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_SAFE_MODE",
+  "CLAUDE_CODE_SIMPLE", "CLAUDE_PLUGIN_ROOT", "CLAUDE_PLUGIN_DATA", "CLAUDE_PROJECT_DIR",
+  "GEMINI_CLI_HOME", "GEMINI_CLI_SYSTEM_SETTINGS_PATH", "GEMINI_CLI_USER_SETTINGS",
+  "GEMINI_CLI_TRUSTED_FOLDERS_PATH", "GEMINI_CLI_TRUST_WORKSPACE", "GEMINI_CLI_EXTENSION_REGISTRY_URI",
+  "HEPHAESTUS_RUNTIME_ROOT", "HEPHAESTUS_RUNTIME_BASE", "HEPHAESTUS_PYTHON", "HEPHAESTUS_AUTO_UPDATE",
+  "HEPHAESTUS_UPDATE_CHECK", "NPM_CONFIG_PREFIX", "NODE_OPTIONS", "NODE_PATH",
+  "PYTHONHOME", "PYTHONPATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
+  "AGENTLAS_HUB_CONNECT_TIMEOUT_MS", "AGENTLAS_HUB_IDLE_TIMEOUT_MS", "AGENTLAS_HUB_TOTAL_TIMEOUT_MS",
+  "AGENTLAS_NATIVE_IDLE_TIMEOUT_MS", "AGENTLAS_NATIVE_TOTAL_TIMEOUT_MS", "AGENTLAS_NATIVE_KILL_GRACE_MS",
+  "AGENTLAS_CAPTURE_MAX_OUTPUT_BYTES",
+]);
+function isProtectedChildEnvKeyCli(key) {
+  return PROTECTED_CHILD_ENV_KEYS_CLI.has(String(key || "").trim().toUpperCase());
+}
+function mergeChildEnvValuesCli(target, values, overwrite) {
+  const injected = [];
+  for (const [key, value] of Object.entries(values || {})) {
+    if (!value || isProtectedChildEnvKeyCli(key)) continue;
+    if (!overwrite && target[key]) continue;
+    target[key] = value;
+    injected.push(key);
+  }
+  return injected;
+}
 async function buildChildEnvCli(db, ctx) {
   const env = { ...process.env };
   const apply = (values, overwrite) => {
-    for (const [key, value] of Object.entries(values || {})) {
-      if (!value) continue;
-      if (!overwrite && env[key]) continue;
-      env[key] = value;
-    }
+    mergeChildEnvValuesCli(env, values, overwrite);
   };
   const globalCredentials = {
     ...readDotEnvFileCli(path.join(userDataDir(), "credentials.env")),
@@ -6347,7 +6579,7 @@ function buildHelpers(db) {
       if (cookie) headers.cookie = cookie;
       let resp;
       try {
-        resp = await fetch(`${base.replace(/\/$/, "")}/tools/call`, {
+        resp = await fetchHubCli(`${base.replace(/\/$/, "")}/tools/call`, {
           method: "POST",
           headers,
           body: JSON.stringify({ method: "marketplace.get_manifest", params: { name: "marketplace.get_manifest", arguments: { kind: "agent", slug } } }),
@@ -6359,7 +6591,7 @@ function buildHelpers(db) {
         const authHint = resp.status === 401 || resp.status === 403 ? " — 로그인이 필요합니다 (앱에서 로그인 또는 AGENTLAS_SESSION 설정)" : "";
         throw new Error(`마켓플레이스 응답 ${resp.status}${authHint}`);
       }
-      const json = await resp.json();
+      const json = parseHubJsonCli(resp, "marketplace.get_manifest");
       if (json.error) throw new Error(json.error.message || "marketplace error");
       const listing = json.result;
       if (!listing) throw new Error(`마켓플레이스에서 찾을 수 없음: ${slug}`);
@@ -6486,32 +6718,159 @@ function spawnRuntime(kind, systemPrompt, prompt, opts) {
   });
 }
 
+const CAPTURE_OUTPUT_DEFAULT_BYTES = 4 * 1024 * 1024;
+function captureOutputLimit(env = process.env) {
+  return finiteTimeoutMs(env.AGENTLAS_CAPTURE_MAX_OUTPUT_BYTES, CAPTURE_OUTPUT_DEFAULT_BYTES, 64 * 1024, 32 * 1024 * 1024);
+}
+function directCaptureOutputLimit(value) {
+  return finiteTimeoutMs(value, CAPTURE_OUTPUT_DEFAULT_BYTES, 128, 32 * 1024 * 1024);
+}
+
 function captureRuntime(kind, systemPrompt, prompt, opts) {
   opts = opts || {};
   const cwd = opts.cwd || runCwd();
+  const { nativeTimeoutConfig, directNativeTimeoutConfig } = require("./agentlas-native-host.cjs");
+  const timeout = opts.timeoutConfig
+    ? directNativeTimeoutConfig(opts.timeoutConfig)
+    : nativeTimeoutConfig(opts.env || process.env);
+  const outputLimit = opts.outputLimitBytes == null
+    ? captureOutputLimit(opts.env || process.env)
+    : directCaptureOutputLimit(opts.outputLimitBytes);
   return new Promise((resolve, reject) => {
     const bin = which(RUNTIME_BIN[kind]) || RUNTIME_BIN[kind];
-    const child = spawn(bin, buildArgs(kind, systemPrompt, prompt, opts.permission), {
-      cwd,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: opts.env || process.env,
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code && code !== 0) {
-        reject(new Error(`${kind} exited ${code}: ${stderr.slice(0, 500)}`));
+    let child;
+    try {
+      const spawnImpl = opts.spawn || spawn;
+      child = spawnImpl(bin, buildArgs(kind, systemPrompt, prompt, opts.permission), {
+        cwd,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: opts.env || process.env,
+      });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    let capturedBytes = 0;
+    let settled = false;
+    let terminationError = null;
+    let idleTimer = null;
+    let totalTimer = null;
+    let killTimer = null;
+    let forceTimer = null;
+    let onStdout = () => {};
+    let onStderr = () => {};
+    let onError = () => {};
+    let onClose = () => {};
+    let onAbort = () => {};
+
+    const clearTimers = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      if (totalTimer) clearTimeout(totalTimer);
+      if (killTimer) clearTimeout(killTimer);
+      if (forceTimer) clearTimeout(forceTimer);
+      idleTimer = totalTimer = killTimer = forceTimer = null;
+    };
+    const cleanup = () => {
+      clearTimers();
+      child.stdout?.removeListener("data", onStdout);
+      child.stderr?.removeListener("data", onStderr);
+      child.removeListener("error", onError);
+      child.removeListener("close", onClose);
+      if (opts.signal) opts.signal.removeEventListener?.("abort", onAbort);
+    };
+    const finishReject = (error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const finishResolve = (value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(value);
+    };
+    const requestStop = (error) => {
+      if (settled || terminationError) return;
+      terminationError = error;
+      if (idleTimer) clearTimeout(idleTimer);
+      if (totalTimer) clearTimeout(totalTimer);
+      idleTimer = totalTimer = null;
+      try { child.kill("SIGTERM"); } catch { /* ignore */ }
+      if (settled) return;
+      killTimer = setTimeout(() => {
+        if (settled) return;
+        try { child.kill("SIGKILL"); } catch { /* ignore */ }
+        if (settled) return;
+        forceTimer = setTimeout(() => finishReject(terminationError), Math.max(250, Math.min(1_000, timeout.killGraceMs)));
+      }, timeout.killGraceMs);
+    };
+    const timeoutError = (phase, ms) => {
+      const error = new Error(
+        phase === "idle"
+          ? `${kind} capture idle timeout: ${ms}ms 동안 출력이 없습니다.`
+          : `${kind} capture total timeout: 전체 실행 시간이 ${ms}ms를 초과했습니다.`,
+      );
+      error.code = `AGENTLAS_CAPTURE_${phase.toUpperCase()}_TIMEOUT`;
+      return error;
+    };
+    const armIdle = () => {
+      if (settled || terminationError) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => requestStop(timeoutError("idle", timeout.idleMs)), timeout.idleMs);
+    };
+    const append = (target, chunk) => {
+      armIdle();
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const remaining = Math.max(0, outputLimit - capturedBytes);
+      if (remaining > 0) {
+        const kept = bytes.length > remaining ? bytes.subarray(0, remaining) : bytes;
+        target.push(kept);
+        capturedBytes += kept.length;
+      }
+      if (bytes.length > remaining) {
+        const error = new Error(`${kind} capture output limit: ${outputLimit} bytes를 초과했습니다.`);
+        error.code = "AGENTLAS_CAPTURE_OUTPUT_LIMIT";
+        requestStop(error);
+      }
+    };
+
+    onStdout = (chunk) => append(stdoutChunks, chunk);
+    onStderr = (chunk) => append(stderrChunks, chunk);
+    onError = (error) => finishReject(terminationError || error);
+    onClose = (code) => {
+      if (terminationError) {
+        finishReject(terminationError);
         return;
       }
-      resolve(stdout.trim() || stderr.trim());
-    });
+      const stdout = Buffer.concat(stdoutChunks).toString("utf8");
+      const stderr = Buffer.concat(stderrChunks).toString("utf8");
+      if (code && code !== 0) {
+        finishReject(new Error(`${kind} exited ${code}: ${stderr.slice(-500)}`));
+        return;
+      }
+      finishResolve(stdout.trim() || stderr.trim());
+    };
+    onAbort = () => {
+      const reason = opts.signal && opts.signal.reason;
+      const error = reason instanceof Error ? reason : new Error(`${kind} capture aborted`);
+      if (!error.code) error.code = "ABORT_ERR";
+      requestStop(error);
+    };
+
+    child.stdout.on("data", onStdout);
+    child.stderr.on("data", onStderr);
+    child.on("error", onError);
+    child.on("close", onClose);
+    armIdle();
+    totalTimer = setTimeout(() => requestStop(timeoutError("total", timeout.totalMs)), timeout.totalMs);
+    if (opts.signal) {
+      if (opts.signal.aborted) onAbort();
+      else opts.signal.addEventListener("abort", onAbort, { once: true });
+    }
   });
 }
 
@@ -6722,7 +7081,15 @@ function upsertEnvLine(file, key, value) {
   if (re.test(body)) body = body.replace(re, line);
   else body = body ? body.replace(/\n?$/, "\n") + line + "\n" : line + "\n";
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, body, "utf8");
+  // 이 헬퍼의 모든 호출자는 credential 값/경로를 기록한다. 새 파일뿐 아니라 기존 0644
+  // 파일도 매번 0600으로 수렴시켜 같은 머신의 다른 계정이 읽지 못하게 한다.
+  fs.writeFileSync(file, body, { encoding: "utf8", mode: 0o600 });
+  try { fs.chmodSync(file, 0o600); } catch { /* Windows/읽기전용 FS best-effort */ }
+}
+function resolveCredentialSourcePath(source, cwd) {
+  // `agentlas creds file`은 일반 CLI 명령이므로 상대경로 기준은 사용자가 명령을 실행한
+  // 셸 cwd다. 런타임 격리용 agent-cwd를 쓰면 실제 프로젝트 파일을 조용히 못 찾는다.
+  return path.resolve(cwd || process.cwd(), source);
 }
 async function cmdCredsFile(db, args) {
   const f = parseCredFlags(args);
@@ -6740,7 +7107,7 @@ async function cmdCredsFile(db, args) {
   ensureLocalCredentialStoreCli(project, projectName, arch);
   ensureSoulCredentialIndexCli(project, projectName, arch);
 
-  const sourceAbs = path.resolve(runCwd(), source);
+  const sourceAbs = resolveCredentialSourcePath(source);
   let stat;
   try { stat = fs.statSync(sourceAbs); } catch { fail(`credential source not found: ${source}`); }
   if (!stat.isFile()) fail(`credential source is not a file: ${source}`);
@@ -6993,48 +7360,220 @@ function cmdUpdateHelp() {
   );
 }
 
-function versionParts(value) {
-  return String(value || "")
-    .trim()
-    .replace(/^v/i, "")
-    .split(/[.-]/)
-    .slice(0, 3)
-    .map((part) => {
-      const parsed = Number.parseInt(part, 10);
-      return Number.isFinite(parsed) ? parsed : 0;
-    });
-}
-
-function compareVersions(a, b) {
-  const left = versionParts(a);
-  const right = versionParts(b);
-  for (let i = 0; i < 3; i++) {
-    const delta = (left[i] || 0) - (right[i] || 0);
-    if (delta !== 0) return delta;
-  }
-  return 0;
-}
-
 function macReleaseArch() {
   if (process.arch === "arm64") return "arm64";
   if (process.arch === "x64") return "x64";
   return null;
 }
 
+const UPDATE_METADATA_MAX_BYTES = 1024 * 1024;
+const UPDATE_DOWNLOAD_MAX_BYTES = 1024 * 1024 * 1024;
+const UPDATE_TIMEOUT_DEFAULTS = Object.freeze({
+  metadata: Object.freeze({ connectMs: 15_000, idleMs: 15_000, totalMs: 30_000 }),
+  download: Object.freeze({ connectMs: 20_000, idleMs: 60_000, totalMs: 30 * 60_000 }),
+});
+
+function updateTimeoutConfig(env = process.env, kind = "download") {
+  const selected = kind === "metadata" ? "metadata" : "download";
+  const defaults = UPDATE_TIMEOUT_DEFAULTS[selected];
+  const prefix = selected === "metadata" ? "AGENTLAS_UPDATE_METADATA" : "AGENTLAS_UPDATE_DOWNLOAD";
+  const totalMs = finiteTimeoutMs(env[`${prefix}_TOTAL_TIMEOUT_MS`], defaults.totalMs, 5_000, 60 * 60_000);
+  return {
+    connectMs: Math.min(totalMs, finiteTimeoutMs(env[`${prefix}_CONNECT_TIMEOUT_MS`], defaults.connectMs, 1_000, 120_000)),
+    idleMs: Math.min(totalMs, finiteTimeoutMs(env[`${prefix}_IDLE_TIMEOUT_MS`], defaults.idleMs, 1_000, 300_000)),
+    totalMs,
+  };
+}
+
+function directUpdateTimeoutConfig(value = {}, kind = "download") {
+  const defaults = UPDATE_TIMEOUT_DEFAULTS[kind === "metadata" ? "metadata" : "download"];
+  const totalMs = finiteTimeoutMs(value.totalMs, defaults.totalMs, 10, 60 * 60_000);
+  return {
+    connectMs: Math.min(totalMs, finiteTimeoutMs(value.connectMs, defaults.connectMs, 10, 120_000)),
+    idleMs: Math.min(totalMs, finiteTimeoutMs(value.idleMs, defaults.idleMs, 10, 300_000)),
+    totalMs,
+  };
+}
+
+function updateDownloadMaxBytes(env = process.env) {
+  return finiteTimeoutMs(env.AGENTLAS_UPDATE_DOWNLOAD_MAX_BYTES, UPDATE_DOWNLOAD_MAX_BYTES, 16 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
+}
+
+function updateTransferError(code, message, cause) {
+  const error = new Error(message, cause ? { cause } : undefined);
+  error.code = code;
+  return error;
+}
+
+function updateTimeoutError(kind, ms) {
+  const message = kind === "connect"
+    ? `업데이트 서버 연결 제한 시간(${ms}ms)을 초과했습니다.`
+    : kind === "idle"
+      ? `업데이트 전송이 ${ms}ms 동안 멈췄습니다.`
+      : `업데이트 요청 전체 제한 시간(${ms}ms)을 초과했습니다.`;
+  return updateTransferError(`AGENTLAS_UPDATE_${kind.toUpperCase()}_TIMEOUT`, message);
+}
+
+function parseSafeUpdateUrl(value, label = "업데이트 URL") {
+  let parsed;
+  try {
+    parsed = new URL(String(value || ""));
+  } catch (error) {
+    throw updateTransferError("AGENTLAS_UPDATE_INVALID_URL", `${label} 형식이 올바르지 않습니다.`, error);
+  }
+  const loopback = parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1" || parsed.hostname === "[::1]" || parsed.hostname === "::1";
+  if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback)) {
+    throw updateTransferError("AGENTLAS_UPDATE_INSECURE_URL", `${label}은 HTTPS여야 합니다(로컬 루프백 제외).`);
+  }
+  if (parsed.username || parsed.password) {
+    throw updateTransferError("AGENTLAS_UPDATE_INVALID_URL", `${label}에 사용자 정보가 포함될 수 없습니다.`);
+  }
+  return parsed.toString();
+}
+
+/** Headers 전 connect, chunk 사이 idle, 전체 total 제한을 적용하는 bounded 스트림 reader. */
+async function consumeUpdateResponse(url, init = {}, options = {}) {
+  const fetchImpl = options.fetch || globalThis.fetch;
+  if (typeof fetchImpl !== "function") throw updateTransferError("AGENTLAS_UPDATE_FETCH_UNAVAILABLE", "이 런타임에 fetch가 없습니다.");
+  const kind = options.kind === "metadata" ? "metadata" : "download";
+  const timeout = options.timeoutConfig
+    ? directUpdateTimeoutConfig(options.timeoutConfig, kind)
+    : updateTimeoutConfig(options.env || process.env, kind);
+  const maxBytes = Number.isSafeInteger(options.maxBytes) && options.maxBytes > 0
+    ? options.maxBytes
+    : kind === "metadata" ? UPDATE_METADATA_MAX_BYTES : updateDownloadMaxBytes(options.env || process.env);
+  const expectedBytes = options.expectedBytes == null ? null : Number(options.expectedBytes);
+  const controller = new AbortController();
+  const upstreamSignal = init.signal;
+  let connectTimer = null;
+  let idleTimer = null;
+  let totalTimer = null;
+  let reader = null;
+  let terminalError = null;
+  let caughtError = null;
+  let rejectTerminal;
+  const terminal = new Promise((_, reject) => { rejectTerminal = reject; });
+  const stop = (error) => {
+    if (terminalError) return;
+    terminalError = error;
+    try { controller.abort(error); } catch { controller.abort(); }
+    rejectTerminal(error);
+  };
+  const onUpstreamAbort = () => {
+    const reason = upstreamSignal && upstreamSignal.reason;
+    const error = reason instanceof Error ? reason : updateTransferError("ABORT_ERR", "업데이트 요청이 취소되었습니다.");
+    if (!error.code) error.code = "ABORT_ERR";
+    stop(error);
+  };
+  const armIdle = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => stop(updateTimeoutError("idle", timeout.idleMs)), timeout.idleMs);
+  };
+
+  if (upstreamSignal) {
+    if (upstreamSignal.aborted) onUpstreamAbort();
+    else upstreamSignal.addEventListener("abort", onUpstreamAbort, { once: true });
+  }
+  connectTimer = setTimeout(() => stop(updateTimeoutError("connect", timeout.connectMs)), timeout.connectMs);
+  totalTimer = setTimeout(() => stop(updateTimeoutError("total", timeout.totalMs)), timeout.totalMs);
+
+  try {
+    const response = await Promise.race([
+      Promise.resolve().then(() => fetchImpl(url, { ...init, signal: controller.signal })),
+      terminal,
+    ]);
+    if (connectTimer) clearTimeout(connectTimer);
+    connectTimer = null;
+    if (!response || typeof response.ok !== "boolean") {
+      throw updateTransferError("AGENTLAS_UPDATE_INVALID_RESPONSE", "업데이트 서버 응답 형식이 올바르지 않습니다.");
+    }
+    if (response.url) parseSafeUpdateUrl(response.url, "리디렉션된 업데이트 URL");
+    if (!response.ok) {
+      throw updateTransferError("AGENTLAS_UPDATE_HTTP_ERROR", `업데이트 요청 실패: HTTP ${response.status}`);
+    }
+    const contentLengthValue = response.headers && response.headers.get ? response.headers.get("content-length") : null;
+    if (contentLengthValue != null && contentLengthValue !== "") {
+      const contentLength = Number(contentLengthValue);
+      if (!Number.isSafeInteger(contentLength) || contentLength < 0) {
+        throw updateTransferError("AGENTLAS_UPDATE_INVALID_CONTENT_LENGTH", "업데이트 서버의 Content-Length가 올바르지 않습니다.");
+      }
+      if (contentLength > maxBytes) {
+        throw updateTransferError("AGENTLAS_UPDATE_TOO_LARGE", `업데이트 응답이 허용 크기(${maxBytes} bytes)를 초과합니다.`);
+      }
+      if (Number.isSafeInteger(expectedBytes) && contentLength !== expectedBytes) {
+        throw updateTransferError("AGENTLAS_UPDATE_SIZE_MISMATCH", `다운로드 크기가 맞지 않습니다: expected=${expectedBytes} header=${contentLength}`);
+      }
+    }
+    if (!response.body || typeof response.body.getReader !== "function") {
+      throw updateTransferError("AGENTLAS_UPDATE_BODY_UNAVAILABLE", "업데이트 응답을 스트림으로 읽을 수 없습니다.");
+    }
+
+    reader = response.body.getReader();
+    let bytes = 0;
+    armIdle();
+    while (true) {
+      const part = await Promise.race([reader.read(), terminal]);
+      if (part.done) break;
+      armIdle();
+      const chunk = Buffer.from(part.value || []);
+      bytes += chunk.length;
+      if (bytes > maxBytes) {
+        const error = updateTransferError("AGENTLAS_UPDATE_TOO_LARGE", `업데이트 응답이 허용 크기(${maxBytes} bytes)를 초과했습니다.`);
+        stop(error);
+        throw error;
+      }
+      if (typeof options.onChunk === "function") await options.onChunk(chunk);
+    }
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = null;
+    return { response, bytes };
+  } catch (error) {
+    caughtError = terminalError || error;
+    try { controller.abort(caughtError); } catch { controller.abort(); }
+    throw caughtError;
+  } finally {
+    if (connectTimer) clearTimeout(connectTimer);
+    if (idleTimer) clearTimeout(idleTimer);
+    if (totalTimer) clearTimeout(totalTimer);
+    if (upstreamSignal) upstreamSignal.removeEventListener?.("abort", onUpstreamAbort);
+    if (reader && caughtError) {
+      try { await reader.cancel(caughtError); } catch { /* ignore */ }
+    }
+  }
+}
+
+async function fetchUpdateMetadata(url, options = {}) {
+  const safeUrl = parseSafeUpdateUrl(url, "업데이트 메타데이터 URL");
+  const chunks = [];
+  let bytes = 0;
+  await consumeUpdateResponse(safeUrl, { headers: { accept: "application/json", "accept-encoding": "identity" }, signal: options.signal }, {
+    ...options,
+    kind: "metadata",
+    maxBytes: Number.isSafeInteger(options.maxBytes) ? options.maxBytes : UPDATE_METADATA_MAX_BYTES,
+    onChunk(chunk) {
+      bytes += chunk.length;
+      chunks.push(chunk);
+    },
+  });
+  let json;
+  try {
+    json = JSON.parse(Buffer.concat(chunks, bytes).toString("utf8"));
+  } catch (error) {
+    throw updateTransferError("AGENTLAS_UPDATE_INVALID_METADATA", "업데이트 정보가 올바른 JSON이 아닙니다.", error);
+  }
+  if (!json || typeof json !== "object" || Array.isArray(json) || !parseSemVer(json.version)) {
+    throw updateTransferError("AGENTLAS_UPDATE_INVALID_METADATA", "업데이트 정보 형식이 올바르지 않습니다.");
+  }
+  return { ...json, version: normalizeSemVer(json.version) };
+}
+
 async function fetchDesktopRelease(url) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 20_000);
   try {
-    const resp = await fetch(url, { headers: { accept: "application/json" }, signal: controller.signal });
-    if (!resp.ok) fail(`업데이트 정보를 가져오지 못했습니다: ${resp.status}`);
-    const json = await resp.json();
-    if (!json || typeof json !== "object" || !json.version) fail("업데이트 정보 형식이 올바르지 않습니다.");
-    return json;
+    return await fetchUpdateMetadata(url, { signal: controller.signal });
   } catch (error) {
-    const message = error && error.name === "AbortError" ? "요청 시간이 초과되었습니다." : String((error && error.message) || error);
+    const message = String((error && error.message) || error);
     fail(`업데이트 확인 실패: ${message}`);
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -7069,8 +7608,9 @@ async function cmdUpdateStandalone(flags) {
     const resp = await fetch("https://registry.npmjs.org/agentlas/latest", { headers: { accept: "application/json" } });
     if (resp.ok) latestVersion = String((await resp.json()).version || "");
   } catch { /* offline 등 — 아래에서 안내 */ }
+  const comparison = latestVersion ? compareSemVer(currentVersion, latestVersion) : null;
   if (flags.json) {
-    return out(JSON.stringify({ currentVersion, latestVersion, updateAvailable: latestVersion ? compareVersions(currentVersion, latestVersion) < 0 : null, channel: "npm" }, null, 2));
+    return out(JSON.stringify({ currentVersion, latestVersion, updateAvailable: comparison == null ? null : comparison < 0, channel: "npm" }, null, 2));
   }
   out(`현재 버전: ${currentVersion}`);
   if (!latestVersion) {
@@ -7079,7 +7619,9 @@ async function cmdUpdateStandalone(flags) {
     return;
   }
   out(`최신 버전: ${latestVersion}`);
-  if (compareVersions(currentVersion, latestVersion) < 0) {
+  if (comparison == null) {
+    out("버전 형식을 비교하지 못했습니다. 수동 업데이트:  npm i -g agentlas@latest");
+  } else if (comparison < 0) {
     out("업데이트:  npm i -g agentlas@latest");
   } else {
     out("이미 최신 버전입니다.");
@@ -7096,7 +7638,9 @@ async function cmdUpdate(args) {
   const release = await fetchDesktopRelease(flags.url);
   const latestVersion = String(release.version || "");
   const artifact = findCurrentArtifact(release);
-  const updateAvailable = compareVersions(currentVersion, latestVersion) < 0;
+  const comparison = compareSemVer(currentVersion, latestVersion);
+  if (comparison == null) fail(`현재/최신 버전이 SemVer 형식이 아닙니다: current=${currentVersion} latest=${latestVersion}`);
+  const updateAvailable = comparison < 0;
   const status = {
     currentVersion,
     latestVersion,
@@ -7153,17 +7697,80 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function downloadUpdateFile(url, destination, artifact) {
-  const resp = await fetch(url);
-  if (!resp.ok) fail(`다운로드 실패: ${resp.status}`);
-  const bytes = Buffer.from(await resp.arrayBuffer());
-  fs.writeFileSync(destination, bytes);
-  if (artifact.sizeBytes && bytes.length !== Number(artifact.sizeBytes)) {
-    fail(`다운로드 크기가 맞지 않습니다: expected=${artifact.sizeBytes} actual=${bytes.length}`);
+function validateDesktopUpdateArtifact(artifact, options = {}) {
+  if (!artifact || typeof artifact !== "object" || Array.isArray(artifact)) {
+    throw updateTransferError("AGENTLAS_UPDATE_INVALID_ARTIFACT", "업데이트 아티팩트 정보가 없습니다.");
   }
-  if (artifact.sha256) {
-    const actual = crypto.createHash("sha256").update(bytes).digest("hex");
-    if (actual !== artifact.sha256) fail(`다운로드 해시가 맞지 않습니다: ${actual}`);
+  const url = parseSafeUpdateUrl(artifact.url, "업데이트 아티팩트 URL");
+  const sha256 = String(artifact.sha256 || "").trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(sha256)) {
+    throw updateTransferError("AGENTLAS_UPDATE_MISSING_DIGEST", "안전한 자동 업데이트를 위해 64자리 SHA-256이 반드시 필요합니다.");
+  }
+  const sizeBytes = Number(artifact.sizeBytes);
+  if (!Number.isSafeInteger(sizeBytes) || sizeBytes <= 0) {
+    throw updateTransferError("AGENTLAS_UPDATE_MISSING_SIZE", "안전한 자동 업데이트를 위해 정확한 sizeBytes가 반드시 필요합니다.");
+  }
+  const maxBytes = Number.isSafeInteger(options.maxBytes) && options.maxBytes > 0
+    ? options.maxBytes
+    : updateDownloadMaxBytes(options.env || process.env);
+  if (sizeBytes > maxBytes) {
+    throw updateTransferError("AGENTLAS_UPDATE_TOO_LARGE", `업데이트 파일 크기(${sizeBytes} bytes)가 허용 한도(${maxBytes} bytes)를 초과합니다.`);
+  }
+  let fileName = artifact.fileName == null ? "" : String(artifact.fileName).trim();
+  if (fileName) {
+    if (fileName.length > 180 || /[\\/\0]/.test(fileName) || path.basename(fileName) !== fileName || !fileName.toLowerCase().endsWith(".dmg")) {
+      throw updateTransferError("AGENTLAS_UPDATE_INVALID_FILENAME", "업데이트 파일 이름이 안전하지 않습니다.");
+    }
+  }
+  return { ...artifact, url, sha256, sizeBytes, fileName };
+}
+
+async function downloadUpdateFile(url, destination, artifact, options = {}) {
+  const validated = validateDesktopUpdateArtifact({ ...artifact, url }, options);
+  if (fs.existsSync(destination)) {
+    throw updateTransferError("AGENTLAS_UPDATE_DESTINATION_EXISTS", `업데이트 다운로드 대상이 이미 존재합니다: ${destination}`);
+  }
+  const partialPath = options.partialPath || `${destination}.partial.${process.pid}.${crypto.randomBytes(6).toString("hex")}`;
+  if (fs.existsSync(partialPath)) {
+    throw updateTransferError("AGENTLAS_UPDATE_PARTIAL_EXISTS", `업데이트 임시 파일이 이미 존재합니다: ${partialPath}`);
+  }
+  const hash = crypto.createHash("sha256");
+  let fd = null;
+  let actualBytes = 0;
+  try {
+    fd = fs.openSync(partialPath, "wx", 0o600);
+    await consumeUpdateResponse(validated.url, {
+      headers: { accept: "application/octet-stream", "accept-encoding": "identity" },
+      signal: options.signal,
+    }, {
+      ...options,
+      kind: "download",
+      maxBytes: Number.isSafeInteger(options.maxBytes) ? options.maxBytes : updateDownloadMaxBytes(options.env || process.env),
+      expectedBytes: validated.sizeBytes,
+      onChunk(chunk) {
+        fs.writeSync(fd, chunk, 0, chunk.length);
+        hash.update(chunk);
+        actualBytes += chunk.length;
+      },
+    });
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+    if (actualBytes !== validated.sizeBytes) {
+      throw updateTransferError("AGENTLAS_UPDATE_SIZE_MISMATCH", `다운로드 크기가 맞지 않습니다: expected=${validated.sizeBytes} actual=${actualBytes}`);
+    }
+    const actualSha256 = hash.digest("hex");
+    if (actualSha256 !== validated.sha256) {
+      throw updateTransferError("AGENTLAS_UPDATE_DIGEST_MISMATCH", `다운로드 SHA-256이 맞지 않습니다: expected=${validated.sha256} actual=${actualSha256}`);
+    }
+    fs.renameSync(partialPath, destination);
+    return { bytes: actualBytes, sha256: actualSha256, destination };
+  } catch (error) {
+    if (fd != null) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+    try { fs.rmSync(partialPath, { force: true }); } catch { /* ignore */ }
+    throw error;
   }
 }
 
@@ -7180,10 +7787,199 @@ function macAppInstallPath() {
   return "/Applications/Agentlas.app";
 }
 
+async function verifyMacAppBundle(appPath, options = {}) {
+  const runner = options.runCommand || runCommand;
+  const commands = options.commands || {};
+  if (!commands.codesign || !commands.spctl) {
+    throw updateTransferError("AGENTLAS_UPDATE_VERIFY_TOOL_MISSING", "앱 서명 검증 도구가 지정되지 않았습니다.");
+  }
+  await runner(commands.codesign, ["--verify", "--deep", "--strict", "--verbose=2", appPath]);
+  const detail = await runner(commands.codesign, ["-d", "--verbose=4", appPath], { capture: true });
+  const signatureText = `${(detail && detail.stdout) || ""}\n${(detail && detail.stderr) || ""}`;
+  const identifier = (signatureText.match(/^Identifier=(.+)$/m) || [])[1]?.trim() || "";
+  const teamIdentifier = (signatureText.match(/^TeamIdentifier=(.+)$/m) || [])[1]?.trim() || "";
+  if (identifier !== "com.agentlas.desktop") {
+    throw updateTransferError("AGENTLAS_UPDATE_SIGNER_MISMATCH", `앱 번들 식별자가 올바르지 않습니다: ${identifier || "missing"}`);
+  }
+  if (!teamIdentifier || teamIdentifier.toLowerCase() === "not set") {
+    throw updateTransferError("AGENTLAS_UPDATE_SIGNER_MISSING", "앱 서명에서 Apple TeamIdentifier를 확인하지 못했습니다.");
+  }
+  await runner(commands.spctl, ["-a", "-t", "exec", "-vv", appPath]);
+  return { identifier, teamIdentifier };
+}
+
+function assertSameMacSigningIdentity(expected, actual, phase) {
+  if (!expected || !actual) return;
+  if (expected.identifier !== actual.identifier || expected.teamIdentifier !== actual.teamIdentifier) {
+    throw updateTransferError(
+      "AGENTLAS_UPDATE_SIGNER_MISMATCH",
+      `${phase} 앱의 서명 주체가 다릅니다: expected=${expected.identifier}/${expected.teamIdentifier} actual=${actual.identifier}/${actual.teamIdentifier}`,
+    );
+  }
+}
+
+async function removeUpdatePathChecked(targetPath, options) {
+  const fsImpl = options.fs || fs;
+  if (!fsImpl.existsSync(targetPath)) return;
+  try {
+    await options.runCommand(options.commands.rm, ["-rf", targetPath]);
+  } catch (error) {
+    if (fsImpl.existsSync(targetPath)) throw error;
+  }
+  if (fsImpl.existsSync(targetPath)) {
+    throw updateTransferError("AGENTLAS_UPDATE_REMOVE_FAILED", `업데이트 임시 경로를 제거하지 못했습니다: ${targetPath}`);
+  }
+}
+
+/**
+ * 기존 앱을 같은 디렉터리의 backup으로 원자 이동한 뒤 staging 앱을 검증해 교체한다.
+ * backup이 생긴 이후 어느 단계든 실패하면 원본을 다시 이동하고 서명까지 재검증한다.
+ */
+async function replaceMacAppBundle(options) {
+  const rawPaths = [options.sourceApp, options.targetApp, options.backupPath, options.stagingPath];
+  if (rawPaths.some((value) => typeof value !== "string" || !value.trim())) {
+    throw updateTransferError("AGENTLAS_UPDATE_PATH_MISSING", "업데이트 source/target/backup/staging 경로가 모두 필요합니다.");
+  }
+  const sourceApp = path.resolve(options.sourceApp);
+  const targetApp = path.resolve(options.targetApp);
+  const backupPath = path.resolve(options.backupPath);
+  const stagingPath = path.resolve(options.stagingPath);
+  const runner = options.runCommand || runCommand;
+  const fsImpl = options.fs || fs;
+  const commands = options.commands || {};
+  const verifyApp = options.verifyApp || ((appPath, context) => verifyMacAppBundle(appPath, {
+    runCommand: runner,
+    commands,
+    context,
+  }));
+  if (!commands.mv || !commands.rm || !commands.ditto) {
+    throw updateTransferError("AGENTLAS_UPDATE_INSTALL_TOOL_MISSING", "앱 교체 도구가 지정되지 않았습니다.");
+  }
+  if (!fsImpl.existsSync(sourceApp)) {
+    throw updateTransferError("AGENTLAS_UPDATE_SOURCE_MISSING", `설치할 앱을 찾지 못했습니다: ${sourceApp}`);
+  }
+  if (!sourceApp.toLowerCase().endsWith(".app") || !targetApp.toLowerCase().endsWith(".app")) {
+    throw updateTransferError("AGENTLAS_UPDATE_INVALID_APP_PATH", "업데이트 source와 target은 .app 번들이어야 합니다.");
+  }
+  if (new Set([sourceApp, targetApp, backupPath, stagingPath]).size !== 4) {
+    throw updateTransferError("AGENTLAS_UPDATE_PATH_COLLISION", "업데이트 source/target/backup/staging 경로가 서로 달라야 합니다.");
+  }
+  if (path.dirname(backupPath) !== path.dirname(targetApp) || path.dirname(stagingPath) !== path.dirname(targetApp)) {
+    throw updateTransferError("AGENTLAS_UPDATE_NONATOMIC_PATH", "backup과 staging은 대상 앱과 같은 디렉터리에 있어야 합니다.");
+  }
+  if (fsImpl.existsSync(backupPath) || fsImpl.existsSync(stagingPath)) {
+    throw updateTransferError("AGENTLAS_UPDATE_PATH_EXISTS", "업데이트 backup 또는 staging 경로가 이미 존재합니다.");
+  }
+
+  const hadOriginal = fsImpl.existsSync(targetApp);
+  let sourceIdentity = null;
+  let originalIdentity = null;
+  try {
+    sourceIdentity = await verifyApp(sourceApp, { phase: "source" });
+    if (hadOriginal) {
+      originalIdentity = await verifyApp(targetApp, { phase: "original" });
+      assertSameMacSigningIdentity(originalIdentity, sourceIdentity, "새 릴리즈");
+      await runner(commands.mv, [targetApp, backupPath]);
+      if (fsImpl.existsSync(targetApp) || !fsImpl.existsSync(backupPath)) {
+        throw updateTransferError("AGENTLAS_UPDATE_BACKUP_FAILED", "기존 앱 백업 이동을 확인하지 못했습니다.");
+      }
+      const backupIdentity = await verifyApp(backupPath, { phase: "backup" });
+      assertSameMacSigningIdentity(originalIdentity, backupIdentity, "백업");
+    }
+
+    await runner(commands.ditto, [sourceApp, stagingPath]);
+    if (!fsImpl.existsSync(stagingPath)) {
+      throw updateTransferError("AGENTLAS_UPDATE_STAGE_MISSING", "복사 후 staging 앱을 찾지 못했습니다.");
+    }
+    const stagingIdentity = await verifyApp(stagingPath, { phase: "staging" });
+    assertSameMacSigningIdentity(sourceIdentity, stagingIdentity, "staging");
+    await runner(commands.mv, [stagingPath, targetApp]);
+    if (fsImpl.existsSync(stagingPath) || !fsImpl.existsSync(targetApp)) {
+      throw updateTransferError("AGENTLAS_UPDATE_COMMIT_FAILED", "검증된 앱의 최종 이동을 확인하지 못했습니다.");
+    }
+    const installedIdentity = await verifyApp(targetApp, { phase: "installed" });
+    assertSameMacSigningIdentity(sourceIdentity, installedIdentity, "설치된");
+
+    let backupRetained = false;
+    if (hadOriginal && fsImpl.existsSync(backupPath)) {
+      try {
+        await removeUpdatePathChecked(backupPath, { fs: fsImpl, runCommand: runner, commands });
+      } catch {
+        backupRetained = fsImpl.existsSync(backupPath);
+      }
+    }
+    return { hadOriginal, backupRetained, backupPath: backupRetained ? backupPath : null };
+  } catch (originalError) {
+    if (hadOriginal && fsImpl.existsSync(backupPath)) {
+      let rollbackError = null;
+      try {
+        if (fsImpl.existsSync(stagingPath)) {
+          try { await removeUpdatePathChecked(stagingPath, { fs: fsImpl, runCommand: runner, commands }); } catch { /* does not block original restore */ }
+        }
+        if (fsImpl.existsSync(targetApp)) {
+          await removeUpdatePathChecked(targetApp, { fs: fsImpl, runCommand: runner, commands });
+        }
+        await runner(commands.mv, [backupPath, targetApp]);
+        if (fsImpl.existsSync(backupPath) || !fsImpl.existsSync(targetApp)) {
+          throw updateTransferError("AGENTLAS_UPDATE_RESTORE_MOVE_FAILED", "백업 앱의 원위치 복구를 확인하지 못했습니다.");
+        }
+        const restoredIdentity = await verifyApp(targetApp, { phase: "restored" });
+        assertSameMacSigningIdentity(originalIdentity, restoredIdentity, "복구된");
+      } catch (error) {
+        rollbackError = error;
+      }
+      if (rollbackError) {
+        const critical = updateTransferError(
+          "AGENTLAS_UPDATE_ROLLBACK_FAILED",
+          `앱 교체 실패 후 원본 복구를 완료하지 못했습니다. target=${targetApp} backup=${backupPath}: ${rollbackError.message || rollbackError}`,
+          originalError,
+        );
+        critical.rollbackError = rollbackError;
+        critical.backupPath = fsImpl.existsSync(backupPath) ? backupPath : null;
+        critical.targetPath = fsImpl.existsSync(targetApp) ? targetApp : null;
+        throw critical;
+      }
+      const rolledBack = updateTransferError(
+        "AGENTLAS_UPDATE_REPLACEMENT_FAILED_ROLLED_BACK",
+        `앱 교체에 실패했지만 기존 앱을 복구하고 서명을 확인했습니다: ${originalError.message || originalError}`,
+        originalError,
+      );
+      rolledBack.restoredPath = targetApp;
+      throw rolledBack;
+    }
+
+    try {
+      if (fsImpl.existsSync(stagingPath)) {
+        await removeUpdatePathChecked(stagingPath, { fs: fsImpl, runCommand: runner, commands });
+      }
+      if (!hadOriginal && fsImpl.existsSync(targetApp)) {
+        await removeUpdatePathChecked(targetApp, { fs: fsImpl, runCommand: runner, commands });
+      }
+    } catch (cleanupError) {
+      const cleanupFailure = updateTransferError(
+        "AGENTLAS_UPDATE_CLEANUP_FAILED",
+        `앱 교체 실패 후 임시 앱을 제거하지 못했습니다: ${cleanupError.message || cleanupError}`,
+        originalError,
+      );
+      cleanupFailure.cleanupError = cleanupError;
+      throw cleanupFailure;
+    }
+    if (hadOriginal && !fsImpl.existsSync(targetApp)) {
+      throw updateTransferError(
+        "AGENTLAS_UPDATE_ROLLBACK_FAILED",
+        `앱 교체 실패 후 기존 앱과 백업을 모두 찾지 못했습니다. target=${targetApp} backup=${backupPath}`,
+        originalError,
+      );
+    }
+    throw originalError;
+  }
+}
+
 async function installMacDesktopUpdate(release, artifact, flags) {
   const hdiutil = requirePath("/usr/bin/hdiutil", "hdiutil");
   const xcrun = requirePath("/usr/bin/xcrun", "xcrun");
   const spctl = requirePath("/usr/sbin/spctl", "spctl");
+  const codesign = requirePath("/usr/bin/codesign", "codesign");
   const osascript = requirePath("/usr/bin/osascript", "osascript");
   const ditto = requirePath("/usr/bin/ditto", "ditto");
   const plistBuddy = requirePath("/usr/libexec/PlistBuddy", "PlistBuddy");
@@ -7192,16 +7988,21 @@ async function installMacDesktopUpdate(release, artifact, flags) {
   const open = requirePath("/usr/bin/open", "open");
   const lsregister = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
 
+  const validatedArtifact = validateDesktopUpdateArtifact(artifact);
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agentlas-update."));
-  const fileName = artifact.fileName || `Agentlas-${release.version}-${artifact.arch || macReleaseArch()}.dmg`;
+  const fileName = validatedArtifact.fileName || `Agentlas-${macReleaseArch() || "mac"}.dmg`;
   const dmgPath = path.join(tmpDir, fileName);
   let mountPoint = "";
-  let backupPath = "";
   const targetApp = macAppInstallPath();
+  const transactionId = `${Date.now()}.${process.pid}.${crypto.randomBytes(5).toString("hex")}`;
+  const targetDir = path.dirname(targetApp);
+  const targetName = path.basename(targetApp, path.extname(targetApp));
+  const backupPath = path.join(targetDir, `.${targetName}.backup.${transactionId}.app`);
+  const stagingPath = path.join(targetDir, `.${targetName}.installing.${transactionId}.app`);
 
   try {
     out(`다운로드: ${fileName}`);
-    await downloadUpdateFile(artifact.url, dmgPath, artifact);
+    await downloadUpdateFile(validatedArtifact.url, dmgPath, validatedArtifact);
     out("검증: DMG, notarization, Gatekeeper");
     await runCommand(hdiutil, ["verify", dmgPath]);
     await runCommand(xcrun, ["stapler", "validate", dmgPath]);
@@ -7210,34 +8011,29 @@ async function installMacDesktopUpdate(release, artifact, flags) {
     const mount = await runCommand(hdiutil, ["attach", "-nobrowse", "-readonly", dmgPath], { capture: true });
     mountPoint = parseHdiutilMountPoint(mount.stdout);
     const sourceApp = mountPoint ? path.join(mountPoint, "Agentlas.app") : "";
-    if (!sourceApp || !fs.existsSync(sourceApp)) fail("DMG 안에서 Agentlas.app을 찾지 못했습니다.");
+    if (!sourceApp || !fs.existsSync(sourceApp)) {
+      throw updateTransferError("AGENTLAS_UPDATE_APP_MISSING", "DMG 안에서 Agentlas.app을 찾지 못했습니다.");
+    }
 
     const installedVersion = await runCommand(plistBuddy, ["-c", "Print :CFBundleShortVersionString", path.join(sourceApp, "Contents", "Info.plist")], { capture: true });
     const appVersion = installedVersion.stdout.trim();
-    if (appVersion !== String(release.version)) fail(`앱 버전이 릴리즈와 다릅니다: release=${release.version} app=${appVersion}`);
-    await runCommand(spctl, ["-a", "-vv", sourceApp]);
+    if (appVersion !== String(release.version)) {
+      throw updateTransferError("AGENTLAS_UPDATE_VERSION_MISMATCH", `앱 버전이 릴리즈와 다릅니다: release=${release.version} app=${appVersion}`);
+    }
 
     out("설치: 기존 Agentlas 종료 후 앱 교체");
     await runCommand(osascript, ["-e", 'tell application "Agentlas" to quit'], { capture: true, allowFailure: true });
     await sleep(2_000);
-    if (fs.existsSync(targetApp)) {
-      backupPath = `${targetApp}.backup.${Date.now()}`;
-      await runCommand(mv, [targetApp, backupPath]);
-    }
-    await runCommand(ditto, [sourceApp, targetApp]);
+    const replacement = await replaceMacAppBundle({
+      sourceApp,
+      targetApp,
+      backupPath,
+      stagingPath,
+      runCommand,
+      commands: { codesign, spctl, ditto, mv, rm },
+    });
+    if (replacement.backupRetained) out(`주의: 검증된 새 앱은 설치됐지만 이전 앱 백업을 지우지 못했습니다: ${replacement.backupPath}`);
     if (fs.existsSync(lsregister)) await runCommand(lsregister, ["-f", targetApp], { allowFailure: true });
-
-    try {
-      await runCommand(spctl, ["-a", "-vv", targetApp]);
-    } catch (error) {
-      if (backupPath && fs.existsSync(backupPath)) {
-        await runCommand(rm, ["-rf", targetApp], { allowFailure: true });
-        await runCommand(mv, [backupPath, targetApp], { allowFailure: true });
-      }
-      throw error;
-    }
-
-    if (backupPath && fs.existsSync(backupPath)) await runCommand(rm, ["-rf", backupPath], { allowFailure: true });
     if (flags.launch) await runCommand(open, ["-a", "Agentlas"], { allowFailure: true });
     out(`Agentlas ${release.version} 설치 완료.`);
   } finally {
@@ -7791,4 +8587,32 @@ async function main() {
   }
 }
 
-main().catch((e) => fail(String(e && e.stack ? e.stack : e)));
+// 런처가 스폰하는 실행 파일일 때만 CLI main을 돌린다. 회귀 테스트/라이브러리 require는 종료하지 않는다.
+if (require.main === module) {
+  main().catch((e) => fail(String(e && e.stack ? e.stack : e)));
+}
+
+module.exports = {
+  runApi,
+  normalizeCustomApiBaseUrl,
+  readCustomApiBaseUrl,
+  parseDotEnvCli,
+  isProtectedChildEnvKeyCli,
+  mergeChildEnvValuesCli,
+  resolveCredentialSourcePath,
+  upsertEnvLine,
+  fetchHubCli,
+  hubTimeoutConfig,
+  compareSemVer,
+  parseSemVer,
+  updateTimeoutConfig,
+  fetchUpdateMetadata,
+  validateDesktopUpdateArtifact,
+  downloadUpdateFile,
+  verifyMacAppBundle,
+  replaceMacAppBundle,
+  captureRuntime,
+  captureOutputLimit,
+  DEFAULT_API_MODEL,
+  ANTHROPIC_COMPAT_API,
+};
