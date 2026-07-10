@@ -545,7 +545,12 @@ function agentFolder(agent) {
   const routes = routesMap();
   const r = routes[agent.id];
   if (r && r.path) return r.path; // 로컬 임포트는 원본 폴더
+  const cloudRoot = path.join(userDataDir(), "cloud-agent-installs", cloudSlug(agent.slug));
+  if (exists(path.join(cloudRoot, CLOUD_RESTORE_MARKER_PATH))) return cloudRoot;
   return path.join(userDataDir(), "agents", agent.slug);
+}
+function agentSystemPromptCli(agent) {
+  return agent && agent.system_prompt ? agent.system_prompt : `You are ${agent?.name || "an Agentlas agent"}.`;
 }
 
 // ── 로컬 폴더 임포트 (앱의 electron/agents/import-local.ts 와 동일 규칙) ──
@@ -768,10 +773,15 @@ function cmdImport(db, absPath) {
 const CLOUD_MAX_TOTAL_BYTES = 3 * 1024 * 1024;
 const CLOUD_MAX_FILE_BYTES = 512 * 1024;
 const CLOUD_MAX_FILES = 400;
-const CLOUD_TEXT_EXTS = new Set([".cjs", ".css", ".csv", ".html", ".js", ".json", ".jsonl", ".md", ".mjs", ".py", ".sh", ".toml", ".ts", ".tsx", ".txt", ".yaml", ".yml"]);
+const CLOUD_PACKAGE_HASH_V1 = "path-sha256-v1";
+const CLOUD_PACKAGE_HASH_V2 = "path-sha256-executable-v2";
+const CLOUD_RESTORE_MARKER_PATH = ".agentlas-cloud-package.json";
+const CLOUD_ASSET_STATE_FILE = "cloud-asset-state.v1.json";
+const CLOUD_ASSET_SCOPES = new Set(["owner-private", "hub-public"]);
+const CLOUD_TEXT_EXTS = new Set([".cfg", ".cjs", ".conf", ".config", ".css", ".csv", ".env", ".html", ".ini", ".js", ".json", ".jsonl", ".md", ".mjs", ".properties", ".ps1", ".psd1", ".psm1", ".py", ".sh", ".toml", ".ts", ".tsx", ".txt", ".xml", ".yaml", ".yml"]);
 const CLOUD_AGENT_FILES = new Set(["AGENT.md", "AGENTS.md", "CLAUDE.md", "GEMINI.md", "README.md", "agent.md", "manifest.md", "system-prompt.md"]);
 const CLOUD_SKIP_DIRS = new Set([".git", ".next", ".studio-runtime", ".turbo", "build", "coverage", "dist", "node_modules", "out", "release"]);
-const CLOUD_BLOCKED_FILE_RE = [/^\.env(?:\..*)?$/i, /^id_rsa(?:\.pub)?$/i, /^credentials(?:\..*)?$/i, /^secrets?(?:\..*)?$/i, /(?:^|[._-])service-account(?:[._-]|$)/i, /\.(?:key|pem|p12|pfx|mobileprovision)$/i];
+const CLOUD_BLOCKED_FILE_RE = [/^\.env(?:\..*)?$/i, /^id_rsa(?:\.pub)?$/i, /^credentials(?:\..*)?$/i, /^secrets?(?:\..*)?$/i, /^cloud-asset-state\.v1\.json$/i, /(?:^|[._-])service-account(?:[._-]|$)/i, /\.(?:key|pem|p12|pfx|mobileprovision)$/i];
 const CLOUD_ROUTING_CARD_PATH = ".agentlas/routing-card.json";
 const CLOUD_ROUTING_CARD_CAPABILITY_RE = /^[a-z][a-z0-9]*(_[a-z0-9]+)+$/;
 const CLOUD_ROUTING_CARD_STATUSES = new Set(["draft", "searchable", "candidate", "routing_ready", "trusted"]);
@@ -779,6 +789,10 @@ const CLOUD_SECRET_RE = [
   ["private-key", /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/i, "private key material"],
   ["openai-key", /\bsk-[A-Za-z0-9_-]{20,}\b/, "OpenAI-style API key"],
   ["github-token", /\bgh[pousr]_[A-Za-z0-9_]{30,}\b/, "GitHub token"],
+  ["gitlab-token", /\bglpat-[A-Za-z0-9_-]{20,}\b/, "GitLab token"],
+  ["google-api-key", /\bAIza[0-9A-Za-z_-]{35}\b/, "Google API key"],
+  ["npm-token", /\bnpm_[A-Za-z0-9]{30,}\b/, "npm access token"],
+  ["stripe-secret", /\bsk_(?:live|test)_[A-Za-z0-9]{16,}\b/, "Stripe secret key"],
   ["slack-token", /\bxox[baprs]-[A-Za-z0-9-]{20,}\b/, "Slack token"],
   ["aws-key", /\bAKIA[0-9A-Z]{16}\b/, "AWS access key"],
   ["generic-secret", /\b(?:api[_-]?key|secret|token|password)\s*[:=]\s*['"][^'"]{8,}['"]/i, "hard-coded credential"],
@@ -938,6 +952,35 @@ function parseCloudFlags(args) {
   return flags;
 }
 
+function cloudVisibilityFlag(value) {
+  if (value == null) return null;
+  if (value === "private-link" || value === "marketplace") return value;
+  throw new Error("--visibility must be private-link or marketplace");
+}
+
+function cloudVisibilityForAction(sub, flags) {
+  const explicit = cloudVisibilityFlag(flags.visibility);
+  if (sub === "save") {
+    if (explicit === "marketplace") {
+      throw new Error("`agentlas cloud save` is owner-private. Use `agentlas cloud publish` for the public Hub.");
+    }
+    return "private-link";
+  }
+  if (sub === "publish") {
+    if (explicit === "private-link") {
+      throw new Error("`agentlas cloud publish` is public Hub publication. Use `agentlas cloud save` for owner-private Agent Cloud storage.");
+    }
+    return "marketplace";
+  }
+  if (explicit) return explicit;
+  return "private-link";
+}
+
+function cloudActionForTopLevelUpload(args) {
+  const flags = parseCloudFlags(args);
+  return cloudVisibilityFlag(flags.visibility) === "marketplace" ? "publish" : "save";
+}
+
 async function cmdCloud(db, args, runtimeOverride) {
   const sub = args[0] || "help";
   if (sub === "help" || sub === "--help" || sub === "-h") {
@@ -950,28 +993,58 @@ async function cmdCloud(db, args, runtimeOverride) {
       "  runtime read-agent-file <path> <file>",
       "                                      lazy read with allow/deny gates",
       "  field-test [--json]                 run local Cloud contract field test",
-      "  package <path> [--json]             package + static security review",
+      "  save <path> [--dry-run] [--slug name]",
+      "                                      save owner-private in Agent Cloud (default upload)",
       "  publish <path> [--dry-run] [--llm-review] [--slug name]",
-      "                                      register with submitter-paid local review",
-      "  install <slug>                      download/install from Agentlas Cloud marketplace",
-      "  delete <slug> [--json]              unpublish one of your cloud marketplace agents",
+      "                                      explicitly publish to the public Agentlas Hub",
+      "  package <path> [--json] [--visibility private-link|marketplace]",
+      "                                      package only; defaults to private-save checks",
+      "  list [--json]                       list packages in your private Agent Cloud",
+      "  restore <slug> [--json]             restore an owned Cloud package on this machine",
+      "  install <slug>                      compatibility alias: install from the public Hub",
+      "  delete <slug> [--scope owner-private|hub-public] [--json]",
+      "                                      conditionally delete one exact observed Cloud revision",
       "  search \"<what you need>\" [--limit 10]",
-      "                                      search the marketplace (no sign-in needed)",
+      "                                      search the public Hub (no sign-in needed)",
       "",
-      "Model cost rule: Agentlas Cloud does not run a platform-owned LLM here.",
-      "--llm-review uses only this machine's active CLI/BYOK/Ollama runtime.",
+      "Private save rule: no public review or routing card; local secret/path/hash checks remain.",
+      "--llm-review applies only to public Hub publishing and uses this machine's runtime.",
     ].join("\n"));
     return;
   }
   if (sub === "search") {
     return parity().cloudSearch(db, args.slice(1));
   }
+  if (sub === "list") {
+    const flags = parseCloudFlags(args.slice(1));
+    const result = await listOwnedCloudAgentsCli(Number(flags.limit || 100));
+    if (flags.json) return out(JSON.stringify(result, null, 2));
+    const agents = Array.isArray(result.results) ? result.results : [];
+    if (!agents.length) return out("Private Agent Cloud에 저장된 에이전트가 없습니다.");
+    for (const agent of agents) out(`${agent.slug}\t${agent.name || agent.nameEn || agent.slug}\t${agent.entityKind || "agent"}`);
+    return;
+  }
+  if (sub === "restore") {
+    const flags = parseCloudFlags(args.slice(1));
+    const slug = flags._[0];
+    if (!slug) fail("usage: agentlas cloud restore <slug> [--json]");
+    const result = await restoreOwnedCloudAgentCli(db, slug);
+    if (flags.json) return out(JSON.stringify(result, null, 2));
+    out(`✓ restored ${result.slug} from private Agent Cloud`);
+    out(`  hash: ${result.packageHash}`);
+    if (result.localPath) out(`  files: ${result.localPath}`);
+    if (result.localStateWarning) out(`  warning: ${result.localStateWarning}`);
+    return;
+  }
   if (sub === "delete" || sub === "unpublish") {
     const flags = parseCloudFlags(args.slice(1));
     const slug = flags._[0];
     if (!slug) fail(`usage: agentlas cloud ${sub} <slug> [--json]`);
-    const result = await deleteCloudAgentCli(slug);
+    const result = await deleteCloudAgentCli(slug, { scope: flags.scope });
     out(flags.json ? JSON.stringify(result, null, 2) : `✓ deleted ${result.slug || slug}`);
+    if (!flags.json && Array.isArray(result.localStateWarnings)) {
+      for (const warning of result.localStateWarnings) out(`  warning: ${warning}`);
+    }
     return;
   }
   const cloudRuntime = require("./agentlas-cloud-runtime.cjs");
@@ -1019,14 +1092,15 @@ async function cmdCloud(db, args, runtimeOverride) {
     return;
   }
   if (sub === "install") return cmdCloudInstall(db, args[1]);
-  if (sub !== "package" && sub !== "publish") fail("usage: agentlas cloud <package|publish|install|delete> ...");
+  if (sub !== "package" && sub !== "save" && sub !== "publish") fail("usage: agentlas cloud <save|publish|package|list|restore|install|delete> ...");
   const flags = parseCloudFlags(args.slice(1));
   const root = flags._[0];
   if (!root) fail(`usage: agentlas cloud ${sub} <path>`);
+  const visibility = cloudVisibilityForAction(sub, flags);
   const dryRun = sub === "package" || Boolean(flags["dry-run"]);
   const result = await packageCloudAgentCli(db, root, {
     slug: typeof flags.slug === "string" ? flags.slug : undefined,
-    visibility: flags.visibility === "private-link" ? "private-link" : "marketplace",
+    visibility,
     llmReview: Boolean(flags["llm-review"]),
     dryRun,
     runtimeOverride,
@@ -1036,51 +1110,74 @@ async function cmdCloud(db, args, runtimeOverride) {
     return;
   }
   printCloudPackageResult(result);
-  if (sub === "publish" && result.status === "blocked") process.exit(1);
+  if ((sub === "save" || sub === "publish") && result.status === "blocked") process.exit(1);
 }
 
 async function packageCloudAgentCli(db, root, opts) {
-  const rootPath = path.resolve(root);
+  const requestedRoot = path.resolve(root);
   let st;
-  try { st = fs.statSync(rootPath); } catch { fail(`폴더를 찾을 수 없습니다: ${root}`); }
-  if (!st.isDirectory()) fail(`폴더가 아닙니다: ${root}`);
+  try { st = fs.lstatSync(requestedRoot); } catch { throw new Error(`폴더를 찾을 수 없습니다: ${root}`); }
+  if (!st.isDirectory() || st.isSymbolicLink()) throw new Error(`실제 폴더가 아닙니다: ${root}`);
+  const rootPath = fs.realpathSync.native(requestedRoot);
+  const visibility = opts.visibility || "private-link";
+  const isPublicHubPublish = visibility === "marketplace";
   const scan = scanCloudFolderCli(rootPath);
-  const routingCard = readCloudRoutingCardCli(rootPath);
+  let snapshot = cloudPackageSnapshot(scan.included);
+  let careerGraph;
+  if (isPublicHubPublish) {
+    careerGraph = cloudReadPublicCareerCard(snapshot, scan.findings);
+    cloudReplacePublicCareerCard(scan, careerGraph);
+    snapshot = cloudPackageSnapshot(scan.included);
+  }
+  const routingCard = isPublicHubPublish ? readCloudRoutingCardCli(snapshot) : {};
   if (routingCard.finding) scan.findings.push(routingCard.finding);
-  const name = cloudReadName(rootPath);
-  const slug = cloudSlug(opts.slug || cloudReadStableSlug(rootPath) || name || path.basename(rootPath));
-  const packageHash = cloudHashPackage(scan.included);
+  const packageFindings = isPublicHubPublish ? scan.findings : privateCloudSafetyFindingsCli(scan.findings);
+  const name = cloudReadName(snapshot, path.basename(rootPath));
+  const slug = cloudSlug(opts.slug || cloudReadStableSlug(snapshot) || name || path.basename(rootPath));
+  const scope = cloudScopeForVisibility(visibility);
+  const baseDescriptor = cloudBaseDescriptorForSourceCli(scan.localPackageMarker, rootPath, slug, scope);
+  const packageHashVersion = CLOUD_PACKAGE_HASH_V2;
+  const packageHash = cloudHashPackage(scan.included, packageHashVersion);
   const manifest = {
     version: "0.1",
     kind: "agentlas-cloud-agent",
     slug,
     name,
-    tagline: cloudReadTagline(rootPath),
-    agentKind: cloudInferKind(rootPath),
-    runtimeLabels: detectRuntimeLabels(rootPath),
-    visibility: opts.visibility || "marketplace",
-    rootFingerprint: sha(rootPath),
+    tagline: cloudReadTagline(snapshot),
+    agentKind: cloudInferKind(snapshot),
+    runtimeLabels: cloudDetectRuntimeLabels(snapshot),
+    visibility,
+    // Content-derived and host-independent. Never persist an absolute local
+    // path fingerprint into a portable Cloud package.
+    rootFingerprint: sha(`agentlas-package-root:${packageHash}`),
     packageHash,
+    packageHashVersion,
     fileCount: scan.files.length,
     includedFileCount: scan.included.length,
     totalBytes: scan.included.reduce((sum, file) => sum + file.bytes, 0),
     createdAt: new Date().toISOString(),
-    billingMode: opts.llmReview ? "submitter-local-runtime" : "static-only",
-    costOwner: opts.llmReview ? "submitter" : "none",
-    security: cloudSecuritySummary(scan.findings),
+    billingMode: isPublicHubPublish && opts.llmReview ? "submitter-local-runtime" : "static-only",
+    costOwner: isPublicHubPublish && opts.llmReview ? "submitter" : "none",
+    security: cloudSecuritySummary(packageFindings),
+    ...(careerGraph ? { careerGraph } : {}),
   };
   if (routingCard.card) manifest.routingCard = routingCard.card;
   const packageDir = cloudPackageDir(slug);
   fs.mkdirSync(packageDir, { recursive: true });
   const manifestPath = path.join(packageDir, "package.manifest.json");
   const bundlePath = path.join(packageDir, "package.bundle.json");
-  const bundle = { manifest, files: scan.included, source: { packagedBy: "agentlas-cli", packagedAt: manifest.createdAt, costOwner: manifest.costOwner } };
+  const bundle = {
+    manifest,
+    files: scan.included,
+    source: { packagedBy: "agentlas-cli", packagedAt: manifest.createdAt, costOwner: manifest.costOwner },
+    ...(careerGraph ? { careerGraph } : {}),
+  };
   fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n", "utf8");
   fs.writeFileSync(bundlePath, JSON.stringify(bundle, null, 2) + "\n", "utf8");
-  const review = opts.llmReview
-    ? await runCloudLocalReviewCli(db, rootPath, manifest, scan.findings, opts.runtimeOverride)
-    : cloudStaticReview(scan.findings);
-  const allFindings = [...scan.findings, ...review.findings.filter((f) => !scan.findings.some((s) => s.id === f.id))];
+  const review = isPublicHubPublish && opts.llmReview
+    ? await runCloudLocalReviewCli(db, rootPath, manifest, packageFindings, opts.runtimeOverride)
+    : cloudStaticReview(packageFindings, isPublicHubPublish ? "hub-public" : "owner-private");
+  const allFindings = [...packageFindings, ...review.findings.filter((f) => !packageFindings.some((s) => s.id === f.id))];
   manifest.security = cloudSecuritySummary(allFindings);
   fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n", "utf8");
   fs.writeFileSync(bundlePath, JSON.stringify({ ...bundle, manifest }, null, 2) + "\n", "utf8");
@@ -1088,7 +1185,34 @@ async function packageCloudAgentCli(db, root, opts) {
   let registration = null;
   let status = blocked ? "blocked" : opts.dryRun ? "dry-run" : "ready";
   if (!blocked && !opts.dryRun) {
-    registration = await registerCloudAgentCli(manifest, bundlePath, review, opts.visibility || "marketplace");
+    registration = await registerCloudAgentCli(manifest, bundlePath, review, visibility, { baseDescriptor });
+    let descriptor;
+    try {
+      descriptor = rememberCloudAssetDescriptorCli(registration, { sourceRoot: rootPath });
+    } catch (error) {
+      const stateError = new Error(
+        `Cloud save committed on the server, but this machine could not persist revision ${registration.revision}. ` +
+        "Do not retry blindly; run `agentlas cloud list` and restore the asset before the next update. " +
+        `Local state error: ${error.message || error}`,
+      );
+      stateError.code = "AGENTLAS_CLOUD_LOCAL_STATE_COMMIT_FAILED";
+      stateError.receipt = registration;
+      throw stateError;
+    }
+    try {
+      writeCloudSourceMarkerCli(rootPath, scan, descriptor, {
+        previousMarker: scan.localPackageMarker,
+        packageHash,
+        packageHashVersion,
+        fileCount: scan.included.length,
+        totalBytes: manifest.totalBytes,
+        executablePaths: packageHashVersion === CLOUD_PACKAGE_HASH_V2
+          ? scan.included.filter((file) => file.executable).map((file) => file.path).sort()
+          : undefined,
+      });
+    } catch (error) {
+      registration.localStateWarning = `Cloud save succeeded, but the source marker could not be updated: ${error.message || error}`;
+    }
     status = "registered";
   }
   return {
@@ -1101,83 +1225,466 @@ async function packageCloudAgentCli(db, root, opts) {
     files: scan.files,
     review,
     registration,
-    summary: status === "registered" ? `Registered ${slug}.` : status === "blocked" ? `Blocked: ${review.summary}` : `Ready: ${slug}.`,
+    summary: status === "registered"
+      ? isPublicHubPublish
+        ? `Published ${slug} publicly to Agentlas Hub.`
+        : `Saved ${slug} privately in Agent Cloud.`
+      : status === "blocked"
+        ? isPublicHubPublish
+          ? `Hub publish blocked: ${review.summary}`
+          : `Private Agent Cloud save blocked: ${review.summary}`
+        : isPublicHubPublish
+          ? `Hub package ready: ${slug}.`
+          : `Private Agent Cloud package ready: ${slug}.`,
   };
+}
+
+function cloudScopeForVisibility(visibility) {
+  return visibility === "marketplace" ? "hub-public" : "owner-private";
+}
+
+function normalizeCloudScopeFlagCli(value) {
+  if (value === "owner-private" || value === "private" || value === "private-link") return "owner-private";
+  if (value === "hub-public" || value === "marketplace" || value === "public") return "hub-public";
+  return null;
+}
+
+function cloudRevisionEtag(revision) {
+  return `"${revision}"`;
+}
+
+function normalizeCloudAssetDescriptorCli(value, label = "cloud asset descriptor") {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} is missing`);
+  }
+  const cloudId = typeof value.cloudId === "string" ? value.cloudId.trim() : "";
+  const slug = typeof value.slug === "string" ? value.slug.trim() : "";
+  const scope = value.scope;
+  const packageHash = String(value.packageHash || "").replace(/^sha256:/i, "").toLowerCase();
+  const packageHashVersion = cloudPackageHashVersion(value.packageHashVersion);
+  const revision = typeof value.revision === "string" ? value.revision : "";
+  const etag = typeof value.etag === "string" ? value.etag : cloudRevisionEtag(revision);
+  const updatedAt = typeof value.updatedAt === "string"
+    ? value.updatedAt
+    : typeof value.savedAt === "string"
+      ? value.savedAt
+      : typeof value.registeredAt === "string"
+        ? value.registeredAt
+        : "";
+  if (!/^[A-Za-z0-9_-]{8,128}$/.test(cloudId)) {
+    throw new Error(`${label} cloudId is invalid`);
+  }
+  if (!slug || cloudSlug(slug) !== slug) throw new Error(`${label} slug is invalid`);
+  if (!CLOUD_ASSET_SCOPES.has(scope)) throw new Error(`${label} scope is invalid`);
+  if (!/^[a-f0-9]{64}$/.test(packageHash) || !packageHashVersion) {
+    throw new Error(`${label} package identity is invalid`);
+  }
+  if (!revision || revision.length > 512 || /["\\\u0000-\u001f\u007f]/.test(revision)) {
+    throw new Error(`${label} revision is invalid`);
+  }
+  if (etag !== cloudRevisionEtag(revision)) throw new Error(`${label} ETag does not authenticate revision`);
+  if (!updatedAt || !Number.isFinite(Date.parse(updatedAt))) throw new Error(`${label} updatedAt is invalid`);
+  return { cloudId, slug, scope, packageHash, packageHashVersion, revision, etag, updatedAt };
+}
+
+function cloudDescriptorKey(descriptor) {
+  return `${descriptor.scope}:${descriptor.slug}`;
+}
+
+function cloudAssetStatePathCli() {
+  return path.join(userDataDir(), CLOUD_ASSET_STATE_FILE);
+}
+
+function readCloudAssetStateCli() {
+  const statePath = cloudAssetStatePathCli();
+  if (!fs.existsSync(statePath)) return { schemaVersion: 1, assets: {}, deletedBases: [] };
+  let fd;
+  try {
+    fd = fs.openSync(statePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error("state file is not a bounded regular file");
+    const parsed = JSON.parse(fs.readFileSync(fd, "utf8"));
+    if (!parsed || parsed.schemaVersion !== 1 || !parsed.assets || typeof parsed.assets !== "object" || Array.isArray(parsed.assets)) {
+      throw new Error("state schema is invalid");
+    }
+    const assets = {};
+    for (const [key, raw] of Object.entries(parsed.assets)) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`state entry ${key} is invalid`);
+      const descriptor = normalizeCloudAssetDescriptorCli(raw.descriptor, `state entry ${key}`);
+      if (key !== cloudDescriptorKey(descriptor)) throw new Error(`state entry ${key} key is invalid`);
+      const sourceRoots = Array.isArray(raw.sourceRoots)
+        ? [...new Set(raw.sourceRoots.filter((item) => typeof item === "string" && path.isAbsolute(item)).map((item) => path.resolve(item)))].slice(0, 32)
+        : [];
+      assets[key] = { descriptor, sourceRoots };
+    }
+    const deletedBases = Array.isArray(parsed.deletedBases)
+      ? parsed.deletedBases.filter((item) =>
+          item && typeof item === "object" && !Array.isArray(item) &&
+          typeof item.rootPath === "string" && path.isAbsolute(item.rootPath) &&
+          typeof item.slug === "string" && cloudSlug(item.slug) === item.slug &&
+          CLOUD_ASSET_SCOPES.has(item.scope) && typeof item.cloudId === "string" &&
+          typeof item.revision === "string"
+        ).map((item) => ({
+          rootPath: path.resolve(item.rootPath),
+          slug: item.slug,
+          scope: item.scope,
+          cloudId: item.cloudId,
+          revision: item.revision,
+        })).slice(-256)
+      : [];
+    return { schemaVersion: 1, assets, deletedBases };
+  } catch (error) {
+    throw new Error(`Agent Cloud local revision state is unreadable: ${error.message || error}`);
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch { /* best-effort */ }
+  }
+}
+
+function writeCloudAssetStateCli(state) {
+  const statePath = cloudAssetStatePathCli();
+  fs.mkdirSync(path.dirname(statePath), { recursive: true });
+  const temp = `${statePath}.tmp-${process.pid}-${crypto.randomBytes(4).toString("hex")}`;
+  const fd = fs.openSync(temp, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+  try {
+    fs.writeFileSync(fd, JSON.stringify(state, null, 2) + "\n", "utf8");
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.renameSync(temp, statePath);
+  cloudApplyPortableFileMode(statePath, 0o600);
+  cloudFsyncDirectoryCli(path.dirname(statePath));
+}
+
+function rememberCloudAssetDescriptorCli(value, options = {}) {
+  const descriptor = normalizeCloudAssetDescriptorCli(value);
+  const state = readCloudAssetStateCli();
+  const key = cloudDescriptorKey(descriptor);
+  const previous = state.assets[key];
+  const sameRevision = previous && previous.descriptor.cloudId === descriptor.cloudId && previous.descriptor.revision === descriptor.revision;
+  const roots = sameRevision ? [...previous.sourceRoots] : [];
+  if (options.sourceRoot) {
+    const sourceRoot = path.resolve(options.sourceRoot);
+    roots.push(sourceRoot);
+    state.deletedBases = state.deletedBases.filter(
+      (item) => !(item.rootPath === sourceRoot && item.slug === descriptor.slug && item.scope === descriptor.scope),
+    );
+  }
+  state.assets[key] = { descriptor, sourceRoots: [...new Set(roots)].slice(0, 32) };
+  writeCloudAssetStateCli(state);
+  return descriptor;
+}
+
+function findCloudAssetDescriptorCli(slug, scope) {
+  const safeSlug = cloudSlug(slug);
+  const state = readCloudAssetStateCli();
+  const matches = Object.values(state.assets).filter(
+    (entry) => entry.descriptor.slug === safeSlug && (!scope || entry.descriptor.scope === scope),
+  );
+  if (!scope && matches.length > 1) {
+    throw new Error(`Cloud asset ${safeSlug} exists in multiple scopes. Retry with --scope owner-private or --scope hub-public.`);
+  }
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function cloudMarkerDescriptorsCli(marker) {
+  const descriptors = {};
+  if (!marker || typeof marker !== "object" || Array.isArray(marker)) return descriptors;
+  if (marker.cloudAssets && typeof marker.cloudAssets === "object" && !Array.isArray(marker.cloudAssets)) {
+    for (const scope of CLOUD_ASSET_SCOPES) {
+      if (!marker.cloudAssets[scope]) continue;
+      try {
+        const descriptor = normalizeCloudAssetDescriptorCli(marker.cloudAssets[scope], `local marker ${scope}`);
+        if (descriptor.scope === scope) descriptors[scope] = descriptor;
+      } catch { /* legacy or corrupt CAS entry is not adopted as a base revision */ }
+    }
+  }
+  if (marker.revision && marker.cloudId && marker.scope) {
+    try {
+      const descriptor = normalizeCloudAssetDescriptorCli(marker, "local marker");
+      if (!descriptors[descriptor.scope]) descriptors[descriptor.scope] = descriptor;
+    } catch { /* legacy marker */ }
+  }
+  return descriptors;
+}
+
+function cloudBaseDescriptorFromMarkerCli(marker, slug, scope) {
+  const descriptor = cloudMarkerDescriptorsCli(marker)[scope];
+  return descriptor && descriptor.slug === slug ? descriptor : null;
+}
+
+function cloudBaseDescriptorForSourceCli(marker, rootPath, slug, scope) {
+  const state = readCloudAssetStateCli();
+  const normalizedRoot = path.resolve(rootPath);
+  let markerDescriptor = cloudBaseDescriptorFromMarkerCli(marker, slug, scope);
+  if (markerDescriptor && state.deletedBases.some((item) =>
+    item.rootPath === normalizedRoot && item.slug === slug && item.scope === scope &&
+    item.cloudId === markerDescriptor.cloudId && item.revision === markerDescriptor.revision
+  )) {
+    markerDescriptor = null;
+  }
+  const entry = state.assets[`${scope}:${slug}`];
+  const stateDescriptor = entry && entry.sourceRoots.includes(normalizedRoot) ? entry.descriptor : null;
+  if (!markerDescriptor) return stateDescriptor;
+  if (!stateDescriptor) return markerDescriptor;
+  return stateDescriptor.cloudId === markerDescriptor.cloudId && stateDescriptor.updatedAt >= markerDescriptor.updatedAt
+    ? stateDescriptor
+    : markerDescriptor;
+}
+
+function writeCloudSourceMarkerCli(rootPath, scan, descriptor, options = {}) {
+  const markerPath = path.join(rootPath, CLOUD_RESTORE_MARKER_PATH);
+  if (fs.existsSync(markerPath)) {
+    const stat = fs.lstatSync(markerPath);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Agent Cloud revision marker is not a regular file");
+  }
+  const descriptors = cloudMarkerDescriptorsCli(options.previousMarker);
+  if (descriptor) descriptors[descriptor.scope] = descriptor;
+  if (options.removeDescriptor) {
+    const current = descriptors[options.removeDescriptor.scope];
+    if (current && current.cloudId === options.removeDescriptor.cloudId && current.revision === options.removeDescriptor.revision) {
+      delete descriptors[options.removeDescriptor.scope];
+    }
+  }
+  const latest = descriptor || Object.values(descriptors)[0] || null;
+  const marker = {
+    schemaVersion: 1,
+    source: "agentlas-cloud",
+    slug: latest?.slug || options.removeDescriptor?.slug || cloudSlug(path.basename(rootPath)),
+    packageHash: descriptor?.packageHash || options.packageHash || options.previousMarker?.packageHash || "",
+    packageHashVersion: descriptor?.packageHashVersion || options.packageHashVersion || options.previousMarker?.packageHashVersion || CLOUD_PACKAGE_HASH_V1,
+    fileCount: Number.isSafeInteger(options.fileCount) ? options.fileCount : (options.previousMarker?.fileCount || 0),
+    totalBytes: Number.isSafeInteger(options.totalBytes) ? options.totalBytes : (options.previousMarker?.totalBytes || 0),
+    executablePaths: Array.isArray(options.executablePaths) ? options.executablePaths : options.previousMarker?.executablePaths,
+    cloudAssets: descriptors,
+    ...(latest ? latest : {}),
+    restoredAt: options.previousMarker?.restoredAt,
+    savedAt: new Date().toISOString(),
+  };
+  for (const key of Object.keys(marker)) if (marker[key] === undefined) delete marker[key];
+  const temp = path.join(rootPath, `.${CLOUD_RESTORE_MARKER_PATH}.tmp-${process.pid}-${crypto.randomBytes(4).toString("hex")}`);
+  const fd = fs.openSync(temp, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+  try {
+    fs.writeFileSync(fd, JSON.stringify(marker, null, 2) + "\n", "utf8");
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.renameSync(temp, markerPath);
+  cloudApplyPortableFileMode(markerPath, 0o600);
+  cloudFsyncDirectoryCli(rootPath);
+  return marker;
+}
+
+function readCloudSourceMarkerCli(rootPath) {
+  const markerPath = path.join(rootPath, CLOUD_RESTORE_MARKER_PATH);
+  if (!fs.existsSync(markerPath)) return null;
+  let fd;
+  try {
+    fd = fs.openSync(markerPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error("marker is not a bounded regular file");
+    return JSON.parse(fs.readFileSync(fd, "utf8"));
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
 }
 
 function scanCloudFolderCli(rootPath) {
   const files = [];
   const included = [];
   const findings = [];
+  const restoredExecutablePaths = cloudReadRestoreExecutablePaths(rootPath);
+  let localPackageMarker = null;
   let totalBytes = 0;
   let count = 0;
   let hasDefinition = false;
   function addFinding(kind, severity, category, message, file, remediation) {
     findings.push({ id: `${kind}-${sha(file || message).slice(0, 10)}`, severity, category, message, ...(file ? { file } : {}), ...(remediation ? { remediation } : {}) });
   }
+  function insideRoot(candidate) {
+    const relative = path.relative(rootPath, candidate);
+    return relative === "" || (relative && !relative.startsWith("..") && !path.isAbsolute(relative));
+  }
+  function readStableFile(file, rel) {
+    const beforeReal = fs.realpathSync.native(file);
+    if (!insideRoot(beforeReal)) throw new Error("file resolves outside the approved package root");
+    const noFollow = fs.constants.O_NOFOLLOW || 0;
+    const nonBlock = fs.constants.O_NONBLOCK || 0;
+    const fd = fs.openSync(file, fs.constants.O_RDONLY | noFollow | nonBlock);
+    try {
+      const before = fs.fstatSync(fd);
+      if (!before.isFile()) throw new Error("package entry is not a regular file");
+      if (before.size > CLOUD_MAX_FILE_BYTES) throw new Error(`file exceeds ${CLOUD_MAX_FILE_BYTES} bytes`);
+      const chunks = [];
+      let actualBytes = 0;
+      for (;;) {
+        const capacity = Math.min(64 * 1024, CLOUD_MAX_FILE_BYTES + 1 - actualBytes);
+        if (capacity <= 0) throw new Error(`file exceeds ${CLOUD_MAX_FILE_BYTES} bytes`);
+        const chunk = Buffer.allocUnsafe(capacity);
+        const read = fs.readSync(fd, chunk, 0, chunk.length, null);
+        if (read === 0) break;
+        actualBytes += read;
+        if (actualBytes > CLOUD_MAX_FILE_BYTES) throw new Error(`file exceeds ${CLOUD_MAX_FILE_BYTES} bytes`);
+        chunks.push(chunk.subarray(0, read));
+      }
+      const after = fs.fstatSync(fd);
+      const afterReal = fs.realpathSync.native(file);
+      const pathStat = fs.statSync(file);
+      if (
+        !insideRoot(afterReal) || beforeReal !== afterReal ||
+        before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size ||
+        before.mode !== after.mode || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs ||
+        after.dev !== pathStat.dev || after.ino !== pathStat.ino || after.mode !== pathStat.mode ||
+        actualBytes !== after.size
+      ) {
+        throw new Error("package entry changed while it was being read");
+      }
+      return {
+        bytes: Buffer.concat(chunks, actualBytes),
+        executable: cloudPortableExecutableForFile(rel, after.mode, restoredExecutablePaths),
+      };
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
   function walk(dir) {
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    let directoryBefore;
+    let directoryRealBefore;
+    try {
+      directoryBefore = fs.lstatSync(dir);
+      directoryRealBefore = fs.realpathSync.native(dir);
+      if (!directoryBefore.isDirectory() || directoryBefore.isSymbolicLink() || !insideRoot(directoryRealBefore)) {
+        throw new Error("directory is not stable inside the approved root");
+      }
+    } catch (error) {
+      addFinding("unsafe-directory", "blocker", "policy", `Package directory could not be read safely: ${error.message || error}`, path.relative(rootPath, dir).split(path.sep).join("/"), "Remove linked or changing directories and retry.");
+      return;
+    }
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (error) {
+      addFinding("unsafe-directory", "blocker", "policy", `Package directory could not be read safely: ${error.message || error}`, path.relative(rootPath, dir).split(path.sep).join("/"), "Remove linked or changing directories and retry.");
+      return;
+    }
     for (const entry of entries) {
       if (entry.name.startsWith("._")) continue;
       const abs = path.join(dir, entry.name);
       const rel = path.relative(rootPath, abs).split(path.sep).join("/");
+      if (cloudPortablePathKey(rel) === cloudPortablePathKey(CLOUD_RESTORE_MARKER_PATH)) {
+        // Local restore/CAS metadata is runtime state, never portable asset
+        // data, but it must be captured with the same no-follow stability gate.
+        if (entry.isSymbolicLink() || !entry.isFile()) {
+          addFinding("unsafe-local-state", "blocker", "policy", "Agent Cloud local revision marker must be a stable regular file.", rel, "Remove the linked or special marker and restore/list the asset again.");
+          continue;
+        }
+        try {
+          const stableMarker = readStableFile(abs, rel);
+          localPackageMarker = JSON.parse(stableMarker.bytes.toString("utf8"));
+        } catch (error) {
+          addFinding("invalid-local-state", "blocker", "policy", `Agent Cloud local revision marker could not be read safely: ${error.message || error}`, rel, "Repair or remove the marker, then restore/list the asset again.");
+        }
+        continue;
+      }
       if (entry.isSymbolicLink()) {
         addFinding("symlink", "blocker", "policy", "Symbolic links are not allowed in cloud agent packages.", rel, "Replace the symlink with an ordinary file or remove it.");
         files.push({ path: rel, bytes: 0, sha256: "", kind: "binary", included: false, reason: "symlink-blocked" });
         continue;
       }
       if (entry.isDirectory()) {
-        if (!CLOUD_SKIP_DIRS.has(entry.name)) walk(abs);
+        if (CLOUD_SKIP_DIRS.has(entry.name)) continue;
+        walk(abs);
         continue;
       }
-      if (!entry.isFile()) continue;
+      if (!entry.isFile()) {
+        addFinding("unsupported-entry", "blocker", "policy", "Only stable ordinary files and directories are allowed in Cloud packages.", rel, "Remove sockets, FIFOs, devices, and other special filesystem entries.");
+        files.push({ path: rel, bytes: 0, sha256: "", kind: "binary", included: false, reason: "unsupported-entry" });
+        continue;
+      }
+      if (!cloudPortableRelativePath(rel)) {
+        addFinding("unsafe-path", "blocker", "policy", "File path is not portable across supported hosts.", rel, "Rename the file to a Unicode NFC, relative, cross-platform-safe path.");
+        files.push({ path: rel, bytes: 0, sha256: "", kind: "binary", included: false, reason: "unsafe-path" });
+        continue;
+      }
       count++;
       if (count > CLOUD_MAX_FILES) {
         addFinding("file-count-limit", "blocker", "size", `Package has more than ${CLOUD_MAX_FILES} files.`, "", "Publish a focused agent/team folder.");
         continue;
       }
       if (CLOUD_AGENT_FILES.has(entry.name)) hasDefinition = true;
-      const stat = fs.statSync(abs);
-      totalBytes += stat.size;
-      const digest = sha(fs.readFileSync(abs));
+      let hint;
+      try { hint = fs.lstatSync(abs); } catch { hint = { size: 0 }; }
       if (CLOUD_BLOCKED_FILE_RE.some((re) => re.test(entry.name))) {
         addFinding("blocked-file", "blocker", "secret", "Secret-bearing file names are not allowed in cloud packages.", rel, "Remove credentials and publish only env key names.");
-        files.push({ path: rel, bytes: stat.size, sha256: digest, kind: "binary", included: false, reason: "secret-file-blocked" });
+        files.push({ path: rel, bytes: Number(hint.size) || 0, sha256: "", kind: "binary", included: false, reason: "secret-file-blocked" });
         continue;
       }
-      if (stat.size > CLOUD_MAX_FILE_BYTES) {
-        addFinding("large-file", "high", "size", `File exceeds ${CLOUD_MAX_FILE_BYTES} bytes.`, rel, "Move large assets out of the package.");
-        files.push({ path: rel, bytes: stat.size, sha256: digest, kind: "binary", included: false, reason: "file-too-large" });
+      if (Number(hint.size) > CLOUD_MAX_FILE_BYTES) {
+        addFinding("large-file", "blocker", "size", `File exceeds ${CLOUD_MAX_FILE_BYTES} bytes.`, rel, "Move large assets out of the package.");
+        files.push({ path: rel, bytes: Number(hint.size), sha256: "", kind: "binary", included: false, reason: "file-too-large" });
         continue;
       }
       const ext = path.extname(entry.name).toLowerCase();
       const isText = CLOUD_TEXT_EXTS.has(ext) || CLOUD_AGENT_FILES.has(entry.name);
-      if (!isText) {
-        files.push({ path: rel, bytes: stat.size, sha256: digest, kind: "binary", included: false, reason: "binary-skipped" });
+      let stable;
+      try {
+        stable = readStableFile(abs, rel);
+      } catch (error) {
+        addFinding("unstable-file", "blocker", "policy", `Package file could not be read safely: ${error.message || error}`, rel, "Remove linked or concurrently changing files and retry.");
+        files.push({ path: rel, bytes: Number(hint.size) || 0, sha256: "", kind: isText ? "text" : "binary", included: false, reason: "unstable-file" });
         continue;
       }
-      const text = fs.readFileSync(abs, "utf8");
-      for (const [id, re, label] of CLOUD_SECRET_RE) {
-        if (re.test(text)) addFinding(id, "blocker", "secret", `Possible ${label} found in package content.`, rel, "Remove the value and require users to configure their own key.");
+      const content = stable.bytes;
+      const executable = stable.executable;
+      totalBytes += content.length;
+      const digest = sha(content);
+      cloudAddSecretFindingsFromBytes(content, rel, addFinding);
+      if (isText) {
+        const decoded = cloudDecodeTextAsset(content);
+        if (!decoded.ok) {
+          addFinding("invalid-text-encoding", "blocker", "policy", "A text agent asset is not valid UTF-8 or BOM-marked UTF-16.", rel, "Save the file as UTF-8 or BOM-marked UTF-16 before packaging.");
+          files.push({ path: rel, bytes: content.length, sha256: digest, kind: "text", executable, included: false, reason: "invalid-text-encoding" });
+          continue;
+        }
+        const text = decoded.text;
+        if (/(?:curl|wget)[^\n|&;]+[|]\s*(?:sh|bash)/i.test(text)) {
+          addFinding("curl-pipe-shell", "high", "network", "Remote shell install pattern detected.", rel, "Use explicit, reviewable install steps.");
+        }
       }
-      if (/(?:curl|wget)[^\n|&;]+[|]\s*(?:sh|bash)/i.test(text)) {
-        addFinding("curl-pipe-shell", "high", "network", "Remote shell install pattern detected.", rel, "Use explicit, reviewable install steps.");
+      files.push({ path: rel, bytes: content.length, sha256: digest, kind: isText ? "text" : "binary", executable, included: true });
+      included.push({ path: rel, bytes: content.length, sha256: digest, executable, contentBase64: content.toString("base64") });
+    }
+    try {
+      const directoryAfter = fs.lstatSync(dir);
+      const directoryRealAfter = fs.realpathSync.native(dir);
+      if (
+        !directoryAfter.isDirectory() || directoryAfter.isSymbolicLink() || !insideRoot(directoryRealAfter) ||
+        directoryRealBefore !== directoryRealAfter || directoryBefore.dev !== directoryAfter.dev ||
+        directoryBefore.ino !== directoryAfter.ino || directoryBefore.mtimeMs !== directoryAfter.mtimeMs ||
+        directoryBefore.ctimeMs !== directoryAfter.ctimeMs
+      ) {
+        throw new Error("directory changed while it was scanned");
       }
-      files.push({ path: rel, bytes: stat.size, sha256: digest, kind: "text", included: true });
-      included.push({ path: rel, bytes: stat.size, sha256: digest, contentBase64: Buffer.from(text, "utf8").toString("base64") });
+    } catch (error) {
+      addFinding("unstable-directory", "blocker", "policy", `Package directory changed while it was scanned: ${error.message || error}`, path.relative(rootPath, dir).split(path.sep).join("/"), "Stop concurrent edits and retry.");
     }
   }
   walk(rootPath);
+  const pathConflict = cloudPortablePathConflict(included.map((file) => file.path));
+  if (pathConflict) {
+    addFinding(pathConflict.code, "blocker", "policy", pathConflict.message, "", "Rename aliased paths so every file and ancestor directory has one portable identity.");
+  }
   if (!hasDefinition) addFinding("missing-agent-definition", "blocker", "structure", "No agent definition file was found.", "", "Add AGENTS.md, CLAUDE.md, GEMINI.md, AGENT.md, or README.md at the package root.");
   if (totalBytes > CLOUD_MAX_TOTAL_BYTES) addFinding("package-size-limit", "blocker", "size", `Package exceeds ${CLOUD_MAX_TOTAL_BYTES} bytes.`, "", "Publish a smaller agent folder.");
-  files.sort((a, b) => a.path.localeCompare(b.path));
-  included.sort((a, b) => a.path.localeCompare(b.path));
-  return { files, included, findings, totalBytes };
+  files.sort(cloudCodePointPathOrder);
+  included.sort(cloudCodePointPathOrder);
+  return { files, included, findings, totalBytes, localPackageMarker };
 }
 
-function readCloudRoutingCardCli(rootPath) {
-  const abs = path.join(rootPath, CLOUD_ROUTING_CARD_PATH);
-  if (!fs.existsSync(abs)) {
+function readCloudRoutingCardCli(snapshot) {
+  const file = snapshot.get(CLOUD_ROUTING_CARD_PATH);
+  if (!file) {
     return {
       finding: {
         id: "routing-card-required",
@@ -1190,7 +1697,7 @@ function readCloudRoutingCardCli(rootPath) {
     };
   }
   try {
-    const parsed = JSON.parse(fs.readFileSync(abs, "utf8"));
+    const parsed = JSON.parse(Buffer.from(file.contentBase64, "base64").toString("utf8"));
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       return cloudRoutingCardFinding("routing-card-invalid", "Routing card must be a JSON object.", "Replace .agentlas/routing-card.json with a routing-card/2.0 object.");
     }
@@ -1235,14 +1742,25 @@ function cloudRoutingCardProblem(card) {
   return null;
 }
 
-function cloudStaticReview(findings) {
+function privateCloudSafetyFindingsCli(findings) {
+  return findings.filter((finding) =>
+    (finding.severity === "blocker" && !finding.id.startsWith("missing-agent-definition"))
+    || finding.category === "secret"
+    || finding.category === "size");
+}
+
+function cloudStaticReview(findings, scope = "hub-public") {
   const blockers = findings.filter((f) => f.severity === "blocker").length;
   const high = findings.filter((f) => f.severity === "high").length;
   return {
     mode: "static-only",
     verdict: blockers ? "fail" : high ? "needs-review" : "pass",
     costOwner: "none",
-    summary: blockers || high ? `${blockers} blocker(s), ${high} high-risk finding(s).` : "Static package review passed.",
+    summary: blockers || high
+      ? `${blockers} blocker(s), ${high} high-risk finding(s).`
+      : scope === "owner-private"
+        ? "Private Agent Cloud safety checks passed."
+        : "Static public package review passed.",
     findings,
     reviewedAt: new Date().toISOString(),
   };
@@ -1288,42 +1806,178 @@ async function runCloudLocalReviewCli(db, rootPath, manifest, staticFindings, ru
   };
 }
 
-async function registerCloudAgentCli(manifest, bundlePath, review, visibility) {
+function cloudCasResponseErrorCli(response, label) {
+  let body = null;
+  try { body = JSON.parse(response.text || "null"); } catch { /* generic below */ }
+  const code = body && typeof body.code === "string" ? body.code : "cloud_request_failed";
+  let message = `${label} 실패 ${response.status}`;
+  if (response.status === 412 && code === "cloud_agent_revision_conflict") {
+    const current = body && body.current ? body.current : body && body.conflict && body.conflict.current;
+    message = current
+      ? `다른 PC에서 이 Agent Cloud 자산이 변경되었습니다. 자동 덮어쓰기는 중단했습니다. \`agentlas cloud list\`로 최신 revision을 확인하고 \`agentlas cloud restore ${current.slug || "<slug>"}\`로 복원한 뒤 변경 사항을 병합하세요.`
+      : "이 Agent Cloud 자산은 다른 PC에서 삭제되었거나 다른 식별자로 다시 생성되었습니다. 자동 재생성은 중단했습니다. `agentlas cloud list`로 현재 상태를 확인하세요.";
+  } else if (response.status === 428 && code === "client_upgrade_required") {
+    message = "기존 Cloud 자산을 안전하게 갱신할 base revision이 없습니다. 서버 revision을 자동 복사하지 않습니다. `agentlas cloud list`로 확인하고 `agentlas cloud restore <slug>`로 복원한 뒤 다시 저장하세요.";
+  } else if (response.status === 503 && code === "cloud_mutations_maintenance") {
+    const retryAfter = response.headers && typeof response.headers.get === "function" ? response.headers.get("retry-after") : null;
+    message = `Agent Cloud 저장/삭제가 잠시 점검 중입니다${retryAfter ? ` (약 ${retryAfter}초 후 재시도)` : ""}. 읽기·목록·복원은 계속 사용할 수 있습니다.`;
+  } else if (body && typeof body.error === "string") {
+    message = `${label} 실패 ${response.status}: ${body.error.slice(0, 300)}`;
+  }
+  const error = new Error(message);
+  error.code = code;
+  error.status = response.status;
+  if (body && body.current) error.current = body.current;
+  if (body && body.conflict) error.conflict = body.conflict;
+  return error;
+}
+
+async function registerCloudAgentCli(manifest, bundlePath, review, visibility, options = {}) {
   const cookie = await cloudSessionCookieCli();
   if (!cookie) fail("agentlas.cloud 로그인이 필요합니다. 데스크톱 앱에서 로그인하거나 AGENTLAS_SESSION을 설정하세요.");
   if (typeof fetch !== "function") fail("이 런타임에 fetch가 없습니다(앱 런타임으로 실행 필요).");
   const base = (process.env.AGENTLAS_WEB_BASE_URL || "https://agentlas.cloud").replace(/\/$/, "");
   const bundle = JSON.parse(fs.readFileSync(bundlePath, "utf8"));
+  const expectedScope = cloudScopeForVisibility(visibility);
+  const baseDescriptor = options.baseDescriptor
+    ? normalizeCloudAssetDescriptorCli(options.baseDescriptor, "base revision")
+    : null;
+  if (baseDescriptor && (baseDescriptor.slug !== manifest.slug || baseDescriptor.scope !== expectedScope)) {
+    throw new Error("Agent Cloud base revision does not match the requested slug/scope.");
+  }
+  const headers = { "content-type": "application/json", cookie, origin: base };
+  if (baseDescriptor) {
+    headers["if-match"] = baseDescriptor.etag;
+    headers["x-agentlas-cloud-id"] = baseDescriptor.cloudId;
+  } else {
+    headers["if-none-match"] = "*";
+  }
   const resp = await fetchHubCli(`${base}/api/cloud-agents/v1/register`, {
     method: "POST",
-    headers: { "content-type": "application/json", cookie, origin: base },
+    headers,
     body: JSON.stringify({ manifest, bundle, review, visibility, billing: { modelCallsPaidBy: review.costOwner, localRuntime: review.runtimeLabel || null } }),
   });
-  if (!resp.ok) fail(`Agentlas Cloud 등록 실패 ${resp.status}: ${resp.text.slice(0, 300)}`);
+  if (!resp.ok) throw cloudCasResponseErrorCli(resp, "Agentlas Cloud 등록");
   const json = parseHubJsonCli(resp, "Agentlas Cloud 등록");
+  const expectedSource = visibility === "marketplace" ? "hub" : "agent-cloud";
+  const expectedVisibility = visibility === "marketplace" ? "marketplace" : "owner-private";
+  const etag = resp.headers && typeof resp.headers.get === "function" ? resp.headers.get("etag") : null;
+  const cacheControl = resp.headers && typeof resp.headers.get === "function" ? resp.headers.get("cache-control") : null;
+  const expectedOperations = baseDescriptor ? new Set(["updated", "unchanged"]) : new Set(["created"]);
+  if (
+    json.schema !== "agentlas.agent_cloud.registration.v1" ||
+    !expectedOperations.has(json.operation) ||
+    json.source !== expectedSource ||
+    json.visibility !== expectedVisibility ||
+    json.scope !== expectedScope ||
+    json.owner !== true ||
+    json.publicHubPublished !== (visibility === "marketplace") ||
+    json.dryRun !== false ||
+    typeof json.cloudId !== "string" || !json.cloudId.trim() ||
+    json.slug !== manifest.slug ||
+    json.packageHash !== manifest.packageHash ||
+    json.packageHashVersion !== manifest.packageHashVersion ||
+    typeof json.revision !== "string" || etag !== cloudRevisionEtag(json.revision) ||
+    typeof json.registeredAt !== "string" || !Number.isFinite(Date.parse(json.registeredAt)) ||
+    !String(cacheControl || "").toLowerCase().includes("no-store") ||
+    (baseDescriptor && json.cloudId !== baseDescriptor.cloudId)
+  ) {
+    throw new Error("Agentlas Cloud register returned an invalid or mismatched registration receipt.");
+  }
+  const descriptor = normalizeCloudAssetDescriptorCli({
+    cloudId: json.cloudId,
+    slug: json.slug,
+    scope: json.scope,
+    packageHash: json.packageHash,
+    packageHashVersion: json.packageHashVersion,
+    revision: json.revision,
+    etag,
+    updatedAt: json.savedAt || json.registeredAt,
+  }, "registration receipt");
   return {
-    cloudId: json.cloudId || crypto.randomUUID(),
-    slug: json.slug || manifest.slug,
-    url: json.url,
-    marketplaceUrl: json.marketplaceUrl,
-    registeredAt: json.registeredAt || new Date().toISOString(),
+    ...descriptor,
+    operation: json.operation,
+    ...(typeof json.url === "string" ? { url: json.url } : {}),
+    ...(typeof json.marketplaceUrl === "string" ? { marketplaceUrl: json.marketplaceUrl } : {}),
+    registeredAt: json.registeredAt,
     dryRun: false,
   };
 }
 
-async function deleteCloudAgentCli(slug) {
+async function deleteCloudAgentCli(slug, options = {}) {
   const safeSlug = String(slug || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64);
   if (!safeSlug) fail("usage: agentlas cloud delete <slug> [--json]");
   const cookie = await cloudSessionCookieCli();
   if (!cookie) fail("agentlas.cloud 로그인이 필요합니다. 데스크톱 앱에서 로그인하거나 AGENTLAS_SESSION을 설정하세요.");
   if (typeof fetch !== "function") fail("이 런타임에 fetch가 없습니다(앱 런타임으로 실행 필요).");
+  const scope = options.scope == null ? null : normalizeCloudScopeFlagCli(options.scope);
+  if (options.scope != null && !scope) throw new Error("--scope must be owner-private or hub-public");
+  const localEntry = findCloudAssetDescriptorCli(safeSlug, scope);
+  if (!localEntry) {
+    throw new Error(`No observed base revision for ${safeSlug}${scope ? ` (${scope})` : ""}. Run \`agentlas cloud list\` first, then retry the exact asset deletion.`);
+  }
+  const descriptor = localEntry.descriptor;
   const base = (process.env.AGENTLAS_WEB_BASE_URL || "https://agentlas.cloud").replace(/\/$/, "");
-  const resp = await fetchHubCli(`${base}/api/cloud-agents/v1/register?slug=${encodeURIComponent(safeSlug)}`, {
+  const query = new URLSearchParams({ slug: safeSlug, scope: descriptor.scope, cloudId: descriptor.cloudId });
+  const resp = await fetchHubCli(`${base}/api/cloud-agents/v1/register?${query.toString()}`, {
     method: "DELETE",
-    headers: { "content-type": "application/json", cookie, origin: base },
+    headers: {
+      "content-type": "application/json",
+      cookie,
+      origin: base,
+      "if-match": descriptor.etag,
+      "x-agentlas-cloud-id": descriptor.cloudId,
+    },
   });
-  if (!resp.ok) fail(`Agentlas Cloud 삭제 실패 ${resp.status}: ${resp.text.slice(0, 300)}`);
-  return parseHubJsonCli(resp, "Agentlas Cloud 삭제");
+  if (!resp.ok) throw cloudCasResponseErrorCli(resp, "Agentlas Cloud 삭제");
+  const json = parseHubJsonCli(resp, "Agentlas Cloud 삭제");
+  const responseEtag = resp.headers && typeof resp.headers.get === "function" ? resp.headers.get("etag") : null;
+  const cacheControl = resp.headers && typeof resp.headers.get === "function" ? resp.headers.get("cache-control") : null;
+  const expectedSource = descriptor.scope === "hub-public" ? "hub" : "agent-cloud";
+  const expectedVisibility = descriptor.scope === "hub-public" ? "marketplace" : "owner-private";
+  const deletionTimestamp = descriptor.scope === "hub-public" ? json.unpublishedAt : json.deletedAt;
+  if (
+    json.schema !== "agentlas.agent_cloud.delete.v1" || json.ok !== true ||
+    json.source !== expectedSource || json.visibility !== expectedVisibility ||
+    json.scope !== descriptor.scope || json.cloudId !== descriptor.cloudId || json.slug !== descriptor.slug ||
+    json.packageHash !== descriptor.packageHash || json.packageHashVersion !== descriptor.packageHashVersion ||
+    json.revision !== descriptor.revision ||
+    responseEtag !== descriptor.etag || !String(cacheControl || "").toLowerCase().includes("no-store") ||
+    (descriptor.scope === "hub-public" && json.operation !== "unpublished") ||
+    typeof deletionTimestamp !== "string" || !Number.isFinite(Date.parse(deletionTimestamp))
+  ) {
+    throw new Error("Agentlas Cloud delete returned an invalid or mismatched deletion receipt.");
+  }
+  const state = readCloudAssetStateCli();
+  const key = cloudDescriptorKey(descriptor);
+  const roots = state.assets[key]?.sourceRoots || [];
+  const warnings = [];
+  for (const rootPath of roots) {
+    state.deletedBases.push({ rootPath, slug: descriptor.slug, scope: descriptor.scope, cloudId: descriptor.cloudId, revision: descriptor.revision });
+  }
+  delete state.assets[key];
+  state.deletedBases = state.deletedBases.slice(-256);
+  try {
+    writeCloudAssetStateCli(state);
+  } catch (error) {
+    const stateError = new Error(
+      `Cloud delete committed on the server, but this machine could not persist the deletion tombstone. ` +
+      "Run `agentlas cloud list` before saving this slug again. " +
+      `Local state error: ${error.message || error}`,
+    );
+    stateError.code = "AGENTLAS_CLOUD_LOCAL_STATE_COMMIT_FAILED";
+    stateError.receipt = json;
+    throw stateError;
+  }
+  for (const rootPath of roots) {
+    try {
+      const marker = readCloudSourceMarkerCli(rootPath);
+      if (marker) writeCloudSourceMarkerCli(rootPath, null, null, { previousMarker: marker, removeDescriptor: descriptor });
+    } catch (error) {
+      warnings.push(`Could not clear ${rootPath}: ${error.message || error}`);
+    }
+  }
+  return { ...json, ...(warnings.length ? { localStateWarnings: warnings } : {}) };
 }
 
 // `agentlas login`이 저장하는 CLI 세션 파일 (평문·0600 — 데스크탑의 safeStorage 파일과 별개).
@@ -1358,101 +2012,635 @@ async function cloudSessionCookieCli() {
 async function cmdCloudInstall(db, slug) {
   if (!slug) fail("usage: agentlas cloud install <slug>");
   const listing = await fetchCloudManifestCli(slug);
-  if (!listing) fail(`cloud agent를 찾을 수 없습니다: ${slug}`);
+  if (!listing) fail(`Hub agent를 찾을 수 없습니다: ${slug}`);
+  if (listing.delivery && listing.delivery.mode === "call_only") {
+    fail(`이 Hub 에이전트는 소스 설치가 허용되지 않은 call-only 자산입니다. 실행: agentlas call ${slug}`);
+  }
   const agent = persistCloudListingCli(db, listing);
-  out(`✓ installed ${agent.slug} — ${agent.name}`);
+  out(`✓ Hub installed ${agent.slug} — ${agent.name}`);
   if (agent.localPath) out(`  files: ${agent.localPath}`);
 }
 
-async function fetchCloudManifestCli(slug) {
+async function callAgentlasMcpToolCli(name, args, { requireSession = false } = {}) {
   if (typeof fetch !== "function") fail("이 런타임에 fetch가 없습니다(앱 런타임으로 실행 필요).");
   const base = process.env.AGENTLAS_MCP_BASE_URL || "https://agentlas.cloud/api/mcp/v1";
   const headers = { "content-type": "application/json" };
   const cookie = await cloudSessionCookieCli();
+  if (requireSession && !cookie) fail("Agent Cloud에는 로그인이 필요합니다. 먼저 `agentlas login`을 실행하세요.");
   if (cookie) headers.cookie = cookie;
   const resp = await fetchHubCli(`${base.replace(/\/$/, "")}/tools/call`, {
     method: "POST",
     headers,
-    body: JSON.stringify({ method: "marketplace.get_manifest", params: { name: "marketplace.get_manifest", arguments: { kind: "agent", slug } } }),
+    body: JSON.stringify({ method: name, params: { name, arguments: args || {} } }),
   });
-  if (!resp.ok) fail(`marketplace.get_manifest 실패 ${resp.status}`);
-  const json = parseHubJsonCli(resp, "marketplace.get_manifest");
-  if (json.error) fail(`marketplace.get_manifest: ${json.error.message || "unknown error"}`);
+  if (!resp.ok) fail(`${name} 실패 ${resp.status}`);
+  const json = parseHubJsonCli(resp, name);
+  if (json.error) fail(`${name}: ${json.error.message || "unknown error"}`);
   return json.result || null;
 }
 
+async function fetchCloudManifestCli(slug) {
+  return callAgentlasMcpToolCli("marketplace.get_manifest", { kind: "agent", slug });
+}
+
+async function listOwnedCloudAgentsCli(limit = 100) {
+  const safeLimit = Math.max(1, Math.min(100, Number.isFinite(limit) ? Math.floor(limit) : 100));
+  const result = (await callAgentlasMcpToolCli("cargo.search_agents", { q: "", limit: safeLimit }, { requireSession: true })) || {
+    schema: "agentlas.agent_cloud.search.v1",
+    source: "cloud",
+    status: "ok",
+    count: 0,
+    total: 0,
+    results: [],
+  };
+  if (!Array.isArray(result.results)) throw new Error("Agent Cloud list returned an invalid results contract.");
+  if (result.results.length) {
+    const state = readCloudAssetStateCli();
+    for (const raw of result.results) {
+      const descriptor = normalizeCloudAssetDescriptorCli(raw, "Agent Cloud list result");
+      const key = cloudDescriptorKey(descriptor);
+      const previous = state.assets[key];
+      const preserveRoots = previous && previous.descriptor.cloudId === descriptor.cloudId && previous.descriptor.revision === descriptor.revision;
+      state.assets[key] = { descriptor, sourceRoots: preserveRoots ? previous.sourceRoots : [] };
+    }
+    writeCloudAssetStateCli(state);
+  }
+  return result;
+}
+
+async function restoreOwnedCloudAgentCli(db, slug) {
+  const raw = await callAgentlasMcpToolCli("cargo.restore_package", { slug }, { requireSession: true });
+  if (!raw || raw.error) {
+    const code = raw && raw.error ? raw.error : "agent_not_found";
+    const message = raw && raw.message ? raw.message : `Agent Cloud package not found: ${slug}`;
+    throw new Error(`${code}: ${message}`);
+  }
+  const restored = normalizeOwnerRestorePayloadCli(raw, slug);
+  const cloudPackage = restored.cloudPackage;
+  const listing = {
+    slug: restored.slug || slug,
+    name: restored.name || restored.nameEn || restored.slug || slug,
+    nameEn: restored.nameEn || restored.name || restored.slug || slug,
+    tagline: restored.tagline || restored.taglineEn || "",
+    taglineEn: restored.taglineEn || restored.tagline || "",
+    trustGrade: "A",
+    visibility: "visible",
+    source: "cloud",
+    assetDescriptor: restored.descriptor,
+    cloudPackage,
+  };
+  const agent = persistCloudListingCli(db, listing);
+  let descriptor = restored.descriptor;
+  let localStateWarning;
+  try {
+    descriptor = rememberCloudAssetDescriptorCli(restored.descriptor, { sourceRoot: agent.localPath || undefined });
+  } catch (error) {
+    localStateWarning = `Restore completed, but observed revision state could not be indexed: ${error.message || error}`;
+  }
+  return {
+    schema: restored.schema || "agentlas.agent_cloud.restore.v1",
+    source: "cloud",
+    slug: agent.slug,
+    name: agent.name,
+    packageHash: cloudPackage.packageHash,
+    packageHashVersion: cloudPackage.packageHashVersion || CLOUD_PACKAGE_HASH_V1,
+    cloudId: descriptor.cloudId,
+    scope: descriptor.scope,
+    revision: descriptor.revision,
+    etag: descriptor.etag,
+    updatedAt: descriptor.updatedAt,
+    localPath: agent.localPath || null,
+    ...(localStateWarning ? { localStateWarning } : {}),
+  };
+}
+
+function normalizeOwnerRestorePayloadCli(raw, expectedSlug) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("invalid_restore_contract");
+  if (raw.schema !== "agentlas.agent_cloud.restore.v1" || raw.source !== "cloud" || raw.owner !== true) {
+    throw new Error("invalid_restore_contract");
+  }
+  if (typeof raw.slug !== "string" || !raw.slug || raw.slug !== expectedSlug) {
+    throw new Error(`restore_slug_mismatch: requested ${expectedSlug}; received ${String(raw.slug || "")}`);
+  }
+  const pkg = raw.cloudPackage;
+  if (!pkg || typeof pkg !== "object" || Array.isArray(pkg) || !Array.isArray(pkg.files)) {
+    throw new Error("invalid_restore_contract");
+  }
+  const version = cloudPackageHashVersion(pkg.packageHashVersion);
+  if (!version || !/^[a-f0-9]{64}$/i.test(String(pkg.packageHash || "").replace(/^sha256:/i, ""))) {
+    throw new Error("invalid_restore_contract");
+  }
+  let descriptor;
+  let nestedDescriptor;
+  try {
+    descriptor = normalizeCloudAssetDescriptorCli(raw, "owner restore receipt");
+    nestedDescriptor = normalizeCloudAssetDescriptorCli({
+      ...pkg,
+      slug: raw.slug,
+      etag: raw.etag,
+    }, "owner restore package receipt");
+  } catch (error) {
+    throw new Error(`invalid_restore_contract: ${error.message || error}`);
+  }
+  if (JSON.stringify(descriptor) !== JSON.stringify(nestedDescriptor)) {
+    throw new Error("invalid_restore_contract: restore revision envelope and cloudPackage disagree");
+  }
+  if (!["agent", "team", "repo"].includes(pkg.agentKind) || !Number.isSafeInteger(pkg.fileCount) || !Number.isSafeInteger(pkg.totalBytes)) {
+    throw new Error("invalid_restore_contract");
+  }
+  for (const file of pkg.files) {
+    if (!file || typeof file !== "object" || typeof file.path !== "string" || !Number.isSafeInteger(file.bytes) || typeof file.sha256 !== "string" || typeof file.contentBase64 !== "string") {
+      throw new Error("invalid_restore_contract");
+    }
+  }
+  const outerVersion = raw.packageHashVersion == null ? version : cloudPackageHashVersion(raw.packageHashVersion);
+  if (
+    (raw.packageHash != null && String(raw.packageHash) !== String(pkg.packageHash)) ||
+    !outerVersion || outerVersion !== version ||
+    (raw.fileCount != null && raw.fileCount !== pkg.fileCount) ||
+    (raw.totalBytes != null && raw.totalBytes !== pkg.totalBytes) ||
+    (raw.agentKind != null && raw.agentKind !== pkg.agentKind)
+  ) {
+    throw new Error("invalid_restore_contract: restore envelope and cloudPackage disagree");
+  }
+  return {
+    schema: raw.schema,
+    source: raw.source,
+    owner: true,
+    slug: raw.slug,
+    name: typeof raw.name === "string" && raw.name ? raw.name : raw.slug,
+    nameEn: typeof raw.nameEn === "string" && raw.nameEn ? raw.nameEn : (raw.name || raw.slug),
+    tagline: typeof raw.tagline === "string" ? raw.tagline : "",
+    taglineEn: typeof raw.taglineEn === "string" ? raw.taglineEn : (raw.tagline || ""),
+    descriptor,
+    cloudPackage: {
+      cloudId: descriptor.cloudId,
+      scope: descriptor.scope,
+      revision: descriptor.revision,
+      updatedAt: descriptor.updatedAt,
+      packageHash: String(pkg.packageHash).replace(/^sha256:/i, "").toLowerCase(),
+      packageHashVersion: version,
+      fileCount: pkg.fileCount,
+      totalBytes: pkg.totalBytes,
+      agentKind: pkg.agentKind,
+      runtimeLabels: Array.isArray(pkg.runtimeLabels) ? pkg.runtimeLabels.filter((item) => typeof item === "string" && item.trim()) : [],
+      files: pkg.files,
+    },
+  };
+}
+
+function cloudSystemPromptFromPackageCli(listing, slug) {
+  const pkg = listing && listing.cloudPackage;
+  if (!pkg || !Array.isArray(pkg.files) || !pkg.files.length) return "";
+  const byPath = new Map();
+  for (const file of pkg.files) {
+    if (!file || typeof file.path !== "string" || typeof file.contentBase64 !== "string") continue;
+    byPath.set(cloudPortablePathKey(file.path), file);
+  }
+  const readText = (candidate) => {
+    const safe = cloudPortableRelativePath(candidate);
+    if (!safe) return "";
+    const file = byPath.get(cloudPortablePathKey(safe));
+    if (!file) return "";
+    let bytes;
+    try { bytes = Buffer.from(file.contentBase64, "base64"); } catch { return ""; }
+    if (!bytes.length || bytes.includes(0)) return "";
+    const text = bytes.toString("utf8");
+    if (!text.trim() || text.includes("\ufffd")) return "";
+    return text.slice(0, 64 * 1024);
+  };
+  let manifest = null;
+  const manifestFile = byPath.get(cloudPortablePathKey("agentlas.json"));
+  if (manifestFile) {
+    try { manifest = JSON.parse(Buffer.from(manifestFile.contentBase64, "base64").toString("utf8")); }
+    catch { manifest = null; }
+  }
+  const declaredEntry = manifest && typeof manifest === "object" && typeof manifest.entry === "string"
+    ? cloudPortableRelativePath(manifest.entry)
+    : null;
+  const candidates = [
+    declaredEntry,
+    "AGENTS.md",
+    "CLAUDE.md",
+    "GEMINI.md",
+    "AGENT.md",
+    "agent.md",
+    "system-prompt.md",
+    "README.md",
+  ].filter(Boolean);
+  let entryPath = "";
+  let entryText = "";
+  for (const candidate of candidates) {
+    const text = readText(candidate);
+    if (!text) continue;
+    entryPath = candidate;
+    entryText = text;
+    break;
+  }
+  if (!entryText) return "";
+  const installRoot = path.join(userDataDir(), "cloud-agent-installs", slug);
+  return [
+    `You are the Agentlas Cloud agent "${listing.name || slug}".`,
+    `IMMUTABLE CLOUD AGENT ROOT: ${installRoot}`,
+    `CANONICAL ENTRY: ${entryPath}`,
+    `PACKAGE HASH: ${String(pkg.packageHash || "").replace(/^sha256:/i, "")}`,
+    "Resolve package-relative references under IMMUTABLE CLOUD AGENT ROOT. Treat that root as read-only and do work in the user's active project.",
+    "",
+    "--- CLOUD AGENT ENTRY ---",
+    entryText,
+  ].join("\n");
+}
+
 function persistCloudListingCli(db, listing) {
+  if (listing?.delivery?.mode === "call_only") {
+    throw new Error(`call-only Hub asset cannot be source-installed; invoke it with agentlas call ${listing.slug || "<slug>"}`);
+  }
   const slug = cloudSlug(listing.slug || listing.name || "cloud-agent");
+  recoverCloudInstallJournalCli(db, slug);
   const existing = db.prepare("SELECT * FROM installed_agents WHERE slug=?").get(slug);
   const now = new Date().toISOString();
   const envReqs = JSON.stringify(listing.envRequirements || []);
   const mcpServers = JSON.stringify(listing.mcpServers || []);
-  if (existing) {
-    db.prepare("UPDATE installed_agents SET name=?, name_en=?, tagline=?, tagline_en=?, system_prompt=?, mcp_servers_json=?, env_requirements_json=?, trust_grade=?, visibility=? WHERE slug=?")
-      .run(listing.name || slug, listing.nameEn || listing.name || slug, listing.tagline || "", listing.taglineEn || listing.tagline || "", listing.systemPrompt || "", mcpServers, envReqs, listing.trustGrade || "unknown", listing.visibility || "visible", slug);
-    const localPath = materializeCloudListingCli(existing.id, slug, listing);
-    return { ...existing, slug, name: listing.name || slug, ...(localPath ? { localPath } : {}) };
-  }
-  const id = crypto.randomUUID();
+  const id = existing?.id || crypto.randomUUID();
   const hasVisibility = columnExists(db, "installed_agents", "visibility");
-  if (hasVisibility) {
-    db.prepare("INSERT INTO installed_agents (id, slug, name, name_en, tagline, tagline_en, system_prompt, mcp_servers_json, env_requirements_json, preferred_backend, trust_grade, installed_at, tone, visibility) VALUES (?,?,?,?,?,?,?,?,?,NULL,?,?,?,?)")
-      .run(id, slug, listing.name || slug, listing.nameEn || listing.name || slug, listing.tagline || "", listing.taglineEn || listing.tagline || "", listing.systemPrompt || "", mcpServers, envReqs, listing.trustGrade || "unknown", now, listing.tone || "blue", listing.visibility || "visible");
-  } else {
-    db.prepare("INSERT INTO installed_agents (id, slug, name, name_en, tagline, tagline_en, system_prompt, mcp_servers_json, env_requirements_json, preferred_backend, trust_grade, installed_at, tone) VALUES (?,?,?,?,?,?,?,?,?,NULL,?,?,?)")
-      .run(id, slug, listing.name || slug, listing.nameEn || listing.name || slug, listing.tagline || "", listing.taglineEn || listing.tagline || "", listing.systemPrompt || "", mcpServers, envReqs, listing.trustGrade || "unknown", now, listing.tone || "blue");
+  let installedAt = now;
+  if (existing && String(existing.installed_at || "") === installedAt) {
+    installedAt = new Date(Date.now() + 1).toISOString();
   }
-  const localPath = materializeCloudListingCli(id, slug, listing);
-  return { id, slug, name: listing.name || slug, ...(localPath ? { localPath } : {}) };
+  const tone = listing.tone || "blue";
+  const packageSystemPrompt = cloudSystemPromptFromPackageCli(listing, slug);
+  const dbExpected = {
+    id,
+    slug,
+    name: listing.name || slug,
+    name_en: listing.nameEn || listing.name || slug,
+    tagline: listing.tagline || "",
+    tagline_en: listing.taglineEn || listing.tagline || "",
+    system_prompt: packageSystemPrompt || listing.systemPrompt || "",
+    mcp_servers_json: mcpServers,
+    env_requirements_json: envReqs,
+    trust_grade: listing.trustGrade || "unknown",
+    installed_at: installedAt,
+    tone,
+    ...(!existing ? { preferred_backend: null } : {}),
+    ...(hasVisibility ? { visibility: listing.visibility || "visible" } : {}),
+  };
+  const restore = materializeCloudListingCli(id, slug, listing, { deferCommit: true, dbExpected });
+  const mutate = () => {
+    if (existing) {
+      if (hasVisibility) {
+        db.prepare("UPDATE installed_agents SET name=?, name_en=?, tagline=?, tagline_en=?, system_prompt=?, mcp_servers_json=?, env_requirements_json=?, trust_grade=?, installed_at=?, tone=?, visibility=? WHERE slug=?")
+          .run(dbExpected.name, dbExpected.name_en, dbExpected.tagline, dbExpected.tagline_en, dbExpected.system_prompt, mcpServers, envReqs, dbExpected.trust_grade, installedAt, tone, dbExpected.visibility, slug);
+      } else {
+        db.prepare("UPDATE installed_agents SET name=?, name_en=?, tagline=?, tagline_en=?, system_prompt=?, mcp_servers_json=?, env_requirements_json=?, trust_grade=?, installed_at=?, tone=? WHERE slug=?")
+          .run(dbExpected.name, dbExpected.name_en, dbExpected.tagline, dbExpected.tagline_en, dbExpected.system_prompt, mcpServers, envReqs, dbExpected.trust_grade, installedAt, tone, slug);
+      }
+      return;
+    }
+    if (hasVisibility) {
+      db.prepare("INSERT INTO installed_agents (id, slug, name, name_en, tagline, tagline_en, system_prompt, mcp_servers_json, env_requirements_json, preferred_backend, trust_grade, installed_at, tone, visibility) VALUES (?,?,?,?,?,?,?,?,?,NULL,?,?,?,?)")
+        .run(id, slug, dbExpected.name, dbExpected.name_en, dbExpected.tagline, dbExpected.tagline_en, dbExpected.system_prompt, mcpServers, envReqs, dbExpected.trust_grade, installedAt, tone, dbExpected.visibility);
+    } else {
+      db.prepare("INSERT INTO installed_agents (id, slug, name, name_en, tagline, tagline_en, system_prompt, mcp_servers_json, env_requirements_json, preferred_backend, trust_grade, installed_at, tone) VALUES (?,?,?,?,?,?,?,?,?,NULL,?,?,?)")
+        .run(id, slug, dbExpected.name, dbExpected.name_en, dbExpected.tagline, dbExpected.tagline_en, dbExpected.system_prompt, mcpServers, envReqs, dbExpected.trust_grade, installedAt, tone);
+    }
+  };
+  let dbCommitted = false;
+  try {
+    if (typeof db.transaction === "function") db.transaction(mutate)();
+    else mutate();
+    dbCommitted = true;
+    restore?.commit();
+  } catch (error) {
+    if (!dbCommitted) restore?.rollback();
+    throw error;
+  }
+  const localPath = restore?.path || null;
+  return existing
+    ? { ...existing, slug, name: dbExpected.name, ...(localPath ? { localPath } : {}) }
+    : { id, slug, name: dbExpected.name, ...(localPath ? { localPath } : {}) };
 }
 
-function materializeCloudListingCli(agentId, slug, listing) {
+function materializeCloudListingCli(agentId, slug, listing, options = {}) {
   const pkg = listing.cloudPackage;
   if (!pkg || !Array.isArray(pkg.files) || pkg.files.length === 0) return null;
-  const dir = path.join(userDataDir(), "cloud-agent-installs", slug);
-  fs.mkdirSync(dir, { recursive: true });
-  const markerPath = path.join(dir, ".agentlas-cloud-package.json");
-  let currentHash = null;
-  try {
-    currentHash = JSON.parse(fs.readFileSync(markerPath, "utf8")).packageHash || null;
-  } catch {}
-  const overwrite = currentHash !== pkg.packageHash;
-  for (const file of pkg.files) {
-    const target = resolveCloudInstallPathCli(dir, file.path);
-    const bytes = Buffer.from(String(file.contentBase64 || ""), "base64");
-    if (bytes.length !== Number(file.bytes) || sha(bytes) !== String(file.sha256 || "").toLowerCase()) {
-      fail(`cloud package file integrity failed: ${file.path}`);
-    }
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    if (overwrite || !fs.existsSync(target)) fs.writeFileSync(target, bytes);
+  if (pkg.files.length > CLOUD_MAX_FILES) throw new Error(`cloud package exceeds ${CLOUD_MAX_FILES} files`);
+  if (!Number.isSafeInteger(pkg.fileCount) || pkg.fileCount !== pkg.files.length) {
+    throw new Error("cloud package file count does not match its manifest");
   }
-  fs.writeFileSync(
-    markerPath,
-    JSON.stringify({ agentId, packageHash: pkg.packageHash, installedAt: new Date().toISOString() }, null, 2) + "\n",
-    "utf8",
+  if (!Number.isSafeInteger(pkg.totalBytes) || pkg.totalBytes < 0 || pkg.totalBytes > CLOUD_MAX_TOTAL_BYTES) {
+    throw new Error("cloud package total byte count is invalid");
+  }
+  const packageHashVersion = cloudPackageHashVersion(pkg.packageHashVersion);
+  if (!packageHashVersion) throw new Error(`unsupported cloud package hash version: ${pkg.packageHashVersion}`);
+  const assetDescriptor = listing.assetDescriptor
+    ? normalizeCloudAssetDescriptorCli(listing.assetDescriptor, "restore asset descriptor")
+    : null;
+  if (assetDescriptor && assetDescriptor.slug !== slug) throw new Error("restore asset descriptor slug mismatch");
+  const pathConflict = cloudPortablePathConflict(pkg.files.map((file) => file && file.path));
+  if (pathConflict) throw new Error(pathConflict.message);
+  const dir = path.join(userDataDir(), "cloud-agent-installs", slug);
+  const parent = path.dirname(dir);
+  fs.mkdirSync(parent, { recursive: true });
+  const nonce = `${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+  const staging = path.join(parent, `.${path.basename(dir)}.installing-${nonce}`);
+  const backup = path.join(parent, `.${path.basename(dir)}.backup-${nonce}`);
+  const journal = path.join(parent, `.${path.basename(dir)}.install-journal.json`);
+  const seen = new Set();
+  const verifiedFiles = [];
+  let verifiedTotalBytes = 0;
+  let movedExisting = false;
+  let installed = false;
+  try {
+    fs.mkdirSync(staging, { recursive: false, mode: 0o700 });
+    cloudApplyPrivateDirectoryMode(staging);
+    for (const file of pkg.files) {
+      const target = resolveCloudInstallPathCli(staging, file.path);
+      const normalizedPath = path.relative(staging, target).split(path.sep).join("/");
+      if (seen.has(normalizedPath)) throw new Error(`duplicate cloud package path: ${file.path}`);
+      seen.add(normalizedPath);
+      if (packageHashVersion === CLOUD_PACKAGE_HASH_V2 && typeof file.executable !== "boolean") {
+        throw new Error(`cloud package hash v2 requires executable boolean: ${file.path}`);
+      }
+      if (packageHashVersion === CLOUD_PACKAGE_HASH_V1 && file.executable !== undefined) {
+        throw new Error(`legacy cloud package hash v1 cannot authenticate executable flag: ${file.path}`);
+      }
+      if (!cloudCanonicalBase64(file.contentBase64)) {
+        throw new Error(`cloud package file base64 is not canonical: ${file.path}`);
+      }
+      const bytes = Buffer.from(String(file.contentBase64 || ""), "base64");
+      if (!Number.isSafeInteger(file.bytes) || file.bytes < 0 || file.bytes > CLOUD_MAX_FILE_BYTES) {
+        throw new Error(`cloud package file byte count is invalid: ${file.path}`);
+      }
+      if (bytes.length !== Number(file.bytes) || sha(bytes) !== String(file.sha256 || "").toLowerCase()) {
+        throw new Error(`cloud package file integrity failed: ${file.path}`);
+      }
+      verifiedFiles.push({
+        path: normalizedPath,
+        bytes: bytes.length,
+        sha256: String(file.sha256 || "").toLowerCase(),
+        ...(packageHashVersion === CLOUD_PACKAGE_HASH_V2 ? { executable: file.executable } : {}),
+      });
+      verifiedTotalBytes += bytes.length;
+      if (verifiedTotalBytes > CLOUD_MAX_TOTAL_BYTES) throw new Error("cloud package exceeds total byte limit");
+      fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+      cloudApplyPrivateDirectoryMode(path.dirname(target));
+      const mode = packageHashVersion === CLOUD_PACKAGE_HASH_V2 && file.executable ? 0o700 : 0o600;
+      fs.writeFileSync(target, bytes, { mode });
+      cloudApplyPortableFileMode(target, mode);
+    }
+    const expectedPackageHash = String(pkg.packageHash || "").toLowerCase().replace(/^sha256:/, "");
+    if (!/^[a-f0-9]{64}$/.test(expectedPackageHash)) {
+      throw new Error("cloud package aggregate hash is missing or invalid");
+    }
+    const actualPackageHash = cloudHashPackage(verifiedFiles, packageHashVersion);
+    if (actualPackageHash !== expectedPackageHash) {
+      throw new Error("cloud package aggregate integrity failed");
+    }
+    if (assetDescriptor && (
+      assetDescriptor.packageHash !== expectedPackageHash ||
+      assetDescriptor.packageHashVersion !== packageHashVersion
+    )) {
+      throw new Error("restore asset descriptor package identity mismatch");
+    }
+    if (verifiedTotalBytes !== pkg.totalBytes) throw new Error("cloud package total byte count does not match its files");
+    const restoredAt = new Date().toISOString();
+    fs.writeFileSync(
+      path.join(staging, ".agentlas-cloud-package.json"),
+      JSON.stringify({
+        schemaVersion: 1,
+        source: "agentlas-cloud",
+        slug,
+        packageHash: expectedPackageHash,
+        packageHashVersion,
+        fileCount: verifiedFiles.length,
+        totalBytes: verifiedTotalBytes,
+        executablePaths: packageHashVersion === CLOUD_PACKAGE_HASH_V2
+          ? verifiedFiles.filter((file) => file.executable).map((file) => file.path).sort()
+          : undefined,
+        ...(assetDescriptor ? {
+          cloudId: assetDescriptor.cloudId,
+          scope: assetDescriptor.scope,
+          revision: assetDescriptor.revision,
+          etag: assetDescriptor.etag,
+          updatedAt: assetDescriptor.updatedAt,
+          cloudAssets: { [assetDescriptor.scope]: assetDescriptor },
+        } : {}),
+        restoredAt,
+      }, null, 2) + "\n",
+      { encoding: "utf8", mode: 0o600 },
+    );
+    cloudApplyPortableFileMode(path.join(staging, CLOUD_RESTORE_MARKER_PATH), 0o600);
+    cloudVerifyRestoredSnapshot(staging, verifiedFiles, {
+      slug,
+      packageHash: expectedPackageHash,
+      packageHashVersion,
+      totalBytes: verifiedTotalBytes,
+      assetDescriptor,
+    });
+
+    if (options.deferCommit) {
+      writeCloudInstallJournalCli(journal, {
+        schemaVersion: 1,
+        slug,
+        phase: "prepared",
+        destination: dir,
+        staging,
+        backup,
+        hadExisting: fs.existsSync(dir),
+        dbExpected: options.dbExpected || {},
+      });
+    }
+
+    // A Cloud agent is an immutable asset snapshot. Replace the managed install
+    // as a whole so removed files and local mutations cannot leak across versions.
+    if (fs.existsSync(dir)) {
+      fs.renameSync(dir, backup);
+      movedExisting = true;
+    }
+    fs.renameSync(staging, dir);
+    cloudFsyncDirectoryCli(parent);
+    installed = true;
+    if (options.deferCommit) {
+      writeCloudInstallJournalCli(journal, {
+        schemaVersion: 1,
+        slug,
+        phase: "disk-swapped-db-pending",
+        destination: dir,
+        staging,
+        backup,
+        hadExisting: movedExisting,
+        dbExpected: options.dbExpected || {},
+      });
+    }
+  } catch (error) {
+    rollbackCloudInstallSwapCli({ destination: dir, staging, backup, movedExisting, installed });
+    try { if (fs.existsSync(journal)) fs.unlinkSync(journal); } catch { /* best-effort */ }
+    throw error;
+  } finally {
+    try { if (fs.existsSync(staging)) fs.rmSync(staging, { recursive: true, force: true }); } catch { /* best-effort */ }
+    try { if (!options.deferCommit && installed && fs.existsSync(backup)) fs.rmSync(backup, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+  if (!options.deferCommit) return dir;
+  let settled = false;
+  return {
+    path: dir,
+    commit() {
+      if (settled) return;
+      writeCloudInstallJournalCli(journal, {
+        schemaVersion: 1,
+        slug,
+        phase: "db-committed",
+        destination: dir,
+        staging,
+        backup,
+        hadExisting: movedExisting,
+        dbExpected: options.dbExpected || {},
+      });
+      if (fs.existsSync(backup)) fs.rmSync(backup, { recursive: true, force: true });
+      if (fs.existsSync(journal)) fs.unlinkSync(journal);
+      cloudFsyncDirectoryCli(parent);
+      settled = true;
+    },
+    rollback() {
+      if (settled) return;
+      rollbackCloudInstallSwapCli({ destination: dir, staging, backup, movedExisting, installed });
+      if (fs.existsSync(journal)) fs.unlinkSync(journal);
+      cloudFsyncDirectoryCli(parent);
+      settled = true;
+    },
+  };
+}
+
+function writeCloudInstallJournalCli(journalPath, value) {
+  fs.mkdirSync(path.dirname(journalPath), { recursive: true, mode: 0o700 });
+  const temp = `${journalPath}.tmp-${process.pid}-${crypto.randomBytes(4).toString("hex")}`;
+  const fd = fs.openSync(temp, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+  try {
+    fs.writeFileSync(fd, JSON.stringify(value, null, 2) + "\n", "utf8");
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.renameSync(temp, journalPath);
+  cloudApplyPortableFileMode(journalPath, 0o600);
+  cloudFsyncDirectoryCli(path.dirname(journalPath));
+}
+
+function cloudFsyncDirectoryCli(directory) {
+  if (process.platform === "win32") return;
+  let fd;
+  try {
+    fd = fs.openSync(directory, fs.constants.O_RDONLY);
+    fs.fsyncSync(fd);
+  } catch { /* some filesystems do not support directory fsync */ }
+  finally { if (fd !== undefined) try { fs.closeSync(fd); } catch { /* best-effort */ } }
+}
+
+function rollbackCloudInstallSwapCli({ destination, staging, backup, movedExisting, installed }) {
+  if (installed && fs.existsSync(destination)) fs.rmSync(destination, { recursive: true, force: true });
+  if (movedExisting && fs.existsSync(backup) && !fs.existsSync(destination)) fs.renameSync(backup, destination);
+  if (fs.existsSync(staging)) fs.rmSync(staging, { recursive: true, force: true });
+  cloudFsyncDirectoryCli(path.dirname(destination));
+}
+
+function recoverCloudInstallJournalCli(db, slug) {
+  const destination = path.join(userDataDir(), "cloud-agent-installs", slug);
+  const parent = path.dirname(destination);
+  const journalPath = path.join(parent, `.${path.basename(destination)}.install-journal.json`);
+  if (!fs.existsSync(journalPath)) return;
+  let journal;
+  try { journal = JSON.parse(fs.readFileSync(journalPath, "utf8")); } catch { throw new Error(`cloud install recovery journal is unreadable for ${slug}`); }
+  const safeSibling = (candidate, prefix) =>
+    typeof candidate === "string" && path.dirname(candidate) === parent && path.basename(candidate).startsWith(prefix);
+  if (
+    journal.schemaVersion !== 1 || journal.slug !== slug || journal.destination !== destination ||
+    !["prepared", "disk-swapped-db-pending", "db-committed"].includes(journal.phase) ||
+    typeof journal.hadExisting !== "boolean" ||
+    !safeSibling(journal.staging, `.${path.basename(destination)}.installing-`) ||
+    !safeSibling(journal.backup, `.${path.basename(destination)}.backup-`)
+  ) {
+    throw new Error(`cloud install recovery journal is invalid for ${slug}`);
+  }
+  const row = db.prepare("SELECT * FROM installed_agents WHERE slug=?").get(slug);
+  const expected = journal.dbExpected && typeof journal.dbExpected === "object" ? journal.dbExpected : {};
+  const expectedEntries = Object.entries(expected);
+  const dbMatches = Boolean(row) && expectedEntries.length > 0 && expectedEntries.every(
+    ([key, value]) => String(row[key] ?? "") === String(value ?? ""),
   );
-  return dir;
+  if (journal.phase === "prepared") {
+    // The DB mutation starts only after materializeCloudListingCli returns, so a
+    // prepared journal always represents the pre-DB state. Cover both rename
+    // crash windows: old→backup and staging→destination.
+    if (journal.hadExisting) {
+      if (fs.existsSync(journal.backup)) {
+        if (fs.existsSync(destination)) fs.rmSync(destination, { recursive: true, force: true });
+        fs.renameSync(journal.backup, destination);
+      } else if (!fs.existsSync(destination)) {
+        throw new Error(`prepared cloud install lost both destination and backup for ${slug}`);
+      }
+    } else {
+      if (fs.existsSync(journal.backup)) {
+        throw new Error(`prepared first cloud install has an unexpected backup for ${slug}`);
+      }
+      if (fs.existsSync(destination)) fs.rmSync(destination, { recursive: true, force: true });
+    }
+    if (fs.existsSync(journal.staging)) fs.rmSync(journal.staging, { recursive: true, force: true });
+  } else if (journal.phase === "db-committed" || dbMatches) {
+    if (!fs.existsSync(destination) && fs.existsSync(journal.staging)) fs.renameSync(journal.staging, destination);
+    if (!fs.existsSync(destination)) throw new Error(`committed cloud install is missing for ${slug}`);
+    if (fs.existsSync(journal.backup)) fs.rmSync(journal.backup, { recursive: true, force: true });
+    if (fs.existsSync(journal.staging)) fs.rmSync(journal.staging, { recursive: true, force: true });
+  } else if (journal.phase === "disk-swapped-db-pending") {
+    if (!fs.existsSync(destination)) throw new Error(`pending cloud install destination is missing for ${slug}`);
+    if (journal.hadExisting !== fs.existsSync(journal.backup)) {
+      throw new Error(`pending cloud install backup state is invalid for ${slug}`);
+    }
+    rollbackCloudInstallSwapCli({
+      destination,
+      staging: journal.staging,
+      backup: journal.backup,
+      movedExisting: Boolean(journal.hadExisting),
+      installed: true,
+    });
+  }
+  fs.unlinkSync(journalPath);
+  cloudFsyncDirectoryCli(parent);
+}
+
+function recoverCloudInstallJournalsCli(db) {
+  const parent = path.join(userDataDir(), "cloud-agent-installs");
+  if (!fs.existsSync(parent)) return 0;
+  let recovered = 0;
+  for (const entry of fs.readdirSync(parent, { withFileTypes: true })) {
+    if (!entry.name.endsWith(".install-journal.json")) continue;
+    const match = entry.name.match(/^\.([a-z0-9][a-z0-9-]{0,63})\.install-journal\.json$/);
+    if (!match || cloudSlug(match[1]) !== match[1] || !entry.isFile() || entry.isSymbolicLink()) {
+      throw new Error(`invalid cloud install recovery journal entry: ${entry.name}`);
+    }
+    recoverCloudInstallJournalCli(db, match[1]);
+    recovered += 1;
+  }
+  return recovered;
 }
 
 function resolveCloudInstallPathCli(root, relPath) {
-  const normalized = String(relPath || "").replace(/\\/g, "/");
-  if (!normalized || normalized.startsWith("/") || normalized.includes("\0")) {
-    fail(`unsafe cloud package path: ${relPath}`);
+  const normalized = cloudPortableRelativePath(relPath);
+  if (!normalized || cloudPortablePathKey(normalized) === cloudPortablePathKey(CLOUD_RESTORE_MARKER_PATH)) {
+    throw new Error(`unsafe cloud package path: ${relPath}`);
   }
-  const parts = normalized.split("/").filter((part) => part && part !== ".");
-  if (parts.length === 0 || parts.some((part) => part === "..")) {
-    fail(`unsafe cloud package path: ${relPath}`);
-  }
+  const parts = normalized.split("/");
   const target = path.resolve(root, ...parts);
   const relative = path.relative(root, target);
   if (relative.startsWith("..") || path.isAbsolute(relative)) {
-    fail(`cloud package path escapes install folder: ${relPath}`);
+    throw new Error(`cloud package path escapes install folder: ${relPath}`);
   }
   return target;
 }
 
 function printCloudPackageResult(result) {
   out(`${result.status === "blocked" ? "✖" : "✓"} ${result.summary}`);
+  out(`  target:  ${result.manifest.visibility === "marketplace" ? "Agentlas Hub (public)" : "Agent Cloud (owner-private)"}`);
   out(`  slug:    ${result.manifest.slug}`);
   out(`  files:   ${result.manifest.includedFileCount}/${result.manifest.fileCount}`);
   out(`  hash:    ${result.manifest.packageHash}`);
@@ -1463,11 +2651,106 @@ function printCloudPackageResult(result) {
     out("  findings:");
     for (const f of findings.slice(0, 20)) out(`    - ${f.severity} ${f.file ? f.file + ": " : ""}${f.message}`);
   }
-  if (result.registration) out(`  cloud:   ${result.registration.marketplaceUrl || result.registration.url || result.registration.cloudId}`);
+  if (result.registration) {
+    const label = result.manifest.visibility === "marketplace" ? "hub" : "cloud";
+    out(`  ${label}:     ${result.registration.marketplaceUrl || result.registration.url || result.registration.cloudId}`);
+    if (result.registration.localStateWarning) out(`  warning: ${result.registration.localStateWarning}`);
+  }
 }
 
-function cloudReadName(rootPath) {
-  const manifest = cloudReadPackageJson(rootPath);
+function cloudPackageSnapshot(files) {
+  return new Map(files.map((file) => [file.path, file]));
+}
+function cloudReadPublicCareerCard(snapshot, findings) {
+  const relativePath = ".agentlas/public-career-card.json";
+  const file = snapshot.get(relativePath);
+  if (!file) return undefined;
+  let parsed;
+  try { parsed = JSON.parse(Buffer.from(file.contentBase64, "base64").toString("utf8")); }
+  catch {
+    findings.push(cloudCareerFinding("career-card-invalid-json", "structure", "Career Graph public card is not valid JSON."));
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || parsed.kind !== "agentlas-public-career-card") {
+    findings.push(cloudCareerFinding("career-card-invalid-kind", "structure", "Career Graph public card has an invalid kind."));
+    return undefined;
+  }
+  const privacy = parsed.privacy && typeof parsed.privacy === "object" && !Array.isArray(parsed.privacy) ? parsed.privacy : {};
+  for (const key of ["rawLocalPathsIncluded", "rawPromptsIncluded", "rawTranscriptsIncluded", "sourceTextIncluded"]) {
+    if (privacy[key] !== false) findings.push(cloudCareerFinding(`career-card-privacy-${key}`, "policy", `Career Graph public card must set privacy.${key}=false.`));
+  }
+  if (cloudContainsAbsoluteLocalPath(JSON.stringify(parsed))) {
+    findings.push(cloudCareerFinding("career-card-local-path", "policy", "Career Graph public card contains a local absolute path."));
+  }
+  if (findings.some((finding) => finding.severity === "blocker" && finding.id.startsWith("career-card-"))) return undefined;
+  return cloudSanitizePublicCareerCard(parsed);
+}
+function cloudCareerFinding(id, category, message) {
+  return {
+    id,
+    severity: "blocker",
+    category,
+    file: ".agentlas/public-career-card.json",
+    message,
+    remediation: "Regenerate a redacted aggregate-only public Career Graph card before publishing.",
+  };
+}
+function cloudContainsAbsoluteLocalPath(value) {
+  return (
+    (os.homedir() && value.includes(os.homedir())) ||
+    /(?:^|["'\s:(])\/(?:Users|home|var|tmp|private|Volumes|opt|etc)\//i.test(value) ||
+    /(?:^|["'\s:(])[A-Za-z]:[\\/]/.test(value) ||
+    /(?:^|["'\s:(])\\\\[^\\\s]+\\/.test(value)
+  );
+}
+function cloudSanitizePublicCareerCard(parsed) {
+  const card = { kind: "agentlas-public-career-card" };
+  for (const [key, max] of [["schemaVersion", 80], ["generatedAt", 80], ["projectName", 200], ["indexStatus", 80], ["policy", 160]]) {
+    if (typeof parsed[key] === "string" && parsed[key].length <= max) card[key] = parsed[key];
+  }
+  card.privacy = {
+    rawLocalPathsIncluded: false,
+    rawPromptsIncluded: false,
+    rawTranscriptsIncluded: false,
+    sourceTextIncluded: false,
+  };
+  for (const key of ["counts", "sourceKinds", "nodeTypes", "edgeTypes"]) {
+    const safe = cloudSanitizeCountRecord(parsed[key]);
+    if (safe) card[key] = safe;
+  }
+  for (const key of ["canonicalSources", "staleSourceCount"]) {
+    if (Number.isSafeInteger(parsed[key]) && parsed[key] >= 0) card[key] = parsed[key];
+  }
+  return card;
+}
+function cloudSanitizeCountRecord(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const result = {};
+  for (const [key, count] of Object.entries(value).slice(0, 200)) {
+    if (/^[A-Za-z0-9_.:-]{1,80}$/.test(key) && Number.isSafeInteger(count) && count >= 0) result[key] = count;
+  }
+  return Object.keys(result).length ? result : undefined;
+}
+function cloudReplacePublicCareerCard(scan, card) {
+  const relativePath = ".agentlas/public-career-card.json";
+  const includedIndex = scan.included.findIndex((file) => file.path === relativePath);
+  const existing = includedIndex >= 0 ? scan.included[includedIndex] : null;
+  if (includedIndex >= 0) scan.included.splice(includedIndex, 1);
+  const fileRecord = scan.files.find((file) => file.path === relativePath);
+  if (!card) {
+    if (fileRecord) { fileRecord.included = false; fileRecord.reason = "public-career-card-blocked"; }
+    return;
+  }
+  const bytes = Buffer.from(JSON.stringify(card, null, 2) + "\n", "utf8");
+  const replacement = { path: relativePath, bytes: bytes.length, sha256: sha(bytes), contentBase64: bytes.toString("base64"), executable: false };
+  scan.included.push(replacement);
+  scan.included.sort(cloudCodePointPathOrder);
+  scan.totalBytes += bytes.length - (existing?.bytes || 0);
+  if (fileRecord) Object.assign(fileRecord, { bytes: bytes.length, sha256: replacement.sha256, kind: "text", executable: false, included: true, reason: undefined });
+  else scan.files.push({ path: relativePath, bytes: bytes.length, sha256: replacement.sha256, kind: "text", executable: false, included: true });
+}
+function cloudReadName(snapshot, fallbackName) {
+  const manifest = cloudReadPackageJson(snapshot);
   const explicit = stringFirstCli(
     manifest.agentlas?.displayName,
     manifest.agentlas?.name,
@@ -1476,12 +2759,12 @@ function cloudReadName(rootPath) {
     manifest.routingCard?.name,
   );
   if (explicit) return explicit.replace(/\s+/g, " ").trim().slice(0, 80);
-  const text = cloudReadFirst(rootPath, ["agent.md", "AGENT.md", "README.md", "CLAUDE.md", "AGENTS.md"], 2000);
+  const text = cloudReadFirst(snapshot, ["agent.md", "AGENT.md", "README.md", "CLAUDE.md", "AGENTS.md"], 2000);
   const heading = text.match(/^#\s+(.+)$/m);
-  return (heading ? heading[1] : path.basename(rootPath)).replace(/\s+/g, " ").trim().slice(0, 80);
+  return (heading ? heading[1] : fallbackName).replace(/\s+/g, " ").trim().slice(0, 80);
 }
-function cloudReadTagline(rootPath) {
-  const manifest = cloudReadPackageJson(rootPath);
+function cloudReadTagline(snapshot) {
+  const manifest = cloudReadPackageJson(snapshot);
   const explicit = stringFirstCli(
     manifest.agentlas?.summary,
     manifest.agentlas?.description,
@@ -1490,15 +2773,15 @@ function cloudReadTagline(rootPath) {
     manifest.routingCard?.summary,
   );
   if (explicit) return explicit.replace(/\s+/g, " ").trim().slice(0, 160);
-  const text = cloudReadFirst(rootPath, ["README.md", "agent.md", "AGENT.md"], 3000);
+  const text = cloudReadFirst(snapshot, ["README.md", "agent.md", "AGENT.md"], 3000);
   for (const line of text.split(/\r?\n/)) {
     const t = line.trim();
     if (t && !t.startsWith("#") && !t.startsWith(">")) return t.slice(0, 160);
   }
   return "Portable Agentlas cloud agent package.";
 }
-function cloudReadStableSlug(rootPath) {
-  const manifest = cloudReadPackageJson(rootPath);
+function cloudReadStableSlug(snapshot) {
+  const manifest = cloudReadPackageJson(snapshot);
   return stringFirstCli(
     manifest.agentlas?.slug,
     manifest.agentlas?.id,
@@ -1509,13 +2792,19 @@ function cloudReadStableSlug(rootPath) {
     manifest.routingCard?.agent_card_ref?.slug,
   );
 }
-function cloudReadPackageJson(rootPath) {
+function cloudReadPackageJson(snapshot) {
   return {
-    agentlas: readJsonObjectCli(path.join(rootPath, "agentlas.json"), {}),
-    manifest: readJsonObjectCli(path.join(rootPath, "manifest.json"), {}),
-    agentCard: readJsonObjectCli(path.join(rootPath, ".agentlas", "agent-card.json"), {}),
-    routingCard: readJsonObjectCli(path.join(rootPath, ".agentlas", "routing-card.json"), {}),
+    agentlas: cloudReadSnapshotJson(snapshot, "agentlas.json"),
+    manifest: cloudReadSnapshotJson(snapshot, "manifest.json"),
+    agentCard: cloudReadSnapshotJson(snapshot, ".agentlas/agent-card.json"),
+    routingCard: cloudReadSnapshotJson(snapshot, ".agentlas/routing-card.json"),
   };
+}
+function cloudReadSnapshotJson(snapshot, relativePath) {
+  try {
+    const parsed = JSON.parse(cloudReadSnapshotText(snapshot, relativePath));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch { return {}; }
 }
 function stringFirstCli(...values) {
   for (const value of values) {
@@ -1523,38 +2812,301 @@ function stringFirstCli(...values) {
   }
   return "";
 }
-function cloudReadFirst(rootPath, names, maxChars) {
+function cloudReadFirst(snapshot, names, maxChars) {
   for (const name of names) {
-    const file = path.join(rootPath, name);
-    try {
-      const stat = fs.statSync(file);
-      if (stat.isFile() && stat.size <= CLOUD_MAX_FILE_BYTES) return fs.readFileSync(file, "utf8").slice(0, maxChars);
-    } catch { /* continue */ }
+    const text = cloudReadSnapshotText(snapshot, name);
+    if (text) return text.slice(0, maxChars);
   }
   return "";
 }
-function cloudInferKind(rootPath) {
-  for (const name of ["TEAM.md", "team.json", "agents", "team", "departments", "hr-departments"]) {
-    if (fs.existsSync(path.join(rootPath, name))) return "team";
-  }
+function cloudReadSnapshotText(snapshot, relativePath) {
+  const file = snapshot.get(relativePath);
+  return file ? Buffer.from(file.contentBase64, "base64").toString("utf8") : "";
+}
+function cloudInferKind(snapshot) {
+  const paths = [...snapshot.keys()];
+  if (paths.some((file) => file === "TEAM.md" || file === "team.json" || /^(?:agents|team|departments|hr-departments)\//.test(file))) return "team";
   return "agent";
+}
+function cloudDetectRuntimeLabels(snapshot) {
+  const paths = new Set(snapshot.keys());
+  const labels = [];
+  if (paths.has("CLAUDE.md") || [...paths].some((file) => file.startsWith(".claude/"))) labels.push("claude-code");
+  if (paths.has("AGENTS.md")) labels.push("codex");
+  if (paths.has("GEMINI.md")) labels.push("gemini");
+  if (paths.has(".cursorrules") || [...paths].some((file) => file.startsWith(".cursor/"))) labels.push("cursor");
+  return labels.length ? labels : ["generic"];
 }
 function cloudPackageDir(slug) {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   return path.join(userDataDir(), "cloud-agent-packages", `${slug}-${stamp}`);
 }
-function cloudHashPackage(files) {
+function cloudPackageHashVersion(value) {
+  if (value === undefined || value === null || value === "") return CLOUD_PACKAGE_HASH_V1;
+  if (value === CLOUD_PACKAGE_HASH_V1 || value === CLOUD_PACKAGE_HASH_V2) return value;
+  return null;
+}
+function cloudHashPackage(files, version = CLOUD_PACKAGE_HASH_V1) {
+  const hashVersion = cloudPackageHashVersion(version);
+  if (!hashVersion) throw new Error(`unsupported cloud package hash version: ${version}`);
   const h = crypto.createHash("sha256");
-  // 서버(register/route.ts hashPackage)와 바이트 동일해야 한다: 경로 코드포인트 순 정렬.
+  // 서버 package-contract.ts와 바이트 동일해야 한다: 경로 코드포인트 순 정렬.
   // 정렬 없이 스캔 순서로 해시하면 대소문자 혼합 경로 패키지(AGENTS.md + agents/…)가
   // 전부 package_hash_mismatch로 거절된다(2026-07-02 근본 수정).
-  for (const file of [...files].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))) {
+  for (const file of [...files].sort(cloudCodePointPathOrder)) {
     h.update(file.path);
     h.update("\0");
     h.update(file.sha256);
     h.update("\0");
+    if (hashVersion === CLOUD_PACKAGE_HASH_V2) {
+      h.update(file.executable ? "x" : "-");
+      h.update("\0");
+    }
   }
   return h.digest("hex");
+}
+function cloudCodePointPathOrder(a, b) {
+  return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
+}
+function cloudPortablePathKey(value) {
+  return String(value).normalize("NFC").toLowerCase();
+}
+function cloudPortableRelativePath(value) {
+  if (typeof value !== "string" || !value || value !== value.normalize("NFC")) return null;
+  if (value.includes("\\") || value.includes("\0") || value.startsWith("/") || value.endsWith("/")) return null;
+  if (value.includes("//") || value.length > 260) return null;
+  const parts = value.split("/");
+  for (const part of parts) {
+    if (!part || part === "." || part === "..") return null;
+    if (part.length > 255 || Buffer.byteLength(part, "utf8") > 255 || cloudHasUnpairedSurrogate(part)) return null;
+    if (/[<>:"|?*\u0000-\u001f]/.test(part) || /[ .]$/.test(part)) return null;
+    if (/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part)) return null;
+  }
+  return value;
+}
+function cloudHasUnpairedSurrogate(value) {
+  for (let index = 0; index < value.length; index++) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+      index++;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) return true;
+  }
+  return false;
+}
+function cloudPortablePathConflict(paths) {
+  const files = new Map();
+  const directories = new Map();
+  for (const value of paths) {
+    if (typeof value !== "string" || !value) continue;
+    const fileKey = cloudPortablePathKey(value);
+    const existingFile = files.get(fileKey);
+    if (existingFile) {
+      if (existingFile.path === value) {
+        return { code: "duplicate-path", message: `Cloud package repeats file path ${JSON.stringify(value)}.` };
+      }
+      return { code: "path-alias-collision", message: `Cloud package paths ${JSON.stringify(existingFile.path)} and ${JSON.stringify(value)} alias after Unicode NFC normalization and case-folding.` };
+    }
+    files.set(fileKey, { path: value });
+    const parts = value.split("/");
+    for (let index = 1; index < parts.length; index++) {
+      const directory = parts.slice(0, index).join("/");
+      const directoryKey = cloudPortablePathKey(directory);
+      const existingDirectory = directories.get(directoryKey);
+      if (existingDirectory && existingDirectory.directory !== directory) {
+        return {
+          code: "path-alias-collision",
+          message: `Ancestor directories ${JSON.stringify(existingDirectory.directory)} (from ${JSON.stringify(existingDirectory.sourcePath)}) and ${JSON.stringify(directory)} (from ${JSON.stringify(value)}) alias after Unicode NFC normalization and case-folding.`,
+        };
+      }
+      if (!existingDirectory) directories.set(directoryKey, { directory, sourcePath: value });
+    }
+  }
+  for (const [key, file] of files) {
+    const directory = directories.get(key);
+    if (!directory) continue;
+    if (file.path === directory.directory) {
+      return { code: "path-type-collision", message: `Cloud package path ${JSON.stringify(file.path)} is both a file and an ancestor directory.` };
+    }
+    return {
+      code: "path-alias-collision",
+      message: `File path ${JSON.stringify(file.path)} aliases ancestor directory ${JSON.stringify(directory.directory)} from ${JSON.stringify(directory.sourcePath)} after Unicode NFC normalization and case-folding.`,
+    };
+  }
+  return null;
+}
+function cloudReadRestoreExecutablePaths(rootPath) {
+  if (process.platform !== "win32") return new Set();
+  const marker = path.join(rootPath, CLOUD_RESTORE_MARKER_PATH);
+  try {
+    const parsed = JSON.parse(fs.readFileSync(marker, "utf8"));
+    if (cloudPackageHashVersion(parsed.packageHashVersion) !== CLOUD_PACKAGE_HASH_V2) return new Set();
+    if (!Array.isArray(parsed.executablePaths)) return new Set();
+    return new Set(parsed.executablePaths
+      .filter((value) => cloudPortableRelativePath(value))
+      .map((value) => cloudPortablePathKey(value)));
+  } catch {
+    return new Set();
+  }
+}
+function cloudPortableExecutableForFile(relativePath, statMode, restoredExecutablePaths, platform = process.platform) {
+  if (platform === "win32") return restoredExecutablePaths.has(cloudPortablePathKey(relativePath));
+  return Boolean(statMode & 0o111);
+}
+function cloudApplyPrivateDirectoryMode(directoryPath, platform = process.platform) {
+  if (platform === "win32") return;
+  fs.chmodSync(directoryPath, 0o700);
+  const actual = fs.statSync(directoryPath).mode & 0o777;
+  if (actual !== 0o700) throw new Error(`cloud restore directory mode verification failed: ${directoryPath}`);
+}
+function cloudApplyPortableFileMode(filePath, mode, platform = process.platform) {
+  if (platform === "win32") return;
+  fs.chmodSync(filePath, mode);
+  const actual = fs.statSync(filePath).mode & 0o777;
+  if (actual !== mode) throw new Error(`cloud restore file mode verification failed: ${filePath}`);
+}
+function cloudVerifyRestoredSnapshot(root, files, expected) {
+  const expectedByPath = new Map(files.map((file) => [file.path, file]));
+  const seen = new Set();
+  function walk(dir) {
+    const dirStat = fs.lstatSync(dir);
+    if (!dirStat.isDirectory() || dirStat.isSymbolicLink()) throw new Error("cloud restore staging contains an unsafe directory");
+    if (process.platform !== "win32" && (dirStat.mode & 0o777) !== 0o700) throw new Error("cloud restore staging directory mode mismatch");
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const absolute = path.join(dir, entry.name);
+      const relative = path.relative(root, absolute).split(path.sep).join("/");
+      if (relative === CLOUD_RESTORE_MARKER_PATH) continue;
+      const stat = fs.lstatSync(absolute);
+      if (stat.isSymbolicLink()) throw new Error("cloud restore staging contains a symbolic link");
+      if (stat.isDirectory()) { walk(absolute); continue; }
+      if (!stat.isFile()) throw new Error("cloud restore staging contains a special filesystem entry");
+      const expectedFile = expectedByPath.get(relative);
+      if (!expectedFile || seen.has(relative)) throw new Error(`cloud restore staging has an unexpected file: ${relative}`);
+      const bytes = fs.readFileSync(absolute);
+      if (bytes.length !== expectedFile.bytes || sha(bytes) !== expectedFile.sha256) {
+        throw new Error(`cloud restore staging file integrity mismatch: ${relative}`);
+      }
+      if (process.platform !== "win32") {
+        const mode = expected.packageHashVersion === CLOUD_PACKAGE_HASH_V2 && expectedFile.executable ? 0o700 : 0o600;
+        if ((stat.mode & 0o777) !== mode) throw new Error(`cloud restore staging file mode mismatch: ${relative}`);
+      }
+      seen.add(relative);
+    }
+  }
+  walk(root);
+  if (seen.size !== expectedByPath.size) throw new Error("cloud restore staging is missing package files");
+  const markerPath = path.join(root, CLOUD_RESTORE_MARKER_PATH);
+  const markerStat = fs.lstatSync(markerPath);
+  if (!markerStat.isFile() || markerStat.isSymbolicLink()) throw new Error("cloud restore marker is unsafe");
+  if (process.platform !== "win32" && (markerStat.mode & 0o777) !== 0o600) throw new Error("cloud restore marker mode mismatch");
+  const marker = JSON.parse(fs.readFileSync(markerPath, "utf8"));
+  const expectedExecutablePaths = expected.packageHashVersion === CLOUD_PACKAGE_HASH_V2
+    ? files.filter((file) => file.executable).map((file) => file.path).sort()
+    : undefined;
+  if (
+    marker.schemaVersion !== 1 || marker.source !== "agentlas-cloud" || marker.slug !== expected.slug ||
+    String(marker.packageHash).replace(/^sha256:/i, "").toLowerCase() !== expected.packageHash ||
+    marker.packageHashVersion !== expected.packageHashVersion || marker.fileCount !== files.length ||
+    marker.totalBytes !== expected.totalBytes || typeof marker.restoredAt !== "string" ||
+    !Number.isFinite(Date.parse(marker.restoredAt)) ||
+    JSON.stringify(marker.executablePaths) !== JSON.stringify(expectedExecutablePaths)
+  ) {
+    throw new Error("cloud restore marker contract mismatch");
+  }
+  if (expected.assetDescriptor) {
+    const descriptor = normalizeCloudAssetDescriptorCli(marker, "cloud restore marker");
+    const nested = normalizeCloudAssetDescriptorCli(marker.cloudAssets?.[descriptor.scope], "cloud restore marker scope");
+    if (
+      JSON.stringify(descriptor) !== JSON.stringify(expected.assetDescriptor) ||
+      JSON.stringify(nested) !== JSON.stringify(expected.assetDescriptor)
+    ) {
+      throw new Error("cloud restore marker revision contract mismatch");
+    }
+  }
+}
+function cloudDecodeUtf16CredentialText(bytes) {
+  if (bytes.length < 4) return null;
+  if (bytes[0] === 0xff && bytes[1] === 0xfe) {
+    return bytes.subarray(2, bytes.length - ((bytes.length - 2) % 2)).toString("utf16le");
+  }
+  if (bytes[0] === 0xfe && bytes[1] === 0xff) {
+    const body = Buffer.from(bytes.subarray(2, bytes.length - ((bytes.length - 2) % 2)));
+    body.swap16();
+    return body.toString("utf16le");
+  }
+  const sampleLength = Math.min(bytes.length - (bytes.length % 2), 4096);
+  if (sampleLength < 8) return null;
+  let oddNuls = 0;
+  let evenNuls = 0;
+  for (let index = 0; index < sampleLength; index += 2) {
+    if (bytes[index] === 0) evenNuls++;
+    if (bytes[index + 1] === 0) oddNuls++;
+  }
+  const pairs = sampleLength / 2;
+  const fullLength = bytes.length - (bytes.length % 2);
+  if (oddNuls / pairs > 0.3) return bytes.subarray(0, fullLength).toString("utf16le");
+  if (evenNuls / pairs > 0.3) {
+    const body = Buffer.from(bytes.subarray(0, fullLength));
+    body.swap16();
+    return body.toString("utf16le");
+  }
+  return null;
+}
+function cloudDecodeTextAsset(bytes) {
+  const utf16 = cloudDecodeUtf16CredentialText(bytes);
+  if (utf16 !== null) return { ok: true, text: utf16 };
+  try {
+    return { ok: true, text: new TextDecoder("utf-8", { fatal: true }).decode(bytes) };
+  } catch {
+    return { ok: false };
+  }
+}
+function cloudCredentialValueLooksReal(rawValue) {
+  let value = String(rawValue || "").trim().replace(/^['"]|['"]$/g, "").trim();
+  try { value = decodeURIComponent(value); } catch { /* keep raw */ }
+  if (value.length < 8) return false;
+  if (/^(?:\$\{[^}]+\}|\$[A-Z_][A-Z0-9_]*|\{\{[^}]+\}\}|<[^>]+>)$/i.test(value)) return false;
+  if (/^(?:process\.env\.|os\.environ|env\(|secret\(|vault:)/i.test(value)) return false;
+  const compact = value.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  if (/^(?:your|example|sample|dummy|placeholder|configure|configureonthismachine|changeme|replaceme|replacewith|redacted|masked|notareal|none|null|undefined|x+|star+)(?:api)?(?:key|secret|token|password)?(?:here)?$/.test(compact)) return false;
+  if (/^(?:\*+|x+|_+|-+)$/.test(value)) return false;
+  return true;
+}
+function cloudTextContainsStructuredCredential(text) {
+  const assignment = /(?:^|\n)\s*["']?(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|secret|token|password|passwd|pwd)["']?\s*[:=]\s*([^\r\n#;]+)/gi;
+  for (const match of text.matchAll(assignment)) {
+    if (cloudCredentialValueLooksReal(match[1])) return true;
+  }
+  const urlCredential = /\bhttps?:\/\/[^/\s:@]+:([^@\s/]{8,})@/gi;
+  for (const match of text.matchAll(urlCredential)) {
+    if (cloudCredentialValueLooksReal(match[1])) return true;
+  }
+  const queryCredential = /[?&](?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|secret|token|password)=([^&#\s]+)/gi;
+  for (const match of text.matchAll(queryCredential)) {
+    if (cloudCredentialValueLooksReal(match[1])) return true;
+  }
+  return false;
+}
+function cloudAddSecretFindingsFromBytes(bytes, relativePath, addFinding) {
+  const candidates = new Set([bytes.toString("utf8")]);
+  const utf16 = cloudDecodeUtf16CredentialText(bytes);
+  if (utf16) candidates.add(utf16);
+  for (const text of candidates) {
+    for (const [id, re, label] of CLOUD_SECRET_RE) {
+      if (re.test(text)) addFinding(id, "blocker", "secret", `Possible ${label} found in package content.`, relativePath, "Remove the value and require users to configure their own key.");
+    }
+    if (cloudTextContainsStructuredCredential(text)) {
+      addFinding("generic-unquoted-secret", "blocker", "secret", "Possible unquoted or URL-embedded credential found in package content.", relativePath, "Replace the value with an environment/BYOK placeholder.");
+    }
+  }
+}
+function cloudCanonicalBase64(value) {
+  if (typeof value !== "string") return false;
+  if (value === "") return true;
+  if (value.length % 4 !== 0) return false;
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) return false;
+  return Buffer.from(value, "base64").toString("base64") === value;
 }
 function cloudSecuritySummary(findings) {
   const blockerCount = findings.filter((f) => f.severity === "blocker").length;
@@ -6539,7 +8091,7 @@ function launchInteractive(db, agent, runtimeOverride) {
     id: agent.id,
     slug: agent.slug,
     label: agent.name,
-    system: agent.system_prompt || `You are ${agent.name}.`,
+    system: agentSystemPromptCli(agent),
     capAgent: agent,
   };
   return launchTui(db, subject, runtimeOverride);
@@ -6570,7 +8122,7 @@ function buildHelpers(db) {
     autoRoutePreamble: (choice, lang) => autoRoutePreamble(choice, lang),
     cliMemoryContext: (db_, pp) => cliMemoryContext(db_, pp),
     importLocal: (db_, p) => importLocalFolderCli(db_, p),
-    // REPL-safe 마켓플레이스 설치: fail()(process.exit) 대신 Error를 throw 해 REPL이 직접 렌더하게 한다.
+    // REPL-safe public Hub install: fail()(process.exit) 대신 Error를 throw 해 REPL이 직접 렌더하게 한다.
     cloudInstall: async (db_, slug) => {
       if (typeof fetch !== "function") throw new Error("이 런타임에 fetch가 없습니다(앱 런타임 필요).");
       const base = process.env.AGENTLAS_MCP_BASE_URL || "https://agentlas.cloud/api/mcp/v1";
@@ -6585,16 +8137,19 @@ function buildHelpers(db) {
           body: JSON.stringify({ method: "marketplace.get_manifest", params: { name: "marketplace.get_manifest", arguments: { kind: "agent", slug } } }),
         });
       } catch (e) {
-        throw new Error(`마켓플레이스 연결 실패: ${(e && e.message) || e}`);
+        throw new Error(`Hub 연결 실패: ${(e && e.message) || e}`);
       }
       if (!resp.ok) {
         const authHint = resp.status === 401 || resp.status === 403 ? " — 로그인이 필요합니다 (앱에서 로그인 또는 AGENTLAS_SESSION 설정)" : "";
-        throw new Error(`마켓플레이스 응답 ${resp.status}${authHint}`);
+        throw new Error(`Hub 응답 ${resp.status}${authHint}`);
       }
       const json = parseHubJsonCli(resp, "marketplace.get_manifest");
-      if (json.error) throw new Error(json.error.message || "marketplace error");
+      if (json.error) throw new Error(json.error.message || "Hub error");
       const listing = json.result;
-      if (!listing) throw new Error(`마켓플레이스에서 찾을 수 없음: ${slug}`);
+      if (!listing) throw new Error(`Hub에서 찾을 수 없음: ${slug}`);
+      if (listing.delivery && listing.delivery.mode === "call_only") {
+        throw new Error(`이 Hub 에이전트는 call-only 자산입니다. 실행: agentlas call ${slug}`);
+      }
       return persistCloudListingCli(db_, listing);
     },
     hasCloudSession: async () => {
@@ -6937,7 +8492,7 @@ function cmdList(db) {
 
 function ensureNativeFiles(agent, folder) {
   fs.mkdirSync(folder, { recursive: true });
-  const sys = agent.system_prompt || `You are ${agent.name}.`;
+  const sys = agentSystemPromptCli(agent);
   writeIfMissing(path.join(folder, "system-prompt.md"), sys);
   const header = `# ${agent.name}\n\n${agent.tagline || ""}\n\n${sys}\n`;
   // 네이티브 CLI가 프로젝트 지시로 자동 인식하는 파일들
@@ -6974,7 +8529,7 @@ async function cmdRun(db, query, prompt, runtimeOverride) {
   if (!userPrompt) userPrompt = await readStdin();
   if (!userPrompt || !userPrompt.trim()) fail("프롬프트가 비어 있습니다. agentlas run <agent> \"...\" 또는 stdin으로 전달하세요.");
   process.stderr.write(`▸ ${agent.name}\n`);
-  const code = await executeOnce(db, agent.system_prompt || "", userPrompt.trim(), runtimeOverride, { projectPath: activeProjectPath(db), agentId: agent.id, permission: PERMISSION });
+  const code = await executeOnce(db, agentSystemPromptCli(agent), userPrompt.trim(), runtimeOverride, { projectPath: activeProjectPath(db), agentId: agent.id, permission: PERMISSION });
   process.exit(code);
 }
 
@@ -6984,7 +8539,7 @@ async function cmdAutoRun(db, prompt, runtimeOverride) {
   if (!choice) fail("자동 라우팅할 에이전트가 없습니다. agentlas list로 설치 상태를 확인하세요.");
   process.stderr.write(`▸ ${choice.agent.name} (auto)\n`);
   process.stderr.write(`  ${autoRouteNote(choice, lang)}\n`);
-  const sys = `${autoRoutePreamble(choice, lang)}\n\n${choice.agent.system_prompt || ""}`;
+  const sys = `${autoRoutePreamble(choice, lang)}\n\n${agentSystemPromptCli(choice.agent)}`;
   const code = await executeOnce(db, sys, prompt.trim(), runtimeOverride, {
     projectPath: activeProjectPath(db),
     agentId: choice.agent.id,
@@ -8377,7 +9932,8 @@ function cmdHelp() {
       "  search \"<what you need>\" discover agents in the Hub + local            (hep-search)",
       "  install <slug>           install an agent from the Hub                    (hep-cloud)",
       "  build \"<request>\"        build/repair/package an agent or team           (hep-build)",
-      "  upload <path>            package + publish an agent to the Hub            (hep-upload)",
+      "  upload <path>            save owner-private in Agent Cloud (default)       (hep-upload)",
+      "    --visibility marketplace  explicit compatibility flag: publish to Hub",
       "  connect [<sub>]          wire Telegram / platforms to an agent team       (hep-connect)",
       "  import <path>            import a local agent/team folder",
       "  list                     installed agents/companies + active runtime",
@@ -8410,7 +9966,7 @@ function cmdHelp() {
       hdr("ADVANCED"),
       "  hep <sub…>               full Hephaestus passthrough (wizard·security·cards·ao·plugins·meta-agent…)",
       "  netadmin <sub>           local network admin: init|status|reindex|bench|add-source",
-      "  cloud <sub>              agent packaging: wizard|security|bundle|package|publish|field-test",
+      "  cloud <sub>              cloud assets: save|publish|package|list|restore|field-test",
       "  cd <agent>               print the agent folder — cd \"$(agentlas cd seo)\" && claude",
       "  oberon <sub>             AI film render (scaffold|render|list)",
       "",
@@ -8461,6 +10017,10 @@ async function main() {
   if (cmd === "update") return cmdUpdate(rest.slice(1));
 
   const db = openDb();
+
+  // Finish or compensate any Cloud install interrupted between the durable
+  // filesystem swap and the SQLite transaction before normal agent resolution.
+  recoverCloudInstallJournalsCli(db);
 
   // Agentlas 아키텍처 빌트인 에이전트를 보장(앱과 동일, 멱등·버전 게이팅). 스키마가 준비됐을 때만.
   try { seedBuiltins(db); } catch { /* best-effort */ }
@@ -8520,12 +10080,14 @@ async function main() {
     case "search": // hep-search — 에이전트 디렉터리 발견 (Hub + 로컬)
       if (!rest[1]) return fail('usage: agentlas search "<찾는 일>" [--limit 10]');
       return parity().cloudSearch(db, rest.slice(1));
-    case "install": // hep-cloud import — slug로 에이전트 설치
+    case "install": // public Hub package install — slug로 에이전트 설치
       if (!rest[1]) return fail('usage: agentlas install <slug>   (먼저 agentlas search "할 일" 로 찾으세요)');
       return cmdCloudInstall(db, rest[1]);
-    case "upload": // hep-upload — 컴파일된 에이전트를 Hub로 배포 (경로 필요)
-      if (!rest[1]) return fail("usage: agentlas upload <에이전트 폴더 경로>   (패키징 후 Hub 배포)");
-      return cmdCloud(db, ["publish", ...rest.slice(1)], runtimeOverride);
+    case "upload": { // 기본은 owner-private Agent Cloud, public Hub는 명시 flag로만.
+      if (!rest[1]) return fail("usage: agentlas upload <에이전트 폴더 경로> [--visibility marketplace]");
+      const uploadArgs = rest.slice(1);
+      return cmdCloud(db, [cloudActionForTopLevelUpload(uploadArgs), ...uploadArgs], runtimeOverride);
+    }
     case "connect": // hep-connect — Telegram 등 플랫폼 연결
       return parity().cmdHep(db, ["hep-connect", ...rest.slice(1)]);
     case "browser": // hep-browser — 실제 브라우저 실행 하드포인트
@@ -8613,6 +10175,24 @@ module.exports = {
   replaceMacAppBundle,
   captureRuntime,
   captureOutputLimit,
+  materializeCloudListingCli,
+  recoverCloudInstallJournalCli,
+  recoverCloudInstallJournalsCli,
+  persistCloudListingCli,
+  cloudSystemPromptFromPackageCli,
+  agentSystemPromptCli,
+  listOwnedCloudAgentsCli,
+  restoreOwnedCloudAgentCli,
+  deleteCloudAgentCli,
+  readCloudAssetStateCli,
+  normalizeCloudAssetDescriptorCli,
+  packageCloudAgentCli,
+  cloudVisibilityForAction,
+  cloudActionForTopLevelUpload,
+  cloudHashPackage,
+  cloudPackageHashVersion,
+  cloudPortablePathConflict,
+  cloudPortableExecutableForFile,
   DEFAULT_API_MODEL,
   ANTHROPIC_COMPAT_API,
 };

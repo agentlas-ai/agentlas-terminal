@@ -31,6 +31,10 @@ check "mcp"     node "$BIN" mcp
 check "chats"   node "$BIN" chats
 check "run-api-regression" node "$SCRIPT_DIR/run-api-regression.cjs"
 check "cloud-runtime-paths" node "$SCRIPT_DIR/cloud-runtime-paths.cjs"
+check "cloud-save-publish" node "$SCRIPT_DIR/cloud-save-publish.cjs"
+check "cloud-asset-restore" node "$SCRIPT_DIR/cloud-asset-restore.cjs"
+check "cloud-owner-restore" node "$SCRIPT_DIR/cloud-owner-restore.cjs"
+check "cloud-cas-client" node "$SCRIPT_DIR/cloud-cas-client.cjs"
 check "runtime-env-protection" node "$SCRIPT_DIR/runtime-env-protection.cjs"
 check "credential-env-regression" node "$SCRIPT_DIR/credential-env-regression.cjs"
 check "mcp-config-isolation" node "$SCRIPT_DIR/mcp-config-isolation.cjs"

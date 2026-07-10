@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { matches, normalizeRequestedPath, readAgentFile } = require("../engine/agentlas-cloud-runtime.cjs");
+const { buildManifest, matches, normalizeRequestedPath, readAgentFile } = require("../engine/agentlas-cloud-runtime.cjs");
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "agentlas-cloud-paths-"));
 try {
@@ -33,6 +33,7 @@ try {
   assert.equal(readAgentFile(root, "../outside.md").status, "denied");
   assert.equal(readAgentFile(root, "skills/../../outside.md").status, "denied");
   assert.equal(normalizeRequestedPath("skills\\nested\\docs\\guide.md"), "skills/nested/docs/guide.md");
+  assert.equal(buildManifest(root).createdBy, "agentlas-terminal-setup-wizard");
   console.log("cloud runtime glob/path containment: PASS");
 } finally {
   fs.rmSync(root, { recursive: true, force: true });

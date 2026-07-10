@@ -78,7 +78,7 @@ function buildManifest(root, options = {}) {
     publicExportPolicy: "clean-copy",
     requiredRuntime: ["mcp-client"],
     license: "call-only-default",
-    createdBy: "agentlas-desktop-setup-wizard",
+    createdBy: "agentlas-terminal-setup-wizard",
   };
 }
 

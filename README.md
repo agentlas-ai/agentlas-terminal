@@ -14,6 +14,17 @@ agents and teams, build new ones, and run the full Agentlas OS surface
 (`build` · `search` · `install` · `storm` · `network` · …) from one command.
 Claude Code style, standalone: **no desktop app required.**
 
+Agentlas Terminal is the already-shipped independent terminal product. It is
+not a Desktop `cli/` mirror and does not require the Desktop app to run.
+
+> **We are Agent Trust. Your agent is not a program. It is an asset. — Agentlas —**
+
+Agent Trust means owner-scoped, portable, inspectable, and restorable agent
+packages. It is a product principle, not a claim of regulated financial or
+legal trust services. Private Agent Cloud stores owned packages; this existing
+Terminal verifies and runs their local execution copies through supported
+runtimes.
+
 ```sh
 npm install -g agentlas
 agentlas
@@ -66,13 +77,29 @@ agentlas chats [n]                 # 최근 대화 목록
 **에이전트 & 허브** (Agentlas OS 표면)
 ```sh
 agentlas search "할 일"            # Hub에서 에이전트 발견            (hep-search)
-agentlas install <slug>            # Hub 에이전트 설치                (hep-cloud)
+agentlas install <slug>            # 공개 Hub 에이전트 설치           (hep-cloud)
 agentlas build "요청"              # 에이전트/팀 빌드·수리·패키징     (hep-build)
-agentlas upload <경로>             # 에이전트 패키징+Hub 배포         (hep-upload)
+agentlas upload <경로>             # 내 Agent Cloud에 비공개 저장    (hep-upload)
+agentlas upload <경로> --visibility marketplace
+                                  # 호환 flag: Agentlas Hub 공개 발행
 agentlas connect                   # Telegram/플랫폼 연결             (hep-connect)
 agentlas import <폴더>             # 로컬 에이전트/팀 임포트
 agentlas list                      # 설치된 에이전트/회사 + 활성 런타임
 ```
+
+**내 Agent Cloud 자산**
+```sh
+agentlas cloud save <경로>         # 소유자 전용 비공개 저장(공개 심사/라우팅 카드 없음)
+agentlas cloud publish <경로>      # Agentlas Hub에 명시적으로 공개 발행
+agentlas cloud list                # 로그인한 소유자의 비공개 패키지 조회
+agentlas cloud restore <slug>      # 전체 hash 검증 후 이 컴퓨터에 exact snapshot 복원
+```
+
+비공개 저장도 업로드 전 로컬에서 비밀값, 안전하지 않은 경로, 파일별 hash와
+전체 package hash를 검사한다. 공개 Hub 발행에만 라우팅 카드와 공개 검토가 붙는다.
+
+`agentlas cloud install <slug>`은 기존 호환 명령이며 공개 Hub 설치다. 비공개
+Agent Cloud 소유자 복원은 반드시 `agentlas cloud restore <slug>`를 사용한다.
 
 **실행 엔진**
 ```sh
@@ -107,7 +134,7 @@ agentlas setup                     # 온보딩 다시 실행
 ```sh
 agentlas hep <sub…>                # 전체 Hephaestus 패스스루 (wizard·security·cards·ao·plugins…)
 agentlas netadmin <sub>            # 로컬 네트워크 관리 (init|status|reindex|bench)
-agentlas cloud <sub>               # 에이전트 패키징 (wizard|security|bundle|package|publish)
+agentlas cloud <sub>               # 자산 저장·공개·복원 (save|publish|package|list|restore|…)
 ```
 
 공통 옵션: `--runtime claude-code|codex|gemini` · `--permission read|write|full`
