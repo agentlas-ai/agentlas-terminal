@@ -7815,7 +7815,7 @@ async function executeOnce(db, system, prompt, override, ctx) {
     const { Ui } = require("./agentlas-ui.cjs");
     const ui = new Ui({ lang: prefsLang() });
     let mcpServers = [];
-    if (permission !== "read") {
+    if (permission === "full") {
       try {
         mcpServers = db.prepare("SELECT id, name, transport, command, args_json, enabled FROM mcp_servers WHERE enabled=1 AND transport='stdio'").all();
       } catch { /* ignore */ }
@@ -7998,6 +7998,7 @@ function readVaultEnvValuesCli(keys, projectPath) {
 const PROTECTED_CHILD_ENV_KEYS_CLI = new Set([
   "HOME", "PATH", "PATHEXT", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
   "XDG_CONFIG_HOME", "XDG_DATA_HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_SAFE_MODE",
+  "AGENTLAS_CODEX_HOME", "AGENTLAS_USER_DATA_DIR",
   "CLAUDE_CODE_SIMPLE", "CLAUDE_PLUGIN_ROOT", "CLAUDE_PLUGIN_DATA", "CLAUDE_PROJECT_DIR",
   "GEMINI_CLI_HOME", "GEMINI_CLI_SYSTEM_SETTINGS_PATH", "GEMINI_CLI_USER_SETTINGS",
   "GEMINI_CLI_TRUSTED_FOLDERS_PATH", "GEMINI_CLI_TRUST_WORKSPACE", "GEMINI_CLI_EXTENSION_REGISTRY_URI",
@@ -8051,33 +8052,27 @@ async function buildChildEnvCli(db, ctx) {
   return env;
 }
 
-// 권한 → 네이티브 CLI 권한 모드 매핑 (앱의 claude-code.ts 와 동일 의미).
-//   read=기본(헤드리스에서 위험 툴 자동 거부) · write=편집 허용 · full=셸 포함 전체 자동.
+// One-shot/background capture uses the same permission truth as the interactive host.
+// Keep its plain-output argument shape, but never duplicate the security mapping here.
 function buildArgs(kind, systemPrompt, prompt, permission) {
+  const native = require("./agentlas-native-host.cjs");
+  const level = require("./agentlas-permissions.cjs").normalize(permission);
   if (kind === "claude-code") {
-    const perm =
-      permission === "full"
-        ? ["--permission-mode", "bypassPermissions"]
-        : permission === "write"
-          ? ["--permission-mode", "acceptEdits"]
-          : [];
-    const mcp = permission === "write" || permission === "full"
-      ? ["--mcp-config", cliMcpConfigPath(), "--allowedTools", "mcp__playwright"]
-      : [];
+    const perm = native.claudePermissionArgs(level);
+    const mcp = level === "full"
+      ? ["--strict-mcp-config", "--mcp-config", cliMcpConfigPath(), "--allowedTools", "mcp__playwright"]
+      : native.claudeMcpIsolationArgs();
     return ["-p", prompt, "--append-system-prompt", systemPrompt, ...perm, ...mcp];
   }
   if (kind === "codex") {
-    // codex exec: browser/account setup flows must not stall on approval prompts.
-    const perm =
-      permission === "full" || permission === "write"
-        ? ["--dangerously-bypass-approvals-and-sandbox"]
-        : ["--sandbox", "read-only", "--ask-for-approval", "never"];
-    const mcp = permission === "write" || permission === "full" ? CODEX_PLAYWRIGHT_MCP_ARGS : [];
+    const perm = native.codexPermissionArgs(level);
+    const mcp = level === "full" ? CODEX_PLAYWRIGHT_MCP_ARGS : [];
     return ["exec", "--skip-git-repo-check", ...perm, ...mcp, `[SYSTEM]\n${systemPrompt}\n\n${prompt}`];
   }
   if (kind === "gemini") {
-    const perm = permission === "full" || permission === "write" ? ["--yolo"] : [];
-    return ["--prompt", `[SYSTEM]\n${systemPrompt}\n\n${prompt}`, ...perm];
+    const perm = native.geminiPermissionArgs(level);
+    const mcp = level === "full" ? [] : native.geminiMcpIsolationArgs();
+    return ["--prompt", `[SYSTEM]\n${systemPrompt}\n\n${prompt}`, ...perm, ...mcp];
   }
   return [prompt];
 }
@@ -8262,10 +8257,11 @@ function spawnRuntime(kind, systemPrompt, prompt, opts) {
   const cwd = opts.cwd || runCwd();
   return new Promise((resolve) => {
     const bin = which(RUNTIME_BIN[kind]) || RUNTIME_BIN[kind];
+    const env = require("./agentlas-native-host.cjs").runtimeEnvForKind(kind, opts.env || process.env);
     const child = spawn(bin, buildArgs(kind, systemPrompt, prompt, opts.permission), {
       cwd,
       stdio: ["ignore", "inherit", "inherit"],
-      env: opts.env || process.env,
+      env,
     });
     child.on("error", (err) => {
       process.stderr.write(`\n실행 실패(${kind}): ${err.message}\n`);
@@ -8298,10 +8294,11 @@ function captureRuntime(kind, systemPrompt, prompt, opts) {
     let child;
     try {
       const spawnImpl = opts.spawn || spawn;
+      const env = require("./agentlas-native-host.cjs").runtimeEnvForKind(kind, opts.env || process.env);
       child = spawnImpl(bin, buildArgs(kind, systemPrompt, prompt, opts.permission), {
         cwd,
         stdio: ["ignore", "pipe", "pipe"],
-        env: opts.env || process.env,
+        env,
       });
     } catch (error) {
       reject(error);
@@ -10176,6 +10173,7 @@ module.exports = {
   verifyMacAppBundle,
   replaceMacAppBundle,
   captureRuntime,
+  buildArgs,
   captureOutputLimit,
   materializeCloudListingCli,
   recoverCloudInstallJournalCli,

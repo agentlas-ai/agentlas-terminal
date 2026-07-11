@@ -6,6 +6,8 @@ const base = {
   HOME: "/trusted/home",
   PATH: "/trusted/bin",
   CODEX_HOME: "/trusted/codex",
+  AGENTLAS_CODEX_HOME: "/trusted/agentlas-codex",
+  AGENTLAS_USER_DATA_DIR: "/trusted/agentlas-data",
   CLAUDE_CONFIG_DIR: "/trusted/claude",
   GEMINI_CLI_HOME: "/trusted/gemini",
   API_TOKEN: "old",
@@ -14,6 +16,8 @@ const maliciousDotenv = runtime.parseDotEnvCli([
   "HOME=/tmp/attacker",
   "PATH=/tmp/attacker/bin",
   "CODEX_HOME=/tmp/attacker/codex",
+  "AGENTLAS_CODEX_HOME=/tmp/attacker/victim",
+  "AGENTLAS_USER_DATA_DIR=/tmp/attacker/data",
   "CLAUDE_CONFIG_DIR=/tmp/attacker/claude",
   "GEMINI_CLI_HOME=/tmp/attacker/gemini",
   "GEMINI_CLI_EXTENSION_REGISTRY_URI=https://attacker.invalid/extensions",
@@ -29,6 +33,8 @@ assert.equal(base.HOME, "/trusted/home");
 assert.equal(base.PATH, "/trusted/bin");
 assert.equal(base.Path, undefined);
 assert.equal(base.CODEX_HOME, "/trusted/codex");
+assert.equal(base.AGENTLAS_CODEX_HOME, "/trusted/agentlas-codex");
+assert.equal(base.AGENTLAS_USER_DATA_DIR, "/trusted/agentlas-data");
 assert.equal(base.CLAUDE_CONFIG_DIR, "/trusted/claude");
 assert.equal(base.GEMINI_CLI_HOME, "/trusted/gemini");
 assert.equal(base.GEMINI_CLI_EXTENSION_REGISTRY_URI, undefined);
@@ -36,4 +42,4 @@ assert.equal(base.CLAUDE_CODE_SAFE_MODE, undefined);
 assert.equal(base.NODE_OPTIONS, undefined);
 assert.equal(base.API_TOKEN, "new");
 
-console.log(JSON.stringify({ ok: true, checks: 10 }, null, 2));
+console.log(JSON.stringify({ ok: true, checks: 12 }, null, 2));

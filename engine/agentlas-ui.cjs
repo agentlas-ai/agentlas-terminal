@@ -8,6 +8,8 @@
  */
 
 const i18n = require("./agentlas-i18n.cjs");
+const readline = require("node:readline");
+const taskEvents = require("./agentlas-tasks.cjs");
 
 const RESET = "\x1b[0m";
 
@@ -182,6 +184,7 @@ class Ui {
     this.enabled = opts.color != null ? opts.color : colorEnabled();
     this.c = makePalette(this.enabled);
     this.out = opts.stream || process.stdout;
+    this.input = opts.input || process.stdin;
     this.lang = opts.lang || "en";
     this.t = (key, ...args) => i18n.t(this.lang, key, ...args);
     this._spinTimer = null;
@@ -197,9 +200,14 @@ class Ui {
     this._lastTool = null;
     this._turnChrome = null;
     this._footerDrawn = false;
+    this._footerDrawnRows = 0;
     this._footerSuspended = false;
     this._resumeSpinnerAfterStream = false;
     this._streamKeepsFooter = false;
+    this._turnTasks = [];
+    this._tasksExpanded = true;
+    this._turnKeyHandler = null;
+    this._turnInputWasRaw = false;
   }
 
   write(s) {
@@ -246,17 +254,44 @@ class Ui {
     const available = Math.max(12, width - visibleWidth(frame + " "));
     const plain = truncateCells(`${status}  ${meta}`, available);
     const statusLine = this.c.emerald(frame + " ") + this.c.text(plain);
-    return [rule, prompt, rule, statusLine];
+    const taskLines = [];
+    if (this._turnTasks.length) {
+      const completed = this._turnTasks.filter((task) => task.status === "completed").length;
+      const toggle = this._tasksExpanded ? this.t("tasks.hide") : this.t("tasks.show");
+      taskLines.push(this.c.bold(this.c.text(`${this.t("tasks.title")} ${completed}/${this._turnTasks.length}`)) + this.c.faint(`  ·  ${toggle}`));
+      if (this._tasksExpanded) {
+        const visible = this._turnTasks.slice(-8);
+        for (let index = 0; index < visible.length; index++) {
+          const task = visible[index];
+          const last = index === visible.length - 1;
+          const branch = last ? "└" : "├";
+          const icon = task.status === "completed" ? "✓" : task.status === "failed" ? "!" : task.status === "in_progress" ? "■" : "□";
+          const statusKey = task.status === "completed"
+            ? "tasks.done"
+            : task.status === "failed"
+              ? "tasks.failed"
+              : task.status === "in_progress"
+                ? "tasks.progress"
+                : "tasks.pending";
+          const labelRoom = Math.max(8, width - visibleWidth(`${branch} ${icon}   ${this.t(statusKey)}`) - 4);
+          const label = truncateCells(task.label, labelRoom);
+          const paint = task.status === "completed" ? this.c.green : task.status === "failed" ? this.c.paw : task.status === "in_progress" ? this.c.emerald : this.c.dim;
+          taskLines.push(this.c.faint(`${branch} `) + paint(`${icon} ${label}`) + this.c.faint(`  ${this.t(statusKey)}`));
+        }
+      }
+    }
+    return [...taskLines, rule, prompt, rule, statusLine];
   }
 
   _eraseFooter() {
     if (!this._footerDrawn) return;
-    const rows = this._footerLines().length;
+    const rows = this._footerDrawnRows;
     let seq = "\r";
     if (rows > 1) seq += `\x1b[${rows - 1}A`;
     seq += "\x1b[0J";
     this.out.write(seq);
     this._footerDrawn = false;
+    this._footerDrawnRows = 0;
   }
 
   _drawFooter() {
@@ -266,6 +301,7 @@ class Ui {
     if (!this._atLineStart) this.out.write("\n");
     this.out.write(lines.join("\n"));
     this._footerDrawn = true;
+    this._footerDrawnRows = lines.length;
   }
 
   _redrawFooter() {
@@ -319,17 +355,71 @@ class Ui {
     this._turnActions = 0;
     this._turnFailures = 0;
     this._lastTool = null;
+    this._turnTasks = [];
+    this._tasksExpanded = true;
     if (chrome && this.out.isTTY) {
       this._turnChrome = typeof chrome === "string" ? { status: chrome } : { ...chrome };
       this._drawFooter();
+      this._attachTurnKeys();
     }
   }
   endTurn() {
     this.stopSpinner(true);
     this._eraseFooter();
+    this._detachTurnKeys();
     this._turnChrome = null;
     this._footerSuspended = false;
     this._turnStart = null;
+    this._turnTasks = [];
+  }
+
+  _attachTurnKeys() {
+    const input = this.input;
+    if (this._turnKeyHandler || !input || !input.isTTY || !this.out.isTTY) return;
+    this._turnInputWasRaw = !!input.isRaw;
+    try { if (input.setRawMode) input.setRawMode(true); } catch { /* fallback to SIGINT/canonical input */ }
+    readline.emitKeypressEvents(input);
+    const handler = (_str, key = {}) => {
+      if (key.ctrl && String(key.name || "").toLowerCase() === "t") {
+        this._tasksExpanded = !this._tasksExpanded;
+        this._redrawFooter();
+        return;
+      }
+      if (key.ctrl && String(key.name || "").toLowerCase() === "c" && this._turnChrome?.onInterrupt) {
+        this._turnChrome.onInterrupt();
+      }
+    };
+    this._turnKeyHandler = handler;
+    input.prependListener("keypress", handler);
+    try { input.resume?.(); } catch { /* ignore */ }
+  }
+
+  _detachTurnKeys() {
+    const input = this.input;
+    if (this._turnKeyHandler && input) input.removeListener("keypress", this._turnKeyHandler);
+    this._turnKeyHandler = null;
+    try { if (input?.setRawMode) input.setRawMode(this._turnInputWasRaw); } catch { /* ignore */ }
+  }
+
+  replaceTasks(payload, source) {
+    const normalized = taskEvents.normalizeTaskList(payload, source);
+    if (!normalized.length && !Array.isArray(payload) && !Array.isArray(payload?.todos) && !Array.isArray(payload?.items) && !Array.isArray(payload?.tasks)) return;
+    this._turnTasks = normalized;
+    this._redrawFooter();
+  }
+
+  applyTaskTool(name, payload, toolId) {
+    const next = taskEvents.applyTaskTool(this._turnTasks, name, payload, toolId);
+    if (next === this._turnTasks) return;
+    this._turnTasks = next;
+    this._redrawFooter();
+  }
+
+  applyTaskResult(name, payload, toolId) {
+    const next = taskEvents.applyTaskResult(this._turnTasks, name, payload, toolId);
+    if (next === this._turnTasks) return;
+    this._turnTasks = next;
+    this._redrawFooter();
   }
   updateSpinner(text) {
     this._spinText = text || "";

@@ -8,7 +8,7 @@
  *             (멀티턴은 --resume <session_id>)
  *  - codex:   codex exec --json --skip-git-repo-check -C <cwd> [sandbox] <prompt>
  *             (멀티턴은 codex exec resume <thread_id> ...)
- *  - gemini:  gemini -p <system+prompt> [--yolo]  (stdout 평문 스트리밍)
+ *  - gemini:  gemini -p <system+prompt> --approval-mode <mode>
  *
  * 스키마는 실측으로 확인됨 (cli/agentlas.cjs 상단 주석 참고).
  */
@@ -17,6 +17,12 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const permissions = require("./agentlas-permissions.cjs");
+const i18n = require("./agentlas-i18n.cjs");
+
+function uiText(ui, key, ...args) {
+  return ui && typeof ui.t === "function" ? ui.t(key, ...args) : i18n.t("en", key, ...args);
+}
 
 const NATIVE_TIMEOUT_DEFAULTS = Object.freeze({
   idleMs: 10 * 60_000,
@@ -55,13 +61,99 @@ function nativeTimeoutMessage(kind, ms) {
     : `native runtime total timeout: 전체 실행 시간이 ${ms}ms를 초과했습니다.`;
 }
 
-function userDataDir() {
-  const override = process.env.AGENTLAS_USER_DATA_DIR;
+function userDataDir(env = process.env) {
+  const override = env.AGENTLAS_USER_DATA_DIR;
   if (override) return override;
   const home = os.homedir();
   if (process.platform === "darwin") return path.join(home, "Library", "Application Support", "Agentlas");
-  if (process.platform === "win32") return path.join(process.env.APPDATA || path.join(home, "AppData", "Roaming"), "Agentlas");
-  return path.join(process.env.XDG_CONFIG_HOME || path.join(home, ".config"), "Agentlas");
+  if (process.platform === "win32") return path.join(env.APPDATA || path.join(home, "AppData", "Roaming"), "Agentlas");
+  return path.join(env.XDG_CONFIG_HOME || path.join(home, ".config"), "Agentlas");
+}
+
+const EMPTY_CLAUDE_MCP_CONFIG = '{"mcpServers":{}}';
+
+function claudeMcpIsolationArgs() {
+  return ["--strict-mcp-config", "--mcp-config", EMPTY_CLAUDE_MCP_CONFIG];
+}
+
+function geminiMcpIsolationArgs() {
+  // Gemini treats a non-empty allow-list as exclusive. A per-turn random name
+  // cannot match a configured or extension-provided server, so read/write gets none.
+  return ["--allowed-mcp-server-names", `__agentlas_no_mcp_${crypto.randomUUID()}__`];
+}
+
+function writeManagedFile(file, content) {
+  const temp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temp, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    try {
+      fs.renameSync(temp, file);
+    } catch (error) {
+      // Windows cannot always replace an existing destination atomically.
+      if (!error || !["EEXIST", "EPERM"].includes(error.code)) throw error;
+      fs.rmSync(file, { force: true });
+      fs.renameSync(temp, file);
+    }
+  } finally {
+    try { fs.rmSync(temp, { force: true }); } catch { /* best-effort cleanup */ }
+  }
+  try { fs.chmodSync(file, 0o600); } catch { /* Windows/best-effort */ }
+}
+
+function prepareCodexRuntimeEnv(env = process.env) {
+  const base = { ...env };
+  const sourceHome = path.resolve(base.CODEX_HOME || path.join(os.homedir(), ".codex"));
+  const dataHome = path.resolve(userDataDir(base));
+  const explicitTarget = Boolean(base.AGENTLAS_CODEX_HOME);
+  const targetHome = path.resolve(base.AGENTLAS_CODEX_HOME || path.join(dataHome, "runtime-homes", "codex"));
+  fs.mkdirSync(dataHome, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(targetHome, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(targetHome, 0o700); } catch { /* Windows/best-effort */ }
+  const realDataHome = fs.realpathSync(dataHome);
+  const realTargetHome = fs.realpathSync(targetHome);
+  let realSourceHome = sourceHome;
+  try { realSourceHome = fs.realpathSync(sourceHome); } catch (error) { if (!error || error.code !== "ENOENT") throw error; }
+  const targetRelative = path.relative(realDataHome, realTargetHome);
+  if (!explicitTarget && (path.isAbsolute(targetRelative) || targetRelative === ".." || targetRelative.startsWith(`..${path.sep}`))) {
+    throw new Error("Agentlas Codex runtime home escapes the Agentlas data directory");
+  }
+  if (realTargetHome === realSourceHome) {
+    throw new Error("Agentlas Codex runtime home must be isolated from the user's Codex home");
+  }
+
+  // CODEX_HOME has no replace-config CLI flag: profiles and `mcp_servers={}`
+  // merge with the user's global config. A dedicated home is the only reliable
+  // way to exclude global/project/plugin MCP while keeping Agentlas sessions.
+  writeManagedFile(
+    path.join(targetHome, "config.toml"),
+    "# Managed by Agentlas Terminal. MCP is supplied only for explicit full-access turns.\n",
+  );
+
+  if (sourceHome !== targetHome) {
+    const sourceAuth = path.join(sourceHome, "auth.json");
+    const targetAuth = path.join(realTargetHome, "auth.json");
+    let targetExists = false;
+    try { fs.lstatSync(targetAuth); targetExists = true; } catch (error) { if (!error || error.code !== "ENOENT") throw error; }
+    if (!targetExists && fs.existsSync(sourceAuth)) {
+      try {
+        fs.symlinkSync(sourceAuth, targetAuth, "file");
+      } catch {
+        try {
+          fs.linkSync(sourceAuth, targetAuth);
+        } catch {
+          fs.copyFileSync(sourceAuth, targetAuth, fs.constants.COPYFILE_EXCL);
+          try { fs.chmodSync(targetAuth, 0o600); } catch { /* Windows/best-effort */ }
+        }
+      }
+    }
+  }
+
+  base.CODEX_HOME = realTargetHome;
+  return base;
+}
+
+function runtimeEnvForKind(kind, env = process.env) {
+  return kind === "codex" ? prepareCodexRuntimeEnv(env) : env;
 }
 
 // MCP 서버 이름 → TOML/JSON 안전 키 (하이픈/공백 → _).
@@ -71,7 +163,7 @@ function mcpKey(s) {
 function mcpStdioArgs(s) {
   try { return JSON.parse((s && s.args_json) || "[]"); } catch { return []; }
 }
-// claude --mcp-config 파일을 쓴다. playwright(항상) + DB에 enabled 된 stdio MCP 서버들.
+// Full-access turns only: claude --mcp-config with Playwright + enabled DB stdio servers.
 function cliMcpConfigPath(servers) {
   const dir = path.join(userDataDir(), "mcp");
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -99,7 +191,7 @@ function cliMcpConfigPath(servers) {
   try { fs.chmodSync(file, 0o600); } catch { /* Windows/best-effort */ }
   return { file, names: Object.keys(mcpServers) };
 }
-// codex -c mcp_servers.<key>.command/args — playwright(항상) + DB stdio 서버들.
+// Full-access turns only: codex -c mcp_servers.* with Playwright + enabled DB stdio servers.
 function codexMcpArgs(servers) {
   const out = [
     "-c", 'mcp_servers.playwright.command="npx"',
@@ -161,14 +253,32 @@ function lineReader(stream, onLine, onActivity) {
   };
 }
 
+function structuredToolResult(content, fallbackText) {
+  if (content && typeof content === "object" && !Array.isArray(content)) return content;
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue;
+      if (block.json && typeof block.json === "object") return block.json;
+      if (block.content && typeof block.content === "object" && !Array.isArray(block.content)) return block.content;
+    }
+  }
+  const text = String(fallbackText || "").trim();
+  if (!text || text.length > 256 * 1024) return null;
+  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(text);
+  try { return JSON.parse(fenced ? fenced[1] : text); } catch { return null; }
+}
+
 // ── claude-code ──────────────────────────────────────────
+function claudePermissionArgs(permission) {
+  const level = permissions.normalize(permission);
+  if (level === "full") return ["--dangerously-skip-permissions"];
+  if (level === "write") return ["--permission-mode", "acceptEdits"];
+  return ["--permission-mode", "plan"];
+}
+
 function claudeArgs({ prompt, systemPrompt, permission, session, model, effort, mcpServers }) {
-  const perm =
-    permission === "full"
-      ? ["--permission-mode", "bypassPermissions"]
-      : permission === "write"
-        ? ["--permission-mode", "acceptEdits"]
-        : [];
+  const level = permissions.normalize(permission);
+  const perm = claudePermissionArgs(level);
   // /effort → Claude Code는 think 키워드로 reasoning 예산을 올린다(전용 CLI 플래그 없음).
   const thinkKw =
     effort === "max" ? "Ultrathink. " : effort === "high" ? "Think hard. " : effort === "medium" ? "Think. " : "";
@@ -181,9 +291,13 @@ function claudeArgs({ prompt, systemPrompt, permission, session, model, effort, 
     "--verbose",
     ...perm,
   ];
-  if (permission === "write" || permission === "full") {
+  // MCP tools can mutate state outside the workspace sandbox. Until the desktop schema
+  // carries a trustworthy readOnlyHint per tool, only explicit full access may inject them.
+  if (level === "full") {
     const mcpCfg = cliMcpConfigPath(mcpServers);
-    args.push("--mcp-config", mcpCfg.file, "--allowedTools", mcpCfg.names.map((n) => "mcp__" + n).join(","));
+    args.push("--strict-mcp-config", "--mcp-config", mcpCfg.file, "--allowedTools", mcpCfg.names.map((n) => "mcp__" + n).join(","));
+  } else {
+    args.push(...claudeMcpIsolationArgs());
   }
   if (model) args.push("--model", model); // alias (sonnet/opus) or full id — /model parity
   if (session && session.id) {
@@ -217,11 +331,13 @@ function handleClaudeLine(line, st, ui) {
       if (ev.type === "content_block_start") {
         const cb = ev.content_block || {};
         if (cb.type === "tool_use") {
-          st.tools[ev.index] = { name: cb.name || "tool", input: "" };
+          const tool = { id: cb.id || String(ev.index), name: cb.name || "tool", input: "" };
+          st.tools[ev.index] = tool;
+          st.toolById[tool.id] = tool;
           // 인자가 다 모이는 content_block_stop에서 한 줄로(⏺ Name(arg)) 출력 — Claude Code 스타일
         } else if (cb.type === "thinking") {
           st.think[ev.index] = "";
-          ui.status("✻ thinking…");
+          ui.status(uiText(ui, "runtime.thinking"));
         } else if (cb.type === "text") {
           ui.streamStart();
         }
@@ -244,7 +360,9 @@ function handleClaudeLine(line, st, ui) {
           } catch {
             parsed = null;
           }
+          ui.applyTaskTool?.(t.name, parsed, t.id);
           ui.tool(prettyToolName(t.name), summarizeToolInput(t.name, parsed));
+          delete st.tools[ev.index];
         } else if (st.think[ev.index] != null) {
           const th = String(st.think[ev.index] || "").trim();
           if (th) ui.line(ui.c.faint("  " + ui.c.italic(truncateLines(th, 3))));
@@ -258,6 +376,7 @@ function handleClaudeLine(line, st, ui) {
     case "user": {
       // tool_result 들
       const content = obj.message && obj.message.content;
+      const outerToolResult = obj.toolUseResult ?? obj.tool_use_result ?? obj.message?.toolUseResult ?? obj.message?.tool_use_result;
       if (Array.isArray(content)) {
         for (const block of content) {
           if (block.type === "tool_result") {
@@ -266,6 +385,12 @@ function handleClaudeLine(line, st, ui) {
               : typeof block.content === "string"
                 ? block.content
                 : "";
+            const taskTool = st.toolById[block.tool_use_id];
+            if (taskTool) {
+              const structured = structuredToolResult(block.content, txt) || structuredToolResult(outerToolResult, "");
+              ui.applyTaskResult?.(taskTool.name, structured, taskTool.id);
+              delete st.toolById[block.tool_use_id];
+            }
             ui.toolResult(txt, !block.is_error);
           }
         }
@@ -284,7 +409,7 @@ function handleClaudeLine(line, st, ui) {
       return;
     case "rate_limit_event":
       if (obj.rate_limit_info && obj.rate_limit_info.status === "rejected") {
-        ui.warn("claude rate limit reached");
+        ui.warn(uiText(ui, "runtime.rateLimit", "Claude"));
       }
       return;
     default:
@@ -301,13 +426,17 @@ function prettyToolName(name) {
 }
 
 // ── codex ────────────────────────────────────────────────
+function codexPermissionArgs(permission) {
+  const level = permissions.normalize(permission);
+  if (level === "full") return ["--dangerously-bypass-approvals-and-sandbox"];
+  // `codex exec` has no -a flag. The installed CLI accepts approval_policy via -c.
+  return ["--sandbox", level === "write" ? "workspace-write" : "read-only", "-c", 'approval_policy="never"'];
+}
+
 function codexArgs({ prompt, systemPrompt, permission, session, cwd, model, effort, mcpServers }) {
-  const sandbox =
-    permission === "full" || permission === "write"
-      ? ["--dangerously-bypass-approvals-and-sandbox"]
-      : // `codex exec` 는 --ask-for-approval 플래그가 없다(그건 top-level codex 옵션). config 오버라이드로 지정.
-        ["--sandbox", "read-only", "-c", 'approval_policy="never"'];
-  const mcp = permission === "write" || permission === "full" ? codexMcpArgs(mcpServers) : [];
+  const level = permissions.normalize(permission);
+  const sandbox = codexPermissionArgs(level);
+  const mcp = level === "full" ? codexMcpArgs(mcpServers) : [];
   const mdl = model ? ["-m", model] : []; // /model parity
   // /effort parity → codex reasoning effort (low|medium|high). max는 high로 매핑.
   const eff = effort ? ["-c", `model_reasoning_effort="${effort === "max" ? "high" : effort}"`] : [];
@@ -333,7 +462,7 @@ function handleCodexLine(line, st, ui) {
       if (obj.thread_id) st.session.id = obj.thread_id;
       return;
     case "turn.started":
-      ui.status("thinking…");
+      ui.status(uiText(ui, "runtime.thinking"));
       return;
     case "item.started":
     case "item.updated":
@@ -384,7 +513,7 @@ function renderCodexItem(item, done, st, ui) {
       if (done && item.text) {
         ui.line(ui.c.faint("  " + ui.c.italic(truncateLines(item.text, 3))));
       } else {
-        ui.status("reasoning…");
+        ui.status(uiText(ui, "runtime.reasoning"));
       }
       return;
     }
@@ -423,6 +552,12 @@ function renderCodexItem(item, done, st, ui) {
       if (done && (item.result || item.output)) ui.toolResult(item.result || item.output, true);
       return;
     }
+    case "todo_list": {
+      // Codex 0.144 JSONL exposes actual plan state as a todo_list item. Keep this
+      // separate from ordinary Bash/Edit activity so Ctrl-T never invents tasks.
+      ui.replaceTasks?.(item, "codex");
+      return;
+    }
     default:
       // 알 수 없는 item — 우아하게 한 줄.
       if (done && (item.text || item.summary)) {
@@ -447,15 +582,22 @@ function truncateLines(s, n) {
 
 // ── gemini (stream-json 구조화 렌더 — claude/codex와 동일 파리티) ──
 // gemini-cli는 -o stream-json 으로 init/message(delta)/tool_use/tool_result/result 이벤트를 낸다(실측).
+function geminiPermissionArgs(permission) {
+  const level = permissions.normalize(permission);
+  const approvalMode = level === "full" ? "yolo" : level === "write" ? "auto_edit" : "plan";
+  return ["--approval-mode", approvalMode];
+}
+
 function geminiArgs({ prompt, systemPrompt, permission, model }) {
-  // read = 읽기전용(plan), write/full = 자동승인(yolo).
-  const approval =
-    permission === "full" || permission === "write" ? ["--yolo"] : ["--approval-mode", "plan"];
+  const level = permissions.normalize(permission);
+  // Gemini CLI 0.50 exposes three matching modes: plan, auto_edit, and yolo.
+  const approval = geminiPermissionArgs(level);
   const mdl = model ? ["-m", model] : []; // /model parity
   return [
     "--output-format", "stream-json",
     "--skip-trust", // 헤드리스: 이 세션 동안 워크스페이스 신뢰 (untrusted dir exit 55 방지)
     ...approval,
+    ...(level === "full" ? [] : geminiMcpIsolationArgs()),
     ...mdl,
     "--prompt", systemPrompt ? `[SYSTEM]\n${systemPrompt}\n\n${prompt}` : prompt,
   ];
@@ -497,6 +639,7 @@ function handleGeminiLine(line, st, ui) {
         ui.streamEnd();
         st.geminiStreaming = false;
       }
+      ui.applyTaskTool?.(obj.tool_name, p, obj.tool_id || obj.id);
       ui.tool(prettyGeminiTool(obj.tool_name), arg);
       return;
     }
@@ -555,6 +698,7 @@ function runNativeTurn(req) {
     error: null,
     session: req.session || {},
     tools: {},
+    toolById: {},
     think: {},
     geminiStreaming: false,
     itemText: {},
@@ -564,32 +708,41 @@ function runNativeTurn(req) {
   let args;
   let lineHandler;
   let plainStream = false;
-  if (kind === "claude-code") {
-    args = claudeArgs(req);
-    lineHandler = (l) => handleClaudeLine(l, st, ui);
-  } else if (kind === "codex") {
-    args = codexArgs({ ...req, cwd });
-    lineHandler = (l) => handleCodexLine(l, st, ui);
-  } else if (kind === "gemini") {
-    args = geminiArgs(req);
-    lineHandler = (l) => handleGeminiLine(l, st, ui);
-  } else {
-    return Promise.resolve({ text: "", session: st.session, error: `unknown runtime: ${kind}` });
+  try {
+    if (kind === "claude-code") {
+      args = claudeArgs(req);
+      lineHandler = (l) => handleClaudeLine(l, st, ui);
+    } else if (kind === "codex") {
+      args = codexArgs({ ...req, cwd });
+      lineHandler = (l) => handleCodexLine(l, st, ui);
+    } else if (kind === "gemini") {
+      args = geminiArgs(req);
+      lineHandler = (l) => handleGeminiLine(l, st, ui);
+    } else {
+      return Promise.resolve({ text: "", session: st.session, error: `unknown runtime: ${kind}` });
+    }
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error);
+    ui.error(uiText(ui, "runtime.failed", kind, message));
+    return Promise.resolve({ text: "", session: st.session, error: message });
   }
 
   const timeout = req.timeoutConfig ? directNativeTimeoutConfig(req.timeoutConfig) : nativeTimeoutConfig(req.env || process.env);
   return new Promise((resolve) => {
-    ui.status(`starting ${kind === "claude-code" ? "claude" : kind}…`);
+    ui.status(uiText(ui, "runtime.starting", kind === "claude-code" ? "Claude" : kind));
     let child;
     try {
       const spawnImpl = req.spawn || spawn;
+      const childEnv = req.prepareRuntimeEnv === false
+        ? (req.env || process.env)
+        : runtimeEnvForKind(kind, req.env || process.env);
       child = spawnImpl(bin, args, {
         cwd,
         stdio: ["ignore", "pipe", "pipe"],
-        env: req.env || process.env,
+        env: childEnv,
       });
     } catch (e) {
-      ui.error(`failed to run ${kind}: ${e.message}`);
+      ui.error(uiText(ui, "runtime.failed", kind, e.message));
       return resolve({ text: "", session: st.session, error: e.message });
     }
 
@@ -683,7 +836,7 @@ function runNativeTurn(req) {
         return;
       }
       ui.stopSpinner();
-      ui.error(`failed to run ${kind}: ${err.message}`);
+      ui.error(uiText(ui, "runtime.failed", kind, err.message));
       finish({ text: "", session: st.session, error: err.message });
     });
     child.on("close", (code) => {
@@ -707,9 +860,9 @@ function runNativeTurn(req) {
             const { runRuntimeDoctor } = require("./agentlas-doctor.cjs");
             const report = runRuntimeDoctor(`${kind} exited with code ${code}\n${stripAnsi(stderrBuf)}`);
             if (report.repaired) {
-              ui.warn(`🩺 Runtime Doctor: ${report.summary}`);
-              for (const act of report.actions) ui.warn(`   🔧 ${act.title} — ${act.detail}`);
-              ui.warn("   자동 수리 완료 — 같은 요청을 다시 시도합니다.");
+              ui.warn(uiText(ui, "runtime.doctor", report.summary));
+              for (const act of report.actions) ui.warn(`   ${act.title} — ${act.detail}`);
+              ui.warn(uiText(ui, "runtime.doctorRetry"));
               settled = true;
               cleanup();
               resolve(runNativeTurn({ ...req, _doctorRetried: true }));
@@ -719,10 +872,10 @@ function runNativeTurn(req) {
             /* 닥터 실패는 원래 에러 표출을 막지 않는다 */
           }
         }
-        ui.error(`${kind} exited with code ${code}` + (errTail ? `\n  ${errTail.slice(-400)}` : ""));
+        ui.error(uiText(ui, "runtime.exited", kind, String(code)) + (errTail ? `\n  ${errTail.slice(-400)}` : ""));
       } else if (!text && !st.error) {
         // 정상 종료인데 출력이 비어 있음(거부/차단 등) — 무음 실패 방지
-        ui.warn(`${kind}: no output` + (errTail ? ` (${errTail.slice(-200)})` : ""));
+        ui.warn(uiText(ui, "runtime.noOutput", kind) + (errTail ? ` (${errTail.slice(-200)})` : ""));
       }
       if (st.usage) ui.cost(st.usage);
       finish({ text, session: st.session, usage: st.usage, error: st.error });
@@ -741,7 +894,15 @@ module.exports = {
   runNativeTurn,
   summarizeToolInput,
   claudeArgs,
+  claudePermissionArgs,
   codexArgs,
+  codexPermissionArgs,
+  geminiArgs,
+  geminiPermissionArgs,
+  claudeMcpIsolationArgs,
+  geminiMcpIsolationArgs,
+  prepareCodexRuntimeEnv,
+  runtimeEnvForKind,
   cliMcpConfigPath,
   codexMcpArgs,
   nativeTimeoutConfig,

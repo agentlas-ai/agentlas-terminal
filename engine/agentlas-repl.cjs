@@ -16,6 +16,7 @@ const caps = require("./agentlas-capabilities.cjs");
 const input = require("./agentlas-input.cjs");
 const i18n = require("./agentlas-i18n.cjs");
 const style = require("./agentlas-style.cjs");
+const permissions = require("./agentlas-permissions.cjs");
 
 function runtimeLabel(rt) {
   if (!rt) return "(none)";
@@ -56,6 +57,8 @@ function makeMemoryGuard(ui, heading) {
   };
   return {
     c: ui.c,
+    lang: ui.lang,
+    t: (...a) => ui.t(...a),
     streamStart: () => ui.streamStart(),
     streamDelta: (t) => {
       if (cut) {
@@ -89,6 +92,9 @@ function makeMemoryGuard(ui, heading) {
     ok: (...a) => ui.ok(...a),
     cost: (...a) => ui.cost(...a),
     line: (...a) => ui.line(...a),
+    applyTaskTool: (...a) => ui.applyTaskTool(...a),
+    applyTaskResult: (...a) => ui.applyTaskResult(...a),
+    replaceTasks: (...a) => ui.replaceTasks(...a),
   };
 }
 
@@ -111,6 +117,8 @@ function makeStyleGuard(ui) {
   };
   return {
     c: ui.c,
+    lang: ui.lang,
+    t: (...a) => ui.t(...a),
     streamStart: () => {
       buf = "";
       inCode = false;
@@ -144,6 +152,9 @@ function makeStyleGuard(ui) {
     cost: (...a) => ui.cost(...a),
     line: (...a) => ui.line(...a),
     stopSpinner: (...a) => ui.stopSpinner(...a),
+    applyTaskTool: (...a) => ui.applyTaskTool(...a),
+    applyTaskResult: (...a) => ui.applyTaskResult(...a),
+    replaceTasks: (...a) => ui.replaceTasks(...a),
   };
 }
 
@@ -158,7 +169,7 @@ function startRepl(opts) {
   const state = {
     subject: opts.subject || null,
     runtime: opts.runtime,
-    permission: opts.permission || "write",
+    permission: opts.permission == null ? "write" : permissions.normalize(opts.permission),
     cwd: opts.cwd,
     history: [],
     native: {}, // kind → { id }
@@ -198,6 +209,7 @@ function startRepl(opts) {
   let closed = false;
   let currentAbort = null;
   let idleExitArmedUntil = 0;
+  const permissionCycle = permissions.createCycleController();
   rl.on("close", () => {
     if (handoff) return; // intentionally closed to hand stdin to the raw-mode composer
     closed = true;
@@ -236,6 +248,19 @@ function startRepl(opts) {
     return { projectPath: state.projectPath, agentId: state.subject && state.subject.id, permission: state.permission, cwd: state.cwd, lang: ui.lang };
   }
 
+  function setPermission(value, options = {}) {
+    const notify = options.notify !== false;
+    const persist = options.persist !== false;
+    const level = permissions.normalize(value);
+    state.permission = level;
+    if (persist) {
+      prefs.permission = level;
+      if (opts.savePrefs) opts.savePrefs(prefs);
+    }
+    if (notify) ui.ok(ui.t("permSet", level));
+    return level;
+  }
+
   // Session usage ledger — accumulate per runtime label (host advantage: no single-model CLI can show this).
   function recordCost(label, usage) {
     const e = state.cost[label] || (state.cost[label] = { turns: 0, in: 0, out: 0, cost: 0, ms: 0 });
@@ -271,20 +296,27 @@ function startRepl(opts) {
   // ── run one turn ──
   async function runTurn(prompt, runOptions = {}) {
     busy = true;
-    ui.beginTurn(composerMeta()); // 작업 중에도 composer/status bar를 화면 하단에 유지
     currentAbort = new AbortController();
     const signal = currentAbort.signal;
-    const recordHistoryEntry = !runOptions.side;
-    const targetLang = H.detectResponseLanguage ? H.detectResponseLanguage(prompt, ui.lang) : ui.lang;
-    const ctx = { ...ctxNow(), lang: targetLang, uiLang: ui.lang };
-    const rt = state.runtime;
-    const costLabel = runtimeLabel(rt);
-    const runEnv = H.buildChildEnv ? await H.buildChildEnv(db, { ...ctx, cwd: state.cwd }) : process.env;
-    ui._lastUsage = null;
-    const assistantUi = makeStyleGuard(ui);
-    const thinkingText = i18n.t(targetLang, "thinkingWith", costLabel);
-    ui.status(thinkingText);
     try {
+      ui.beginTurn({
+        ...composerMeta(),
+        onInterrupt: () => {
+          if (!currentAbort || currentAbort.signal.aborted) return;
+          currentAbort.abort();
+          ui.warn(ui.t("interrupted"));
+        },
+      }); // 작업 중에도 composer/status bar와 실제 runtime task 목록을 화면 하단에 유지
+      const recordHistoryEntry = !runOptions.side;
+      const targetLang = H.detectResponseLanguage ? H.detectResponseLanguage(prompt, ui.lang) : ui.lang;
+      const ctx = { ...ctxNow(), lang: targetLang, uiLang: ui.lang };
+      const rt = state.runtime;
+      const costLabel = runtimeLabel(rt);
+      const runEnv = H.buildChildEnv ? await H.buildChildEnv(db, { ...ctx, cwd: state.cwd }) : process.env;
+      ui._lastUsage = null;
+      const assistantUi = makeStyleGuard(ui);
+      const thinkingText = i18n.t(targetLang, "thinkingWith", costLabel);
+      ui.status(thinkingText);
       if (rt.mode === "cli") {
         const bin = H.which(H.RUNTIME_BIN[rt.kind]) || H.RUNTIME_BIN[rt.kind];
         const session = state.native[rt.kind] || (state.native[rt.kind] = {});
@@ -304,7 +336,7 @@ function startRepl(opts) {
           model: rt.model || null, // /model (claude --model, codex -m, gemini -m)
           effort: state.effort || null, // /effort (codex reasoning effort, claude think-keyword)
           mcpServers:
-            (state.permission === "write" || state.permission === "full") && H.mcpServers
+            state.permission === "full" && H.mcpServers
               ? H.mcpServers(db).filter((s) => s.enabled && s.transport === "stdio")
               : [],
           env: runEnv,
@@ -550,8 +582,8 @@ function startRepl(opts) {
 
   function printSlashSkills() {
     ui.line("");
-    ui.rule("Skills");
-    for (const entry of input.slashCommandEntries()) {
+    ui.rule(ui.t("skills.title"));
+    for (const entry of input.slashCommandEntries(ui.lang)) {
       const tag = entry.category ? ui.c.faint(entry.category.padEnd(10)) : "";
       ui.line("  " + ui.c.emerald(entry.command.padEnd(18)) + tag + ui.c.dim(entry.description));
       if (!entry.aliasOf && entry.usage) ui.line("  " + ui.c.faint(" ".repeat(18) + entry.usage));
@@ -560,14 +592,10 @@ function startRepl(opts) {
 
   function printPermissions() {
     ui.line("");
-    ui.rule("Permissions");
-    ui.line("  " + ui.c.faint("Current") + "  " + ui.c.emerald(state.permission));
-    const rows = [
-      ["read", "inspect files and answer; no file writes or shell automation"],
-      ["write", "read plus create/edit files in the current work area"],
-      ["full", "write plus shell commands and external local automation"],
-    ];
-    for (const [level, description] of rows) {
+    ui.rule(ui.t("permissions.title"));
+    ui.line("  " + ui.c.faint(ui.t("permissions.current")) + "  " + ui.c.emerald(state.permission));
+    for (const level of permissions.LEVELS) {
+      const description = permissions.copy(level, ui.lang).description;
       const mark = level === state.permission ? "› " : "  ";
       ui.line("  " + ui.c.emerald((mark + level).padEnd(10)) + ui.c.dim(description));
     }
@@ -801,16 +829,14 @@ function startRepl(opts) {
           return true;
         }
         if (!["read", "write", "full"].includes(p)) return ui.warn(ui.t("permUsage")), true;
-        state.permission = p;
-        ui.ok(ui.t("permSet", p));
+        setPermission(p);
         return true;
       }
       case "permissions":
         if (arg) {
           const p = (arg || "").toLowerCase();
           if (!["read", "write", "full"].includes(p)) return ui.warn(ui.t("permUsage")), true;
-          state.permission = p;
-          ui.ok(ui.t("permSet", p));
+          setPermission(p);
         } else {
           printPermissions();
         }
@@ -913,10 +939,7 @@ function startRepl(opts) {
         const servers = H.mcpServers ? H.mcpServers(db) : [];
         ui.line("");
         ui.rule("MCP");
-        if (!servers.length) {
-          ui.info(ui.t("mcp.none"));
-          return true;
-        }
+        ui.line("   " + ui.c.emerald(ui.t("mcp.playwright").padEnd(22)) + ui.c.blue("stdio  ") + ui.c.green("on ") + ui.c.dim("  " + ui.t("mcp.fullOnly")));
         for (const s of servers) {
           let envKeys = [];
           try { envKeys = JSON.parse(s.env_keys_json || "[]"); } catch { /* ignore */ }
@@ -925,7 +948,7 @@ function startRepl(opts) {
           const envStr = envKeys.length ? envKeys.join(", ") : "no key";
           ui.line("   " + ui.c.emerald(String(name).padEnd(22)) + ui.c.blue(String(s.transport || "").padEnd(7)) + on + ui.c.dim("  " + envStr));
         }
-        const wired = servers.filter((s) => s.enabled && s.transport === "stdio").length + 1; // +1 = playwright(항상)
+        const wired = servers.filter((s) => s.enabled && s.transport === "stdio").length + 1; // +1 = full-only Playwright
         ui.line("   " + ui.c.faint(ui.t("mcp.wired", String(wired))));
         ui.line("   " + ui.c.faint(ui.t("mcp.usage")));
         return true;
@@ -1133,13 +1156,34 @@ function startRepl(opts) {
     const rt = runtimeLabel(state.runtime);
     const subj = state.subject ? state.subject.label : ui.t("composer.autoroute");
     const eff = state.effort ? " · " + state.effort : "";
-    const permissionLabel = ui.lang === "ko"
-      ? (state.permission === "full" ? "전체 권한" : state.permission === "read" ? "읽기 전용" : "읽기 + 쓰기")
-      : (state.permission === "full" ? "full access" : state.permission === "read" ? "read only" : "read + write");
+    const permissionLabel = permissions.copy(state.permission, ui.lang).label;
     return {
+      lang: ui.lang,
       permission: state.permission,
       permissionLabel,
-      status: `${rt}${eff} · ${subj} · ${ui.t("composer.hint")} · ↑↓ history`,
+      status: `${rt}${eff} · ${subj} · ${ui.t("permCycleHint")} · ${ui.t("composer.hint")} · ↑↓ history`,
+      onCyclePermission: () => {
+        const cycle = permissionCycle.step(state.permission);
+        if (cycle.armed) {
+          return {
+            ...composerMeta(),
+            confirmation: ui.t("permFullArm"),
+            confirmationTone: "danger",
+          };
+        }
+        const level = setPermission(cycle.level, { notify: false, persist: false });
+        return {
+          ...composerMeta(),
+          confirmation: cycle.enteredFull
+            ? ui.t("permFullConfirm")
+            : ui.t("permCycleConfirm", permissions.copy(level, ui.lang).label),
+          confirmationTone: cycle.enteredFull ? "danger" : "normal",
+        };
+      },
+      onPermissionCycleCancel: () => {
+        permissionCycle.cancel();
+        return { ...composerMeta(), confirmation: null, confirmationTone: null };
+      },
     };
   }
   async function composerLoop() {
@@ -1151,7 +1195,7 @@ function startRepl(opts) {
         r = await composer.read({
           glyph: buffer ? "…" : "›",
           ...meta,
-          suggest: (l) => input.slashCommandSuggestions(l),
+          suggest: (l) => input.slashCommandSuggestions(l, 12, ui.lang),
           complete: completer,
         });
       } catch (e) {
@@ -1244,10 +1288,10 @@ function startRepl(opts) {
 function printHelp(ui) {
   const c = ui.c;
   ui.line("");
-  ui.rule("Help");
-  ui.line("  " + c.bold(c.text("Agentlas runs local agents from this terminal, with runtime, permission, files, shell, and history controls.")));
+  ui.rule(ui.t("help.title"));
+  ui.line("  " + c.bold(c.text(ui.t("help.intro"))));
   ui.line("");
-  ui.line("  " + c.faint("Commands"));
+  ui.line("  " + c.faint(ui.t("help.commands")));
   const rows = [
     [ui.t("help.talkKey"), ui.t("help.talk")],
     ["/skills", ui.t("help.skills")],
@@ -1305,10 +1349,12 @@ function printKeybindings(ui) {
     ["!cmd", ui.t("help.bang")],
     ["\\ + Enter", ui.t("help.multiline")],
     ["Tab", ui.t("help.tab")],
+    ["Shift-Tab", ui.t("help.shiftTab")],
+    ["Ctrl-T", ui.t("help.ctrlT")],
     ["Up / Down", ui.t("help.arrows")],
     ["Ctrl-C", ui.t("help.ctrlc")],
   ];
   for (const [k, v] of tips) ui.line("  " + c.emerald(k.padEnd(24)) + c.dim(v));
 }
 
-module.exports = { startRepl, runtimeLabel };
+module.exports = { startRepl, runtimeLabel, makeMemoryGuard, makeStyleGuard };

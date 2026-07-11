@@ -1012,7 +1012,7 @@ function create(deps) {
       D.out(`${r.enabled ? "●" : "○"} ${String(r.name || r.name_en || r.id).padEnd(28).slice(0, 28)} ${String(r.transport || "stdio").padEnd(8)} ${String(r.id).slice(0, 12)}`);
     }
     D.out("");
-    D.out("write/full 턴에서 활성(●) stdio 서버가 런타임에 배선됩니다. REPL에서는 /mcp.");
+    D.out("full 턴에서만 활성(●) stdio 서버가 런타임에 배선됩니다. REPL에서는 /mcp.");
   }
 
   function cmdChats(db, args) {

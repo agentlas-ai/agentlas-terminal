@@ -11,6 +11,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const readline = require("node:readline");
+const i18n = require("./agentlas-i18n.cjs");
 
 function userDataDir() {
   const override = process.env.AGENTLAS_USER_DATA_DIR;
@@ -92,7 +93,7 @@ const SLASH_COMMAND_META = [
   { command: "/memory", description: "Show the memory injected into this run", category: "Context", usage: "/memory", detail: "Print the project memory that Agentlas adds to agent turns." },
   { command: "/side", description: "Ask a side question without saving it to chat context", category: "Context", usage: "/side <question>", detail: "Runs a one-off answer using current context, then returns without appending to chat history.", aliases: ["/btw"] },
   { command: "/multimodal", description: "Show or set image, video, and audio fallback providers", category: "Settings", usage: "/multimodal", detail: "Inspect or change fallback providers for media work." },
-  { command: "/mcp", description: "List configured MCP servers", category: "Settings", usage: "/mcp", detail: "Show MCP servers and which enabled stdio servers the terminal wires into write/full turns." },
+  { command: "/mcp", description: "List configured MCP servers", category: "Settings", usage: "/mcp", detail: "Show MCP servers available only during explicit full-access turns." },
   { command: "/diff", description: "Show the current git diff", category: "Files", usage: "/diff", detail: "Print the working-tree diff for the current cwd." },
   { command: "/history", description: "Show recent inputs", category: "Session", usage: "/history", detail: "Show persisted terminal input history." },
   { command: "/resume", description: "Resume a recent runtime session", category: "Session", usage: "/resume [n]", detail: "List recent agent/runtime sessions and continue one (restores the native session thread)." },
@@ -102,7 +103,6 @@ const SLASH_COMMAND_META = [
   { command: "/clear", description: "Clear the chat and redraw", category: "Session", usage: "/clear", detail: "Clear local conversation state and redraw the Agentlas banner." },
   { command: "/import", description: "Import a local agent or team folder", category: "Files", usage: "/import <path>", detail: "Install a local agent or team into Agentlas." },
   { command: "/marketplace", description: "Browse/install marketplace agents", category: "Routing", usage: "/marketplace", detail: "Show how to install agents from the Agentlas cloud marketplace or a local folder.", aliases: ["/market"] },
-  { command: "/install", description: "Install a cloud agent by slug", category: "Routing", usage: "/install <slug>", detail: "Download and install an agent from the Agentlas cloud marketplace by slug." },
   { command: "/storm", description: "Run a force-robust Stormbreaker pipeline on a goal", category: "Engine", usage: "/storm <goal> [--research]", detail: "Route the goal through Hephaestus Stormbreaker and execute the verified pipeline; --research grounds it with Research Engine evidence." },
   { command: "/swarm", description: "Fan out an emergent agent swarm on a goal", category: "Engine", usage: "/swarm <goal> [--parallel N]", detail: "Parallel workers share a blackboard and spawn subtasks with ## Spawn; a synthesizer merges results into one answer." },
   { command: "/build", description: "Build/repair/package an agent or team (Hephaestus)", category: "Engine", usage: "/build <what to build>", detail: "Runs Hephaestus hep-build natively — deep interview, scaffolding, packaging." },
@@ -120,19 +120,79 @@ const SLASH_COMMANDS = SLASH_COMMAND_META.flatMap((entry) => [entry.command].con
 const RUNTIME_SPECS = ["claude-code", "codex", "gemini", "anthropic", "openai", "google", "ollama", "upstage"];
 const PERM_LEVELS = ["read", "write", "full"];
 
+const HELP_KEY_BY_COMMAND = {
+  "/help": "help.help",
+  "/status": "help.status",
+  "/skills": "help.skills",
+  "/career-graph": "help.careerGraph",
+  "/ontology": "help.ontology",
+  "/agents": "help.agents",
+  "/team": "help.team",
+  "/agent": "help.agent",
+  "/firms": "help.firms",
+  "/firm": "help.firms",
+  "/runtime": "help.runtime",
+  "/model": "help.model",
+  "/effort": "help.effort",
+  "/permission": "help.permission",
+  "/permissions": "help.permissions",
+  "/setup": "help.setup",
+  "/cwd": "help.cwd",
+  "/memory": "help.memory",
+  "/side": "help.side",
+  "/multimodal": "help.multimodal",
+  "/mcp": "help.mcp",
+  "/diff": "help.diff",
+  "/history": "help.history",
+  "/resume": "help.resume",
+  "/compact": "help.compact",
+  "/cost": "help.cost",
+  "/keybindings": "help.keybindings",
+  "/clear": "help.clear",
+  "/import": "help.import",
+  "/marketplace": "help.market",
+  "/install": "help.install",
+  "/storm": "help.storm",
+  "/swarm": "help.swarm",
+  "/build": "help.build",
+  "/route": "help.route",
+  "/research": "help.research",
+  "/search": "help.search",
+  "/network": "help.network",
+  "/browser": "help.browser",
+  "/connect": "help.connect",
+  "/doctor": "help.doctor",
+  "/exit": "help.exit",
+};
+
 function uniqStartsWith(cands, token) {
   const hits = cands.filter((c) => c.startsWith(token));
   return hits.length ? hits : cands;
 }
 
-function slashCommandEntries() {
+function localizeSlashEntry(entry, lang) {
+  const helpKey = HELP_KEY_BY_COMMAND[entry.command];
+  const description = helpKey ? i18n.t(lang, helpKey) : entry.description;
+  const category = entry.category ? i18n.t(lang, `category.${entry.category}`) : entry.category;
+  return {
+    ...entry,
+    description,
+    category,
+    // English keeps the longer authored detail. Other languages must not fall back to
+    // an English paragraph under an otherwise-localized command palette.
+    detail: lang === "en" ? entry.detail : description,
+  };
+}
+
+function slashCommandEntries(lang = "en") {
   const rows = [];
-  for (const entry of SLASH_COMMAND_META) {
+  for (const rawEntry of SLASH_COMMAND_META) {
+    const entry = localizeSlashEntry(rawEntry, lang);
     rows.push({ ...entry, aliasOf: null });
     for (const alias of entry.aliases || []) {
       rows.push({
         command: alias,
-        description: `Alias for ${entry.command}`,
+        description: lang === "ko" ? `${entry.command} 별칭` : `Alias for ${entry.command}`,
         category: entry.category,
         usage: alias + (entry.usage && entry.usage.includes(" ") ? entry.usage.slice(entry.usage.indexOf(" ")) : ""),
         detail: entry.detail,
@@ -152,11 +212,11 @@ function slashCommandQuery(line) {
   return value;
 }
 
-function slashCommandSuggestions(line, limit = 12) {
+function slashCommandSuggestions(line, limit = 12, lang = "en") {
   const query = slashCommandQuery(line);
   if (query == null) return [];
   const q = query.toLowerCase();
-  const entries = slashCommandEntries();
+  const entries = slashCommandEntries(lang);
   const starts = entries.filter((entry) => entry.command.toLowerCase().startsWith(q));
   const contains = entries.filter(
     (entry) =>
@@ -167,9 +227,9 @@ function slashCommandSuggestions(line, limit = 12) {
 }
 
 function padVisible(value, width) {
-  const clean = stripAnsiLite(value);
-  if (clean.length >= width) return value;
-  return value + " ".repeat(width - clean.length);
+  const current = visibleWidthLite(value);
+  if (current >= width) return value;
+  return value + " ".repeat(width - current);
 }
 
 function stripAnsiLite(value) {
@@ -179,8 +239,40 @@ function stripAnsiLite(value) {
 
 function truncateVisible(value, width) {
   const clean = stripAnsiLite(value);
-  if (clean.length <= width) return value;
-  return clean.slice(0, Math.max(0, width - 1)) + "…";
+  if (visibleWidthLite(clean) <= width) return value;
+  let out = "";
+  let used = 0;
+  const room = Math.max(0, width - 1);
+  for (const ch of clean) {
+    const cells = cellWidthLite(ch);
+    if (used + cells > room) break;
+    out += ch;
+    used += cells;
+  }
+  return out + "…";
+}
+
+function cellWidthLite(ch) {
+  const cp = ch.codePointAt(0);
+  if (cp < 0x20) return 0;
+  return (
+    (cp >= 0x1100 && cp <= 0x115f) ||
+    (cp >= 0x2e80 && cp <= 0x303e) ||
+    (cp >= 0x3041 && cp <= 0x33ff) ||
+    (cp >= 0x3400 && cp <= 0x4dbf) ||
+    (cp >= 0x4e00 && cp <= 0x9fff) ||
+    (cp >= 0xac00 && cp <= 0xd7a3) ||
+    (cp >= 0xf900 && cp <= 0xfaff) ||
+    (cp >= 0xfe30 && cp <= 0xfe4f) ||
+    (cp >= 0xff00 && cp <= 0xff60) ||
+    (cp >= 0x1f300 && cp <= 0x1faff)
+  ) ? 2 : 1;
+}
+
+function visibleWidthLite(value) {
+  let width = 0;
+  for (const ch of stripAnsiLite(value)) width += cellWidthLite(ch);
+  return width;
 }
 
 function renderSlashPalette(rows, selectedIndex, opts = {}) {
@@ -194,32 +286,35 @@ function renderSlashPalette(rows, selectedIndex, opts = {}) {
     inverse: (s) => String(s),
   };
   const c = { ...fallbackColors, ...(opts.colors || {}) };
+  const lang = opts.lang || "en";
   const commandWidth = Math.min(24, Math.max(16, rows.reduce((n, row) => Math.max(n, row.command.length), 0) + 2));
   const descWidth = Math.max(12, columns - commandWidth - 8);
   const lineWidth = Math.min(columns - 1, commandWidth + descWidth + 5);
   const selected = rows[Math.max(0, Math.min(selectedIndex, rows.length - 1))] || rows[0];
   const out = [
-    c.faint("Slash commands") + c.dim("  type to search"),
+    c.faint(truncateVisible(`${i18n.t(lang, "palette.title")}  ${i18n.t(lang, "palette.search")}`, lineWidth)),
     c.faint("─".repeat(lineWidth)),
   ];
   rows.forEach((row, index) => {
     const command = padVisible(row.command, commandWidth);
     const desc = truncateVisible(row.description, descWidth);
     const body = " " + c.blue(command) + c.text(desc);
-    out.push(index === selectedIndex ? c.inverse(body.padEnd(lineWidth)) : body);
+    out.push(index === selectedIndex ? c.inverse(padVisible(body, lineWidth)) : body);
   });
   out.push(c.faint("─".repeat(lineWidth)));
   if (selected) {
     const usage = truncateVisible(selected.usage || selected.command, lineWidth - 2);
     const detail = truncateVisible(selected.detail || selected.description || "", lineWidth - 2);
-    const category = selected.category ? `category: ${selected.category}` : "";
-    out.push(" " + c.text(usage) + (category ? c.dim("  " + category) : ""));
+    const category = selected.category ? i18n.t(lang, "palette.category", selected.category) : "";
+    const categoryRoom = Math.max(0, lineWidth - visibleWidthLite(usage) - 3);
+    const categoryText = categoryRoom > 0 ? truncateVisible(category, categoryRoom) : "";
+    out.push(" " + c.text(usage) + (categoryText ? c.dim("  " + categoryText) : ""));
     if (detail) out.push(" " + c.dim(detail));
     if (selected.examples && selected.examples.length) {
-      out.push(" " + c.dim("examples: " + selected.examples.slice(0, 2).join("  |  ")));
+      out.push(c.dim(truncateVisible(" " + i18n.t(lang, "palette.examples", selected.examples.slice(0, 2).join("  |  ")), lineWidth)));
     }
   }
-  out.push(c.dim(" ↑↓ move  Enter run  Tab complete  Esc close"));
+  out.push(c.dim(truncateVisible(" " + i18n.t(lang, "palette.controls"), lineWidth)));
   return out.join("\n");
 }
 
@@ -244,7 +339,7 @@ function attachSlashPalette(rl, opts = {}) {
 
   function rows() {
     if (!state.enabled) return [];
-    return slashCommandSuggestions(rl.line || "");
+    return slashCommandSuggestions(rl.line || "", 12, opts.lang || (opts.ui && opts.ui.lang) || "en");
   }
   function active() {
     return rows().length > 0 && state.dismissedForLine !== (rl.line || "");
@@ -276,6 +371,7 @@ function attachSlashPalette(rl, opts = {}) {
     const body = renderSlashPalette(list, state.selected, {
       columns: stream.columns || process.stdout.columns || 88,
       colors,
+      lang: opts.lang || (opts.ui && opts.ui.lang) || "en",
     });
     stream.write("\x1b7\x1b[E\x1b[0J" + body + "\x1b8");
     state.visible = true;
@@ -365,6 +461,7 @@ function isAbsolutePathTask(line) {
   const value = String(line || "").trim();
   if (!value.startsWith("/")) return false;
   const first = value.split(/\s+/)[0] || "";
+  if (first === "/") return false;
   if (!first || SLASH_COMMANDS.includes(first)) return false;
   if (!path.isAbsolute(first)) return false;
   if (fs.existsSync(first)) return true;

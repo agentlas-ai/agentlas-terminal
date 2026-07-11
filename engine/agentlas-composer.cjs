@@ -13,6 +13,8 @@
  * Zero external deps. Caller falls back to readline when stdin/stdout is not a TTY.
  */
 const readline = require("node:readline");
+const i18n = require("./agentlas-i18n.cjs");
+const permissions = require("./agentlas-permissions.cjs");
 
 // East-Asian width: CJK / Hangul / Kana / fullwidth glyphs occupy 2 terminal cells.
 function isWide(cp) {
@@ -64,8 +66,8 @@ function identityPalette() {
 }
 
 function permissionPresentation(ctx, c) {
-  const permission = ctx.permission || "write";
-  const fallback = permission === "full" ? "full access" : permission === "read" ? "read only" : "read + write";
+  const permission = permissions.normalize(ctx.permission, "write");
+  const fallback = permissions.copy(permission, ctx.lang || "en").label;
   const label = ctx.permissionLabel || fallback;
   if (permission === "full") return c.paw("▶▶ " + label);
   if (permission === "read") return c.blue("◇ " + label);
@@ -100,23 +102,30 @@ function buildComposerFrame(state, ctx = {}, palette, width = 80) {
   const bot = c.faint("─".repeat(w));
   const lines = [top, mid, bot];
   if (ctx.status || ctx.permission) {
-    const permission = ctx.permission || "write";
-    const fallback = permission === "full" ? "full access" : permission === "read" ? "read only" : "read + write";
+    const permission = permissions.normalize(ctx.permission, "write");
+    const fallback = permissions.copy(permission, ctx.lang || "en").label;
     const permissionLabel = ctx.permissionLabel || fallback;
     const permissionText = (permission === "full" ? "▶▶ " : permission === "read" ? "◇ " : "◆ ") + permissionLabel;
     const available = Math.max(0, w - visWidth(permissionText) - 5);
     const rest = ctx.status && available > 0 ? c.faint("  ·  " + truncateWidth(ctx.status, available)) : "";
     lines.push(permissionPresentation(ctx, c) + rest);
   }
+  if (ctx.confirmation) {
+    const prefix = ctx.confirmationTone === "danger" ? "! " : "✓ ";
+    const paint = ctx.confirmationTone === "danger" && c.paw ? c.paw : c.green || c.emerald || ((value) => value);
+    lines.push(paint(truncateWidth(prefix + ctx.confirmation, w)));
+  }
 
   const rows = state.suggest || [];
   rows.slice(0, 8).forEach((row, index) => {
     const cmd = String(row.command || "").padEnd(16);
     const desc = String(row.description || "");
-    const label = (" " + cmd + " " + desc).slice(0, w);
-    lines.push(index === state.suggestSel ? c.inverse(label) : " " + c.blue(cmd) + c.dim(desc.slice(0, w - 20)));
+    const descRoom = Math.max(0, w - visWidth(" " + cmd + " "));
+    const clippedDesc = truncateWidth(desc, descRoom);
+    const label = " " + cmd + " " + clippedDesc;
+    lines.push(index === state.suggestSel ? c.inverse(label) : " " + c.blue(cmd) + " " + c.dim(clippedDesc));
   });
-  if (rows.length) lines.push(c.faint("  ↑↓ move · Tab complete · Enter run · Esc close"));
+  if (rows.length) lines.push(c.faint("  " + i18n.t(ctx.lang || "en", "palette.controls")));
 
   return { lines, curCol: visWidth(prefix) + visWidth(state.buf.slice(start, state.cur)) };
 }
@@ -212,6 +221,14 @@ function createComposer(opts) {
       function onKey(str, key) {
         key = key || {};
         const name = key.name;
+        const shiftTab = name === "tab" && key.shift;
+
+        if (!shiftTab && ctx.onPermissionCycleCancel) {
+          const hadConfirmation = Boolean(ctx.confirmation);
+          const next = ctx.onPermissionCycleCancel();
+          if (next && typeof next === "object") Object.assign(ctx, next);
+          if (hadConfirmation && !ctx.confirmation) draw();
+        }
 
         if (key.ctrl && name === "c") {
           if (state.buf.length) { ctrlc = 0; return setBuf("", 0); }
@@ -251,6 +268,14 @@ function createComposer(opts) {
         if (name === "down") {
           if (state.suggest.length) { state.suggestSel = (state.suggestSel + 1) % state.suggest.length; state.buf = state.suggest[state.suggestSel].command; state.cur = state.buf.length; return render(state, ctx); }
           return histNav(-1);
+        }
+        if (shiftTab) {
+          if (ctx.onCyclePermission) {
+            const next = ctx.onCyclePermission(ctx.permission);
+            if (next && typeof next === "object") Object.assign(ctx, next);
+            draw();
+          }
+          return;
         }
         if (name === "tab") {
           if (state.suggest.length) { const cmd = state.suggest[state.suggestSel].command; state.dismissed = cmd; return setBuf(cmd, cmd.length); }

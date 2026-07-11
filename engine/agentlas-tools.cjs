@@ -13,9 +13,171 @@ const { spawnSync } = require("node:child_process");
 
 const PERM_RANK = { read: 0, write: 1, full: 2 };
 
-function resolveIn(cwd, p) {
-  if (!p) return cwd;
-  return path.isAbsolute(p) ? p : path.resolve(cwd, p);
+function pathDenied(reason) {
+  throw new Error(`workspace path denied: ${reason}`);
+}
+
+function contained(root, target) {
+  const relative = path.relative(root, target);
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function getWorkspaceRoot(cwd) {
+  if (typeof cwd !== "string" || cwd.length === 0 || cwd.includes("\0")) {
+    pathDenied("working folder is invalid");
+  }
+  const root = fs.realpathSync(path.resolve(cwd));
+  if (!fs.statSync(root).isDirectory()) pathDenied("working folder is not a directory");
+  return root;
+}
+
+function validateRelativePath(input) {
+  if (typeof input !== "string" || input.length === 0 || input.includes("\0")) {
+    pathDenied("path must be a non-empty string");
+  }
+  // Check both dialects. A Windows absolute/UNC path must remain invalid even
+  // when a request is prepared or tested on a POSIX host (and vice versa).
+  if (
+    path.isAbsolute(input) ||
+    path.posix.isAbsolute(input) ||
+    path.win32.isAbsolute(input) ||
+    /^[A-Za-z]:/.test(input)
+  ) {
+    pathDenied("absolute paths are not allowed");
+  }
+  // Reject traversal before path.resolve() normalizes it away. This deliberately
+  // denies `safe/../file`, not only traversal that currently lands outside.
+  if (input.split(/[\\/]+/u).some((segment) => segment === "..")) {
+    pathDenied("parent traversal is not allowed");
+  }
+  return input;
+}
+
+function lexicalPath(root, input) {
+  const candidate = path.resolve(root, validateRelativePath(input));
+  if (!contained(root, candidate)) pathDenied("path leaves the working folder");
+  return candidate;
+}
+
+function resolveExistingIn(cwd, input) {
+  const root = getWorkspaceRoot(cwd);
+  const candidate = lexicalPath(root, input);
+  const real = fs.realpathSync(candidate);
+  if (!contained(root, real)) pathDenied("symbolic link leaves the working folder");
+  return real;
+}
+
+function resolveWritableIn(cwd, input) {
+  const root = getWorkspaceRoot(cwd);
+  const candidate = lexicalPath(root, input);
+  const missing = [];
+  let cursor = candidate;
+
+  // lstat (rather than existsSync) notices broken symlinks and makes them fail
+  // closed. Resolve the nearest existing ancestor before mkdir can have any
+  // side effect outside the workspace.
+  while (true) {
+    try {
+      fs.lstatSync(cursor);
+      break;
+    } catch (error) {
+      if (!error || error.code !== "ENOENT") throw error;
+      const parent = path.dirname(cursor);
+      if (parent === cursor) pathDenied("no existing workspace ancestor");
+      missing.unshift(path.basename(cursor));
+      cursor = parent;
+    }
+  }
+
+  let realAncestor;
+  try {
+    realAncestor = fs.realpathSync(cursor);
+  } catch (error) {
+    if (fs.lstatSync(cursor).isSymbolicLink()) pathDenied("symbolic link target is unavailable");
+    throw error;
+  }
+  if (!contained(root, realAncestor)) pathDenied("symbolic link leaves the working folder");
+  const ancestorStat = fs.statSync(realAncestor);
+  if (missing.length === 0 && !ancestorStat.isFile()) pathDenied("only regular files may be written");
+  if (missing.length > 0 && !ancestorStat.isDirectory()) pathDenied("write parent is not a directory");
+  const destination = path.join(realAncestor, ...missing);
+  if (!contained(root, destination)) pathDenied("path leaves the working folder");
+  return destination;
+}
+
+function safeOpenFlags() {
+  if (process.platform === "win32") return 0;
+  const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
+  // Avoid blocking forever if a special file is swapped into place between
+  // canonicalization and open; fstat below will then reject it.
+  const nonBlock = typeof fs.constants.O_NONBLOCK === "number" ? fs.constants.O_NONBLOCK : 0;
+  return noFollow | nonBlock;
+}
+
+function openRegularFile(file, flags, mode) {
+  const fd = fs.openSync(file, flags | safeOpenFlags(), mode);
+  try {
+    if (!fs.fstatSync(fd).isFile()) pathDenied("only regular files are allowed");
+    return fd;
+  } catch (error) {
+    fs.closeSync(fd);
+    throw error;
+  }
+}
+
+function readUtf8File(file) {
+  if (!fs.statSync(file).isFile()) pathDenied("only regular files may be read");
+  const fd = openRegularFile(file, fs.constants.O_RDONLY);
+  try {
+    return fs.readFileSync(fd, "utf8");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function writeUtf8File(file, content) {
+  // Replace through a fresh inode instead of truncating an existing one. If the
+  // workspace entry is a hard link to a file elsewhere, this updates only the
+  // workspace path and cannot mutate the other link's inode.
+  const temp = path.join(path.dirname(file), `.${path.basename(file)}.agentlas-${process.pid}-${crypto.randomUUID()}.tmp`);
+  let targetMode = 0o600;
+  let targetOwner = null;
+  try {
+    const existing = fs.statSync(file);
+    if (existing.isFile()) {
+      targetMode = existing.mode & 0o777;
+      targetOwner = { uid: existing.uid, gid: existing.gid };
+    }
+  } catch (error) {
+    if (!error || error.code !== "ENOENT") throw error;
+  }
+  let fd;
+  try {
+    fd = openRegularFile(
+      temp,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+      0o600,
+    );
+    fs.writeFileSync(fd, content, "utf8");
+    if (targetOwner) {
+      try { fs.fchownSync(fd, targetOwner.uid, targetOwner.gid); } catch { /* best-effort ownership preservation */ }
+    }
+    try { fs.fchmodSync(fd, targetMode); } catch { /* Windows/best-effort */ }
+    try { fs.fsyncSync(fd); } catch { /* best-effort durability */ }
+    fs.closeSync(fd);
+    fd = null;
+    try {
+      fs.renameSync(temp, file);
+    } catch (error) {
+      // Windows does not replace an existing destination with renameSync.
+      if (!error || !["EEXIST", "EPERM"].includes(error.code)) throw error;
+      fs.rmSync(file, { force: true });
+      fs.renameSync(temp, file);
+    }
+  } finally {
+    if (fd != null) fs.closeSync(fd);
+    try { fs.rmSync(temp, { force: true }); } catch { /* best-effort cleanup */ }
+  }
 }
 function truncate(s, n) {
   s = String(s);
@@ -32,7 +194,7 @@ const TOOLS = [
       properties: { path: { type: "string", description: "Directory path (default: working folder)" } },
     },
     run(args, ctx) {
-      const dir = resolveIn(ctx.cwd, args.path || ".");
+      const dir = resolveExistingIn(ctx.cwd, args.path || ".");
       const entries = fs.readdirSync(dir, { withFileTypes: true });
       const lines = entries
         .slice(0, 400)
@@ -55,8 +217,8 @@ const TOOLS = [
       required: ["path"],
     },
     run(args, ctx) {
-      const file = resolveIn(ctx.cwd, args.path);
-      let content = fs.readFileSync(file, "utf8");
+      const file = resolveExistingIn(ctx.cwd, args.path);
+      let content = readUtf8File(file);
       if (args.offset || args.limit) {
         const lines = content.split("\n");
         const start = Math.max(0, (args.offset || 1) - 1);
@@ -76,10 +238,10 @@ const TOOLS = [
       required: ["path", "content"],
     },
     run(args, ctx) {
-      const file = resolveIn(ctx.cwd, args.path);
+      const file = resolveWritableIn(ctx.cwd, args.path);
       fs.mkdirSync(path.dirname(file), { recursive: true });
       const existed = fs.existsSync(file);
-      fs.writeFileSync(file, args.content, "utf8");
+      writeUtf8File(file, args.content);
       return `${existed ? "overwrote" : "created"} ${file} (${args.content.length} bytes)`;
     },
   },
@@ -100,15 +262,15 @@ const TOOLS = [
     },
     run(args, ctx) {
       if (args.old_string === "") throw new Error("old_string must be non-empty");
-      const file = resolveIn(ctx.cwd, args.path);
-      const src = fs.readFileSync(file, "utf8");
+      const file = resolveExistingIn(ctx.cwd, args.path);
+      const src = readUtf8File(file);
       if (!src.includes(args.old_string)) throw new Error("old_string not found");
       const count = src.split(args.old_string).length - 1;
       if (!args.replace_all && count > 1) throw new Error(`old_string occurs ${count}× (use replace_all or add context)`);
       const out = args.replace_all
         ? src.split(args.old_string).join(args.new_string)
         : src.replace(args.old_string, args.new_string);
-      fs.writeFileSync(file, out, "utf8");
+      writeUtf8File(file, out);
       return `edited ${file} (${count} replacement${count > 1 ? "s" : ""})`;
     },
   },

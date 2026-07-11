@@ -4,6 +4,8 @@
  */
 const path = require("node:path");
 const os = require("node:os");
+const permissions = require("./agentlas-permissions.cjs");
+const { truncateWidth, visWidth } = require("./agentlas-composer.cjs");
 
 // AGENTLAS wordmark (block letters). Rendered with a brand gradient across columns.
 const WORDMARK = [
@@ -45,28 +47,9 @@ function shorten(p) {
 // AGENTLAS wordmark, per-column brand gradient. Falls back to plain / compact.
 function renderMascot(ui) {
   const c = ui.c;
-  const cols = (ui.out && ui.out.columns) || 80;
-  if (!ui.enabled) {
-    ui.line("  AGENTLAS");
-    return;
-  }
-  // Narrow terminal → compact wordmark.
-  if (cols < 72) {
-    ui.line("  " + c.bold(c.emerald(WORDMARK_COMPACT)));
-    return;
-  }
-  const g = (rgb, s) => `\x1b[1;38;2;${rgb[0]};${rgb[1]};${rgb[2]}m${s}\x1b[0m`;
-  for (const rowStr of WORDMARK) {
-    let outLine = "";
-    const n = rowStr.length || 1;
-    for (let i = 0; i < rowStr.length; i++) {
-      const ch = rowStr[i];
-      if (ch === " ") { outLine += " "; continue; }
-      const idx = Math.min(GRADIENT.length - 1, Math.floor((i / n) * GRADIENT.length));
-      outLine += g(GRADIENT[idx], ch);
-    }
-    ui.line(outLine);
-  }
+  // A one-line mark keeps first launch and setup compact. The old six-row wordmark
+  // remains exported for recordings/assets, but is no longer startup chrome.
+  ui.line("  " + c.bold(c.emerald(WORDMARK_COMPACT)));
 }
 
 function stripAnsi(s) {
@@ -87,48 +70,49 @@ function row(ui, width, text) {
   ui.line(ui.c.faint("│ ") + ui.c.text(fit(text, inner)) + ui.c.faint(" │"));
 }
 
+function sessionValues(ctx) {
+  const ui = ctx.ui;
+  return {
+    version: ctx.version || readVersion(),
+    subject: ctx.subjectLabel || ui.t("composer.autoroute"),
+    permission: permissions.copy(ctx.permission || "write", ui.lang).label,
+    runtime: ctx.runtimeLabel || "—",
+    cwd: ctx.cwd ? shorten(ctx.cwd) : process.cwd(),
+  };
+}
+
 function renderStatusCard(ctx, opts = {}) {
   const ui = ctx.ui;
   const c = ui.c;
-  const cols = ui.out.columns || 80;
-  const width = Math.max(54, Math.min(cols - 2, 78));
-  const version = ctx.version || readVersion();
-  const subject = ctx.subjectLabel || "Pick an agent, choose a company, or type a task";
-  const permission = ctx.permission || "write";
-  const runtime = ctx.runtimeLabel || "(not configured)";
-  const cwd = ctx.cwd ? shorten(ctx.cwd) : process.cwd();
-
+  const value = sessionValues(ctx);
+  const columns = ui.out.columns || 80;
+  const labels = [ui.t("status.runtime"), ui.t("status.agent"), ui.t("status.permission"), ui.t("status.directory")].map((label) => `${label}:`);
+  const labelCells = Math.min(Math.max(...labels.map((label) => visWidth(label))) + 2, Math.max(12, Math.floor(columns * 0.42)));
+  const line = (label, text) => {
+    const labelText = `${label}:`;
+    const padded = labelText + " ".repeat(Math.max(1, labelCells - visWidth(labelText)));
+    const room = Math.max(8, columns - 2 - visWidth(padded));
+    ui.line("  " + c.faint(padded) + c.text(truncateWidth(text, room)));
+  };
   ui.line("");
-  if (!opts.noWordmark) {
-    renderMascot(ui);
-    ui.line("  " + c.dim("the operating system for agents") + (version ? c.faint("   v" + version) : ""));
-  }
-  ui.line("");
-  ui.line(c.faint("╭" + "─".repeat(width - 2) + "╮"));
-  row(ui, width, `model:       ${runtime}`);
-  row(ui, width, `agent:       ${subject}`);
-  row(ui, width, `directory:   ${cwd}`);
-  row(ui, width, `permissions: ${permission}`);
-  ui.line(c.faint("╰" + "─".repeat(width - 2) + "╯"));
-  if (!opts.noTip) {
-    ui.line(
-      "  " +
-        c.bold(c.text("Tip:")) +
-        c.dim(" Type ") +
-        c.faint("/help") +
-        c.dim(" for commands, ") +
-        c.faint("/status") +
-        c.dim(" for session state, ") +
-        c.faint("/exit") +
-        c.dim(" to quit."),
-    );
-  }
+  ui.rule(ui.t("status.title"));
+  line(ui.t("status.runtime"), value.runtime);
+  line(ui.t("status.agent"), value.subject);
+  line(ui.t("status.permission"), value.permission);
+  line(ui.t("status.directory"), value.cwd);
 }
 
 // Main splash. ctx = { ui, version, runtimeLabel, subjectLabel, permission, cwd }
 function renderBanner(ctx) {
-  renderStatusCard(ctx);
-  ctx.ui.line("");
+  const ui = ctx.ui;
+  const c = ui.c;
+  const value = sessionValues(ctx);
+  const room = Math.max(20, (ui.out.columns || 80) - 4);
+  ui.line("");
+  ui.line("  " + c.bold(c.emerald(WORDMARK_COMPACT)) + (value.version ? c.faint("  v" + value.version) : "") + c.dim("  ·  " + ui.t("banner.product")));
+  ui.line("  " + c.text(truncateWidth(ui.t("banner.session", value.runtime, value.subject, value.permission), room)));
+  ui.line("  " + c.faint(truncateWidth(ui.t("banner.location", value.cwd), room)));
+  ui.line("");
 }
 
 // runtime · subject · permission · working folder (no wordmark — used for /status).

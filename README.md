@@ -140,6 +140,20 @@ agentlas cloud <sub>               # 자산 저장·공개·복원 (save|publish
 공통 옵션: `--runtime claude-code|codex|gemini` · `--permission read|write|full`
 REPL 안에서는 `/`로 명령 팔레트 (`/build` `/search` `/storm` `/network` …).
 
+권한은 이름과 실제 런타임 실행 범위를 일치시킨다.
+
+| Agentlas 권한 | Claude Code | Codex | Gemini CLI |
+| --- | --- | --- | --- |
+| `read` | `plan` | `read-only` sandbox | `plan` |
+| `write` | `acceptEdits` | `workspace-write` sandbox | `auto_edit` |
+| `full` | permission 검사 우회 | approval + sandbox 우회 | `yolo` |
+
+`write`는 무제한 권한의 다른 이름이 아니다. 외부 상태를 바꿀 수 있는 MCP/Playwright
+도구는 `full` 턴에서만 주입한다. 입력창에서 `Shift-Tab`으로 권한을 순환할 수 있지만,
+`write → full`은 5초 안에 두 번 연속 눌러야 하며 이 변경은 현재 세션에만 적용된다.
+실행 중 `Ctrl-T`는 Claude Todo/Task, Codex `todo_list`, Gemini `write_todos`가 실제로
+보낸 체크리스트만 열고 접는다. 일반 Bash/Read 실행을 계획 항목처럼 꾸며내지 않는다.
+
 ## 동작 방식
 
 런처(`bin/agentlas.cjs`)가 이 패키지의 `engine/`(정본)을 시스템 Node로 실행한다 —
