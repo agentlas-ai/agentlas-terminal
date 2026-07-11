@@ -2,10 +2,10 @@
 /*
  * agentlas-composer: a raw-mode bottom input box (Claude Code / Hermes style).
  *
- *   ╭────────────────────────────────────────────╮
- *   │ › your message                              │
- *   ╰────────────────────────────────────────────╯
- *     claude-code · full · 12.3k tok · / for commands
+ *   ───────────────────────────────────────────────
+ *   › your message
+ *   ───────────────────────────────────────────────
+ *   ◆ read + write · codex · Agent · / for commands
  *     (slash suggestions render here while typing /…)
  *
  * Single-line field with horizontal scroll (fixed 3-line box → flicker-free clear/redraw).
@@ -43,6 +43,84 @@ function visWidth(s) {
   return n;
 }
 
+function truncateWidth(value, max) {
+  const text = String(value || "");
+  if (visWidth(text) <= max) return text;
+  let out = "";
+  let width = 0;
+  const room = Math.max(0, max - 1);
+  for (const ch of text) {
+    const cells = charWidth(ch);
+    if (width + cells > room) break;
+    out += ch;
+    width += cells;
+  }
+  return out + "…";
+}
+
+function identityPalette() {
+  const id = (value) => String(value);
+  return { faint: id, emerald: id, text: id, paw: id, amber: id, blue: id, dim: id, inverse: id };
+}
+
+function permissionPresentation(ctx, c) {
+  const permission = ctx.permission || "write";
+  const fallback = permission === "full" ? "full access" : permission === "read" ? "read only" : "read + write";
+  const label = ctx.permissionLabel || fallback;
+  if (permission === "full") return c.paw("▶▶ " + label);
+  if (permission === "read") return c.blue("◇ " + label);
+  return c.amber("◆ " + label);
+}
+
+// Pure frame builder so layout can be regression-tested without taking over a real TTY.
+function buildComposerFrame(state, ctx = {}, palette, width = 80) {
+  const c = palette || identityPalette();
+  const w = Math.max(29, width);
+  const fieldW = Math.max(8, w - 2);
+
+  // horizontal scroll by visual width — keep the cursor visible (CJK-safe)
+  let start = Math.min(state.scroll, state.cur);
+  while (start < state.cur && visWidth(state.buf.slice(start, state.cur)) > fieldW - 2) start++;
+  state.scroll = start;
+
+  let shown = "";
+  let shownWidth = 0;
+  for (let i = start; i < state.buf.length; ) {
+    const ch = state.buf.codePointAt(i) > 0xffff ? state.buf.slice(i, i + 2) : state.buf[i];
+    const cw = charWidth(ch);
+    if (shownWidth + cw > fieldW - 2) break;
+    shown += ch;
+    shownWidth += cw;
+    i += ch.length;
+  }
+
+  const prefix = (ctx.glyph || "›") + " ";
+  const top = c.faint("─".repeat(w));
+  const mid = c.text(prefix) + c.text(shown);
+  const bot = c.faint("─".repeat(w));
+  const lines = [top, mid, bot];
+  if (ctx.status || ctx.permission) {
+    const permission = ctx.permission || "write";
+    const fallback = permission === "full" ? "full access" : permission === "read" ? "read only" : "read + write";
+    const permissionLabel = ctx.permissionLabel || fallback;
+    const permissionText = (permission === "full" ? "▶▶ " : permission === "read" ? "◇ " : "◆ ") + permissionLabel;
+    const available = Math.max(0, w - visWidth(permissionText) - 5);
+    const rest = ctx.status && available > 0 ? c.faint("  ·  " + truncateWidth(ctx.status, available)) : "";
+    lines.push(permissionPresentation(ctx, c) + rest);
+  }
+
+  const rows = state.suggest || [];
+  rows.slice(0, 8).forEach((row, index) => {
+    const cmd = String(row.command || "").padEnd(16);
+    const desc = String(row.description || "");
+    const label = (" " + cmd + " " + desc).slice(0, w);
+    lines.push(index === state.suggestSel ? c.inverse(label) : " " + c.blue(cmd) + c.dim(desc.slice(0, w - 20)));
+  });
+  if (rows.length) lines.push(c.faint("  ↑↓ move · Tab complete · Enter run · Esc close"));
+
+  return { lines, curCol: visWidth(prefix) + visWidth(state.buf.slice(start, state.cur)) };
+}
+
 function createComposer(opts) {
   const out = opts.stream || process.stdout;
   const inp = opts.input || process.stdin;
@@ -61,45 +139,7 @@ function createComposer(opts) {
 
   // Build the rendered block (array of lines) + the cursor target column on the input line.
   function frame(state, ctx) {
-    const w = boxWidth();
-    const inner = w - 2; // chars between │ … │
-    const glyph = " " + (ctx.glyph || "›") + " "; // " › "
-    const glyphW = visWidth(glyph);
-    const fieldW = Math.max(8, inner - glyphW);
-
-    // horizontal scroll by visual width — keep the cursor visible (CJK-safe)
-    let start = Math.min(state.scroll, state.cur);
-    while (start < state.cur && visWidth(state.buf.slice(start, state.cur)) > fieldW - 1) start++;
-    state.scroll = start;
-
-    let shown = "";
-    let ww = 0;
-    for (let i = start; i < state.buf.length; ) {
-      const ch = state.buf.codePointAt(i) > 0xffff ? state.buf.slice(i, i + 2) : state.buf[i];
-      const cw = charWidth(ch);
-      if (ww + cw > fieldW) break;
-      shown += ch;
-      ww += cw;
-      i += ch.length;
-    }
-    const pad = " ".repeat(Math.max(0, fieldW - ww));
-    const top = c.faint("╭" + "─".repeat(inner) + "╮");
-    const mid = c.faint("│") + c.emerald(glyph) + c.text(shown) + pad + c.faint("│");
-    const bot = c.faint("╰" + "─".repeat(inner) + "╯");
-    const lines = [top, mid, bot];
-    if (ctx.status) lines.push("  " + c.faint(ctx.status));
-
-    const rows = state.suggest || [];
-    rows.slice(0, 8).forEach((r, i) => {
-      const cmd = String(r.command || "").padEnd(16);
-      const desc = String(r.description || "");
-      const label = (" " + cmd + " " + desc).slice(0, w);
-      lines.push(i === state.suggestSel ? c.inverse(label) : " " + c.blue(cmd) + c.dim(desc.slice(0, w - 20)));
-    });
-    if (rows.length) lines.push(c.faint("  ↑↓ move · Tab complete · Enter run · Esc close"));
-
-    const curCol = 1 + glyphW + visWidth(state.buf.slice(start, state.cur)); // 0-based visual column
-    return { lines, curCol };
+    return buildComposerFrame(state, ctx, c, boxWidth());
   }
 
   function render(state, ctx) {
@@ -253,4 +293,4 @@ function createComposer(opts) {
   return { read, setHistory: (h) => { history = (h || []).filter((x) => typeof x === "string"); } };
 }
 
-module.exports = { createComposer, visWidth };
+module.exports = { createComposer, visWidth, buildComposerFrame, truncateWidth };

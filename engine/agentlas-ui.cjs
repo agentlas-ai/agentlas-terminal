@@ -57,13 +57,124 @@ function makePalette(enabled) {
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-// ANSI 시퀀스를 제거한 가시 폭 (대략) — wide char는 단순 1로 계산(충분).
+function cellWidth(ch) {
+  const cp = ch.codePointAt(0);
+  if (cp < 0x20) return 0;
+  return (
+    (cp >= 0x1100 && cp <= 0x115f) ||
+    (cp >= 0x2e80 && cp <= 0x303e) ||
+    (cp >= 0x3041 && cp <= 0x33ff) ||
+    (cp >= 0x3400 && cp <= 0x4dbf) ||
+    (cp >= 0x4e00 && cp <= 0x9fff) ||
+    (cp >= 0xac00 && cp <= 0xd7a3) ||
+    (cp >= 0xf900 && cp <= 0xfaff) ||
+    (cp >= 0xfe30 && cp <= 0xfe4f) ||
+    (cp >= 0xff00 && cp <= 0xff60) ||
+    (cp >= 0x1f300 && cp <= 0x1faff)
+  ) ? 2 : 1;
+}
+
+// ANSI 시퀀스를 제거한 실제 terminal cell 폭 (CJK/emoji 포함).
 function visibleWidth(s) {
-  return stripAnsi(s).length;
+  let width = 0;
+  for (const ch of stripAnsi(s)) width += cellWidth(ch);
+  return width;
 }
 function stripAnsi(s) {
   // eslint-disable-next-line no-control-regex
   return String(s).replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+function oneLine(value) {
+  return stripAnsi(String(value || ""))
+    .replace(/\r?\n+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function truncateCells(value, max) {
+  const text = String(value || "");
+  if (visibleWidth(text) <= max) return text;
+  let out = "";
+  let width = 0;
+  const room = Math.max(0, max - 1);
+  for (const ch of text) {
+    const cells = cellWidth(ch);
+    if (width + cells > room) break;
+    out += ch;
+    width += cells;
+  }
+  return out + "…";
+}
+
+function compactHomePath(value) {
+  const home = process.env.HOME || "";
+  return home && value.startsWith(home + "/") ? "~/" + value.slice(home.length + 1) : value;
+}
+
+function redactCommandSecrets(value) {
+  return value
+    .replace(/\b([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD))=([^\s]+)/g, "$1=••••")
+    .replace(/\b(authorization\s*:\s*bearer)\s+[^\s]+/gi, "$1 ••••")
+    // Some remote MCPs put a bearer-like credential in the URL path instead of a header.
+    // Keep the provider/path useful while ensuring activity summaries never print the secret.
+    .replace(/(https?:\/\/[^\s]+\/)(ocm_[A-Za-z0-9_-]{12,})\b/gi, "$1[redacted]")
+    .replace(/\bocm_[A-Za-z0-9_-]{12,}\b/gi, "[redacted]");
+}
+
+// Runtime JSON often contains an entire heredoc or command chain. The terminal should show
+// what is being done, not reproduce a second debug console inside the conversation.
+function compactToolArg(name, value, max = 120) {
+  let text = redactCommandSecrets(oneLine(value));
+  if (!text) return "";
+  const tool = String(name || "").toLowerCase();
+  if (/bash|shell|command|terminal/.test(tool)) {
+    text = text.replace(/^cd\s+(?:"[^"]+"|'[^']+'|\S+)\s*(?:&&|;)\s*/i, "");
+    const steps = text.split(/\s*(?:&&|\|\||;)\s*/).filter(Boolean);
+    const heredoc = steps[0] && steps[0].replace(/\s*<<['"]?[A-Za-z0-9_-]+['"]?.*$/i, " <<…");
+    text = heredoc || text;
+    if (steps.length > 1) text += `  ·  ${steps.length} steps`;
+  } else if (/read|write|edit|patch|file|glob|grep|search/.test(tool)) {
+    text = compactHomePath(text);
+  }
+  return truncateCells(text, Math.max(8, max));
+}
+
+function compactResult(text, ok, toolName, maxCells = 120) {
+  const clean = stripAnsi(String(text || "")).replace(/\r/g, "").trim();
+  const lines = clean.split("\n").map((line) => line.trim()).filter(Boolean);
+  const count = lines.length;
+  if (!ok) {
+    if (!count) return { headline: "error", details: [] };
+    const first = oneLine(lines[0]);
+    const last = count > 1 ? oneLine(lines[count - 1]) : "";
+    return {
+      headline: truncateCells(first, maxCells),
+      details: last && last !== first ? [truncateCells(last, Math.max(8, maxCells - 6))] : [],
+    };
+  }
+
+  if (!count || (count === 1 && /^(?:done|ok|success)$/i.test(lines[0]))) {
+    return { headline: "done", details: [] };
+  }
+
+  const signalPatterns = [
+    /\b\d+\s+(?:passed|failed|skipped|tests?)\b/i,
+    /\b(?:PASS|FAIL|SUCCESS|ERROR)\b/i,
+    /\b(?:created|updated|written|wrote|saved|modified)\b/i,
+    /\bexit(?:ed)?\s+(?:code\s+)?\d+\b/i,
+  ];
+  let signal = "";
+  for (let i = lines.length - 1; i >= 0 && !signal; i--) {
+    if (signalPatterns.some((pattern) => pattern.test(lines[i]))) signal = oneLine(lines[i]);
+  }
+
+  const tool = String(toolName || "").toLowerCase();
+  if (signal) return { headline: truncateCells(signal, maxCells), details: count > 1 ? [`${count} output lines`] : [] };
+  if (/read|glob|grep|search|list/.test(tool)) return { headline: `${count} line${count === 1 ? "" : "s"} read`, details: [] };
+  if (/write|edit|patch/.test(tool)) return { headline: "updated", details: count > 1 ? [`${count} output lines`] : [] };
+  if (count === 1 && visibleWidth(oneLine(lines[0])) <= maxCells) return { headline: oneLine(lines[0]), details: [] };
+  return { headline: "done", details: [`${count} output lines`] };
 }
 
 class Ui {
@@ -81,14 +192,25 @@ class Ui {
     this._streaming = false;
     this._atLineStart = true;
     this._lastUsage = null; // last per-turn usage (for session /cost ledger)
+    this._turnActions = 0;
+    this._turnFailures = 0;
+    this._lastTool = null;
+    this._turnChrome = null;
+    this._footerDrawn = false;
+    this._footerSuspended = false;
+    this._resumeSpinnerAfterStream = false;
+    this._streamKeepsFooter = false;
   }
 
   write(s) {
+    const redrawFooter = !!(this._turnChrome && !this._footerSuspended);
+    if (redrawFooter) this._eraseFooter();
     this.out.write(s);
     if (s.length) this._atLineStart = s.endsWith("\n");
+    if (redrawFooter) this._drawFooter();
   }
   line(s = "") {
-    this.stopSpinner();
+    if (!this._turnChrome) this.stopSpinner();
     this.write(s + "\n");
   }
   // 줄 시작이 아니면 개행을 보장 (스트리밍/스피너 뒤 깔끔한 블록 시작용).
@@ -107,8 +229,66 @@ class Ui {
     }
   }
 
+  _footerLines() {
+    if (!this._turnChrome) return [];
+    const cols = Math.max(30, this.out.columns || 80);
+    const width = cols - 1;
+    const rule = this.c.faint("─".repeat(width));
+    const prompt = this.c.text("› ");
+    const start = this._turnStart || this._spinStart || Date.now();
+    const secs = Math.max(0, Math.floor((Date.now() - start) / 1000));
+    const frame = SPINNER_FRAMES[this._spinFrame % SPINNER_FRAMES.length];
+    const status = this._spinText || (this.lang === "ko" ? "작업 중" : "Working");
+    const stop = this.lang === "ko" ? "ctrl-c로 중단" : "ctrl-c to interrupt";
+    const permission = this._turnChrome.permissionLabel || "";
+    const contextBits = [permission, this._turnChrome.status].filter(Boolean);
+    const meta = `(${secs}s · ${stop})${contextBits.length ? `  ·  ${contextBits.join("  ·  ")}` : ""}`;
+    const available = Math.max(12, width - visibleWidth(frame + " "));
+    const plain = truncateCells(`${status}  ${meta}`, available);
+    const statusLine = this.c.emerald(frame + " ") + this.c.text(plain);
+    return [rule, prompt, rule, statusLine];
+  }
+
+  _eraseFooter() {
+    if (!this._footerDrawn) return;
+    const rows = this._footerLines().length;
+    let seq = "\r";
+    if (rows > 1) seq += `\x1b[${rows - 1}A`;
+    seq += "\x1b[0J";
+    this.out.write(seq);
+    this._footerDrawn = false;
+  }
+
+  _drawFooter() {
+    if (!this._turnChrome || this._footerSuspended || this._footerDrawn || !this.out.isTTY) return;
+    const lines = this._footerLines();
+    if (!lines.length) return;
+    if (!this._atLineStart) this.out.write("\n");
+    this.out.write(lines.join("\n"));
+    this._footerDrawn = true;
+  }
+
+  _redrawFooter() {
+    if (!this._turnChrome || this._footerSuspended) return;
+    this._eraseFooter();
+    this._drawFooter();
+  }
+
   // ── 스피너 (stderr가 아닌 메인 스트림에, 같은 줄을 갱신) ──
   startSpinner(text) {
+    if (this._turnChrome) {
+      this._spinText = text || this._spinText || "";
+      if (this._spinTimer) return;
+      this._spinStart = Date.now();
+      const tick = () => {
+        this._spinFrame++;
+        this._redrawFooter();
+      };
+      tick();
+      this._spinTimer = setInterval(tick, 120);
+      if (this._spinTimer.unref) this._spinTimer.unref();
+      return;
+    }
     if (!this.enabled || !this.out.isTTY) {
       // 폴백: 한 번만 상태 출력
       if (text && text !== this._spinText) this.line(this.c.dim("  " + text));
@@ -134,22 +314,36 @@ class Ui {
   }
 
   // 턴 시작/끝 — 스피너가 (툴 사이에 멈췄다 다시 떠도) 총 턴 경과시간을 보여주도록.
-  beginTurn() {
+  beginTurn(chrome) {
     this._turnStart = Date.now();
+    this._turnActions = 0;
+    this._turnFailures = 0;
+    this._lastTool = null;
+    if (chrome && this.out.isTTY) {
+      this._turnChrome = typeof chrome === "string" ? { status: chrome } : { ...chrome };
+      this._drawFooter();
+    }
   }
   endTurn() {
+    this.stopSpinner(true);
+    this._eraseFooter();
+    this._turnChrome = null;
+    this._footerSuspended = false;
     this._turnStart = null;
   }
   updateSpinner(text) {
     this._spinText = text || "";
-    if (!this._spinTimer && this.enabled && this.out.isTTY) this.startSpinner(text);
+    if (!this._spinTimer && this.out.isTTY && (this.enabled || this._turnChrome)) this.startSpinner(text);
   }
-  stopSpinner() {
+  stopSpinner(force = false) {
+    if (this._turnChrome && !force) return;
     if (this._spinTimer) {
       clearInterval(this._spinTimer);
       this._spinTimer = null;
-      this.out.write("\r\x1b[2K");
-      this._atLineStart = true;
+      if (!this._turnChrome) {
+        this.out.write("\r\x1b[2K");
+        this._atLineStart = true;
+      }
     }
   }
 
@@ -164,8 +358,19 @@ class Ui {
   }
 
   // ── 스트리밍 텍스트 ──
-  streamStart() {
-    this.stopSpinner();
+  streamStart(keepFooter = false) {
+    if (this._turnChrome && keepFooter) {
+      this._streamKeepsFooter = true;
+      this.ensureNl();
+      this._streaming = true;
+      return;
+    }
+    this._resumeSpinnerAfterStream = !!this._spinTimer;
+    this.stopSpinner(true);
+    if (this._turnChrome) {
+      this._eraseFooter();
+      this._footerSuspended = true;
+    }
     this.ensureNl();
     this._streaming = true;
   }
@@ -180,27 +385,57 @@ class Ui {
       this.ensureNl();
       this._streaming = false;
     }
+    if (this._streamKeepsFooter) {
+      this._streamKeepsFooter = false;
+      return;
+    }
+    if (this._turnChrome) {
+      this._footerSuspended = false;
+      this._drawFooter();
+      if (this._resumeSpinnerAfterStream) this.startSpinner(this._spinText);
+    }
+    this._resumeSpinnerAfterStream = false;
   }
 
   // ── 툴 호출/결과 라인 (claude/codex 스타일) ──
   tool(name, arg) {
-    this.stopSpinner();
     this.ensureNl();
-    const head = this.c.green("⏺ ") + this.c.bold(this.c.text(name));
-    this.line(arg ? head + "  " + this.c.dim(truncate(String(arg), 200)) : head);
+    this._turnActions += 1;
+    this._lastTool = { name: String(name || "tool"), arg: String(arg || "") };
+    const columns = Math.max(24, this.out.columns || 100);
+    const displayName = truncateCells(String(name || "tool"), Math.max(8, Math.min(28, columns - 12)));
+    const headWidth = visibleWidth(`● ${displayName}  `);
+    const room = Math.max(8, Math.min(140, columns - headWidth - 1));
+    const summary = compactToolArg(name, arg, room);
+    const head = this.c.green("● ") + this.c.bold(this.c.text(displayName));
+    this.line(summary ? head + "  " + this.c.dim(summary) : head);
+    this._spinText = this.lang === "ko" ? `${name} 실행 중` : `Running ${name}`;
   }
-  toolResult(text, ok = true) {
-    this.stopSpinner();
-    const body = truncate(String(text || "").trim(), 600);
-    if (!body) {
-      this.line("  " + (ok ? this.c.dim("✓ done") : this.c.paw("✗ error")));
+  toolResult(text, ok = true, options = {}) {
+    if (!ok) this._turnFailures += 1;
+    if (options.verbose) {
+      const body = truncate(stripAnsi(String(text || "")).trim(), options.maxChars || 4_000);
+      const lines = body ? body.split("\n") : [ok ? "done" : "error"];
+      const marker = ok ? this.c.green("  └ ") : this.c.paw("  └ ");
+      for (let index = 0; index < lines.length; index++) {
+        this.line((index === 0 ? marker : "    ") + this.c.dim(lines[index]));
+      }
       return;
     }
-    const lines = body.split("\n");
-    const marker = ok ? this.c.dim("  └ ") : this.c.paw("  └ ");
-    for (let i = 0; i < lines.length; i++) {
-      this.line((i === 0 ? marker : "    ") + this.c.dim(lines[i]));
-    }
+    const marker = ok ? this.c.green("  └ ✓ ") : this.c.paw("  └ ✗ ");
+    const columns = Math.max(24, this.out.columns || 100);
+    const summary = compactResult(
+      text,
+      ok,
+      this._lastTool && this._lastTool.name,
+      Math.max(8, columns - visibleWidth(stripAnsi(marker)) - 1),
+    );
+    this.line(marker + this.c.dim(summary.headline));
+    for (const detail of summary.details) this.line(this.c.faint("      " + detail));
+    const count = this._turnActions;
+    this._spinText = this._turnFailures
+      ? (this.lang === "ko" ? `${count}개 작업 · ${this._turnFailures}개 확인 필요` : `${count} actions · ${this._turnFailures} need attention`)
+      : (this.lang === "ko" ? `${count}개 작업 완료 · 계속 진행 중` : `${count} action${count === 1 ? "" : "s"} complete · working`);
   }
 
   status(msg) {

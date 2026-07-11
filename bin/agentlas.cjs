@@ -51,12 +51,39 @@ function dbPath() {
 // require.resolve가 아니라 실제 로드로 판별한다 — ABI가 깨진 better-sqlite3나
 // node:sqlite가 아직 없는/플래그가 필요한 Node(≤22.4 등)를 정확히 걸러낸다.
 function probeSqliteDriver() {
-  try { require("better-sqlite3"); return "better-sqlite3"; } catch { /* absent or ABI-broken */ }
   try {
-    const { DatabaseSync } = require("node:sqlite");
-    if (DatabaseSync) return "node:sqlite";
+    const Database = require("better-sqlite3");
+    // Loading the JS wrapper alone does not prove that its native binding matches
+    // this Node ABI. Exercise the constructor before reporting it to --where.
+    const db = new Database(":memory:");
+    db.close();
+    return "better-sqlite3";
+  } catch { /* absent or ABI-broken */ }
+  try {
+    const { DatabaseSync } = loadNodeSqliteQuietly();
+    if (DatabaseSync) {
+      const db = new DatabaseSync(":memory:");
+      db.close();
+      return "node:sqlite";
+    }
   } catch { /* not available without a flag on this Node */ }
   return null;
+}
+
+function loadNodeSqliteQuietly() {
+  const originalEmitWarning = process.emitWarning;
+  process.emitWarning = function agentlasSqliteWarningFilter(warning, ...args) {
+    const message = typeof warning === "string" ? warning : String((warning && warning.message) || warning || "");
+    const type = typeof args[0] === "string" ? args[0] : "";
+    if (type === "ExperimentalWarning" && /SQLite/i.test(message)) return;
+    if (/SQLite is an experimental feature/i.test(message)) return;
+    return originalEmitWarning.call(process, warning, ...args);
+  };
+  try {
+    return require("node:sqlite");
+  } finally {
+    process.emitWarning = originalEmitWarning;
+  }
 }
 
 function openSqlite(p) {
@@ -69,7 +96,7 @@ function openSqlite(p) {
   if (major < 22) {
     throw new Error(`Node ${process.version} — better-sqlite3가 없으면 Node 22+ (node:sqlite)가 필요합니다.`);
   }
-  const { DatabaseSync } = require("node:sqlite");
+  const { DatabaseSync } = loadNodeSqliteQuietly();
   const db = new DatabaseSync(p);
   return { exec: (sql) => db.exec(sql), close: () => db.close(), driver: "node:sqlite" };
 }
@@ -193,4 +220,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { bootstrapDbIfMissing, dbPath, userDataDir };
+module.exports = { bootstrapDbIfMissing, dbPath, userDataDir, probeSqliteDriver };

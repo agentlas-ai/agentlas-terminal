@@ -176,6 +176,7 @@ rm ~/.local/bin/agentlas             # install.sh 설치 시
 
 ## License
 
-Apache-2.0 — engine sources are vendored from the public
-[agentlas-ai/agentlas-desktop](https://github.com/agentlas-ai/agentlas-desktop) repo
-(see `engine/ENGINE_META.json` for the exact version/commit).
+Apache-2.0 — Agentlas Terminal is the independent terminal runtime for the
+[Agentlas OS](https://github.com/agentlas-ai/Agentlas-OS) package contract. Its
+`engine/` directory is maintained and released from this repository; it is not
+a generated mirror of Agentlas Desktop.

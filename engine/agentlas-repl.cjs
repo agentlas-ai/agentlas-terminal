@@ -114,7 +114,8 @@ function makeStyleGuard(ui) {
     streamStart: () => {
       buf = "";
       inCode = false;
-      ui.streamStart();
+      // This guard emits complete lines, so the persistent turn footer can safely stay visible.
+      ui.streamStart(true);
     },
     streamDelta: (text) => {
       if (!text) return;
@@ -270,7 +271,7 @@ function startRepl(opts) {
   // ── run one turn ──
   async function runTurn(prompt, runOptions = {}) {
     busy = true;
-    ui.beginTurn(); // 라이브 경과시간 스피너의 턴 시작점
+    ui.beginTurn(composerMeta()); // 작업 중에도 composer/status bar를 화면 하단에 유지
     currentAbort = new AbortController();
     const signal = currentAbort.signal;
     const recordHistoryEntry = !runOptions.side;
@@ -282,7 +283,6 @@ function startRepl(opts) {
     ui._lastUsage = null;
     const assistantUi = makeStyleGuard(ui);
     const thinkingText = i18n.t(targetLang, "thinkingWith", costLabel);
-    ui.info(thinkingText);
     ui.status(thinkingText);
     try {
       if (rt.mode === "cli") {
@@ -632,7 +632,8 @@ function startRepl(opts) {
     ui.tool("$ " + cmd);
     const r = spawnSync("bash", ["-lc", cmd], { cwd: state.cwd, encoding: "utf8", timeout: 120000, maxBuffer: 8 * 1024 * 1024 });
     const out = ((r.stdout || "") + (r.stderr || "")).trim();
-    ui.toolResult(out || ("exit " + (r.status == null ? "?" : r.status)), r.status === 0 || r.status == null);
+    // `!command` is explicit user output, unlike autonomous runtime traces: keep it inspectable.
+    ui.toolResult(out || ("exit " + (r.status == null ? "?" : r.status)), r.status === 0 || r.status == null, { verbose: true });
   }
 
   // @path — inline the contents of mentioned files into the prompt as fenced context.
@@ -1128,20 +1129,28 @@ function startRepl(opts) {
   }
 
   // ── composer (raw-mode bottom box) main loop ──
-  function composerStatus() {
+  function composerMeta() {
     const rt = runtimeLabel(state.runtime);
     const subj = state.subject ? state.subject.label : ui.t("composer.autoroute");
     const eff = state.effort ? " · " + state.effort : "";
-    return `${rt} · ${state.permission}${eff} · ${subj} · ${ui.t("composer.hint")}`;
+    const permissionLabel = ui.lang === "ko"
+      ? (state.permission === "full" ? "전체 권한" : state.permission === "read" ? "읽기 전용" : "읽기 + 쓰기")
+      : (state.permission === "full" ? "full access" : state.permission === "read" ? "read only" : "read + write");
+    return {
+      permission: state.permission,
+      permissionLabel,
+      status: `${rt}${eff} · ${subj} · ${ui.t("composer.hint")} · ↑↓ history`,
+    };
   }
   async function composerLoop() {
     let buffer = "";
     while (!closed) {
       let r;
       try {
+        const meta = composerMeta();
         r = await composer.read({
           glyph: buffer ? "…" : "›",
-          status: composerStatus(),
+          ...meta,
           suggest: (l) => input.slashCommandSuggestions(l),
           complete: completer,
         });
