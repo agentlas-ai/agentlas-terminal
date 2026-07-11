@@ -15,6 +15,7 @@ const RUNTIME_CAPS = {
   "claude-code": { code: true, image: false, label: "claude" },
   codex: { code: true, image: true, label: "codex" }, // Imagen
   gemini: { code: true, image: true, label: "gemini" }, // nano-banana
+  grok: { code: true, image: true, label: "grok" }, // Grok Imagine (generate_image/generate_video, 구독 키리스)
   anthropic: { code: true, image: false, label: "anthropic" },
   openai: { code: true, image: true, label: "openai" }, // gpt-image
   google: { code: true, image: true, label: "google" }, // imagen
@@ -22,6 +23,8 @@ const RUNTIME_CAPS = {
   upstage: { code: true, image: false, label: "solar" }, // Upstage Solar — Korean sovereign LLM (OpenAI-compatible)
 };
 
+// NOTE: grok은 CAPS(멀티모달 능력 인지)만 등록 — 터미널 스폰 러너(RUNTIME_BIN)가 아직 없어
+// CLI_KINDS에 넣으면 repl의 which(RUNTIME_BIN[k]) 탐지가 깨진다. 러너 추가 시 함께 확장할 것.
 const CLI_KINDS = ["claude-code", "codex", "gemini"];
 
 function capsFor(spec) {

@@ -139,6 +139,8 @@ function loadMultimodalCatalog() {
   } catch {
     const providers = [
       { id: "codex-cli-image", modality: "image", label: "Codex CLI image", labelKo: "Codex CLI 이미지", envKeys: [], billing: "subscription", defaultModel: "runtime-default" },
+      { id: "grok-cli-image", modality: "image", label: "Grok CLI image (Imagine)", labelKo: "Grok CLI 이미지 (Imagine)", envKeys: [], billing: "subscription", defaultModel: "runtime-default" },
+      { id: "grok-cli-video", modality: "video", label: "Grok CLI video (Imagine)", labelKo: "Grok CLI 영상 (Imagine)", envKeys: [], billing: "subscription", defaultModel: "runtime-default" },
       { id: "openai-image", modality: "image", label: "OpenAI Images API", labelKo: "OpenAI 이미지 API", envKeys: ["OPENAI_API_KEY"], billing: "paid-api", defaultModel: "gpt-image-2" },
       { id: "google-image", modality: "image", label: "Google Gemini Image", labelKo: "Google Gemini 이미지", envKeys: ["GOOGLE_API_KEY"], billing: "paid-api", defaultModel: "gemini-image" },
       { id: "runway-video", modality: "video", label: "Runway API", labelKo: "Runway API", envKeys: ["RUNWAY_API_KEY"], billing: "paid-api", defaultModel: "gen4.5" },
