@@ -13,3 +13,4 @@ signing/*
 credentials/*
 !credentials/
 !credentials/README.md
+.bug-hunter/

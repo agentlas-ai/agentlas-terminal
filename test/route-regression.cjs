@@ -12,6 +12,7 @@
 
 const assert = require("node:assert/strict");
 const { autoRouteAgent, autoRouteNote, autoRoutePreamble, directSystemPrompt } = require("../engine/agentlas.cjs");
+const { needsImage, autoRuntimeFor } = require("../engine/agentlas-capabilities.cjs");
 
 // 실제 설치 상태를 흉내 낸 스텁 DB — 모든 에이전트 프롬프트에 "AI"가 들어 있다(현실과 동일).
 const AGENTS = [
@@ -63,12 +64,11 @@ const META = [
     system_prompt: "You build new agents and teams.",
   },
 ];
-const db = {
-  prepare(sql) {
-    if (/WHERE slug IN/.test(sql)) return { all: () => META };
-    return { all: () => AGENTS };
-  },
-};
+// 스텁 DB 팩토리 — 엔진의 쿼리 분기(/WHERE slug IN/ = 메타빌더 조회) 계약을 한 곳에 고정.
+function makeDb(agents, meta = []) {
+  return { prepare: (sql) => ({ all: () => (/WHERE slug IN/.test(sql) ? meta : agents) }) };
+}
+const db = makeDb(AGENTS, META);
 
 // 1) 사고 재현 프롬프트 → direct (어떤 에이전트도, 특히 Pitch Deck Architect도 선택 금지)
 {
@@ -109,13 +109,249 @@ const db = {
 
 // 6) 설치 에이전트가 없어도 direct로 답한다 (픽커 오류 대신)
 {
-  const empty = { prepare: (sql) => ({ all: () => (/WHERE slug IN/.test(sql) ? [] : []) }) };
-  const choice = autoRouteAgent(empty, "안녕 오늘 날씨 어때", "ko");
+  const choice = autoRouteAgent(makeDb([]), "안녕 오늘 날씨 어때", "ko");
   assert.equal(choice.direct, true);
 }
 
 // 7) 직답 시스템 프롬프트 — 페르소나 없음, 양 언어 모두 존재
 assert.match(directSystemPrompt("ko"), /기본 어시스턴트/);
 assert.match(directSystemPrompt("en"), /default assistant/);
+
+// ── 2026-07-12 두 번째 오라우팅 사고 고정 ─────────────────────────────────────
+// 사고: "/Users/mason/Documents/법인관련/Appbridge_Template.이 양식으로 …" 프롬프트가
+// 경로 토큰("users","mason","documents","users-mason-documents-")으로 appbridge에 +2씩 쌓여
+// 라우팅 근거에까지 노출되고, appbridge CEO 프롬프트 속 지나가는 "디자인" 한 단어 때문에
+// needsImage가 참이 되어 PPT 요청 세션이 통째로 gemini로 전환됐다.
+const PATH_AGENTS = [
+  {
+    id: "p1",
+    slug: "local-appbridge",
+    name: "appbridge",
+    name_en: "appbridge",
+    tagline: "Imported local team",
+    tagline_en: "Imported local team",
+    system_prompt:
+      "You are the AppBridge CEO coordination team imported from /Users/mason/Documents/Appbridge. " +
+      "CEO는 코디네이션·라우팅의 owner다. 코드/디자인/스토어/보안 결정의 owner가 아니다. " +
+      "Templates live under /Users/mason/Documents/Appbridge/templates (Appbridge_Template).",
+  },
+  {
+    id: "p2",
+    slug: "local-stock-team",
+    name: "주식 팀",
+    name_en: "Stock Team",
+    tagline: "Imported local team",
+    tagline_en: "Imported local team",
+    system_prompt: "You trade stocks. Sources under /Users/mason/Documents/StockTeam. 리포트 디자인 지침을 따른다.",
+  },
+];
+const pathDb = makeDb(PATH_AGENTS);
+
+// 8) 사고 재현 — 이름을 실제로 부른 경로 프롬프트는 그 에이전트로 가되, 근거에 경로 쓰레기 토큰이 없어야 한다
+{
+  const choice = autoRouteAgent(pathDb, "/Users/mason/Documents/법인관련/Appbridge_Template.이 양식으로 고정 시켜서 못만드나 피피티 잘만드는거..", "en");
+  assert.equal(choice.direct, undefined, "Appbridge_Template을 직접 언급했으므로 appbridge 라우트 유지");
+  assert.equal(choice.agent.slug, "local-appbridge");
+  for (const junk of ["users", "mason", "documents", "users-mason-documents"]) {
+    assert.ok(!choice.terms.some((t) => t.toLowerCase().includes(junk)), `경로 토큰 "${junk}"이 라우팅 근거에 노출되면 안 됨 — 실제: ${JSON.stringify(choice.terms)}`);
+  }
+}
+
+// 9) 무관한 파일 경로 프롬프트 — 경로↔경로 우연 일치로 위임되면 안 된다 (direct)
+{
+  const choice = autoRouteAgent(pathDb, "/Users/mason/Documents/법인관련/세금계산서.pdf 이거 요약해줘", "ko");
+  assert.equal(choice.direct, true, `무관 경로 프롬프트는 direct여야 함 — 실제: ${JSON.stringify(choice.agent && choice.agent.slug)}`);
+}
+
+// 10) 약한 본문 단어 적중만으로는(strong 신호 없이) 절대 위임하지 않는다
+{
+  const choice = autoRouteAgent(pathDb, "리포트 지침 owner 정리해줘 coordination 관점에서", "ko");
+  assert.equal(choice.direct, true, `약한 본문 적중만으로 위임 금지 — 실제: ${JSON.stringify(choice.agent && choice.agent.slug)}`);
+}
+
+// 11) name === name_en 인 에이전트가 이름 보너스 +20을 두 번 받지 않는다 (점수 상한 검증)
+{
+  const choice = autoRouteAgent(pathDb, "appbridge 팀 상태 알려줘", "ko");
+  assert.equal(choice.agent.slug, "local-appbridge");
+  assert.ok(choice.score < 40, `이름 중복 보너스 금지 — score ${choice.score} < 40 이어야 함`);
+}
+
+// 12) needsImage — 조율 CEO 프롬프트의 지나가는 "디자인" 한 단어로 이미지 판정 금지
+{
+  assert.equal(needsImage(PATH_AGENTS[0]), false, "appbridge는 이미지 에이전트가 아님");
+  assert.equal(needsImage(PATH_AGENTS[1]), false, "stock team은 이미지 에이전트가 아님");
+  // 정체성 존(이름/태그라인)의 이미지 힌트는 그대로 신뢰
+  assert.equal(
+    needsImage({ slug: "thumbnail-studio", name: "썸네일 스튜디오", tagline: "유튜브 썸네일 디자인", system_prompt: "" }),
+    true,
+    "정체성 존 이미지 힌트는 유지",
+  );
+  // 본문 단독: 힌트를 포함한 "긍정문"이 3문장 이상이어야 이미지 판정
+  assert.equal(
+    needsImage({ slug: "s1", name: "스튜디오", tagline: "제작", system_prompt: "요청마다 이미지를 생성한다. 유튜브 썸네일을 만든다. 배너 시안을 뽑아 저장한다." }),
+    true,
+    "긍정문 3문장 이상이면 이미지 판정 유지",
+  );
+  // 겹치는 정규식 여러 개를 때리는 "한 문장"으로는 판정 금지 (상관 힌트 무력화)
+  assert.equal(
+    needsImage({ slug: "s2", name: "스튜디오", tagline: "제작", system_prompt: "이미지 생성 후 썸네일과 배너, 포스터를 만든다." }),
+    false,
+    "한 문장 안의 상관 힌트 여러 개는 1클러스터",
+  );
+  // 이미지 판정이 꺼졌으니 세션 런타임(claude-code)이 gemini로 전환되지 않는다
+  assert.equal(
+    autoRuntimeFor(PATH_AGENTS[0], { installedKinds: ["claude-code", "codex", "gemini"], activeSpec: "claude-code" }),
+    "claude-code",
+    "appbridge 세션이 gemini로 하이재킹되면 안 됨",
+  );
+}
+
+// ── max 리뷰(2026-07-12)에서 실증된 잔여 결함 고정 ───────────────────────────
+// 13) 힌트 채널 비대칭 — 경로 디렉터리명("projects/plan")이 pm-soul strong 위임을 만들면 안 된다
+{
+  const choice = autoRouteAgent(db, "/Users/mason/projects/plan/발표자료.pptx 열어서 요약해줘", "ko");
+  assert.equal(choice.direct, true, `경로 힌트 위임 금지 — 실제: ${JSON.stringify(choice.agent && choice.agent.slug)}`);
+}
+
+// 14) 이름 채널 비대칭 — 부모 폴더명("…/Appbridge/…")만으로 +20 strong 위임 금지
+{
+  const choice = autoRouteAgent(pathDb, "/Users/mason/Documents/Appbridge/세금계산서.pdf 이거 요약해줘", "ko");
+  assert.equal(choice.direct, true, `부모 폴더명 위임 금지 — 실제: ${JSON.stringify(choice.agent && choice.agent.slug)}`);
+}
+
+// 15) 메타빌더 우회 — 경로 속 "agent-tools"가 빌드 의도(score 1000)로 둔갑하면 안 된다
+{
+  const choice = autoRouteAgent(db, "/Users/mason/agent-tools/notes.md 요약본 만들어줘", "ko");
+  assert.notEqual(choice.agent && choice.agent.slug, "agentlas-meta-agent", "경로 토큰이 메타빌더를 부르면 안 됨");
+  assert.equal(choice.direct, true);
+  // 진짜 빌드 의도는 여전히 메타빌더로 (test 5와 동일 경로 재확인)
+  const build = autoRouteAgent(db, "인스타 카드뉴스 에이전트 하나 만들어줘", "ko");
+  assert.equal(build.agent.slug, "agentlas-meta-agent");
+  assert.equal(build.strong, true, "메타 직행 choice도 strong 계약을 지켜야 함");
+}
+
+// 16) 약점수 1위 가림 — 장황한 약한 적중이 점수 1위여도, strong 자격자가 위임을 받는다
+{
+  const noisy = [
+    {
+      id: "w1", slug: "verbose-ops", name: "운영 도우미", name_en: "Ops Helper", tagline: "운영", tagline_en: "ops",
+      system_prompt: "youtube channel upload schedule traffic metrics publish calendar checklist 관리 매뉴얼 ".repeat(3),
+    },
+    {
+      id: "s1", slug: "banner-studio", name: "배너 스튜디오", name_en: "Banner Studio", tagline: "썸네일 배너 디자인", tagline_en: "thumbnail banner design",
+      system_prompt: "유튜브 썸네일과 배너를 디자인한다.",
+    },
+  ];
+  const choice = autoRouteAgent(makeDb(noisy), "youtube channel upload schedule traffic metrics publish calendar checklist 썸네일 배너 만들어줘", "ko");
+  assert.equal(choice.direct, undefined, "strong 자격자가 있는데 직답으로 새면 안 됨");
+  assert.equal(choice.agent.slug, "banner-studio");
+}
+
+// 17) 공백 포함 macOS 경로("Mobile Documents")도 junk 토큰 없이 접힌다
+{
+  const choice = autoRouteAgent(
+    pathDb,
+    "/Users/mason/Library/Mobile Documents/com~apple~CloudDocs/Appbridge_Template.md 이 양식으로 appbridge 정리해줘",
+    "en",
+  );
+  assert.equal(choice.agent.slug, "local-appbridge");
+  for (const junk of ["mobile", "documents", "com", "apple", "users", "mason", "library"]) {
+    assert.ok(!choice.terms.some((t) => t.toLowerCase() === junk), `공백 경로 토큰 "${junk}" 노출 금지 — 실제: ${JSON.stringify(choice.terms)}`);
+  }
+}
+
+// 18) 임포터 보일러플레이트 태그라인("Imported local team")은 정체성 신호가 아니다 (IDF 꺼지는 소규모 설치)
+{
+  const choice = autoRouteAgent(makeDb(PATH_AGENTS), "local imported 항목 정리해줘", "ko");
+  assert.equal(choice.direct, true, `보일러플레이트 위임 금지 — 실제: ${JSON.stringify(choice.agent && choice.agent.slug)}`);
+  // 'team'은 아무 임포트 팀 slug의 부분문자열(+6 strong)이라 스톱워드여야 한다:
+  // 스톱워드에서 빠지면 'team' 정체성 적중 + 약한 본문 적중으로 10을 넘어 위임된다.
+  const teamProbe = autoRouteAgent(makeDb(PATH_AGENTS), "team 리포트 디자인 지침 정리해줘", "ko");
+  assert.equal(teamProbe.direct, true, `범용어 'team' 위임 금지 — 실제: ${JSON.stringify(teamProbe.agent && teamProbe.agent.slug)}`);
+}
+
+// 18b) 상대경로 파일 참조의 디렉터리명("plan")이 힌트 strong 채널을 때리면 안 된다
+{
+  const choice = autoRouteAgent(db, "docs/plan/roadmap.md 열어서 정리해줘", "ko");
+  assert.equal(choice.direct, true, `상대경로 힌트 위임 금지 — 실제: ${JSON.stringify(choice.agent && choice.agent.slug)}`);
+}
+
+// 18c) 파일명 속 "agent"는 빌드 의도가 아니다 — 산문 빌드 의도만 메타빌더로
+{
+  const file = autoRouteAgent(db, "agent-notes.md 요약본 만들어줘", "ko");
+  assert.notEqual(file.agent && file.agent.slug, "agentlas-meta-agent", "파일명 토큰이 메타빌더를 부르면 안 됨");
+  const rel = autoRouteAgent(db, "agent-tools/notes/summary.md 초안 만들어줘", "ko");
+  assert.notEqual(rel.agent && rel.agent.slug, "agentlas-meta-agent", "상대경로 토큰이 메타빌더를 부르면 안 됨");
+}
+
+// 18d) 공백 병합은 대문자 세그먼트("Mobile Documents")만 — 한글 프로즈를 경로로 삼키지 않는다
+{
+  const choice = autoRouteAgent(makeDb(PATH_AGENTS), "지금 /tmp/out 확인하고 기획/디자인 관련 파일 목록 정리해줘", "ko");
+  assert.equal(choice.direct, true);
+  // 프로즈 토큰("기획","디자인")이 라우팅 어휘에서 사라지지 않았는지 — 스텁에 디자인 전문가를 넣어 확인
+  const designers = [
+    { id: "d1", slug: "design-desk", name: "디자인 데스크", name_en: "Design Desk", tagline: "기획 디자인 전문", tagline_en: "design", system_prompt: "기획과 디자인 자료를 정리한다." },
+  ];
+  const kept = autoRouteAgent(makeDb(designers), "지금 /tmp/out 확인하고 기획/디자인 관련 파일 목록 정리해줘", "ko");
+  assert.equal(kept.direct, undefined, "프로즈 '기획/디자인'이 경로로 삼켜지면 안 됨");
+  assert.equal(kept.agent.slug, "design-desk");
+}
+
+// 19) needsImage 정밀도 — 부정문·그림자·기계 파생 slug는 이미지 판정 금지, 도구 마커는 단독 인정
+{
+  assert.equal(
+    needsImage({ slug: "coord", name: "코디네이터", tagline: "조율", system_prompt: "상품 이미지 생성 금지. 코드 리뷰와 배포만 담당한다." }),
+    false,
+    "부정문(금지)의 힌트는 능력이 아님",
+  );
+  // 긍정문에 흔한 보조 부정("묻지 않고 바로 …")까지 부정으로 오판하면 안 된다
+  assert.equal(
+    needsImage({ slug: "fastgen", name: "생성기", tagline: "콘텐츠", system_prompt: "묻지 않고 바로 이미지를 생성한다. 요청 즉시 썸네일을 뽑는다. 지체 없이 배너를 만든다." }),
+    true,
+    "보조 부정이 낀 긍정문은 능력으로 인정",
+  );
+  assert.equal(
+    needsImage({ slug: "fx", name: "이펙트 코더", tagline: "CSS 전문", system_prompt: "그림자 효과를 코드로 구현한다. 그림자 블러를 조정한다. 그림자 색을 계산한다." }),
+    false,
+    "'그림자'(shadow)는 이미지 힌트가 아님",
+  );
+  assert.equal(
+    needsImage({ slug: "local-design-system", name: "토큰 린터", tagline: "코드 린트", system_prompt: "Lint CSS variables and tokens." }),
+    false,
+    "폴더명 파생 slug('design-system')는 단독 신뢰 대상이 아님",
+  );
+  assert.equal(
+    needsImage({ slug: "gen", name: "제너레이터", tagline: "콘텐츠 제작", system_prompt: "결과물은 nano-banana로 렌더링해 저장한다." }),
+    true,
+    "이미지 도구 마커는 단독으로도 인정",
+  );
+  // 팀 CEO 두뇌는 body 채널을 신뢰하지 않는다 — 부서명("Design HQ")이 몇 문장 나와도
+  // entity_kind='team'이면 정체성 존만 본다. 같은 본문이라도 단일 에이전트면 body로 판정.
+  const orgBody = "디자인 부서가 배너를 만든다. 디자인 부서가 썸네일을 만든다. 디자인 부서가 포스터를 만든다.";
+  assert.equal(
+    needsImage({ slug: "eng-team", name: "엔지니어링 팀", tagline: "제품 개발", entity_kind: "team", system_prompt: orgBody }),
+    false,
+    "팀은 body 키워드로 이미지 판정 금지 (vibecoder 사례)",
+  );
+  assert.equal(
+    needsImage({ slug: "solo", name: "제작기", tagline: "콘텐츠", entity_kind: "agent", system_prompt: orgBody }),
+    true,
+    "단일 에이전트는 body 클러스터 판정 유지",
+  );
+}
+
+// 20) 슬래시로 붙은 엔티티도 빌드 의도로 인식 — 슬래시 토큰 통삭제 회귀 수리(2026-07-12 max 리뷰)
+// 사고: isAgentBuildIntent가 `\S*[\\/]\S*`로 슬래시 포함 토큰을 통째로 지워
+// "에이전트/팀 만들어줘"의 엔티티가 사라져 빌드 의도를 놓치고 direct로 샜다.
+{
+  const b1 = autoRouteAgent(db, "에이전트/팀 하나 만들어줘", "ko");
+  assert.equal(b1.agent && b1.agent.slug, "agentlas-meta-agent", "슬래시-엔티티('에이전트/팀')도 빌드 의도");
+  const b2 = autoRouteAgent(db, "회사/조직 만들어줘", "ko");
+  assert.equal(b2.agent && b2.agent.slug, "agentlas-meta-agent", "'회사/조직'도 빌드 의도");
+  // 경로/파일 참조는 여전히 빌드 의도가 아니다 — 수리가 test 15의 회귀를 되살리지 않았는지 재확인
+  const nf = autoRouteAgent(db, "/Users/mason/agent-tools/notes.md 요약본 만들어줘", "ko");
+  assert.notEqual(nf.agent && nf.agent.slug, "agentlas-meta-agent", "경로 속 'agent-tools'는 빌드 아님");
+  assert.equal(nf.direct, true);
+}
 
 console.log("route-regression: PASS");

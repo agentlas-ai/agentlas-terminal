@@ -326,11 +326,16 @@ function startRepl(opts) {
           : state.subject.system;
         state.routePreambleOnce = null;
         const sys = H.augmentSystem(db, subjectSystem, ctx, false);
+        // claude(--resume)·codex(resume <thread_id>)만 서버측에서 대화를 이어받아 이전 턴의
+        // 시스템 프롬프트를 유지한다(native-host.cjs claudeArgs/codexArgs). gemini CLI는 resume
+        // 플래그가 없어 매 턴이 새 프로세스 — session.id로 시스템 프롬프트를 비우면 2턴째부터
+        // 페르소나가 통째로 사라진다. 그래서 gemini는 매 턴 시스템 프롬프트를 다시 보낸다.
+        const resumesServerSide = rt.kind === "claude-code" || rt.kind === "codex";
         const res = await runNativeTurn({
           kind: rt.kind,
           bin,
           prompt,
-          systemPrompt: session.id ? "" : sys,
+          systemPrompt: session.id && resumesServerSide ? "" : sys,
           cwd: state.cwd,
           permission: state.permission,
           session,
@@ -492,7 +497,7 @@ function startRepl(opts) {
       slug: firm.slug,
       label: displayName(firm) + " CEO",
       system: sys,
-      capAgent: { name: firm.name, name_en: firm.name_en || firm.name, tagline: firm.tagline, system_prompt: sys },
+      capAgent: { name: firm.name, name_en: firm.name_en || firm.name, tagline: firm.tagline, tagline_en: firm.tagline_en, entity_kind: "team", system_prompt: sys },
     };
     state.history = [];
     state.routePreambleOnce = null;
@@ -799,14 +804,6 @@ function startRepl(opts) {
         else await H.hepRun(["hep-search", arg], { cwd: state.cwd });
         return true;
       }
-      case "install": {
-        if (!arg) return ui.warn("usage: /install <slug>  (/search 로 먼저 찾으세요)"), true;
-        if (H.cloudInstall) {
-          try { const r = await H.cloudInstall(db, arg.trim()); ui.ok((r && r.name) ? `설치됨: ${r.name}` : `설치됨: ${arg.trim()}`); }
-          catch (e) { ui.error((e && e.message) || String(e)); }
-        } else ui.warn("설치 기능을 사용할 수 없습니다.");
-        return true;
-      }
       case "network":
       case "taskforce": {
         if (!arg) return ui.warn("usage: /network <요청>  (A2A 태스크포스)"), true;
@@ -1026,11 +1023,16 @@ function startRepl(opts) {
         } else {
           return ui.error(ui.t("noAgent", s.agentSlug)), true;
         }
-        if (s.kind && H.RUNTIME_BIN[s.kind] && H.which(H.RUNTIME_BIN[s.kind])) {
+        // 저장된 CLI 런타임이 실제로 설치돼 있을 때만 그 세션을 복원한다. s.kind가 없거나
+        // (손상된 resume 레코드) 런타임이 미설치면, 잘못된/"undefined" 키로 native 맵을
+        // 덮어써 현재 세션을 잃는 것을 막고 새 대화로 시작한다.
+        if (s.kind && s.sessionId && H.RUNTIME_BIN[s.kind] && H.which(H.RUNTIME_BIN[s.kind])) {
           state.runtime = { mode: "cli", kind: s.kind };
           baseRuntime = state.runtime;
+          state.native = { [s.kind]: { id: s.sessionId } };
+        } else {
+          state.native = {};
         }
-        state.native = { [s.kind]: { id: s.sessionId } };
         try {
           const fs2 = require("node:fs");
           if (s.cwd && fs2.existsSync(s.cwd)) state.cwd = s.cwd;

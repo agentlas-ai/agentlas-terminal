@@ -29,6 +29,7 @@ const fs = require("node:fs");
 const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 const { compareSemVer, normalizeSemVer, parseSemVer } = require("./semver.cjs");
+const terminalAssets = require("./agentlas-experience-mcp.cjs");
 
 // ── 앱과 동일한 userData 경로 (electron app.getPath('userData')와 일치) ──
 function userDataDir() {
@@ -92,6 +93,19 @@ function openNodeSqliteDb(p) {
         all: (...args) => stmt.all(...args),
         run: (...args) => stmt.run(...args),
       };
+    },
+    // better-sqlite3 API 패리티 — 폴백 경로에서도 db.exec/db.pragma가 있어야 한다.
+    // 누락 시 ensureMemoryContextColumn 등 ALTER TABLE(exec)이 TypeError로 조용히 죽어
+    // (try/catch 삼킴) context_json 컬럼 마이그레이션이 되지 않고 memory 조회가 깨진다.
+    exec: (sql) => db.exec(sql),
+    pragma: (source) => {
+      const rows = db.prepare(`PRAGMA ${source}`).all();
+      // better-sqlite3 pragma()의 단일값 반환 관례를 근사(단일 컬럼·단일 행 → 스칼라).
+      if (rows.length === 1) {
+        const keys = Object.keys(rows[0]);
+        if (keys.length === 1) return rows[0][keys[0]];
+      }
+      return rows;
     },
     transaction(fn) {
       return (...args) => {
@@ -280,7 +294,17 @@ const AGENT_BUILD_TERMS = [
 const BUILD_ENTITY_RE = /(에이전트|agent|팀|team|회사|company)/i;
 const BUILD_VERB_RE = /(만들|만든|생성|구축|구성해|꾸려|세팅|패키징|scaffold|build|create|\bmake\b|set\s?up|spin\s?up)/i;
 function isAgentBuildIntent(prompt) {
-  const p = routeNormalize(prompt);
+  // 경로/파일 참조는 빌드 의도의 증거가 아니다 — "/Users/x/agent-tools/notes.md 요약본
+  // 만들어줘"의 디렉터리명이나 "agent-notes.md" 같은 파일명이 BUILD_ENTITY_RE를 때려
+  // 메타빌더(score 1000)로 직행하던 우회로 차단. 빌드 의도는 산문에서만 읽는다.
+  // ⚠️ 남은 슬래시는 통째로 지우지 않고 공백으로만 벌린다 — "에이전트/팀 만들어줘"의
+  // 슬래시-엔티티("에이전트/팀")를 삭제하면 BUILD_ENTITY_RE가 못 맞아 빌드 의도를 놓친다.
+  // 진짜 경로는 이미 routeStripPaths(마지막 세그먼트만)+확장자 제거가 처리했다.
+  const p = routeNormalize(
+    routeStripPaths(prompt)
+      .replace(/\S+\.[A-Za-z0-9]{1,6}(?=\s|$)/g, " ")
+      .replace(/[\\/]+/g, " "),
+  );
   if (!p.trim() || isTrivialRoutePrompt(p)) return false;
   if (AGENT_BUILD_TERMS.some((term) => p.includes(routeNormalize(term)))) return true;
   // 예: "단일 에이전트 하나만 만들어줘", "팀 좀 꾸려줘", "make me an agent"
@@ -302,7 +326,9 @@ function resolveMetaBuilder(db) {
 }
 // "ai"/"llm" 같은 초범용 토큰은 모든 에이전트 프롬프트에 나오므로 판별력이 0이다 —
 // 이런 단어 하나로 전문 에이전트가 선택되던 오라우팅(예: 일반 맥 질문 → Pitch Deck Architect)을 막는다.
-const ROUTE_STOP_WORDS = new Set(["the", "and", "for", "with", "this", "that", "from", "into", "make", "build", "create", "agent", "agents", "please", "ai", "llm", "인공지능", "에이아이", "좀", "해주세요", "해줘", "만들어", "붙여", "연결", "작업", "요청"]);
+// "local"/"imported"/"team"은 임포터 보일러플레이트("Imported local team")와 slug 접두/접미에
+// 편재해 판별력이 없다 — 'team' 한 단어가 아무 임포트 팀의 slug 부분문자열(+6 strong)을 때리던 구멍.
+const ROUTE_STOP_WORDS = new Set(["the", "and", "for", "with", "this", "that", "from", "into", "make", "build", "create", "agent", "agents", "team", "please", "ai", "llm", "local", "imported", "인공지능", "에이아이", "좀", "해주세요", "해줘", "만들어", "붙여", "연결", "작업", "요청"]);
 const ROUTE_HINTS = [
   {
     slug: "agentlas-app-builder",
@@ -360,24 +386,46 @@ const ROUTE_HINTS = [
 function routeNormalize(value) {
   return String(value || "").toLowerCase().replace(/[_/]+/g, "-");
 }
+// 경로 디렉터리 성분은 라우팅 의도가 아니다 — 마지막 세그먼트(파일/폴더명)만 남긴다.
+// 사고(2026-07-12): "/Users/mason/Documents/…/Appbridge_Template.이 …" 프롬프트의 경로 토큰
+// ("users","mason","documents","users-mason-documents-")이 임포트 에이전트 system_prompt 속
+// 절대경로와 맞아떨어져 +2씩 쌓이고 라우팅 근거에까지 노출됐다. 프롬프트/헤이스택 양쪽에
+// 대칭 적용해 경로↔경로 우연 일치를 차단한다. 파일/폴더명은 실제 의도라서 보존한다.
+// 규칙: 공백/인용부호/괄호 뒤(또는 문자열 시작)에서 시작하고, "세그먼트+구분자"가 2회 이상
+// 이어지는 절대·홈·드라이브·UNC 경로만 경로로 본다 — "and/or", "서울/부산", 날짜(2026/07/12),
+// "https://…"(콜론 뒤 //는 시작 조건 불충족)는 건드리지 않는다. 세그먼트 안의 단일 공백은
+// 뒤가 대문자로 시작할 때만 허용해 "Mobile Documents"/"Application Support"는 접되,
+// "/tmp/out 기획/디자인 …" 같은 한글 프로즈를 경로로 삼켜버리지 않는다. 상대경로는
+// 확장자 있는 파일 참조("docs/plan/roadmap.md")만 접는다 — 디렉터리명("plan")이 힌트/이름
+// strong 채널을 때리는 것을 막으면서 "서울/부산/대구" 같은 나열은 보존한다.
+const ROUTE_PATH_RE = /(^|[\s"'`(<\[{])((?:~|[A-Za-z]:)?[\\/]{1,2}(?:[^\s\\/]+(?: [A-Z][^\s\\/]*)?[\\/]+){2,}[^\s\\/]*|(?:[^\s\\/]+[\\/]+){2,}[^\s\\/]+\.[A-Za-z0-9]{1,6})/g;
+function routeStripPaths(value) {
+  return String(value || "").replace(ROUTE_PATH_RE, (whole, pre, p) => {
+    const segs = p.split(/[\\/]+/).filter(Boolean);
+    return pre + (segs.length ? segs[segs.length - 1] : "");
+  });
+}
 function routeTokenize(value) {
-  const matches = routeNormalize(value).match(/[a-z0-9][a-z0-9-]{1,}|[가-힣]{2,}/g) || [];
+  // 매치가 영숫자로 끝나도록 강제해 "users-mason-documents-" 같은 후행 하이픈 토큰을 원천 차단.
+  const matches = routeNormalize(routeStripPaths(value)).match(/[a-z0-9][a-z0-9-]*[a-z0-9]|[가-힣]{2,}/g) || [];
   const expanded = matches.flatMap((term) => term.split("-").filter(Boolean).concat(term));
   return [...new Set(expanded.filter((term) => term.length >= 2 && !ROUTE_STOP_WORDS.has(term)))];
 }
 // 정체성 존(slug/이름/태그라인) — 여기 적중은 강한 라우팅 신호. system_prompt 본문 적중은 약한 신호.
+// 임포터 보일러플레이트 태그라인("Imported local team/agent")의 세 단어는 전부 스톱워드라
+// 프롬프트 토큰이 될 수 없다 — 별도 필터 불필요.
 function routeIdentityHaystack(agent) {
-  return routeNormalize([agent.slug, agent.name, agent.name_en, agent.tagline, agent.tagline_en].join("\n"));
+  return routeNormalize(routeStripPaths([agent.slug, agent.name, agent.name_en, agent.tagline, agent.tagline_en].join("\n")));
 }
 function routeHaystack(agent) {
-  return routeNormalize([
+  return routeNormalize(routeStripPaths([
     agent.slug,
     agent.name,
     agent.name_en,
     agent.tagline,
     agent.tagline_en,
     String(agent.system_prompt || "").slice(0, 3500),
-  ].join("\n"));
+  ].join("\n")));
 }
 const APP_BUILDER_EXPLICIT_TERMS = [
   "apps generate", "app builder", "make an app", "build an app", "create an app",
@@ -420,7 +468,7 @@ function isTrivialRoutePrompt(promptText) {
   return words.length <= 3 && TRIVIAL_ROUTE_PROMPTS.has(stripped);
 }
 function isAppBuilderWorthyRoutePrompt(prompt) {
-  const promptText = routeNormalize(prompt);
+  const promptText = routeNormalize(routeStripPaths(prompt));
   if (!promptText.trim() || isTrivialRoutePrompt(promptText)) return false;
   const explicit = routeMatchedTerms(promptText, APP_BUILDER_EXPLICIT_TERMS);
   if (explicit.length) return true;
@@ -442,8 +490,10 @@ function routeHint(promptText, agent, lang) {
   if (!terms.length) return { score: 0, terms: [], reason: "" };
   return { score: 12 + terms.length * 3, terms, reason: lang === "ko" ? hint.reasonKo : hint.reasonEn };
 }
-function scoreRouteAgent(prompt, promptTerms, agent, lang) {
-  const promptText = routeNormalize(prompt);
+function scoreRouteAgent(prompt, promptTerms, agent, lang, pre) {
+  // 대칭 스트리핑 필수: promptText는 이름(+20)·힌트(+12↑) strong 채널의 입력이라, 여기서
+  // 경로를 안 벗기면 "/Users/x/project-plan/…"의 디렉터리명이 strong 게이트를 그대로 뚫는다.
+  const promptText = routeNormalize(routeStripPaths(prompt));
   if (agent.slug === "agentlas-app-builder" && !isAppBuilderWorthyRoutePrompt(promptText)) {
     return {
       agent,
@@ -452,24 +502,33 @@ function scoreRouteAgent(prompt, promptTerms, agent, lang) {
         ? "전용 App을 만들 만큼 반복·상태·편집·자동화가 뚜렷하지 않아 App Builder 라우트를 보류했습니다"
         : "the request does not clearly need a dedicated App with durable workflow, state, editing, or automation",
       terms: [],
+      strong: false,
     };
   }
-  const identityHay = routeIdentityHaystack(agent);
-  const haystack = routeHaystack(agent);
+  // 헤이스택은 설치/임포트 시에만 변하므로 autoRouteAgent가 미리 계산해 넘긴다(중복 계산 제거).
+  const identityHay = (pre && pre.identityHay) || routeIdentityHaystack(agent);
+  const haystack = (pre && pre.haystack) || routeHaystack(agent);
   let score = 0;
+  let strong = false; // 이름 언급/정체성 적중/큐레이션 힌트 — 데스크탑처럼 "이름/힌트급 증거"가 있어야 위임한다
   const terms = [];
+  const seenNames = new Set();
   for (const name of [agent.slug, agent.name, agent.name_en].filter(Boolean)) {
     const n = routeNormalize(name);
     // 4자 미만 일반 단어("team","agent" 등)가 프롬프트에 우연히 들어가 +20을 독식하지 않도록 가드.
-    if (n && n.length >= 4 && promptText.includes(n)) {
+    // name === name_en 인 임포트 에이전트(appbridge 등)가 +20을 두 번 받지 않도록 정규화 기준 dedupe.
+    if (!n || n.length < 4 || seenNames.has(n)) continue;
+    seenNames.add(n);
+    if (promptText.includes(n)) {
       score += 20;
       terms.push(name);
+      strong = true;
     }
   }
   for (const term of promptTerms) {
     if (identityHay.includes(term)) {
       score += 6; // 이름/태그라인 적중 = 그 에이전트의 정체성 자체를 부른 것
       terms.push(term);
+      strong = true;
     } else if (haystack.includes(term)) {
       score += term.length >= 5 ? 3 : 2;
       terms.push(term);
@@ -477,6 +536,7 @@ function scoreRouteAgent(prompt, promptTerms, agent, lang) {
   }
   const hint = routeHint(promptText, agent, lang);
   score += hint.score;
+  if (hint.score) strong = true;
   terms.push(...hint.terms);
   const unique = [...new Set(terms)].slice(0, 6);
   const reason = hint.reason || (lang === "ko"
@@ -486,13 +546,14 @@ function scoreRouteAgent(prompt, promptTerms, agent, lang) {
     : unique.length
       ? `request terms ${unique.map((term) => `"${term}"`).join(", ")} best match this agent's role/triggers`
       : "no specialist matched clearly, so the default project coordinator is safest");
-  return { agent, score, reason, terms: unique };
+  return { agent, score, reason, terms: unique, strong };
 }
-// 라우팅 확신 임계값. 이름/태그라인 적중(+6), 라우트 힌트(+12↑), 이름 포함(+20)만 전문 라우트로 인정하고,
-// system_prompt 본문의 약한 단어 적중(+2~3) 한두 개로는 에이전트를 절대 선택하지 않는다.
-// 임계값 미만이면 "직답"(에이전트·능력 라우팅 없음) — 일반 질문이 Pitch Deck Architect 같은
-// 무관 페르소나 + gemini 이미지 런타임으로 끌려가던 사고의 근본 수리.
-const MIN_ROUTE_SCORE = 6;
+// 라우팅 확신 임계값 — 데스크탑 auto-router의 MIN_SPECIALIST_SCORE(10)와 동일 기준.
+// 위임에는 점수뿐 아니라 strong 신호(이름 포함 +20 / 정체성 적중 +6 / 큐레이션 힌트 +12↑)가
+// 반드시 있어야 한다. system_prompt 본문의 약한 단어 적중(+2~3)이 몇 개 쌓여도, strong 신호가
+// 없으면 절대 위임하지 않는다. 미달이면 "직답"(에이전트·능력 라우팅 없음) — 일반 질문이
+// Pitch Deck Architect 같은 무관 페르소나 + gemini 이미지 런타임으로 끌려가던 사고의 근본 수리.
+const MIN_ROUTE_SCORE = 10;
 function directRouteChoice(lang) {
   const resolvedLang = lang || prefsLang();
   return {
@@ -500,6 +561,7 @@ function directRouteChoice(lang) {
     agent: null,
     score: 0,
     terms: [],
+    strong: false,
     reason: resolvedLang === "ko"
       ? "특정 전문 에이전트가 필요 없는 일반 요청입니다"
       : "this is a general request that needs no specialist agent",
@@ -521,6 +583,7 @@ function autoRouteAgent(db, prompt, lang) {
       return {
         agent: meta,
         score: 1000,
+        strong: true,
         reason:
           resolvedLang === "ko"
             ? "새 에이전트/팀/회사를 만드는 요청이라 메타에이전트(빌더)로 라우팅했습니다"
@@ -532,13 +595,19 @@ function autoRouteAgent(db, prompt, lang) {
   const agents = listRoutableAgents(db).filter((agent) => !NON_GENERIC_ROUTE_SLUGS.has(agent.slug));
   if (!agents.length) return directRouteChoice(resolvedLang);
   let terms = routeTokenize(prompt);
+  // 헤이스택은 한 번만 계산해 IDF와 스코어링 양쪽에서 재사용한다.
+  const hays = agents.map((agent) => ({ identityHay: routeIdentityHaystack(agent), haystack: routeHaystack(agent) }));
   // IDF 근사 — 설치 에이전트 절반 이상의 haystack에 나오는 단어("ai","도구" 등)는 판별력이 없어 제외.
   if (agents.length >= 3) {
-    const hays = agents.map((agent) => routeHaystack(agent));
-    terms = terms.filter((term) => hays.filter((hay) => hay.includes(term)).length * 2 <= agents.length);
+    terms = terms.filter((term) => hays.filter((h) => h.haystack.includes(term)).length * 2 <= agents.length);
   }
-  const ranked = agents.map((agent) => scoreRouteAgent(prompt, terms, agent, resolvedLang)).sort((a, b) => b.score - a.score);
-  if (ranked[0] && ranked[0].score >= MIN_ROUTE_SCORE) return ranked[0];
+  const ranked = agents
+    .map((agent, i) => scoreRouteAgent(prompt, terms, agent, resolvedLang, hays[i]))
+    .sort((a, b) => b.score - a.score);
+  // 1위가 아니라 "임계값+strong을 모두 만족하는 최고 순위"를 뽑는다 — 장황한 프롬프트의
+  // 약한 단어 적중이 점수 1위를 먹어도, 자격 있는 전문 에이전트가 직답으로 밀려나지 않는다.
+  const pick = ranked.find((r) => r.score >= MIN_ROUTE_SCORE && r.strong);
+  if (pick) return pick;
   return directRouteChoice(resolvedLang);
 }
 function autoRouteNote(choice, lang) {
@@ -754,9 +823,14 @@ function importLocalFolderCli(db, absPath) {
       ).run(id, slug, name, name, tagline, tagline, systemPrompt, envReqsJson, now, tone);
     }
   }
+  // detectKind 결과를 DB에도 기록 — needsImage의 팀 body-veto 등 능력 판정이
+  // 데스크탑이 써준 entity_kind에 무임승차하지 않고 터미널 단독 임포트에서도 성립한다.
+  if (columnExists(db, "installed_agents", "entity_kind")) {
+    db.prepare("UPDATE installed_agents SET entity_kind=? WHERE id=?").run(kind, id);
+  }
   // 라우트 저장
   routes[id] = { agentId: id, path: dir, runtime, labels, kind, importedAt: now };
-  fs.writeFileSync(path.join(userDataDir(), "agent-routes.json"), JSON.stringify(routes, null, 2), "utf8");
+  writeJsonPrivateAtomicCli(path.join(userDataDir(), "agent-routes.json"), routes);
 
   // 팀이면 회사(firm)로도 등록 → 앱 FIRMS 목록 + `agentlas firm <slug>` 사용 가능. slug 기준 멱등.
   let firm = null;
@@ -2364,6 +2438,17 @@ function persistCloudListingCli(db, listing) {
     throw error;
   }
   const localPath = restore?.path || null;
+  // entity_kind 기록 — needsImage의 팀 body-veto가 로컬 폴더 임포트(detectKind)뿐 아니라
+  // 클라우드/Hub 소스 설치 팀에도 걸리게 한다. 안 하면 팀 CEO 두뇌의 부서 키워드
+  // ("Design HQ" 등)로 needsImage가 참이 되어 세션 런타임이 통째로 gemini로 하이재킹된다.
+  // Hub가 준 entityKind를 우선하고, 없으면 materialize된 팩 폴더 구조로 판정한다.
+  if (columnExists(db, "installed_agents", "entity_kind")) {
+    let kind = String(listing.entityKind || "").toLowerCase();
+    if (kind !== "team" && kind !== "agent") {
+      kind = localPath && fs.existsSync(localPath) ? detectKind(localPath) : "agent";
+    }
+    db.prepare("UPDATE installed_agents SET entity_kind=? WHERE id=?").run(kind, id);
+  }
   return existing
     ? { ...existing, slug, name: dbExpected.name, ...(localPath ? { localPath } : {}) }
     : { id, slug, name: dbExpected.name, ...(localPath ? { localPath } : {}) };
@@ -6986,6 +7071,21 @@ function readJsonSafeCli(filePath, fallback) {
 function writeJsonSafeCli(filePath, value) {
   fs.writeFileSync(filePath, JSON.stringify(value, null, 2) + "\n", "utf8");
 }
+// 원자적(temp+rename) + 소유자 전용(0600) JSON 쓰기. 세션 ID/경로 등 민감 상태 파일용:
+// (1) 크래시 중간 쓰기로 JSON이 깨져 routesMap()이 {}를 돌려주며 임포트 매핑을 통째로 잃던 사고,
+// (2) 기본 umask(0644)로 cli-sessions.json/agent-routes.json이 world-readable이던 정보 노출을 함께 막는다.
+function writeJsonPrivateAtomicCli(filePath, value) {
+  const dir = path.dirname(filePath);
+  const tmp = path.join(dir, `.${path.basename(filePath)}.${process.pid}.tmp`);
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+  try {
+    fs.renameSync(tmp, filePath);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+    throw e;
+  }
+  try { fs.chmodSync(filePath, 0o600); } catch { /* 일부 FS는 chmod 미지원 — best-effort */ }
+}
 
 function ontologySourceManifestSkeletonCli(root) {
   return {
@@ -8055,13 +8155,28 @@ const PROTECTED_CHILD_ENV_KEYS_CLI = new Set([
   "AGENTLAS_NATIVE_IDLE_TIMEOUT_MS", "AGENTLAS_NATIVE_TOTAL_TIMEOUT_MS", "AGENTLAS_NATIVE_KILL_GRACE_MS",
   "AGENTLAS_CAPTURE_MAX_OUTPUT_BYTES",
 ]);
-function isProtectedChildEnvKeyCli(key) {
-  return PROTECTED_CHILD_ENV_KEYS_CLI.has(String(key || "").trim().toUpperCase());
+// 네트워크 무결성 키 — TLS 검증·프록시·CA·엔드포인트·세션. 프로젝트/에이전트 dotenv(신뢰 불가:
+// 클론한 레포에 딸려올 수 있음)로 주입되면 MITM/SSRF/세션 하이재킹이 된다. 단, 사용자 본인의
+// 전역 credentials.env와 호스트 셸 env는 신뢰하므로 그대로 허용한다. 사고 방지: 원샷 API 경로는
+// buildChildEnvCli 결과를 process.env에 병합(Object.assign)하므로, 프로젝트 .env가 부모 프로세스의
+// 클라우드 호출(세션 쿠키 동반)까지 오염시킬 수 있었다.
+const UNTRUSTED_PROTECTED_ENV_KEYS_CLI = new Set([
+  "NODE_TLS_REJECT_UNAUTHORIZED", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+  "OPENSSL_CONF", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+  "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "GRPC_PROXY", "NPM_CONFIG_PROXY",
+  "AGENTLAS_SESSION", "AGENTLAS_MCP_BASE_URL", "AGENTLAS_WEB_BASE_URL", "AGENTLAS_API_BASE_URL",
+  "AGENTLAS_HUB_BASE_URL", "AGENTLAS_CLOUD_BASE_URL", "OLLAMA_HOST",
+]);
+function isProtectedChildEnvKeyCli(key, trusted) {
+  const k = String(key || "").trim().toUpperCase();
+  if (PROTECTED_CHILD_ENV_KEYS_CLI.has(k)) return true; // 호스트 신원/플러그인 루트 — 모든 출처 차단
+  if (!trusted && UNTRUSTED_PROTECTED_ENV_KEYS_CLI.has(k)) return true; // 네트워크 무결성 — 비신뢰 출처만 차단
+  return false;
 }
-function mergeChildEnvValuesCli(target, values, overwrite) {
+function mergeChildEnvValuesCli(target, values, overwrite, trusted) {
   const injected = [];
   for (const [key, value] of Object.entries(values || {})) {
-    if (!value || isProtectedChildEnvKeyCli(key)) continue;
+    if (!value || isProtectedChildEnvKeyCli(key, trusted)) continue;
     if (!overwrite && target[key]) continue;
     target[key] = value;
     injected.push(key);
@@ -8070,19 +8185,20 @@ function mergeChildEnvValuesCli(target, values, overwrite) {
 }
 async function buildChildEnvCli(db, ctx) {
   const env = { ...process.env };
-  const apply = (values, overwrite) => {
-    mergeChildEnvValuesCli(env, values, overwrite);
+  // trusted=true: 사용자 본인의 전역 자격/볼트. trusted=false: 프로젝트·에이전트 폴더 dotenv.
+  const apply = (values, overwrite, trusted) => {
+    mergeChildEnvValuesCli(env, values, overwrite, trusted);
   };
   const globalCredentials = {
     ...readDotEnvFileCli(path.join(userDataDir(), "credentials.env")),
     ...readDotEnvFileCli(path.join(os.homedir(), ".agentlas", "credentials.env")),
   };
-  apply(globalCredentials, false);
-  if (ctx && ctx.projectPath) apply(projectScopedEnvValuesCli(globalCredentials, ctx.projectPath), true);
-  if (ctx && ctx.cwd) apply(readDotEnvDirCli(ctx.cwd), true);
-  if (ctx && ctx.projectPath) apply(readDotEnvDirCli(ctx.projectPath), true);
+  apply(globalCredentials, false, true);
+  if (ctx && ctx.projectPath) apply(projectScopedEnvValuesCli(globalCredentials, ctx.projectPath), true, true);
+  if (ctx && ctx.cwd) apply(readDotEnvDirCli(ctx.cwd), true, false);
+  if (ctx && ctx.projectPath) apply(readDotEnvDirCli(ctx.projectPath), true, false);
   const agentDir = agentEnvDirCli(ctx && ctx.agentId);
-  if (agentDir) apply(readDotEnvDirCli(agentDir), true);
+  if (agentDir) apply(readDotEnvDirCli(agentDir), true, false);
 
   const mm = loadMultimodalCatalog();
   const settings = getMultimodalSettingsCli(db);
@@ -8091,7 +8207,7 @@ async function buildChildEnvCli(db, ctx) {
     if (req && req.key) keys.add(req.key);
   }
   const vaultValues = await readVaultEnvValuesCli([...keys].filter((key) => !env[key]), ctx && ctx.projectPath);
-  apply(vaultValues, false);
+  apply(vaultValues, false, true); // 볼트는 사용자 본인 저장소 — 신뢰
   env.AGENTLAS_MULTIMODAL_IMAGE_PROVIDER = settings.imageProvider;
   env.AGENTLAS_MULTIMODAL_VIDEO_PROVIDER = settings.videoProvider;
   env.AGENTLAS_MULTIMODAL_AUDIO_PROVIDER = settings.audioProvider;
@@ -8211,7 +8327,7 @@ function buildHelpers(db) {
       try { return JSON.parse(fs.readFileSync(path.join(userDataDir(), "cli-sessions.json"), "utf8")) || []; } catch { return []; }
     },
     sessionsSave: (list) => {
-      try { fs.writeFileSync(path.join(userDataDir(), "cli-sessions.json"), JSON.stringify((list || []).slice(0, 30), null, 2), "utf8"); } catch { /* ignore */ }
+      try { writeJsonPrivateAtomicCli(path.join(userDataDir(), "cli-sessions.json"), (list || []).slice(0, 30)); } catch { /* ignore */ }
     },
     // 패리티: REPL의 /storm·/swarm·/build·/route·/research 가 그대로 호출한다.
     stormRun: (db_, goal, ctx) => parity().stormRun(db_, goal, ctx),
@@ -8662,7 +8778,7 @@ async function cmdFirm(db, query, prompt, runtimeOverride) {
     slug: firm.slug,
     label: firm.name + " CEO",
     system: sys,
-    capAgent: { name: firm.name, name_en: firm.name_en || firm.name, tagline: firm.tagline, system_prompt: sys },
+    capAgent: { name: firm.name, name_en: firm.name_en || firm.name, tagline: firm.tagline, tagline_en: firm.tagline_en, entity_kind: "team", system_prompt: sys },
   };
   return launchTui(db, subject, runtimeOverride);
 }
@@ -9995,6 +10111,8 @@ function cmdHelp() {
       "  connect [<sub>]          wire Telegram / platforms to an agent team       (hep-connect)",
       "  import <path>            import a local agent/team folder",
       "  list                     installed agents/companies + active runtime",
+      "  experience <sub>         local Experience Pack intent: list|inspect|publish|unpublish",
+      "  variant resolve          local variant selection: selected|fallback|base-only|error",
       "",
       hdr("EXECUTE"),
       "  storm <goal>             force-robust pipeline: route → verify → execute  (Stormbreaker) [--research]",
@@ -10133,8 +10251,33 @@ async function main() {
       return parity().cmdHep(db, rest.slice(1));
     // ── Agentlas OS 정식 표면 (hep-*) 1급 노출 ──
     case "build":
-      // hep-build "<요청>" — 에이전트/팀 빌드 (Meta-Agent Factory)
-      return parity().cmdHep(db, rest.length > 1 ? ["hep-build", rest.slice(1).join(" ")] : ["hep-build"]);
+      // Terminal-owned preflight: trusted system-global MCP metadata first, one consent,
+      // then pass only approved catalog IDs/value-free shortages to the existing builder.
+      return terminalAssets.cmdBuild({
+        db,
+        args: rest.slice(1),
+        userDataDir: userDataDir(),
+        cwd: projectCwd(),
+        input: process.stdin,
+        promptOutput: process.stderr,
+        out,
+        invokeBuild: (request) => parity().cmdHep(db, request ? ["hep-build", request] : ["hep-build"]),
+      });
+    case "experience":
+      return terminalAssets.cmdExperience({
+        args: rest.slice(1),
+        userDataDir: userDataDir(),
+        cwd: projectCwd(),
+        out,
+      });
+    case "variant":
+      return terminalAssets.cmdVariant({
+        db,
+        args: rest.slice(1),
+        userDataDir: userDataDir(),
+        cwd: projectCwd(),
+        out,
+      });
     case "search": // hep-search — 에이전트 디렉터리 발견 (Hub + 로컬)
       if (!rest[1]) return fail('usage: agentlas search "<찾는 일>" [--limit 10]');
       return parity().cloudSearch(db, rest.slice(1));
@@ -10219,6 +10362,9 @@ module.exports = {
   parseDotEnvCli,
   isProtectedChildEnvKeyCli,
   mergeChildEnvValuesCli,
+  openNodeSqliteDb,
+  ensureMemoryContextColumn,
+  writeJsonPrivateAtomicCli,
   resolveCredentialSourcePath,
   upsertEnvLine,
   fetchHubCli,

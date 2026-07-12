@@ -87,6 +87,43 @@ agentlas import <폴더>             # 로컬 에이전트/팀 임포트
 agentlas list                      # 설치된 에이전트/회사 + 활성 런타임
 ```
 
+**경험 팩과 Variant (Terminal 로컬 제어면)**
+```sh
+agentlas experience list
+agentlas experience inspect <pack-id|release-id>
+agentlas experience publish .agentlas/experience-pack.json
+agentlas experience unpublish <pack-id|release-id>
+
+agentlas variant resolve --candidates variants.json --base-release <release-id>
+```
+
+`experience publish|unpublish`는 Terminal의 **로컬 의도만** 0600 상태 파일에
+기록한다. Hub API를 호출하거나 원격 발행/회수를 성공했다고 표시하지 않으며, 실제
+Hub 영수증이 없다는 사실을 항상 출력한다. Terminal 경험 상태는 Desktop DB를
+복제하지 않는다. Experience Pack은 base release를 참조할 뿐 base package를 복사하지
+않는다.
+
+`variant resolve`도 로컬 호환성 미리보기다. 후보 JSON의 `score`나
+`compatibilityStatus: verified`는 사용자가 직접 쓸 수 있으므로 평판·결제·대여·실행
+권위로 인정하지 않는다. 실제 자동대여에는 Agentlas Web이 발급·검증한 서버 resolution
+receipt가 별도로 필요하다.
+
+**빌드 전 MCP 계획**
+```sh
+agentlas build "GitHub 이슈를 정리하는 에이전트" --mcp-plan-only
+agentlas build "GitHub 이슈를 정리하는 에이전트" --approve-mcp github
+agentlas build "오프라인 에이전트" --no-mcp
+```
+
+빌드 전에는 Agentlas 시스템 전역 MCP 레지스트리의 메타데이터를 먼저 읽고, 관련
+MCP·키 필요 여부·키 존재 여부만 한 번에 보여 준다. 명령, 인자, URL, 키 값은 빌더에
+전달하지 않는다. 비대화형 실행은 묻지 않고 기본적으로 아무 MCP도 승인하지 않아
+CI가 멈추지 않는다. 한 MCP가 없거나 키가 없어도 그 기능만 degraded가 되며 빌드는
+empty-MCP 모드로 계속된다. `--require-mcp <catalog-id>`는 빌드 전체를 중단시키지 않고
+Variant 대여 판단에서 해당 Variant만 제외하는 계약을 만든다.
+시스템 전역 레지스트리를 읽지 못한 경우도 `registry: unavailable`로 명확히 구분하고,
+설치나 네트워크 폴백 없이 empty-MCP 모드로 계속한다.
+
 **내 Agent Cloud 자산**
 ```sh
 agentlas cloud save <경로>         # 소유자 전용 비공개 저장(공개 심사/라우팅 카드 없음)
