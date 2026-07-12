@@ -110,6 +110,9 @@ function buildComposerFrame(state, ctx = {}, palette, width = 80) {
     const rest = ctx.status && available > 0 ? c.faint("  ·  " + truncateWidth(ctx.status, available)) : "";
     lines.push(permissionPresentation(ctx, c) + rest);
   }
+  // 연결 LLM 세션 사용량 상시 표시줄 — 입력박스 바로 아래에 항상 유지된다.
+  const usageText = typeof ctx.usage === "function" ? ctx.usage() : ctx.usage;
+  if (usageText) lines.push(c.faint(truncateWidth(String(usageText), w)));
   if (ctx.confirmation) {
     const prefix = ctx.confirmationTone === "danger" ? "! " : "✓ ";
     const paint = ctx.confirmationTone === "danger" && c.paw ? c.paw : c.green || c.emerald || ((value) => value);

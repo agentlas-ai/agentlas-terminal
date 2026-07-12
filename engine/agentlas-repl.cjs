@@ -301,6 +301,7 @@ function startRepl(opts) {
     try {
       ui.beginTurn({
         ...composerMeta(),
+        usage: () => usageSummaryLine(), // 턴 중에도 최신 사용량을 footer에 라이브 반영
         onInterrupt: () => {
           if (!currentAbort || currentAbort.signal.aborted) return;
           currentAbort.abort();
@@ -465,6 +466,23 @@ function startRepl(opts) {
     state.history = [];
     state.routePreambleOnce = null;
     applyRuntimeFor(state.subject);
+  }
+  // 직답 모드 — 전문 에이전트 확신이 없을 때. 페르소나 없음 + 능력(이미지) 라우팅 없음:
+  // 런타임은 세션 기본(baseRuntime) 그대로라, 일반 질문이 gemini 등으로 끌려가지 않는다.
+  function setSubjectDirect() {
+    if (state.subject && state.subject.kind === "direct") return; // 연속 직답 — 세션/히스토리 유지
+    state.subject = {
+      kind: "direct",
+      id: null,
+      slug: "agentlas-direct",
+      label: ui.lang === "ko" ? "Agentlas 직답" : "Agentlas direct",
+      system: H.directSystemPrompt ? H.directSystemPrompt(ui.lang) : "You are the Agentlas terminal's default assistant.",
+      capAgent: null,
+    };
+    state.history = [];
+    state.routePreambleOnce = null;
+    state.runtime = baseRuntime;
+    state.native = {};
   }
   function setSubjectFirm(firm) {
     const sys = H.firmSystemPrompt(db, firm);
@@ -721,6 +739,31 @@ function startRepl(opts) {
       case "runtime":
         setRuntime(arg);
         return true;
+      case "config":
+      case "toggles": {
+        // 클로드코드 /config 스타일 — 자동 엔진 개입은 전부 명시적 opt-in (기본 off).
+        const ENGINE_FLAGS = [
+          { key: "storm", pref: "autoStorm", label: ui.t("config.storm") },
+          { key: "network", pref: "autoNetwork", label: ui.t("config.network") },
+        ];
+        const showConfig = () => {
+          ui.line("");
+          ui.rule(ui.t("config.title"));
+          for (const f of ENGINE_FLAGS) {
+            const on = !!prefs[f.pref];
+            ui.line("  " + (on ? ui.c.green("● on ") : ui.c.dim("○ off")) + "  " + ui.c.emerald(f.key.padEnd(9)) + ui.c.dim(f.label));
+          }
+          ui.line("  " + ui.c.faint(ui.t("config.usage")));
+        };
+        const [cfgKey, cfgVal] = arg.trim().split(/\s+/);
+        if (!cfgKey) return showConfig(), true;
+        const flag = ENGINE_FLAGS.find((f) => f.key === cfgKey.toLowerCase());
+        if (!flag || !/^(on|off)$/i.test(cfgVal || "")) return ui.warn(ui.t("config.usage")), true;
+        prefs[flag.pref] = /^on$/i.test(cfgVal);
+        if (opts.savePrefs) opts.savePrefs(prefs);
+        ui.ok(ui.t("config.set", flag.key, prefs[flag.pref] ? "on" : "off"));
+        return showConfig(), true;
+      }
       case "storm": {
         if (!arg) return ui.warn("usage: /storm <goal>  [--research]"), true;
         let goal = arg;
@@ -976,8 +1019,13 @@ function startRepl(opts) {
         const s = n >= 1 && n <= list.length ? list[n - 1] : null;
         if (!s) return ui.warn(ui.t("resume.noNum")), true;
         const agent = H.resolveAgent(db, s.agentSlug);
-        if (!agent) return ui.error(ui.t("noAgent", s.agentSlug)), true;
-        setSubjectAgent(agent);
+        if (agent) {
+          setSubjectAgent(agent);
+        } else if (s.agentSlug === "agentlas-direct") {
+          setSubjectDirect(); // 직답 세션도 이어서 재개
+        } else {
+          return ui.error(ui.t("noAgent", s.agentSlug)), true;
+        }
         if (s.kind && H.RUNTIME_BIN[s.kind] && H.which(H.RUNTIME_BIN[s.kind])) {
           state.runtime = { mode: "cli", kind: s.kind };
           baseRuntime = state.runtime;
@@ -1097,10 +1145,14 @@ function startRepl(opts) {
       if (H.autoRouteAgent) {
         const choice = H.autoRouteAgent(db, t, ui.lang);
         if (choice) {
-          setSubjectAgent(choice.agent);
+          if (choice.direct) {
+            setSubjectDirect();
+          } else {
+            setSubjectAgent(choice.agent);
+          }
           state.routePreambleOnce = H.autoRoutePreamble ? H.autoRoutePreamble(choice, ui.lang) : null;
-          ui.info(H.autoRouteNote ? H.autoRouteNote(choice, ui.lang) : `auto-routed to ${choice.agent.name}`);
-          routingNote(state.subject);
+          ui.info(H.autoRouteNote ? H.autoRouteNote(choice, ui.lang) : `auto-routed to ${state.subject.label}`);
+          if (!choice.direct) routingNote(state.subject);
           await runTurn(t);
           return ask();
         }
@@ -1120,35 +1172,95 @@ function startRepl(opts) {
       await handleSlash(t); // /exit 는 내부에서 process.exit
       return;
     }
-    if (!state.subject) {
-      const ags = H.listAgents(db);
-      const single = !/\s/.test(t);
-      if (/^\d+$/.test(t)) {
-        const n = parseInt(t, 10);
-        if (n >= 1 && n <= ags.length) {
-          setSubjectAgent(ags[n - 1]);
-          ui.ok(ui.t("switched", state.subject.label));
-          routingNote(state.subject);
-          return;
+    // 직답 모드는 대상 고정이 아니라 "자동 라우팅 유지" — 매 메시지 재라우팅해,
+    // 나중에 전문 요청이 오면 해당 에이전트로 자연스럽게 넘어간다.
+    const directMode = !!(state.subject && state.subject.kind === "direct");
+    if (!state.subject || directMode) {
+      if (!state.subject) {
+        const ags = H.listAgents(db);
+        const single = !/\s/.test(t);
+        if (/^\d+$/.test(t)) {
+          const n = parseInt(t, 10);
+          if (n >= 1 && n <= ags.length) {
+            setSubjectAgent(ags[n - 1]);
+            ui.ok(ui.t("switched", state.subject.label));
+            routingNote(state.subject);
+            return;
+          }
         }
-      }
-      if (single) {
-        const a = H.resolveAgent(db, t);
-        if (a) { setSubjectAgent(a); ui.ok(ui.t("switched", state.subject.label)); routingNote(state.subject); return; }
-        const f = H.resolveFirm(db, t);
-        if (f) { setSubjectFirm(f); ui.ok(ui.t("switched", state.subject.label)); routingNote(state.subject); return; }
+        if (single) {
+          const a = H.resolveAgent(db, t);
+          if (a) { setSubjectAgent(a); ui.ok(ui.t("switched", state.subject.label)); routingNote(state.subject); return; }
+          const f = H.resolveFirm(db, t);
+          if (f) { setSubjectFirm(f); ui.ok(ui.t("switched", state.subject.label)); routingNote(state.subject); return; }
+        }
       }
       if (H.autoRouteAgent) {
         const choice = H.autoRouteAgent(db, t, ui.lang);
         if (choice) {
-          setSubjectAgent(choice.agent);
-          state.routePreambleOnce = H.autoRoutePreamble ? H.autoRoutePreamble(choice, ui.lang) : null;
-          ui.info(H.autoRouteNote ? H.autoRouteNote(choice, ui.lang) : `auto-routed to ${choice.agent.name}`);
-          routingNote(state.subject);
+          if (choice.direct) {
+            setSubjectDirect();
+            if (!directMode) {
+              // 첫 직답 진입에만 알림 — 연속 직답 대화에서는 조용히.
+              state.routePreambleOnce = H.autoRoutePreamble ? H.autoRoutePreamble(choice, ui.lang) : null;
+              ui.info(H.autoRouteNote ? H.autoRouteNote(choice, ui.lang) : `direct answer (no agent)`);
+            }
+          } else {
+            setSubjectAgent(choice.agent);
+            state.routePreambleOnce = H.autoRoutePreamble ? H.autoRoutePreamble(choice, ui.lang) : null;
+            ui.info(H.autoRouteNote ? H.autoRouteNote(choice, ui.lang) : `auto-routed to ${choice.agent.name}`);
+            routingNote(state.subject);
+          }
+        }
+      }
+      // 자동 엔진 개입은 명시적 opt-in 전용 (/config, 기본 off): direct 판정 + 실작업형 프롬프트일 때만.
+      if (state.subject && state.subject.kind === "direct" && goalLikePrompt(t)) {
+        if (prefs.autoStorm && H.stormRun) {
+          ui.info(ui.t("config.autoEngage", "stormbreaker", "storm"));
+          await H.stormRun(db, t, { ui, cwd: state.cwd, research: false });
+          return;
+        }
+        if (prefs.autoNetwork && H.hepRun) {
+          ui.info(ui.t("config.autoEngage", "hep-network", "network"));
+          ui.line("");
+          await H.hepRun(["hep-network", t, "--project", state.cwd, "--runtime", "terminal"], { cwd: state.cwd });
+          return;
         }
       }
     }
     await runTurn(expandMentions(t));
+  }
+
+  // 실작업(goal)형 프롬프트 감지 — 질문/잡담에는 자동 엔진(storm/network)을 절대 걸지 않는다.
+  function goalLikePrompt(t) {
+    const s = String(t || "").trim();
+    if (s.length < 12) return false;
+    if (/[?？]\s*$/.test(s)) return false;
+    return /(해줘|해라|만들|구현|수정|배포|정리|작성|분석|리팩터|고쳐|추가|빌드|테스트|돌려|실행|자동화|automate|build|implement|fix|refactor|deploy|create|write|run|ship)/i.test(s);
+  }
+
+  // ── 연결 LLM 세션 사용량 요약 (챗 입력창 아래 상시 표시) ──
+  // 호스트 이점: 단일 모델 CLI는 못 보여주는 멀티 LLM 합산 사용량을 항상 노출한다.
+  function fmtTok(n) {
+    if (!n) return "0";
+    if (n >= 1e6) return (n >= 1e7 ? Math.round(n / 1e6) : (n / 1e6).toFixed(1)) + "m";
+    if (n >= 1e3) return (n >= 1e5 ? Math.round(n / 1e3) : (n / 1e3).toFixed(1)) + "k";
+    return String(n);
+  }
+  function usageSummaryLine() {
+    const shortLabel = (label) => (label === "claude-code" ? "claude" : label);
+    const labels = [];
+    const push = (label) => { if (label && label !== "(none)" && !labels.includes(label)) labels.push(label); };
+    for (const kind of installedKinds()) push(kind); // 연결(설치)된 CLI 런타임 — 미사용이어도 표시
+    push(runtimeLabel(state.runtime)); // 현재 런타임 (BYOK/Ollama 포함)
+    for (const label of Object.keys(state.cost)) push(label); // 세션 중 사용한 나머지
+    const parts = labels.map((label) => {
+      const e = state.cost[label];
+      if (!e) return `${shortLabel(label)} 0`;
+      if (e.in || e.out) return `${shortLabel(label)} ${fmtTok(e.in)}→${fmtTok(e.out)}`;
+      return `${shortLabel(label)} ${e.turns}${ui.lang === "ko" ? "턴" : "t"}`;
+    });
+    return `${ui.t("usageBar")}  ${parts.join(" · ")}`;
   }
 
   // ── composer (raw-mode bottom box) main loop ──
@@ -1162,6 +1274,7 @@ function startRepl(opts) {
       permission: state.permission,
       permissionLabel,
       status: `${rt}${eff} · ${subj} · ${ui.t("permCycleHint")} · ${ui.t("composer.hint")} · ↑↓ history`,
+      usage: usageSummaryLine(), // 챗 입력창 아래 상시 LLM 사용량 표시줄
       onCyclePermission: () => {
         const cycle = permissionCycle.step(state.permission);
         if (cycle.armed) {
@@ -1228,6 +1341,8 @@ function startRepl(opts) {
     if (closed) return process.exit(0);
     if (slashPalette.setEnabled) slashPalette.setEnabled(true);
     const cont = buffer != null;
+    // 클래식 모드에도 사용량 상시 표시 (composer 모드에선 입력박스 아래 줄이 담당)
+    if (!cont && !composer && Object.keys(state.cost).length) ui.line(ui.c.faint("  " + usageSummaryLine()));
     rl.question(cont ? ui.c.dim("   … ") : "\n" + ui.promptLabel(), async (line) => {
       if (input.isContinuation(line)) {
         return ask((cont ? buffer + "\n" : "") + input.stripContinuation(line));

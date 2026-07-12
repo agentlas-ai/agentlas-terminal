@@ -95,6 +95,23 @@ function testComposerHierarchy() {
     confirmationTone: "danger",
   }, palette(), 48);
   for (const line of warning.lines) assert.ok(visWidth(line) <= 48, "permission warning must not wrap and corrupt redraw rows");
+
+  // 연결 LLM 사용량 표시줄 — ctx.usage가 있으면 상태줄 아래 한 줄로 항상 렌더된다.
+  const withUsage = buildComposerFrame({ buf: "", cur: 0, scroll: 0, suggest: [], suggestSel: 0 }, {
+    lang: "ko",
+    permission: "write",
+    permissionLabel: "읽기 + 쓰기",
+    status: "claude-code · 자동 라우팅",
+    usage: "토큰  claude 12.3k→4.5k · codex 0 · gemini 0",
+  }, palette(), 76);
+  assert.equal(withUsage.lines.length, 5, "usage bar must add exactly one line under the status line");
+  assert.match(withUsage.lines[4], /토큰 {2}claude 12\.3k→4\.5k · codex 0 · gemini 0/);
+  for (const line of withUsage.lines) assert.ok(visWidth(line) <= 76, "usage bar must never overflow the box width");
+  const usageFn = buildComposerFrame({ buf: "", cur: 0, scroll: 0, suggest: [], suggestSel: 0 }, {
+    permission: "write",
+    usage: () => "tokens  claude 1.0k→200",
+  }, palette(), 76);
+  assert.match(usageFn.lines[usageFn.lines.length - 1], /tokens {2}claude 1\.0k→200/, "usage may be a live getter");
 }
 
 function testCompactLocalizedStartup() {
@@ -170,7 +187,7 @@ function testCompactToolActivity() {
 function testPersistentTurnFooter() {
   const stream = captureStream({ tty: true, columns: 84 });
   const ui = new Ui({ color: false, lang: "ko", stream });
-  ui.beginTurn({ permission: "write", permissionLabel: "읽기 + 쓰기", status: "codex · 자동 라우팅" });
+  ui.beginTurn({ permission: "write", permissionLabel: "읽기 + 쓰기", status: "codex · 자동 라우팅", usage: () => "토큰  codex 2.0k→800" });
   ui.status("Codex로 생각 중");
   ui.tool("Read", "/Users/mason/Documents/Agentlas_F/README.md");
   ui.toolResult("first\nsecond\nthird", true);
@@ -193,6 +210,7 @@ function testPersistentTurnFooter() {
   assert.match(output, /읽기 \+ 쓰기/);
   assert.match(output, /● Read/);
   assert.match(output, /└ ✓ 3 lines read/);
+  assert.match(output, /토큰 {2}codex 2\.0k→800/, "usage bar must stay visible in the persistent turn footer");
 }
 
 function testRuntimeTaskPanelAndCtrlT() {

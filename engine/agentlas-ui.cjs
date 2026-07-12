@@ -280,7 +280,11 @@ class Ui {
         }
       }
     }
-    return [...taskLines, rule, prompt, rule, statusLine];
+    // 턴 중에도 사용량 표시줄 유지 (chrome.usage: 문자열 또는 라이브 getter)
+    const usageSrc = this._turnChrome.usage;
+    const usageText = typeof usageSrc === "function" ? usageSrc() : usageSrc;
+    const usageLine = usageText ? this.c.faint(truncateCells(String(usageText), width)) : null;
+    return [...taskLines, rule, prompt, rule, statusLine, ...(usageLine ? [usageLine] : [])];
   }
 
   _eraseFooter() {

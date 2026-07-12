@@ -300,7 +300,9 @@ function resolveMetaBuilder(db) {
   }
   return null;
 }
-const ROUTE_STOP_WORDS = new Set(["the", "and", "for", "with", "this", "that", "from", "into", "make", "build", "create", "agent", "agents", "please", "좀", "해주세요", "해줘", "만들어", "붙여", "연결", "작업", "요청"]);
+// "ai"/"llm" 같은 초범용 토큰은 모든 에이전트 프롬프트에 나오므로 판별력이 0이다 —
+// 이런 단어 하나로 전문 에이전트가 선택되던 오라우팅(예: 일반 맥 질문 → Pitch Deck Architect)을 막는다.
+const ROUTE_STOP_WORDS = new Set(["the", "and", "for", "with", "this", "that", "from", "into", "make", "build", "create", "agent", "agents", "please", "ai", "llm", "인공지능", "에이아이", "좀", "해주세요", "해줘", "만들어", "붙여", "연결", "작업", "요청"]);
 const ROUTE_HINTS = [
   {
     slug: "agentlas-app-builder",
@@ -362,6 +364,10 @@ function routeTokenize(value) {
   const matches = routeNormalize(value).match(/[a-z0-9][a-z0-9-]{1,}|[가-힣]{2,}/g) || [];
   const expanded = matches.flatMap((term) => term.split("-").filter(Boolean).concat(term));
   return [...new Set(expanded.filter((term) => term.length >= 2 && !ROUTE_STOP_WORDS.has(term)))];
+}
+// 정체성 존(slug/이름/태그라인) — 여기 적중은 강한 라우팅 신호. system_prompt 본문 적중은 약한 신호.
+function routeIdentityHaystack(agent) {
+  return routeNormalize([agent.slug, agent.name, agent.name_en, agent.tagline, agent.tagline_en].join("\n"));
 }
 function routeHaystack(agent) {
   return routeNormalize([
@@ -448,6 +454,7 @@ function scoreRouteAgent(prompt, promptTerms, agent, lang) {
       terms: [],
     };
   }
+  const identityHay = routeIdentityHaystack(agent);
   const haystack = routeHaystack(agent);
   let score = 0;
   const terms = [];
@@ -460,7 +467,10 @@ function scoreRouteAgent(prompt, promptTerms, agent, lang) {
     }
   }
   for (const term of promptTerms) {
-    if (haystack.includes(term)) {
+    if (identityHay.includes(term)) {
+      score += 6; // 이름/태그라인 적중 = 그 에이전트의 정체성 자체를 부른 것
+      terms.push(term);
+    } else if (haystack.includes(term)) {
       score += term.length >= 5 ? 3 : 2;
       terms.push(term);
     }
@@ -477,6 +487,30 @@ function scoreRouteAgent(prompt, promptTerms, agent, lang) {
       ? `request terms ${unique.map((term) => `"${term}"`).join(", ")} best match this agent's role/triggers`
       : "no specialist matched clearly, so the default project coordinator is safest");
   return { agent, score, reason, terms: unique };
+}
+// 라우팅 확신 임계값. 이름/태그라인 적중(+6), 라우트 힌트(+12↑), 이름 포함(+20)만 전문 라우트로 인정하고,
+// system_prompt 본문의 약한 단어 적중(+2~3) 한두 개로는 에이전트를 절대 선택하지 않는다.
+// 임계값 미만이면 "직답"(에이전트·능력 라우팅 없음) — 일반 질문이 Pitch Deck Architect 같은
+// 무관 페르소나 + gemini 이미지 런타임으로 끌려가던 사고의 근본 수리.
+const MIN_ROUTE_SCORE = 6;
+function directRouteChoice(lang) {
+  const resolvedLang = lang || prefsLang();
+  return {
+    direct: true,
+    agent: null,
+    score: 0,
+    terms: [],
+    reason: resolvedLang === "ko"
+      ? "특정 전문 에이전트가 필요 없는 일반 요청입니다"
+      : "this is a general request that needs no specialist agent",
+  };
+}
+// 직답 모드 시스템 프롬프트 — 페르소나·라우팅 오염 없이 현재 런타임 그대로 답한다.
+function directSystemPrompt(lang) {
+  const resolvedLang = lang || prefsLang();
+  return resolvedLang === "ko"
+    ? "당신은 Agentlas 터미널의 기본 어시스턴트입니다. 특별한 페르소나 없이 사용자의 요청에 정확하고 간결하게 바로 답하세요. 에이전트 라우팅이나 이미지 생성 능력을 스스로 언급하지 마세요."
+    : "You are the Agentlas terminal's default assistant. Answer the user's request directly and concisely, with no special persona. Do not bring up agent routing or image-generation capabilities on your own.";
 }
 function autoRouteAgent(db, prompt, lang) {
   const resolvedLang = lang || prefsLang();
@@ -496,28 +530,40 @@ function autoRouteAgent(db, prompt, lang) {
     }
   }
   const agents = listRoutableAgents(db).filter((agent) => !NON_GENERIC_ROUTE_SLUGS.has(agent.slug));
-  if (!agents.length) return null;
-  const terms = routeTokenize(prompt);
+  if (!agents.length) return directRouteChoice(resolvedLang);
+  let terms = routeTokenize(prompt);
+  // IDF 근사 — 설치 에이전트 절반 이상의 haystack에 나오는 단어("ai","도구" 등)는 판별력이 없어 제외.
+  if (agents.length >= 3) {
+    const hays = agents.map((agent) => routeHaystack(agent));
+    terms = terms.filter((term) => hays.filter((hay) => hay.includes(term)).length * 2 <= agents.length);
+  }
   const ranked = agents.map((agent) => scoreRouteAgent(prompt, terms, agent, resolvedLang)).sort((a, b) => b.score - a.score);
-  if (ranked[0] && ranked[0].score > 0) return ranked[0];
-  const fallback = agents.find((agent) => agent.slug === "agentlas-pm-soul") || agents[0];
-  return {
-    agent: fallback,
-    score: 0,
-    reason: resolvedLang === "ko"
-      ? "명확한 전문 에이전트가 없어 기본 프로젝트 조율 경로를 선택했습니다"
-      : "no specialist matched clearly, so Agentlas chose the default coordination route",
-    terms: [],
-  };
+  if (ranked[0] && ranked[0].score >= MIN_ROUTE_SCORE) return ranked[0];
+  return directRouteChoice(resolvedLang);
 }
 function autoRouteNote(choice, lang) {
-  const name = (lang || prefsLang()) === "ko" ? choice.agent.name : choice.agent.name_en || choice.agent.name;
-  return (lang || prefsLang()) === "ko"
+  const resolvedLang = lang || prefsLang();
+  if (choice.direct) {
+    return resolvedLang === "ko"
+      ? `사용 에이전트: 없음 — 바로 답합니다. 이유: ${choice.reason}.`
+      : `Selected agent: none — answering directly. Reason: ${choice.reason}.`;
+  }
+  const name = resolvedLang === "ko" ? choice.agent.name : choice.agent.name_en || choice.agent.name;
+  return resolvedLang === "ko"
     ? `사용 에이전트: ${name}. 이유: ${choice.reason}.`
     : `Selected agent: ${name}. Reason: ${choice.reason}.`;
 }
 function autoRoutePreamble(choice, lang) {
   const resolvedLang = lang || prefsLang();
+  if (choice.direct) {
+    return [
+      "## Agentlas direct answer",
+      "",
+      resolvedLang === "ko"
+        ? "이 요청은 전문 에이전트 라우팅 없이 처리합니다. 라우팅이나 에이전트를 언급하지 말고 사용자 요청에 바로 답하세요."
+        : "This request is handled without specialist routing. Answer the user directly, without mentioning routing or agents.",
+    ].join("\n");
+  }
   const appBuilderNeedsConsent = choice.agent && choice.agent.slug === "agentlas-app-builder";
   const instruction = appBuilderNeedsConsent
     ? resolvedLang === "ko"
@@ -8117,6 +8163,7 @@ function buildHelpers(db) {
     autoRouteAgent: (db_, prompt, lang) => autoRouteAgent(db_, prompt, lang),
     autoRouteNote: (choice, lang) => autoRouteNote(choice, lang),
     autoRoutePreamble: (choice, lang) => autoRoutePreamble(choice, lang),
+    directSystemPrompt: (lang) => directSystemPrompt(lang),
     cliMemoryContext: (db_, pp) => cliMemoryContext(db_, pp),
     importLocal: (db_, p) => importLocalFolderCli(db_, p),
     // REPL-safe public Hub install: fail()(process.exit) 대신 Error를 throw 해 REPL이 직접 렌더하게 한다.
@@ -8536,6 +8583,18 @@ async function cmdAutoRun(db, prompt, runtimeOverride) {
   const lang = prefsLang();
   const choice = autoRouteAgent(db, prompt, lang);
   if (!choice) fail("자동 라우팅할 에이전트가 없습니다. agentlas list로 설치 상태를 확인하세요.");
+  if (choice.direct) {
+    // 전문 에이전트 확신 없음 → 페르소나/능력 라우팅 없이 현재 런타임으로 직답.
+    process.stderr.write(`▸ direct (no agent)\n`);
+    process.stderr.write(`  ${autoRouteNote(choice, lang)}\n`);
+    const sys = `${autoRoutePreamble(choice, lang)}\n\n${directSystemPrompt(lang)}`;
+    const code = await executeOnce(db, sys, prompt.trim(), runtimeOverride, {
+      projectPath: activeProjectPath(db),
+      agentId: null,
+      permission: PERMISSION,
+    });
+    process.exit(code);
+  }
   process.stderr.write(`▸ ${choice.agent.name} (auto)\n`);
   process.stderr.write(`  ${autoRouteNote(choice, lang)}\n`);
   const sys = `${autoRoutePreamble(choice, lang)}\n\n${agentSystemPromptCli(choice.agent)}`;
@@ -10195,4 +10254,9 @@ module.exports = {
   cloudPortableExecutableForFile,
   DEFAULT_API_MODEL,
   ANTHROPIC_COMPAT_API,
+  // 자동 라우팅 회귀 테스트 표면 — 약한 매치 직답/오라우팅 방지 규칙 검증용.
+  autoRouteAgent,
+  autoRouteNote,
+  autoRoutePreamble,
+  directSystemPrompt,
 };
