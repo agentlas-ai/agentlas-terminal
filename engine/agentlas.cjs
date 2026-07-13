@@ -34,7 +34,7 @@ const terminalExperienceExchange = require("./agentlas-experience-exchange.cjs")
 const desktopOntologyLoadout = require("./agentlas-desktop-loadout.cjs");
 const workloadRouting = require("./agentlas-workload-routing.cjs");
 const terminalExperienceIntake = require("./agentlas-experience-intake.cjs");
-const { captureCoreJsonSync } = require("./agentlas-core-harness.cjs");
+const { captureCoreJsonSync, resolveCoreRuntimeRoot } = require("./agentlas-core-harness.cjs");
 
 // ── 앱과 동일한 userData 경로 (electron app.getPath('userData')와 일치) ──
 function userDataDir() {
@@ -7681,58 +7681,304 @@ function contextLine(json) {
     return "";
   }
 }
-const coreProjectBootstraps = new Set();
+const AGENTLAS_PROJECT_STATE_IGNORE_START = "# >>> agentlas local project state >>>";
+const AGENTLAS_PROJECT_STATE_IGNORE_END = "# <<< agentlas local project state <<<";
+const AGENTLAS_GITIGNORE_MAX_BYTES = 1024 * 1024;
+const projectBootstrapStates = new Map();
 
-function ensureCoreProjectCli(projectPath) {
-  if (coreProjectBootstraps.has(projectPath)) return true;
+function terminalProjectCandidateCli(projectPath) {
   try {
+    const root = path.resolve(projectPath || process.cwd());
+    const unsafe = new Set([
+      path.resolve(os.homedir()),
+      path.parse(root).root,
+      path.resolve(userDataDir()),
+      path.resolve(runCwd()),
+    ]);
+    if (unsafe.has(root)) return null;
+    const stat = fs.statSync(root);
+    if (!stat.isDirectory()) return null;
+    return root;
+  } catch {
+    return null;
+  }
+}
+
+function assertNoSymlinkInAgentlasStateCli(stateDir) {
+  const pending = [stateDir];
+  let visited = 0;
+  while (pending.length && visited < 4096) {
+    const current = pending.pop();
+    visited += 1;
+    let stat;
+    try { stat = fs.lstatSync(current); } catch (error) {
+      if (error && error.code === "ENOENT") continue;
+      throw error;
+    }
+    if (stat.isSymbolicLink()) throw new Error(".agentlas local state must not contain symbolic links");
+    if (stat.isDirectory()) {
+      for (const entry of fs.readdirSync(current)) pending.push(path.join(current, entry));
+    }
+  }
+  if (pending.length) throw new Error(".agentlas local state exceeds the safe bootstrap inspection limit");
+}
+
+function readRegularUtf8FileNoFollowCli(filePath, maxBytes = AGENTLAS_GITIGNORE_MAX_BYTES) {
+  let before;
+  try { before = fs.lstatSync(filePath); } catch (error) {
+    if (error && error.code === "ENOENT") return { exists: false, content: "", mode: 0o644, stat: null };
+    throw error;
+  }
+  if (before.isSymbolicLink() || !before.isFile()) throw new Error(".gitignore must be a regular non-symbolic-link file");
+  if (before.size > maxBytes) throw new Error(`.gitignore exceeds the ${maxBytes}-byte safe bootstrap limit`);
+
+  const noFollow = fs.constants.O_NOFOLLOW || 0;
+  let fd;
+  try {
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
+  } catch (error) {
+    if (process.platform !== "win32" || !noFollow || !["EINVAL", "ENOTSUP"].includes(error && error.code)) throw error;
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY);
+  }
+  try {
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile()) throw new Error(".gitignore changed type during bootstrap");
+    if (opened.size > maxBytes) throw new Error(`.gitignore exceeds the ${maxBytes}-byte safe bootstrap limit`);
+    if (
+      Number.isFinite(before.dev) && Number.isFinite(before.ino) &&
+      (before.dev !== opened.dev || before.ino !== opened.ino)
+    ) {
+      throw new Error(".gitignore changed during bootstrap");
+    }
+    const chunks = [];
+    let total = 0;
+    while (total <= maxBytes) {
+      const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes + 1 - total));
+      const count = fs.readSync(fd, buffer, 0, buffer.length, null);
+      if (!count) break;
+      chunks.push(buffer.subarray(0, count));
+      total += count;
+    }
+    if (total > maxBytes) throw new Error(`.gitignore exceeds the ${maxBytes}-byte safe bootstrap limit`);
+    const after = fs.fstatSync(fd);
+    if (after.size !== opened.size || after.mtimeMs !== opened.mtimeMs) throw new Error(".gitignore changed while it was being read");
+    let content;
+    try { content = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks, total)); } catch {
+      throw new Error(".gitignore must contain valid UTF-8 text");
+    }
+    return { exists: true, content, mode: before.mode & 0o777, stat: before };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function assertFileSnapshotUnchangedCli(filePath, snapshot) {
+  if (!snapshot.exists) {
+    try {
+      fs.lstatSync(filePath);
+      throw new Error(".gitignore appeared during bootstrap");
+    } catch (error) {
+      if (error && error.code === "ENOENT") return;
+      throw error;
+    }
+  }
+  const current = fs.lstatSync(filePath);
+  if (current.isSymbolicLink() || !current.isFile()) throw new Error(".gitignore changed type during bootstrap");
+  const original = snapshot.stat;
+  if (
+    !original || current.dev !== original.dev || current.ino !== original.ino ||
+    current.size !== original.size || current.mtimeMs !== original.mtimeMs
+  ) {
+    throw new Error(".gitignore changed during bootstrap");
+  }
+}
+
+function replaceRegularFileCli(tempPath, destinationPath, snapshot) {
+  try {
+    fs.renameSync(tempPath, destinationPath);
+    return;
+  } catch (error) {
+    if (process.platform !== "win32" || !snapshot.exists || !["EEXIST", "EPERM", "EACCES"].includes(error && error.code)) {
+      throw error;
+    }
+  }
+
+  // Windows can reject replacement of an existing file. Keep a same-directory
+  // rollback copy so an interrupted replacement never silently loses user rules.
+  assertFileSnapshotUnchangedCli(destinationPath, snapshot);
+  const backup = `${destinationPath}.agentlas-${process.pid}-${crypto.randomUUID()}.bak`;
+  fs.renameSync(destinationPath, backup);
+  try {
+    fs.renameSync(tempPath, destinationPath);
+  } catch (error) {
+    try {
+      if (!fs.existsSync(destinationPath)) fs.renameSync(backup, destinationPath);
+    } catch { /* preserve the original error and leave the backup recoverable */ }
+    throw error;
+  }
+  try { fs.unlinkSync(backup); } catch { /* a harmless rollback copy may remain on locked Windows hosts */ }
+}
+
+function ensureAgentlasProjectStateIgnoreCli(projectPath) {
+  const root = terminalProjectCandidateCli(projectPath);
+  if (!root) throw new Error("refusing to initialize an unsafe Agentlas project root");
+  const stateDir = path.join(root, ".agentlas");
+  let stateExists = false;
+  try {
+    const state = fs.lstatSync(stateDir);
+    stateExists = true;
+    if (state.isSymbolicLink() || !state.isDirectory()) throw new Error(".agentlas must be a real directory");
+    assertNoSymlinkInAgentlasStateCli(stateDir);
+  } catch (error) {
+    if (error && error.code !== "ENOENT") throw error;
+  }
+
+  const gitignorePath = path.join(root, ".gitignore");
+  const snapshot = readRegularUtf8FileNoFollowCli(gitignorePath);
+  const existing = snapshot.content;
+  const mode = snapshot.mode || 0o644;
+
+  let next = existing;
+  const start = existing.indexOf(AGENTLAS_PROJECT_STATE_IGNORE_START);
+  const end = start >= 0 ? existing.indexOf(AGENTLAS_PROJECT_STATE_IGNORE_END, start) : -1;
+  if (start >= 0 && end >= 0) {
+    const blockEnd = end + AGENTLAS_PROJECT_STATE_IGNORE_END.length;
+    const block = existing.slice(start, blockEnd);
+    if (!/^\.agentlas\/$/m.test(block)) {
+      next = `${existing.slice(0, start)}${block.replace(AGENTLAS_PROJECT_STATE_IGNORE_START, `${AGENTLAS_PROJECT_STATE_IGNORE_START}\n.agentlas/`)}${existing.slice(blockEnd)}`;
+    }
+  } else {
+    const block = `${AGENTLAS_PROJECT_STATE_IGNORE_START}\n.agentlas/\n${AGENTLAS_PROJECT_STATE_IGNORE_END}\n`;
+    next = existing.trimEnd() ? `${existing.trimEnd()}\n\n${block}` : block;
+  }
+  if (next !== existing) {
+    const temp = path.join(root, `.gitignore.agentlas-${process.pid}-${crypto.randomUUID()}.tmp`);
+    fs.writeFileSync(temp, next.endsWith("\n") ? next : `${next}\n`, { encoding: "utf8", mode, flag: "wx" });
+    try {
+      assertFileSnapshotUnchangedCli(gitignorePath, snapshot);
+      replaceRegularFileCli(temp, gitignorePath, snapshot);
+    } catch (error) {
+      try { fs.unlinkSync(temp); } catch { /* ignore */ }
+      throw error;
+    }
+  }
+  if (!stateExists) fs.mkdirSync(stateDir, { recursive: false, mode: 0o700 });
+  assertNoSymlinkInAgentlasStateCli(stateDir);
+  try { fs.chmodSync(stateDir, 0o700); } catch { /* Windows/best effort */ }
+}
+
+function hardenAgentlasProjectStateCli(projectPath) {
+  const root = terminalProjectCandidateCli(projectPath);
+  if (!root) return;
+  const stateDir = path.join(root, ".agentlas");
+  const pending = [stateDir];
+  let visited = 0;
+  while (pending.length && visited < 4096) {
+    const current = pending.pop();
+    visited += 1;
+    try {
+      const stat = fs.lstatSync(current);
+      if (stat.isSymbolicLink()) continue;
+      if (stat.isDirectory()) {
+        try { fs.chmodSync(current, 0o700); } catch { /* Windows/best effort */ }
+        for (const entry of fs.readdirSync(current)) pending.push(path.join(current, entry));
+      } else if (stat.isFile()) {
+        try { fs.chmodSync(current, 0o600); } catch { /* Windows/best effort */ }
+      }
+    } catch { /* disappearing files and ACL-only hosts are best effort */ }
+  }
+}
+
+function ensureCoreProjectCli(projectPath, options = {}) {
+  const root = terminalProjectCandidateCli(projectPath);
+  if (!root) throw new Error("Agentlas project bootstrap requires a real project directory");
+  fs.accessSync(root, fs.constants.R_OK | fs.constants.W_OK);
+  ensureAgentlasProjectStateIgnoreCli(root);
+  const cached = projectBootstrapStates.get(root);
+  if (cached && fs.existsSync(path.join(root, ".agentlas", "project-soul-memory.md"))) {
+    return cached === "core";
+  }
+  projectBootstrapStates.delete(root);
+  const coreRoot = resolveCoreRuntimeRoot(options.coreRoot);
+  const hasCanonicalBootstrap = Boolean(
+    coreRoot && fs.existsSync(path.join(coreRoot, "agentlas_cloud", "project_bootstrap.py")),
+  );
+  if (hasCanonicalBootstrap) {
     const result = captureCoreJsonSync(
       "agentlas_cloud",
-      ["project", "ensure", "--project", projectPath, "--reason", "terminal-first-contact"],
-      { cwd: projectPath },
+      ["project", "ensure", "--project", root, "--reason", options.reason || "terminal-first-contact"],
+      { cwd: root },
+      coreRoot,
     );
     if (result && result.status === "active") {
-      coreProjectBootstraps.add(projectPath);
+      // Core owns the canonical seed. Terminal adds one intentionally broader
+      // guard so future local memory files are private without a release update.
+      ensureAgentlasProjectStateIgnoreCli(root);
+      hardenAgentlasProjectStateCli(root);
+      projectBootstrapStates.set(root, "core");
       return true;
     }
-  } catch {
-    // Installed Core can lag the Terminal briefly during an update. Keep the
-    // old merge-only seed as a fallback and retry Core on the next invocation.
+    throw new Error("Agentlas Core returned an incomplete project bootstrap contract");
   }
-  ensureProjectMemoryCli(projectPath);
+  // A just-updated Terminal can briefly see the previous Core. The legacy
+  // merge-only seed remains local-only and Core is retried next process.
+  ensureProjectMemoryCli(root);
+  if (!fs.existsSync(path.join(root, ".agentlas"))) {
+    throw new Error("Agentlas project bootstrap could not create private local state");
+  }
+  ensureAgentlasProjectStateIgnoreCli(root);
+  hardenAgentlasProjectStateCli(root);
+  projectBootstrapStates.set(root, "fallback");
   return false;
 }
 
-// 작업 폴더 첫 접촉 → Core canonical 프로젝트 아키텍처를 즉시 활성화.
-function recordCliFolderVisit(db, projectPath) {
-  ensureCoreProjectCli(projectPath);
-  if (!tableExists(db, "folder_activity")) return { activated: true };
-  const now = new Date().toISOString();
+// Passive checks never increment visits or touch the project. Activation is
+// reserved for an actual write/full Terminal execution or an explicit ensure.
+function recordCliFolderVisit(db, projectPath, options = {}) {
+  const root = terminalProjectCandidateCli(projectPath);
+  if (!root) return { activated: false };
+  const activate = options.activate === true;
   try {
-    const row = db.prepare("SELECT visits, activated_at FROM folder_activity WHERE path=?").get(projectPath);
-    let visits, activatedAt;
+    if (!activate) {
+      const row = tableExists(db, "folder_activity")
+        ? db.prepare("SELECT activated_at FROM folder_activity WHERE path=?").get(root)
+        : null;
+      return { activated: Boolean(row && row.activated_at) || fs.existsSync(path.join(root, ".agentlas")) };
+    }
+
+    ensureCoreProjectCli(root, { reason: options.reason || "terminal-first-contact", coreRoot: options.coreRoot });
+    if (!tableExists(db, "folder_activity")) return { activated: true };
+    const now = new Date().toISOString();
+    const row = db.prepare("SELECT visits FROM folder_activity WHERE path=?").get(root);
     if (row) {
-      visits = row.visits + 1; activatedAt = row.activated_at;
-      db.prepare("UPDATE folder_activity SET visits=?, last_seen=? WHERE path=?").run(visits, now, projectPath);
+      db.prepare("UPDATE folder_activity SET visits=?, activated_at=COALESCE(activated_at,?), last_seen=? WHERE path=?")
+        .run(Number(row.visits || 0) + 1, now, now, root);
     } else {
-      visits = 1; activatedAt = null;
-      db.prepare("INSERT INTO folder_activity (path, visits, activated_at, first_seen, last_seen) VALUES (?,?,NULL,?,?)").run(projectPath, visits, now, now);
+      db.prepare("INSERT INTO folder_activity (path, visits, activated_at, first_seen, last_seen) VALUES (?,?,?,?,?)")
+        .run(root, 1, now, now, now);
     }
-    if (!activatedAt) {
-      db.prepare("UPDATE folder_activity SET activated_at=? WHERE path=?").run(now, projectPath);
-      activatedAt = now;
-    }
-    return { activated: !!activatedAt };
-  } catch { return { activated: false }; }
+    return { activated: true };
+  } catch (error) {
+    // An activation failure can mean that the project-local privacy boundary
+    // could not be established (for example, a symlinked or oversized
+    // .gitignore). Never continue a write/full execution in that state.
+    if (activate) throw error;
+    return { activated: false };
+  }
 }
-// `agentlas run` 등이 호출된 작업 디렉터리 → 활성 프로젝트 경로(또는 null).
-function activeProjectPath(db) {
-  try {
-    const cwd = process.cwd();
-    if (cwd === os.homedir() || cwd === userDataDir() || cwd === runCwd()) return null;
-    const v = recordCliFolderVisit(db, cwd);
-    return v.activated ? cwd : null;
-  } catch { return null; }
+
+function activeProjectPath(db, options = {}) {
+  const root = terminalProjectCandidateCli(options.projectPath || process.cwd());
+  if (!root) return null;
+  const result = recordCliFolderVisit(db, root, options);
+  return result.activated ? root : null;
+}
+
+function ensureTerminalProjectForExecutionCli(db, projectPath, permission = PERMISSION, reason = "terminal-first-contact") {
+  const root = terminalProjectCandidateCli(projectPath);
+  if (!root) return null;
+  if (permission === "read") return activeProjectPath(db, { projectPath: root });
+  return activeProjectPath(db, { projectPath: root, activate: true, reason });
 }
 function cliMemoryContext(db, projectPath) {
   const sections = [];
@@ -7775,6 +8021,7 @@ function parseMemoryEventsCli(text) {
 function curateCliReply(db, text, ctx) {
   const { events, cleaned } = parseMemoryEventsCli(text);
   const style = require("./agentlas-style.cjs");
+  if (ctx && ctx.permission === "read") return style.sanitizeAssistantText(cleaned);
   if (!events.length || !tableExists(db, "memory_entries")) return style.sanitizeAssistantText(cleaned);
   ensureMemoryContextColumn(db);
   const arch = loadArch();
@@ -7874,7 +8121,7 @@ function augmentSystem(db, baseSystem, ctx, withEmitter, request = "") {
   if (connectionSkill) sys += "\n\n" + connectionSkill;
   const mem = cliMemoryContext(db, ctx && ctx.projectPath);
   if (mem) sys += "\n\n" + mem;
-  if (withEmitter) {
+  if (withEmitter && (!ctx || ctx.permission !== "read")) {
     sys += "\n\n" + memoryEmitterPromptFor(request, arch);
     const credentialReminder = credentialIndexReminderFor(request);
     if (credentialReminder) sys += "\n\n" + credentialReminder;
@@ -7903,12 +8150,21 @@ const RUNTIME_BIN = {
 
 // 활성 런타임 → 실행 방식 결정. CLI(claude/codex/gemini) 또는 API(BYOK/Ollama).
 function resolveRuntime(db, override) {
+  const ar = activeRuntime(db);
+  const activeCli = ar && RUNTIME_BIN[ar.kind]
+    ? {
+        mode: "cli",
+        kind: ar.kind,
+        model: ar.model || null,
+        capabilities: ["code", "tools", ...(ar.long_context ? ["long-context"] : [])],
+        efforts: [],
+      }
+    : null;
   if (override) {
     if (!RUNTIME_BIN[override]) fail(`알 수 없는 런타임: ${override} (claude-code|codex|gemini)`);
-    return { mode: "cli", kind: override };
+    return activeCli && activeCli.kind === override ? activeCli : { mode: "cli", kind: override };
   }
-  const ar = activeRuntime(db);
-  if (ar && RUNTIME_BIN[ar.kind]) return { mode: "cli", kind: ar.kind };
+  if (activeCli) return activeCli;
   if (ar && ar.kind === "byok" && ar.backend) return { mode: "api", backend: ar.backend, model: ar.model };
   if (ar && ar.kind === "ollama") return { mode: "api", backend: "ollama", model: ar.model };
   // 폴백: 설치된 CLI 탐지
@@ -7930,11 +8186,17 @@ function listAvailableRuntimes(db, fallbackRuntime = null) {
     const key = runtime.mode === "cli" ? `cli:${runtime.kind}` : `api:${runtime.backend}:${runtime.model || ""}`;
     if (candidates.some((item) => item.key === key)) return;
     const discovered = routing.defaultAvailableModels(runtime);
-    const availableModels = discovered.length
-      ? discovered
-      : runtime.model
-        ? [{ id: runtime.model, capabilities: runtime.capabilities || [], efforts: runtime.efforts || [] }]
-        : [];
+    const availableModels = [...discovered];
+    if (runtime.model && !availableModels.some((model) => model.id === runtime.model)) {
+      availableModels.push({
+        id: runtime.model,
+        tier: runtime.modelTier || runtime.tier || null,
+        capabilities: runtime.capabilities || [],
+        contextWindow: runtime.contextWindow || null,
+        efforts: runtime.efforts || [],
+        description: runtime.modelDescription || "host-selected current model",
+      });
+    }
     candidates.push({ ...runtime, key, availableModels });
   };
   add(active);
@@ -7945,6 +8207,21 @@ function listAvailableRuntimes(db, fallbackRuntime = null) {
   return candidates
     .filter((runtime) => runtime.availableModels.length)
     .map(({ key, ...runtime }, index) => ({ ...runtime, runtimeId: `runtime-${index + 1}` }));
+}
+
+function currentRuntimeInventoryCli(db, runtime) {
+  const candidates = listAvailableRuntimes(db, runtime);
+  const current = candidates.find((candidate) =>
+    candidate.mode === runtime.mode &&
+    (runtime.mode === "cli"
+      ? candidate.kind === runtime.kind
+      : candidate.backend === runtime.backend && candidate.model === runtime.model));
+  if (current) return current;
+  return {
+    ...runtime,
+    runtimeId: "runtime-current",
+    availableModels: workloadRouting.defaultAvailableModels(runtime),
+  };
 }
 
 // ── API 러너 (BYOK / Ollama) — 비스트리밍, 최종 텍스트 반환 ──
@@ -8102,6 +8379,7 @@ async function runApi(backend, model, system, prompt, options) {
 // 1회 실행 — CLI면 spawn(스트리밍 stdout), API면 호출 후 텍스트 출력. 종료코드 반환.
 // ctx = { projectPath, agentId } — 메모리 주입/큐레이션에 사용.
 function finalizeExperienceExecutionCli(db, input) {
+  if (input.permission === "read") return null;
   if (!input.agentId) return null;
   let agent;
   try { agent = db.prepare("SELECT * FROM installed_agents WHERE id=?").get(input.agentId); }
@@ -8252,6 +8530,7 @@ async function executeOnce(db, system, prompt, override, ctx) {
       projectPath: ctx.projectPath,
       cwd,
       runtime: rt,
+      permission: ctx.permission,
       model: ctx.model || rt.model,
       runtimeExperience: ctx.runtimeExperience,
       mcpServers,
@@ -8280,6 +8559,7 @@ async function executeOnce(db, system, prompt, override, ctx) {
       projectPath: ctx.projectPath,
       cwd: ctx.cwd || projectCwd(),
       runtime: rt,
+      permission: ctx.permission,
       model: selectedModel,
       runtimeExperience: ctx.runtimeExperience,
       curatedMemories,
@@ -8297,6 +8577,7 @@ async function executeOnce(db, system, prompt, override, ctx) {
     projectPath: ctx.projectPath,
     cwd: ctx.cwd || projectCwd(),
     runtime: rt,
+    permission: ctx.permission,
     model: selectedModel,
     runtimeExperience: ctx.runtimeExperience,
     curatedMemories,
@@ -8319,10 +8600,12 @@ async function runTerminalBuilder(db, request, metadata = {}, runtimeOverride = 
     : {};
   let allocation = null;
   try {
+    const currentInventory = currentRuntimeInventoryCli(db, runtime);
     const plannerSystem = workloadRouting.plannerSystemPrompt({
       language: prefsLang() === "ko" ? "Korean" : "English",
       maxTasks: 1,
       mode: "builder",
+      liveRuntimeInventory: workloadRouting.runtimeInventory([currentInventory]),
     });
     let plannerText;
     if (runtime.mode === "cli") {
@@ -8342,11 +8625,13 @@ async function runTerminalBuilder(db, request, metadata = {}, runtimeOverride = 
   } catch (error) {
     process.stderr.write(`▸ builder model planner fallback · ${String((error && error.message) || error).slice(0, 160)}\n`);
   }
+  const currentInventory = currentRuntimeInventoryCli(db, runtime);
   const resolution = workloadRouting.resolveAllocation({
-    runtime,
+    runtime: currentInventory,
     decision: allocation,
     modelPin: routingOptions.modelPin,
     effortPin: routingOptions.effortPin,
+    availableModels: currentInventory.availableModels,
     maxTier: routingOptions.maxTier || process.env.AGENTLAS_MODEL_MAX_TIER,
   });
   const receipt = workloadRouting.createDecisionReceipt({
@@ -8359,6 +8644,9 @@ async function runTerminalBuilder(db, request, metadata = {}, runtimeOverride = 
     workloadRouting.appendDecisionReceipt(receipt, path.join(userDataDir(), "model-routing-receipts.jsonl"));
   } catch (error) {
     process.stderr.write(`▸ builder model routing receipt failed · ${String((error && error.message) || error).slice(0, 120)}\n`);
+  }
+  if (!resolution.ok) {
+    throw new Error(`Agentlas builder model allocation failed closed: ${resolution.fallbackReason || "no compliant live model"}`);
   }
   process.stderr.write(
     `▸ builder model route · ${resolution.source} · ${resolution.model || runtime.kind || runtime.backend}` +
@@ -8385,10 +8673,12 @@ async function allocateSingleWorkloadCli(db, request, options = {}) {
   const cwd = options.cwd || projectCwd();
   let allocation = null;
   try {
+    const currentInventory = currentRuntimeInventoryCli(db, runtime);
     const plannerSystem = workloadRouting.plannerSystemPrompt({
       language: options.lang === "ko" ? "Korean" : "English",
       maxTasks: 1,
       mode: options.mode || "team",
+      liveRuntimeInventory: workloadRouting.runtimeInventory([currentInventory]),
     });
     let plannerText;
     if (runtime.mode === "cli") {
@@ -8413,12 +8703,13 @@ async function allocateSingleWorkloadCli(db, request, options = {}) {
   } catch (error) {
     if (options.onWarning) options.onWarning(`model planner fallback: ${String((error && error.message) || error).slice(0, 160)}`);
   }
+  const currentInventory = currentRuntimeInventoryCli(db, runtime);
   const resolution = workloadRouting.resolveAllocation({
-    runtime,
+    runtime: currentInventory,
     decision: allocation,
     modelPin: options.modelPin,
     effortPin: options.effortPin,
-    availableModels: options.availableModels,
+    availableModels: options.availableModels || currentInventory.availableModels,
     maxTier: options.maxTier || process.env.AGENTLAS_MODEL_MAX_TIER,
   });
   const receipt = workloadRouting.createDecisionReceipt({
@@ -8431,6 +8722,9 @@ async function allocateSingleWorkloadCli(db, request, options = {}) {
     workloadRouting.appendDecisionReceipt(receipt, options.receiptFile || path.join(userDataDir(), "model-routing-receipts.jsonl"));
   } catch (error) {
     if (options.onWarning) options.onWarning(`model routing receipt failed: ${String((error && error.message) || error).slice(0, 120)}`);
+  }
+  if (!resolution.ok) {
+    throw new Error(`Agentlas model allocation failed closed: ${resolution.fallbackReason || "no compliant live model"}`);
   }
   return { allocation, resolution, receipt };
 }
@@ -8848,6 +9142,8 @@ function buildHelpers(db) {
         return null;
       }
     },
+    ensureProjectForExecution: (db_, dir, permission, reason) =>
+      ensureTerminalProjectForExecutionCli(db_, dir, permission, reason || "terminal-interactive-turn"),
     doctor: async (db_, ui) => {
       ui.line("");
       ui.info("userData: " + userDataDir());
@@ -9294,10 +9590,11 @@ async function cmdRun(db, query, prompt, runtimeOverride, runtimeExperience = nu
   if (!userPrompt) userPrompt = await readStdin();
   if (!userPrompt || !userPrompt.trim()) fail("프롬프트가 비어 있습니다. agentlas run <agent> \"...\" 또는 stdin으로 전달하세요.");
   process.stderr.write(`▸ ${agent.name}\n`);
-  const cwd = activeProjectPath(db) || projectCwd();
+  const projectPath = ensureTerminalProjectForExecutionCli(db, projectCwd(), PERMISSION, "terminal-run");
+  const cwd = projectPath || projectCwd();
   const resolvedExperience = resolveRuntimeExperienceCli(agent, userPrompt.trim(), runtimeExperience, cwd, { db });
   const code = await executeOnce(db, agentSystemPromptCli(agent), userPrompt.trim(), runtimeOverride, {
-    projectPath: activeProjectPath(db), agentId: agent.id, permission: PERMISSION, runtimeExperience: resolvedExperience,
+    projectPath, agentId: agent.id, permission: PERMISSION, runtimeExperience: resolvedExperience,
   });
   process.exit(code);
 }
@@ -9311,10 +9608,11 @@ async function cmdAutoRun(db, prompt, runtimeOverride, runtimeExperience = null)
     process.stderr.write(`▸ direct (no agent)\n`);
     process.stderr.write(`  ${autoRouteNote(choice, lang)}\n`);
     const sys = `${autoRoutePreamble(choice, lang)}\n\n${directSystemPrompt(lang)}`;
-    const cwd = activeProjectPath(db) || projectCwd();
+    const projectPath = ensureTerminalProjectForExecutionCli(db, projectCwd(), PERMISSION, "terminal-auto-run");
+    const cwd = projectPath || projectCwd();
     const resolvedExperience = resolveRuntimeExperienceCli(null, prompt.trim(), runtimeExperience, cwd, { db });
     const code = await executeOnce(db, sys, prompt.trim(), runtimeOverride, {
-      projectPath: activeProjectPath(db),
+      projectPath,
       agentId: null,
       permission: PERMISSION,
       runtimeExperience: resolvedExperience,
@@ -9324,10 +9622,11 @@ async function cmdAutoRun(db, prompt, runtimeOverride, runtimeExperience = null)
   process.stderr.write(`▸ ${choice.agent.name} (auto)\n`);
   process.stderr.write(`  ${autoRouteNote(choice, lang)}\n`);
   const sys = `${autoRoutePreamble(choice, lang)}\n\n${agentSystemPromptCli(choice.agent)}`;
-  const cwd = activeProjectPath(db) || projectCwd();
+  const projectPath = ensureTerminalProjectForExecutionCli(db, projectCwd(), PERMISSION, "terminal-auto-run");
+  const cwd = projectPath || projectCwd();
   const resolvedExperience = resolveRuntimeExperienceCli(choice.agent, prompt.trim(), runtimeExperience, cwd, { db });
   const code = await executeOnce(db, sys, prompt.trim(), runtimeOverride, {
-    projectPath: activeProjectPath(db),
+    projectPath,
     agentId: choice.agent.id,
     permission: PERMISSION,
     runtimeExperience: resolvedExperience,
@@ -9382,10 +9681,11 @@ async function cmdFirm(db, query, prompt, runtimeOverride) {
   if (prompt && prompt.trim()) {
     process.stderr.write(`▸ ${firm.name} CEO\n`);
     const runtime = resolveRuntime(db, runtimeOverride);
+    const projectPath = ensureTerminalProjectForExecutionCli(db, projectCwd(), PERMISSION, "terminal-firm-run");
     const allocated = await allocateSingleWorkloadCli(db, prompt.trim(), {
       runtime,
       cwd: projectCwd(),
-      projectPath: activeProjectPath(db),
+      projectPath,
       agentId: firm.ceo_agent_id,
       lang: prefsLang(),
       mode: "team",
@@ -9397,7 +9697,7 @@ async function cmdFirm(db, query, prompt, runtimeOverride) {
         `${allocated.resolution.fallbackReason ? ` · ${allocated.resolution.fallbackReason}` : ""}\n`,
     );
     const code = await executeOnce(db, sys, prompt.trim(), runtimeOverride, {
-      projectPath: activeProjectPath(db),
+      projectPath,
       agentId: firm.ceo_agent_id,
       permission: PERMISSION,
       model: allocated.resolution.model,
@@ -10878,10 +11178,16 @@ async function main() {
       return cmdCloud(db, rest.slice(1), runtimeOverride);
     case "creds":
       return cmdCreds(db, rest.slice(1));
-    case "storm":
-      return parity().cmdStorm(db, rest.slice(1), runtimeOverride);
-    case "swarm":
-      return parity().cmdSwarm(db, rest.slice(1), runtimeOverride);
+    case "storm": {
+      const cwd = projectCwd();
+      const projectPath = ensureTerminalProjectForExecutionCli(db, cwd, PERMISSION, "terminal-storm");
+      return parity().cmdStorm(db, rest.slice(1), runtimeOverride, { cwd, projectPath, permission: PERMISSION });
+    }
+    case "swarm": {
+      const cwd = projectCwd();
+      const projectPath = ensureTerminalProjectForExecutionCli(db, cwd, PERMISSION, "terminal-swarm");
+      return parity().cmdSwarm(db, rest.slice(1), runtimeOverride, { cwd, projectPath, permission: PERMISSION });
+    }
     case "automation":
     case "automations":
       return parity().cmdAutomation(db, rest.slice(1), runtimeOverride);
@@ -10892,6 +11198,7 @@ async function main() {
     case "build":
       // Terminal-owned preflight: trusted system-global MCP metadata first, one consent,
       // then pass only approved catalog IDs/value-free shortages to the existing builder.
+      ensureTerminalProjectForExecutionCli(db, projectCwd(), PERMISSION, "terminal-build");
       return terminalAssets.cmdBuild({
         db,
         args: rest.slice(1),
@@ -11045,6 +11352,8 @@ module.exports = {
   parseRunExperienceArgs,
   resolveRuntimeExperienceCli,
   runTerminalBuilder,
+  resolveRuntime,
+  listAvailableRuntimes,
   probeApprovedTerminalMcp,
   finalizeExperienceExecutionCli,
   buildChildEnvCli,
@@ -11056,6 +11365,8 @@ module.exports = {
   memoryEmitterPromptFor,
   credentialIndexReminderFor,
   ensureCoreProjectCli,
+  ensureTerminalProjectForExecutionCli,
+  ensureAgentlasProjectStateIgnoreCli,
   DEFAULT_API_MODEL,
   ANTHROPIC_COMPAT_API,
   // 자동 라우팅 회귀 테스트 표면 — 약한 매치 직답/오라우팅 방지 규칙 검증용.

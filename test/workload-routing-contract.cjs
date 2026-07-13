@@ -6,7 +6,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const routing = require("../engine/agentlas-workload-routing.cjs");
-const { buildArgs } = require("../engine/agentlas.cjs");
+const { buildArgs, listAvailableRuntimes, resolveRuntime } = require("../engine/agentlas.cjs");
 const { create: createParity } = require("../engine/agentlas-parity.cjs");
 const { loadCoreStormbreakerHarness } = require("../engine/agentlas-core-harness.cjs");
 
@@ -50,6 +50,33 @@ async function main() {
       { id: "claude-live-frontier", tier: "frontier", capabilities: ["code", "tools"], efforts: ["low", "high", "max"] },
     ],
   };
+
+  const storedRuntimeDb = {
+    prepare(sql) {
+      if (/FROM active_runtime/.test(sql)) {
+        return { get: () => ({ id: 1, kind: "claude-code", model: "claude-host-current", long_context: 1 }) };
+      }
+      throw new Error(`unexpected test query: ${sql}`);
+    },
+  };
+  const storedRuntime = resolveRuntime(storedRuntimeDb);
+  assert.equal(storedRuntime.model, "claude-host-current", "stored CLI active model must survive runtime resolution");
+  assert.deepEqual(storedRuntime.capabilities, ["code", "tools", "long-context"]);
+  const storedInventory = listAvailableRuntimes(storedRuntimeDb, storedRuntime)
+    .find((runtime) => runtime.kind === "claude-code");
+  assert.ok(storedInventory.availableModels.some((model) => model.id === "claude-host-current"));
+  const unknownTierCurrent = routing.resolveAllocation({
+    runtime: storedInventory,
+    decision: { tier: "balanced", exactModelId: "claude-host-current", effort: "none", reason: "host current model" },
+  });
+  assert.equal(unknownTierCurrent.ok, true, "a host current model may run without a cost ceiling even if its tier is unknown");
+  const ceilingUnknownTier = routing.resolveAllocation({
+    runtime: storedInventory,
+    decision: { tier: "balanced", exactModelId: "claude-host-current", effort: "none", reason: "host current model" },
+    maxTier: "balanced",
+  });
+  assert.equal(ceilingUnknownTier.ok, false, "unknown model cost tier must fail closed under a ceiling");
+  assert.match(ceilingUnknownTier.fallbackReason, /cost_tier_unknown/);
 
   assert.deepEqual(
     routing.resolveAllocation({ runtime: codexRuntime, decision: economy }),
@@ -128,21 +155,43 @@ async function main() {
       { id: "roomy", tier: "balanced", contextWindow: 10_000, capabilities: ["code", "long-context"] },
     ],
   });
-  assert.equal(contextAdjusted.model, "codex-live-economy", "host must preserve current instead of auto-picking another model");
+  assert.equal(contextAdjusted.model, null, "host must not silently run a different model after capability rejection");
+  assert.equal(contextAdjusted.ok, false);
   assert.equal(contextAdjusted.tier, "economy");
   assert.match(contextAdjusted.fallbackReason, /capability_mismatch/);
 
   const unsupported = routing.resolveAllocation({
     runtime: { mode: "cli", kind: "gemini", model: "gemini-current" },
-    decision: economy,
+    decision: { ...economy, exactModelId: "codex-live-economy" },
   });
   assert.equal(unsupported.model, "gemini-current", "unmapped provider must preserve the active model");
   assert.equal(unsupported.source, "fallback");
   assert.match(unsupported.fallbackReason, /parent_model_not_in_live_inventory/);
 
+  const inventoryUnavailable = routing.resolveAllocation({
+    runtime: { mode: "cli", kind: "codex", model: "codex-current", availableModels: [] },
+    decision: { tier: "balanced", exactModelId: "not-advertised", effort: "high", reason: "use current if inventory is unavailable" },
+  });
+  assert.equal(inventoryUnavailable.model, null, "an unadvertised active model is not a verified fallback");
+  assert.equal(inventoryUnavailable.ok, false);
+  assert.equal(inventoryUnavailable.effort, null, "an unavailable inventory must not invent effort support");
+  assert.match(inventoryUnavailable.fallbackReason, /parent_model_not_in_live_inventory/);
+  assert.match(inventoryUnavailable.fallbackReason, /active_model_not_in_live_inventory/);
+
+  const noExactChoice = routing.resolveAllocation({
+    runtime: codexRuntime,
+    decision: { tier: "economy", effort: "low", reason: "parent omitted exact live model" },
+  });
+  assert.equal(noExactChoice.model, "codex-live-economy");
+  assert.equal(noExactChoice.source, "fallback");
+  assert.match(noExactChoice.fallbackReason, /parent_exact_model_required/);
+
   const invalid = routing.resolveAllocation({ runtime: codexRuntime, decision: { tier: "frontier" } });
   assert.equal(invalid.ok, false);
   assert.equal(invalid.fallbackReason, "invalid_ai_allocation");
+  const explicitInvalidPin = routing.resolveAllocation({ runtime: codexRuntime, decision: null, modelPin: "operator-pinned-model" });
+  assert.equal(explicitInvalidPin.ok, true, "an explicit operator model pin is the only unresolved-allocation escape hatch");
+  assert.equal(explicitInvalidPin.model, "operator-pinned-model");
   const invalidWithOff = routing.resolveAllocation({ runtime: codexRuntime, decision: null, effortPin: "none" });
   assert.equal(invalidWithOff.effort, null);
   assert.equal(invalidWithOff.source, "user-pin");
@@ -182,6 +231,8 @@ async function main() {
   assert.match(paritySource, /typeof D\.projectCwd === "function" \? D\.projectCwd\(\) : D\.runCwd\(\)/, "storm/swarm workers must execute in the user's actual project folder");
   assert.match(paritySource, /WORK ALREADY ASSIGNED TO PEERS/, "workers must see sibling ownership before spawning more work");
   assert.match(paritySource, /HOST-VERIFIED ALLOCATION:/, "final gate must receive the host-resolved runtime, model, and effort evidence");
+  assert.match(paritySource, /if \(!resolution\.ok\)[\s\S]*?model allocation failed closed/, "swarm workers must not silently run a CLI default after allocation rejection");
+  assert.match(terminalSource, /if \(!resolution\.ok\)[\s\S]*?builder model allocation failed closed/, "builder execution must fail before silently using a CLI default model");
   const stormPlanner = routing.plannerSystemPrompt({
     mode: "stormbreaker-goal-ultracode",
     liveRuntimeInventory: routing.runtimeInventory(liveRuntimes),

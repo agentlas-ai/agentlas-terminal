@@ -123,19 +123,31 @@ function runtimeProvider(runtime) {
 
 function defaultAvailableModels(runtime) {
   const provider = runtimeProvider(runtime);
+  const current = runtime && runtime.model ? {
+    id: runtime.model,
+    tier: runtime.modelTier || runtime.tier || null,
+    capabilities: runtime.capabilities || [],
+    contextWindow: runtime.contextWindow || null,
+    efforts: runtime.efforts || [],
+    description: runtime.modelDescription || "host-selected current model",
+  } : null;
   if (provider === "codex") {
-    return readCodexModelInventory();
+    const detected = readCodexModelInventory();
+    const currentIndex = current ? detected.findIndex((model) => model.id === current.id) : -1;
+    if (current && currentIndex < 0) {
+      detected.push(...normalizeAvailableModels([current]));
+    } else if (current && currentIndex >= 0) {
+      detected[currentIndex] = {
+        ...detected[currentIndex],
+        tier: detected[currentIndex].tier || current.tier,
+        capabilities: [...new Set([...detected[currentIndex].capabilities, ...normalizeCapabilities(current.capabilities)])],
+        contextWindow: detected[currentIndex].contextWindow || current.contextWindow,
+        efforts: [...new Set([...detected[currentIndex].efforts, ...current.efforts.map(normalizeEffort).filter(Boolean)])],
+      };
+    }
+    return detected;
   }
-  if (runtime && runtime.model) {
-    return normalizeAvailableModels([{
-      id: runtime.model,
-      tier: runtime.modelTier || runtime.tier || null,
-      capabilities: runtime.capabilities || [],
-      contextWindow: runtime.contextWindow || null,
-      efforts: runtime.efforts || [],
-      description: runtime.modelDescription || "host-selected current model",
-    }]);
-  }
+  if (current) return normalizeAvailableModels([current]);
   return [];
 }
 
@@ -230,13 +242,14 @@ function runtimeInventory(runtimes) {
 function resolveEffort(provider, requested, supported = []) {
   if (provider === "claude-code") {
     if (requested === "none") return null;
-    if (requested === "minimal") return "low";
-    if (requested === "xhigh") return "max";
-    return requested;
+    const mapped = requested === "minimal" ? "low" : requested === "xhigh" ? "max" : requested;
+    const available = Array.isArray(supported) ? supported : [];
+    return available.includes(mapped) ? mapped : null;
   }
   if (provider === "codex") {
     if (requested === "none") return null;
-    const available = supported.length ? supported : ["minimal", "low", "medium", "high", "xhigh", "max"];
+    const available = Array.isArray(supported) ? supported : [];
+    if (!available.length) return null;
     if (available.includes(requested)) return requested;
     const requestedRank = EFFORTS.indexOf(requested);
     const lower = available
@@ -262,9 +275,9 @@ function resolveAllocation(options = {}) {
     if (modelPin) pinReasons.push("explicit_model_pin");
     if (effortPinPresent) pinReasons.push("explicit_effort_pin");
     return {
-      ok: false,
+      ok: Boolean(modelPin),
       tier: null,
-      model: modelPin || (runtime && runtime.model) || null,
+      model: modelPin,
       effort: pinnedEffort,
       provider,
       source: modelPin || effortPinPresent ? "user-pin" : "fallback",
@@ -275,7 +288,8 @@ function resolveAllocation(options = {}) {
 
   let tier = decision.tier;
   const maxTier = normalizeTier(options.maxTier);
-  if (options.maxTier && !maxTier) reasons.push("invalid_cost_policy_ignored");
+  const invalidCostPolicy = Boolean(options.maxTier && !maxTier);
+  if (invalidCostPolicy) reasons.push("invalid_cost_policy");
   if (maxTier && TIER_RANK[tier] > TIER_RANK[maxTier]) {
     tier = maxTier;
     reasons.push("cost_policy_clamped");
@@ -289,55 +303,67 @@ function resolveAllocation(options = {}) {
     : null;
   if (decision.exactModelId && !selected) reasons.push("parent_model_not_in_live_inventory");
   if (!decision.exactModelId) reasons.push("parent_exact_model_required");
-  if (selected && decision.requiredCapabilities.length) {
-    const caps = new Set(selected.capabilities);
-    if (decision.requiredCapabilities.some((required) => !caps.has(required))) {
-      selected = null;
-      reasons.push("capability_mismatch");
+  const candidateIssue = (candidate, prefix) => {
+    if (!candidate) return `${prefix}_not_in_live_inventory`;
+    if (invalidCostPolicy) return "invalid_cost_policy";
+    const caps = new Set(candidate.capabilities);
+    if (decision.requiredCapabilities.some((required) => !caps.has(required))) return `${prefix}_capability_mismatch`;
+    if (decision.estimatedContextTokens != null && decision.estimatedContextTokens > 0) {
+      if (candidate.contextWindow == null) return `${prefix}_context_window_unknown`;
+      if (decision.estimatedContextTokens > candidate.contextWindow) return `${prefix}_context_window_exceeded`;
     }
-  }
-  if (selected && decision.estimatedContextTokens != null && selected.contextWindow != null && decision.estimatedContextTokens > selected.contextWindow) {
-    selected = null;
-    reasons.push("context_window_exceeded");
-  }
-  if (selected && maxTier && !selected.tier) {
-    selected = null;
-    reasons.push("selected_model_cost_tier_unknown");
-  }
-  if (selected && maxTier && TIER_RANK[selected.tier] > TIER_RANK[maxTier]) {
-    selected = null;
-    reasons.push("selected_model_exceeds_cost_policy");
-  }
-  if (selected && selected.tier && selected.tier !== tier) {
-    selected = null;
-    reasons.push("selected_model_tier_mismatch");
+    if (maxTier && !candidate.tier) return `${prefix}_cost_tier_unknown`;
+    if (maxTier && TIER_RANK[candidate.tier] > TIER_RANK[maxTier]) return `${prefix}_exceeds_cost_policy`;
+    if (candidate.tier && candidate.tier !== tier) return `${prefix}_tier_mismatch`;
+    return null;
+  };
+  if (selected) {
+    const issue = candidateIssue(selected, "selected_model");
+    if (issue) {
+      selected = null;
+      if (!reasons.includes(issue)) reasons.push(issue);
+    }
   }
 
   let model = selected && selected.id;
+  let effectiveModelEntry = selected;
   let source = decision.exactModelId ? "parent-ai-exact" : "fallback";
   if (modelPin) {
     model = modelPin;
+    effectiveModelEntry = available.find((item) => item.id === modelPin) || null;
     source = "user-pin";
     reasons.push("explicit_model_pin");
   } else if (!model) {
-    model = (runtime && runtime.model) || null;
     source = "fallback";
-    if (!reasons.length) reasons.push(available.length ? "requested_tier_unavailable" : "live_inventory_unavailable");
+    const activeId = cleanText(runtime && runtime.model, 160) || null;
+    const active = activeId ? available.find((item) => item.id === activeId) || null : null;
+    const issue = activeId ? candidateIssue(active, "active_model") : "active_model_unavailable";
+    if (issue) {
+      if (!reasons.includes(issue)) reasons.push(issue);
+    } else {
+      model = active.id;
+      effectiveModelEntry = active;
+      reasons.push("compliant_active_model_fallback");
+    }
   }
 
   let effort;
   if (effortPinPresent) {
-    effort = effortPin === "none" ? null : resolveEffort(provider, effortPin, selected && selected.efforts || []);
+    effort = effortPin === "none" ? null : resolveEffort(provider, effortPin, effectiveModelEntry && effectiveModelEntry.efforts || []);
+    if (effort == null && effortPin !== "none" && modelPin) {
+      if (provider === "codex") effort = effortPin;
+      if (provider === "claude-code") effort = effortPin === "minimal" ? "low" : effortPin === "xhigh" ? "max" : effortPin;
+    }
     source = source === "user-pin" ? source : "user-pin";
     reasons.push("explicit_effort_pin");
     if (effortPin !== "none" && effort == null) reasons.push("effort_pin_unsupported_by_provider");
   } else {
-    effort = resolveEffort(provider, decision.effort, selected && selected.efforts || []);
+    effort = resolveEffort(provider, decision.effort, effectiveModelEntry && effectiveModelEntry.efforts || []);
     if (effort == null && decision.effort !== "none") reasons.push("effort_unsupported_by_provider");
   }
 
   return {
-    ok: Boolean(model || provider),
+    ok: Boolean(model),
     tier,
     model,
     effort: effort || null,

@@ -7,8 +7,12 @@ on:
       - "engine/agentlas-core-harness.cjs"
       - "engine/agentlas-parity.cjs"
       - "engine/agentlas-workload-routing.cjs"
+      - "engine/agentlas.cjs"
+      - "engine/agentlas-repl.cjs"
       - "test/stormbreaker-core-contract.cjs"
       - "test/workload-routing-contract.cjs"
+      - "test/project-bootstrap-contract.cjs"
+      - "package.json"
       - ".github/workflows/cross-platform-harness.yml"
   push:
     branches: [main]
@@ -16,8 +20,12 @@ on:
       - "engine/agentlas-core-harness.cjs"
       - "engine/agentlas-parity.cjs"
       - "engine/agentlas-workload-routing.cjs"
+      - "engine/agentlas.cjs"
+      - "engine/agentlas-repl.cjs"
       - "test/stormbreaker-core-contract.cjs"
       - "test/workload-routing-contract.cjs"
+      - "test/project-bootstrap-contract.cjs"
+      - "package.json"
       - ".github/workflows/cross-platform-harness.yml"
 
 permissions:
@@ -59,6 +67,7 @@ jobs:
         run: |
           node test/stormbreaker-core-contract.cjs
           node test/workload-routing-contract.cjs
+          node test/project-bootstrap-contract.cjs --strict
       - uses: actions/upload-artifact@v4
         with:
           name: terminal-harness-proof-${{ runner.os }}

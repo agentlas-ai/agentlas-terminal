@@ -9,15 +9,15 @@
 - Isolate Windows test hosts and ACL-specific cleanup behavior so successful
   product assertions are not misreported as failures by platform-only process
   or temporary-directory semantics.
-- Initialize every active project through the canonical Agentlas OS first-contact
-  contract before Terminal work begins. The shared Core owns `.gitignore`
-  privacy, project soul, memory and code maps, ontology, and Career Graph;
-  Terminal's older merge-only seeder is only a compatibility fallback when an
-  older Core is installed.
-- Remove vendor model alias tables and first-in-tier model selection. The parent
-  AI must choose an exact model and runtime from live inventory; Terminal only
-  validates pins, cost tier, capability, context, and effort, and otherwise
-  preserves the active model.
+- Select only exact models advertised by the live host inventory; when that
+  inventory is unavailable, preserve the active model instead of inventing a
+  provider-specific model ID or effort level.
+- Bootstrap canonical Core project memory on the first real write/full Terminal
+  execution while keeping read-only and discovery commands non-mutating. The
+  complete `.agentlas/` namespace is ignored and owner-only even during the
+  compatibility fallback to an older Core.
+- Gate the Terminal release contract on the pinned Agentlas Core
+  project-bootstrap surface across macOS, Linux, and Windows.
 
 GitHub release and npm package: `v0.8.1` / `agentlas@0.8.1`. Both are built
 from the exact immutable tag.

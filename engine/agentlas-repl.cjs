@@ -314,6 +314,14 @@ function startRepl(opts) {
           ui.warn(ui.t("interrupted"));
         },
       }); // 작업 중에도 composer/status bar와 실제 runtime task 목록을 화면 하단에 유지
+      if (H.ensureProjectForExecution) {
+        state.projectPath = H.ensureProjectForExecution(
+          db,
+          state.cwd,
+          state.permission,
+          "terminal-interactive-turn",
+        );
+      }
       const recordHistoryEntry = !runOptions.side;
       const targetLang = H.detectResponseLanguage ? H.detectResponseLanguage(prompt, ui.lang) : ui.lang;
       const curatedMemories = [];
@@ -390,6 +398,7 @@ function startRepl(opts) {
             projectPath: ctx.projectPath,
             cwd: state.cwd,
             runtime: rt,
+            permission: state.permission,
             model: selectedModel,
             mcpServers: connectedMcpServers,
             curatedMemories,
@@ -440,6 +449,7 @@ function startRepl(opts) {
             projectPath: ctx.projectPath,
             cwd: state.cwd,
             runtime: rt,
+            permission: state.permission,
             model: selectedModel,
             curatedMemories,
             taskHint: prompt,
@@ -460,6 +470,7 @@ function startRepl(opts) {
           projectPath: experienceContext.ctx.projectPath,
           cwd: state.cwd,
           runtime: experienceContext.rt,
+          permission: experienceContext.ctx.permission,
           model: experienceContext.selectedModel,
           curatedMemories: experienceContext.curatedMemories,
           taskHint: prompt,
@@ -862,13 +873,25 @@ function startRepl(opts) {
           research = true;
           goal = goal.replace(/\s?--research(-evidence)?\b/g, "").trim();
         }
-        await H.stormRun(db, goal, { ui, cwd: state.cwd, research });
+        if (H.ensureProjectForExecution) {
+          state.projectPath = H.ensureProjectForExecution(db, state.cwd, state.permission, "terminal-storm");
+        }
+        await H.stormRun(db, goal, {
+          ui,
+          cwd: state.cwd,
+          permission: state.permission,
+          projectPath: state.projectPath,
+          research,
+        });
         return true;
       }
       case "build": {
         if (!arg) return ui.warn("usage: /build <만들고 싶은 에이전트/팀 설명>"), true;
         ui.line("");
         if (typeof H.terminalBuild !== "function") throw new Error("Terminal MCP build preflight is unavailable");
+        if (H.ensureProjectForExecution) {
+          state.projectPath = H.ensureProjectForExecution(db, state.cwd, state.permission, "terminal-build");
+        }
         await H.terminalBuild(db, arg, {
           cwd: state.cwd,
           modelPin: state.modelPinned ? state.runtime.model : null,
@@ -922,6 +945,9 @@ function startRepl(opts) {
         if (m) {
           concurrency = Number(m[1]);
           goal = goal.replace(m[0], "").trim();
+        }
+        if (H.ensureProjectForExecution) {
+          state.projectPath = H.ensureProjectForExecution(db, state.cwd, state.permission, "terminal-swarm");
         }
         await H.swarmRun(db, goal, {
           ui,

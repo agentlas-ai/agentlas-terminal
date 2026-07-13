@@ -314,10 +314,11 @@ function create(deps) {
     return { ...harnessResult, routeDecision: json };
   }
 
-  async function cmdStorm(db, args, runtimeOverride) {
+  async function cmdStorm(db, args, runtimeOverride, executionContext = {}) {
     const rest = [];
     const ctx = {
-      cwd: typeof D.projectCwd === "function" ? D.projectCwd() : D.runCwd(),
+      ...executionContext,
+      cwd: executionContext.cwd || (typeof D.projectCwd === "function" ? D.projectCwd() : D.runCwd()),
       runtimeOverride,
     };
     for (let i = 0; i < args.length; i++) {
@@ -557,6 +558,9 @@ function create(deps) {
         maxTier: ctx.maxTier || process.env.AGENTLAS_MODEL_MAX_TIER,
       });
       recordAllocation(task, stage, task.allocation, resolution, parentTaskId);
+      if (!resolution.ok) {
+        throw new Error(`model allocation failed closed: ${resolution.fallbackReason || "no compliant live model"}`);
+      }
       if (resolution.fallbackReason) {
         ui.info(`model route: ${resolution.source} · ${resolution.runtimeId || "current"} · ${resolution.model || runtime.kind || runtime.backend} · ${resolution.fallbackReason}`);
       }
@@ -720,14 +724,14 @@ function create(deps) {
     return { ok: true, finalText, taskCount: tasks.length, doneCount: done.length };
   }
 
-  async function cmdSwarm(db, args, runtimeOverride) {
+  async function cmdSwarm(db, args, runtimeOverride, executionContext = {}) {
     const rest = [];
     let concurrency;
     for (let i = 0; i < args.length; i++) {
       if (args[i] === "--parallel" || args[i] === "-n") concurrency = Number(args[++i]);
       else rest.push(args[i]);
     }
-    const r = await swarmRun(db, rest.join(" "), { concurrency, runtimeOverride });
+    const r = await swarmRun(db, rest.join(" "), { ...executionContext, concurrency, runtimeOverride });
     if (!r.ok) process.exitCode = 1;
   }
 
