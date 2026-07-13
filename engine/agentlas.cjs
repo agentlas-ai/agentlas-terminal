@@ -7895,6 +7895,35 @@ function resolveRuntime(db, override) {
   fail("사용할 런타임이 없습니다. CLI(claude/codex/gemini)를 설치하거나 앱에서 API 키/Ollama를 설정하세요.");
 }
 
+// Build the executable runtime inventory for the parent allocator.  It is
+// intentionally local to this host: a Terminal/Codex/Claude plugin never
+// pretends it can schedule a runtime that is not installed and connected here.
+function listAvailableRuntimes(db, fallbackRuntime = null) {
+  const routing = require("./agentlas-workload-routing.cjs");
+  const active = fallbackRuntime || resolveRuntime(db);
+  const candidates = [];
+  const add = (runtime) => {
+    if (!runtime) return;
+    const key = runtime.mode === "cli" ? `cli:${runtime.kind}` : `api:${runtime.backend}:${runtime.model || ""}`;
+    if (candidates.some((item) => item.key === key)) return;
+    const discovered = routing.defaultAvailableModels(runtime);
+    const availableModels = discovered.length
+      ? discovered
+      : runtime.model
+        ? [{ id: runtime.model, tier: "balanced", capabilities: ["code", "tools"], efforts: [] }]
+        : [];
+    candidates.push({ ...runtime, key, availableModels });
+  };
+  add(active);
+  for (const kind of Object.keys(RUNTIME_BIN)) {
+    if (!which(RUNTIME_BIN[kind])) continue;
+    add({ mode: "cli", kind });
+  }
+  return candidates
+    .filter((runtime) => runtime.availableModels.length)
+    .map(({ key, ...runtime }, index) => ({ ...runtime, runtimeId: `runtime-${index + 1}` }));
+}
+
 // ── API 러너 (BYOK / Ollama) — 비스트리밍, 최종 텍스트 반환 ──
 const DEFAULT_API_MODEL = {
   anthropic: "claude-sonnet-4-6",
@@ -8626,7 +8655,9 @@ function buildArgs(kind, systemPrompt, prompt, permission, runtimeOptions = {}) 
     // changes tool authority, not MCP consent, so this path remains exact-empty.
     const mcp = native.claudeMcpIsolationArgs();
     const thinking = effort === "max" || effort === "xhigh" ? "Ultrathink. " : effort === "high" ? "Think hard. " : effort === "medium" ? "Think. " : "";
-    return ["-p", thinking + prompt, "--append-system-prompt", systemPrompt, ...(model ? ["--model", model] : []), ...perm, ...mcp];
+    const claudeEffort = effort === "minimal" ? "low" : effort === "xhigh" ? "max" : effort;
+    const effortArgs = claudeEffort && claudeEffort !== "none" ? ["--effort", claudeEffort] : [];
+    return ["-p", thinking + prompt, "--append-system-prompt", systemPrompt, ...(model ? ["--model", model] : []), ...effortArgs, ...perm, ...mcp];
   }
   if (kind === "codex") {
     const perm = native.codexPermissionArgs(level);
@@ -9049,6 +9080,7 @@ function parity() {
       captureRuntime,
       runApi,
       resolveRuntime,
+      listAvailableRuntimes,
       buildChildEnvCli,
       projectCwd,
       runCwd,
@@ -10697,7 +10729,7 @@ function cmdHelp() {
       "  variant resolve          local variant selection: selected|fallback|base-only|error",
       "",
       hdr("EXECUTE"),
-      "  storm <goal>             force-robust pipeline: route → verify → execute  (Stormbreaker) [--research]",
+      "  storm <goal>             Agentlas Goal+UltraCode harness: plan → allocate → execute → verify  [--research]",
       "  swarm <goal>             emergent agent swarm — parallel workers + synthesizer [--parallel N]",
       "  network <request>        decompose a request into an A2A task force       (hep-network)",
       "  call \"a,b\" \"<ctx>\"       invoke named Hub/Cloud agents                    (hep-call)",

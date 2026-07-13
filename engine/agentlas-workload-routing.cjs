@@ -33,9 +33,9 @@ const MODEL_FAMILY_TIER = Object.freeze({
 
 const PROVIDER_MODELS = Object.freeze({
   "claude-code": Object.freeze({
-    economy: Object.freeze({ id: "haiku", capabilities: ["code", "tools", "long-context"], costTier: "economy", contextWindow: 200_000 }),
-    balanced: Object.freeze({ id: "sonnet", capabilities: ["code", "tools", "long-context"], costTier: "balanced", contextWindow: 200_000 }),
-    frontier: Object.freeze({ id: "opus", capabilities: ["code", "tools", "long-context"], costTier: "frontier", contextWindow: 200_000 }),
+    economy: Object.freeze({ id: "haiku", capabilities: ["code", "tools", "long-context"], costTier: "economy", contextWindow: 200_000, efforts: ["low", "medium", "high", "max"] }),
+    balanced: Object.freeze({ id: "sonnet", capabilities: ["code", "tools", "long-context"], costTier: "balanced", contextWindow: 200_000, efforts: ["low", "medium", "high", "max"] }),
+    frontier: Object.freeze({ id: "opus", capabilities: ["code", "tools", "long-context"], costTier: "frontier", contextWindow: 200_000, efforts: ["low", "medium", "high", "max"] }),
   }),
   codex: Object.freeze({
     economy: Object.freeze({ id: "gpt-5.6-luna", capabilities: ["code", "tools", "image", "long-context"], costTier: "economy", contextWindow: 372_000, efforts: ["low", "medium", "high", "xhigh", "max"] }),
@@ -98,6 +98,7 @@ function normalizeAllocation(value, expectedPhase = null) {
       : null,
     tier,
     modelClass: cleanText(value.modelClass || value.model_class, 32) || null,
+    runtimeId: cleanText(value.runtimeId || value.runtime_id || value.sessionId || value.session_id, 255) || null,
     exactModelId: cleanText(value.exactModelId || value.exact_model_id || value.modelId, 255) || null,
     effort,
     phase,
@@ -214,6 +215,24 @@ function normalizeAvailableModels(models) {
   return out;
 }
 
+// This is intentionally a small, privacy-safe inventory.  The parent LLM sees
+// only executable runtime ids, model ids and supported effort levels; never a
+// path, account, prompt, credential, or transcript.
+function runtimeInventory(runtimes) {
+  return (Array.isArray(runtimes) ? runtimes : []).map((runtime, index) => ({
+    runtimeId: cleanText(runtime && (runtime.runtimeId || runtime.id), 255) || `runtime-${index + 1}`,
+    kind: cleanText(runtime && runtime.kind, 80) || null,
+    backend: cleanText(runtime && runtime.backend, 80) || null,
+    mode: cleanText(runtime && runtime.mode, 24) || null,
+    models: normalizeAvailableModels(runtime && runtime.availableModels || defaultAvailableModels(runtime)).map((model) => ({
+      id: model.id,
+      efforts: model.efforts,
+      capabilities: model.capabilities,
+      contextWindow: model.contextWindow,
+    })),
+  }));
+}
+
 function resolveEffort(provider, requested, supported = []) {
   if (provider === "claude-code") {
     if (requested === "none") return null;
@@ -269,7 +288,12 @@ function resolveAllocation(options = {}) {
   }
 
   const available = normalizeAvailableModels(options.availableModels || defaultAvailableModels(runtime));
-  let selected = available.find((item) => item.tier === tier) || null;
+  // A live parent decision can name an exact model.  Validate it against the
+  // inventory rather than inferring a model name from a tier.
+  let selected = decision.exactModelId
+    ? available.find((item) => item.id === decision.exactModelId) || null
+    : available.find((item) => item.tier === tier) || null;
+  if (decision.exactModelId && !selected) reasons.push("parent_model_not_in_live_inventory");
   const satisfies = (item) => {
     if (!item) return false;
     const caps = new Set(item.capabilities);
@@ -301,7 +325,7 @@ function resolveAllocation(options = {}) {
   }
 
   let model = selected && selected.id;
-  let source = "ai";
+  let source = decision.exactModelId ? "parent-ai-exact" : "ai";
   if (modelPin) {
     model = modelPin;
     source = "user-pin";
@@ -334,6 +358,28 @@ function resolveAllocation(options = {}) {
     aiReason: decision.reason,
     requested: decision,
   };
+}
+
+function resolveAllocationAcrossRuntimes(options = {}) {
+  const runtimes = Array.isArray(options.runtimes) ? options.runtimes : [];
+  const decision = normalizeAllocation(options.decision);
+  const fallbackRuntime = options.fallbackRuntime || options.runtime || runtimes[0] || null;
+  const fallbackId = cleanText(fallbackRuntime && (fallbackRuntime.runtimeId || fallbackRuntime.id), 255) || null;
+  const requestedId = decision && decision.runtimeId;
+  const chosen = requestedId
+    ? runtimes.find((runtime, index) => (cleanText(runtime && (runtime.runtimeId || runtime.id), 255) || `runtime-${index + 1}`) === requestedId) || null
+    : fallbackRuntime;
+  const runtime = chosen || fallbackRuntime;
+  const resolution = resolveAllocation({ ...options, runtime, decision, availableModels: runtime && runtime.availableModels });
+  const requestedExact = Boolean(decision && decision.runtimeId && decision.exactModelId);
+  const runtimeId = cleanText(runtime && (runtime.runtimeId || runtime.id), 255) || fallbackId;
+  if (requestedExact && chosen && resolution.model === decision.exactModelId) {
+    resolution.source = "parent-selected-live-runtime-model";
+  } else if (requestedExact) {
+    resolution.fallbackReason = [resolution.fallbackReason, chosen ? "parent_model_not_in_live_inventory" : "parent_runtime_not_in_live_inventory"].filter(Boolean).join(",");
+    if (resolution.source !== "user-pin") resolution.source = "fallback";
+  }
+  return { ...resolution, runtime, runtimeId, requestedRuntimeId: requestedId || null };
 }
 
 function createDecisionReceipt({ taskId, stage, decision, resolution }) {
@@ -376,6 +422,7 @@ function createDecisionReceipt({ taskId, stage, decision, resolution }) {
     requested: {
       tier: normalized ? normalized.tier : null,
       modelClass: normalized ? normalized.modelClass : null,
+      sessionId: normalized ? normalized.runtimeId : null,
       modelId: normalized && normalized.exactModelId
         ? normalized.exactModelId
         : source === "user-pin" ? cleanText(resolution && resolution.model, 255) || null : null,
@@ -385,7 +432,7 @@ function createDecisionReceipt({ taskId, stage, decision, resolution }) {
       tier: resolution && resolution.tier ? cleanText(resolution.tier, 32) : normalized ? normalized.tier : null,
       provider: cleanText(resolution && resolution.provider, 80) || null,
       modelId: cleanText(resolution && resolution.model, 255) || null,
-      sessionId: null,
+      sessionId: cleanText(resolution && resolution.runtimeId, 255) || null,
       effort: cleanText(resolution && resolution.effort, 16) || "none",
     },
     reasonCodes,
@@ -424,17 +471,18 @@ function appendDecisionReceipt(receipt, file = defaultReceiptPath()) {
   return file;
 }
 
-function plannerSystemPrompt({ language = "English", maxTasks = 12, mode = "swarm" } = {}) {
+function plannerSystemPrompt({ language = "English", maxTasks = 12, mode = "swarm", liveRuntimeInventory = [] } = {}) {
   return [
     `You are the higher-level workload allocator for an Agentlas ${mode}.`,
     "Judge each child task using the full goal and planned dependency graph. Do not use a keyword lookup or fixed role-to-model table.",
-    "Choose tier economy for haiku/luna, balanced for sonnet/tera(terra), or frontier for opus/sol.",
+    "LIVE_RUNTIME_INVENTORY below is authoritative. For every child and synthesis, choose an exact runtimeId and exactModelId only from it. Do not infer, rename, or invent a model from a tier. If an exact choice cannot be justified, select the current-runtime fallback from the inventory.",
+    `LIVE_RUNTIME_INVENTORY=${JSON.stringify(liveRuntimeInventory)}`,
     "Choose effort none|minimal|low|medium|high|xhigh|max. Spend frontier/high effort only when the task's complexity, risk, context, or synthesis burden justifies it.",
     `Return strict JSON only with at most ${Math.max(1, Math.min(24, maxTasks))} tasks:`,
-    '{"tasks":[{"title":"short","brief":"concrete child task","role":"optional","allocation":{"schema":"agentlas.workload-allocation.v1","tier":"economy|balanced|frontier","effort":"none|minimal|low|medium|high|xhigh|max","phase":"delegate","reasonCodes":["bounded-scope|parallel-throughput|complex-reasoning|large-context|high-risk"],"rationale":"short observable rationale","requiredCapabilities":["code|image|tools|long-context"],"estimatedContextTokens":0}}],"synthesis":{"schema":"agentlas.workload-allocation.v1","tier":"economy|balanced|frontier","effort":"none|minimal|low|medium|high|xhigh|max","phase":"synthesize","reasonCodes":["cross-result-synthesis"],"rationale":"short observable rationale","requiredCapabilities":["code|image|tools|long-context"],"estimatedContextTokens":0}}',
+    '{"tasks":[{"title":"short","brief":"concrete child task","role":"optional","allocation":{"schema":"agentlas.workload-allocation.v1","runtimeId":"runtime-1","exactModelId":"model-from-inventory","tier":"economy|balanced|frontier","effort":"none|minimal|low|medium|high|xhigh|max","phase":"delegate","reasonCodes":["bounded-scope|parallel-throughput|complex-reasoning|large-context|high-risk"],"rationale":"short observable rationale","requiredCapabilities":["code|image|tools|long-context"],"estimatedContextTokens":0}}],"synthesis":{"schema":"agentlas.workload-allocation.v1","runtimeId":"runtime-1","exactModelId":"model-from-inventory","tier":"economy|balanced|frontier","effort":"none|minimal|low|medium|high|xhigh|max","phase":"synthesize","reasonCodes":["cross-result-synthesis"],"rationale":"short observable rationale","requiredCapabilities":["code|image|tools|long-context"],"estimatedContextTokens":0}}',
     "Every task and synthesis MUST include an allocation. Keep tasks independent where safe and sequential where dependencies require it.",
     `Write task text and reasons in ${language}.`,
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 module.exports = {
@@ -450,8 +498,10 @@ module.exports = {
   extractJsonObject,
   runtimeProvider,
   defaultAvailableModels,
+  runtimeInventory,
   readCodexModelInventory,
   resolveAllocation,
+  resolveAllocationAcrossRuntimes,
   createDecisionReceipt,
   appendDecisionReceipt,
   defaultReceiptPath,

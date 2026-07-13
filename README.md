@@ -33,16 +33,18 @@ agentlas
 Type a task and it auto-routes to the right agent. Your model, your choice:
 Claude Code / Codex / Gemini CLI subscriptions or BYOK API keys.
 
-For team, builder, and swarm decomposition, the higher-level LLM also assigns
-each child an `economy`, `balanced`, or `frontier` tier plus reasoning effort.
-Terminal validates that structured decision and maps it within the active
-provider (`haiku/luna`, `sonnet/terra`, `opus/sol`). It does not infer model
-quality from task keywords. `/model <id>` and `/effort <level>` are explicit
-user pins and always win; `/model auto` and `/effort auto` return control to the
-allocator. `/effort off` is an explicit no-effort pin. Unavailable families
-fall back visibly to the current model. Decision receipts contain a task hash,
-not the raw prompt, in the private Agentlas user-data directory. Operators can
-set `AGENTLAS_MODEL_MAX_TIER=economy|balanced|frontier` as a hard cost ceiling.
+For team, builder, and swarm decomposition, the parent LLM first receives this
+host's privacy-safe **live runtime inventory** and chooses an exact
+`runtimeId`, `exactModelId`, and reasoning effort for every child and final
+synthesis. When both Claude Code and Codex are connected, workers can run in
+parallel across both; a plugin host only exposes the runtimes available in that
+host. Terminal validates that each exact selection is still live, honors
+explicit `/model <id>` and `/effort <level>` pins, and records visible fallback
+reasons if a selected runtime/model disappears. It never derives a new model
+name from task keywords or a fixed role table. Decision receipts contain a task
+hash, not the raw prompt, in the private Agentlas user-data directory.
+Operators can set `AGENTLAS_MODEL_MAX_TIER=economy|balanced|frontier` as a hard
+cost ceiling.
 
 ---
 
@@ -267,7 +269,7 @@ Agent Cloud 소유자 복원은 반드시 `agentlas cloud restore <slug>`를 사
 
 **실행 엔진**
 ```sh
-agentlas storm "목표"              # 견고 파이프라인 라우팅→검증→실행 (Stormbreaker) [--research]
+agentlas storm "목표"              # Agentlas 자체 Goal+UltraCode: 계획→런타임/모델/effort 배정→실행→검증 [--research]
 agentlas swarm "목표"              # emergent 에이전트 스웜 [--parallel N]
 agentlas network "요청"            # A2A 태스크포스로 분해            (hep-network)
 agentlas call "a,b" "컨텍스트"      # 지정 에이전트 호출               (hep-call)
@@ -275,11 +277,14 @@ agentlas browser                   # 실제 브라우저 하드포인트        
 agentlas route "요청"              # 라우팅 미리보기 (실행 없음)
 ```
 
-`swarm`은 먼저 상위 LLM이 독립 작업과 의존성을 나누고 각 워커 및 최종 종합에
-서로 다른 모델 tier/effort를 지정한다. 터미널 코드는 이 판단을 키워드 규칙으로
-대체하지 않고, 사용 가능한 provider 모델·capability·context·비용 상한과 명시적
-사용자 고정만 검증한다. 배정 JSON이 깨지거나 provider family가 없으면 현재 모델로
-폴백하고 그 이유를 화면과 비공개 영수증에 남긴다.
+`swarm`은 먼저 상위 LLM이 독립 작업과 의존성을 나누고, 이 호스트에서 실제 실행
+가능한 런타임·모델·effort 목록을 보고 각 워커 및 최종 종합의 정확한
+`runtimeId + exactModelId + effort`를 고른다. Claude Code와 Codex가 둘 다 연결돼
+있으면 둘로 병렬 분배한다. 플러그인 안에서는 그 플러그인을 호스트하는 CLI의 목록만
+노출한다. 터미널 코드는 이 판단을 키워드 규칙이나 고정 모델명으로 대체하지 않고,
+선택이 여전히 가능한지·capability·context·비용 상한·명시적 사용자 고정만 검증한다.
+배정 JSON이 깨지거나 런타임/모델이 사라지면 현재 모델로 폴백하고 그 이유를 화면과
+비공개 영수증에 남긴다.
 
 **지식 & 리서치**
 ```sh
@@ -309,6 +314,12 @@ agentlas cloud <sub>               # 자산 저장·공개·복원 (save|publish
 
 공통 옵션: `--runtime claude-code|codex|gemini` · `--permission read|write|full`
 REPL 안에서는 `/`로 명령 팔레트 (`/build` `/search` `/storm` `/network` …).
+
+`storm`은 외부 CLI의 자동 실행 스위치를 켜는 명령이 아니다. Agentlas Core에서 서명된 동일한
+Goal/UltraCode 하네스를 읽고 SHA-256을 검증한 뒤, Terminal의 부모 플래너가 현재 연결된 런타임과
+모델 목록을 보고 작업별 `runtimeId`·정확한 모델·effort를 확정한다. 독립 작업은 병렬 실행하고
+증거 기반 최종 게이트에서 결과를 종합한다. Core 하네스를 읽거나 검증하지 못하면 로컬 문구로
+대체하지 않고 모델 호출 전에 중단한다.
 
 권한은 이름과 실제 런타임 실행 범위를 일치시킨다.
 

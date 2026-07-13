@@ -2,7 +2,7 @@
 /*
  * agentlas-parity: 데스크탑 앱 전용이던 기능의 터미널 패리티 구현.
  *
- *   storm      — Hephaestus Stormbreaker(route --auto-run) 파이프라인 실행 (+연구 증거)
+ *   storm      — Agentlas-owned Goal/UltraCode harness (Hephaestus route evidence + local parallel workers)
  *   swarm      — emergent 에이전트 스웜 (블랙보드 + `## Spawn` 그래프 성장 + 종합)
  *   automation — 앱 스케줄러가 실행하는 자동화의 등록/목록/토글 (같은 SQLite)
  *   usage      — 로컬 실행/자동화/세션 집계
@@ -198,8 +198,53 @@ function create(deps) {
     });
   }
 
-  // ── storm — 앱 stormbreakerRun()과 동일: route <goal> --auto-run ──
-  // ctx: { ui?, cwd?, research?, background? }
+  function parseHephaestusJson(stdout) {
+    const text = String(stdout || "");
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start < 0 || end <= start) return null;
+    try { return JSON.parse(text.slice(start, end + 1)); } catch { return null; }
+  }
+
+  async function loadCoreStormbreakerHarness(cwd) {
+    const child = spawnHephaestus(
+      ["stormbreaker", "harness"],
+      { cwd, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    if (!child) throw new Error("Agentlas Core / Hephaestus runtime is not installed.");
+    const result = await new Promise((resolve) => {
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+      child.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString()).slice(-4000); });
+      child.on("error", (error) => resolve({ code: 1, stdout, stderr: String(error.message) }));
+      child.on("close", (code) => resolve({ code: code ?? 0, stdout, stderr }));
+    });
+    const harness = parseHephaestusJson(result.stdout);
+    if (result.code !== 0 || !harness) {
+      throw new Error(result.stderr.trim() || "Agentlas Core did not return a Stormbreaker harness.");
+    }
+    if (
+      harness.schema_version !== "agentlas.stormbreaker.goal-ultracode-harness.v1" ||
+      harness.harness_id !== "agentlas-core/stormbreaker-goal-ultracode" ||
+      harness.mode !== "stormbreaker-goal-ultracode" ||
+      typeof harness.system_prompt !== "string" ||
+      !harness.system_prompt.trim() ||
+      typeof harness.prompt_sha256 !== "string"
+    ) {
+      throw new Error("Agentlas Core returned an invalid Stormbreaker harness contract.");
+    }
+    const digest = crypto.createHash("sha256").update(harness.system_prompt, "utf8").digest("hex");
+    if (digest !== harness.prompt_sha256) {
+      throw new Error("Agentlas Core Stormbreaker harness failed its SHA-256 integrity check.");
+    }
+    return harness;
+  }
+
+  // ── storm — Agentlas 자체 Goal/UltraCode 하네스 ──
+  // Core owns the exact Goal/UltraCode prompt. Terminal supplies only host
+  // runtime inventory, worker context, and execution; no local prompt fallback.
+  // ctx: { ui?, cwd?, research?, background?, runtimeOverride? }
   async function stormRun(db, goal, ctx = {}) {
     const ui = ctx.ui || newUi();
     goal = String(goal || "").trim();
@@ -211,37 +256,46 @@ function create(deps) {
       ui.error("goal은 '-'로 시작할 수 없습니다.");
       return { ok: false };
     }
-    if (!hephaestusBin()) {
-      ui.error("Hephaestus 런타임이 없습니다 — 데스크탑 앱 설치 또는 Hephaestus 인스톨러 실행 후 다시 시도하세요.");
-      ui.info("설치: https://agentlas.cloud  ·  또는 HEPHAESTUS_BIN=<경로> 지정");
-      return { ok: false };
+    const cwd = ctx.cwd || (typeof D.projectCwd === "function" ? D.projectCwd() : D.runCwd());
+    let executionHarness;
+    try {
+      executionHarness = await loadCoreStormbreakerHarness(cwd);
+    } catch (error) {
+      ui.error(`Stormbreaker Core harness unavailable: ${String((error && error.message) || error).slice(0, 400)}`);
+      return { ok: false, error: "stormbreaker-core-harness-unavailable" };
     }
-    const cwd = ctx.cwd || D.runCwd();
-    const args = ["route", goal, "--project", cwd, "--runtime", "terminal", "--auto-run"];
+    const args = ["route", goal, "--project", cwd, "--runtime", "terminal"];
     if (ctx.research) args.push("--research-evidence");
-    if (ctx.background) args.push("--background");
+    if (ctx.background) {
+      ui.warn(ui.lang === "ko"
+        ? "Agentlas 자체 Stormbreaker 하네스는 현재 포그라운드에서 실행합니다. 세션이 끝나도 영수증으로 재개 지점을 보존합니다."
+        : "The Agentlas-owned Stormbreaker harness currently runs in the foreground and preserves resume receipts.");
+    }
 
-    ui.beginTurn();
-    ui.startSpinner(ui.lang === "ko" ? "Stormbreaker 라우팅/파이프라인 실행 중…" : "Stormbreaker routing/pipeline…");
-    const result = await new Promise((resolve) => {
-      const child = spawnHephaestus(args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
-      let stdout = "";
-      let stderrTail = [];
-      child.stdout.on("data", (c) => { stdout += c.toString(); });
-      child.stderr.on("data", (c) => {
-        for (const ln of c.toString().split("\n")) {
-          const line = ln.trim();
-          if (!line) continue;
-          stderrTail.push(line);
-          if (stderrTail.length > 30) stderrTail.shift();
-          ui.updateSpinner(line.slice(0, 100));
-        }
+    let result = { code: 0, stdout: "", stderr: "" };
+    if (hephaestusBin()) {
+      ui.beginTurn();
+      ui.startSpinner(ui.lang === "ko" ? "Stormbreaker 라우팅 근거 수집 중…" : "Stormbreaker gathering route evidence…");
+      result = await new Promise((resolve) => {
+        const child = spawnHephaestus(args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+        let stdout = "";
+        let stderrTail = [];
+        child.stdout.on("data", (c) => { stdout += c.toString(); });
+        child.stderr.on("data", (c) => {
+          for (const ln of c.toString().split("\n")) {
+            const line = ln.trim();
+            if (!line) continue;
+            stderrTail.push(line);
+            if (stderrTail.length > 30) stderrTail.shift();
+            ui.updateSpinner(line.slice(0, 100));
+          }
+        });
+        child.on("error", (err) => resolve({ code: 1, stdout, stderr: String(err.message) }));
+        child.on("close", (code) => resolve({ code: code ?? 0, stdout, stderr: stderrTail.join("\n") }));
       });
-      child.on("error", (err) => resolve({ code: 1, stdout, stderr: String(err.message) }));
-      child.on("close", (code) => resolve({ code: code ?? 0, stdout, stderr: stderrTail.join("\n") }));
-    });
-    ui.stopSpinner();
-    ui.endTurn();
+      ui.stopSpinner();
+      ui.endTurn();
+    }
 
     let json = null;
     try {
@@ -250,6 +304,7 @@ function create(deps) {
       if (s >= 0 && e > s) json = JSON.parse(result.stdout.slice(s, e + 1));
     } catch { /* 비JSON 출력 */ }
 
+    let routeContext = "";
     if (json) {
       const action = json.action || json.route_action || (json.route_decision && json.route_decision.action) || json.status || "?";
       ui.line("");
@@ -274,6 +329,11 @@ function create(deps) {
       // 파이프라인 패킷 요약
       const packets = json.execution_fabric && json.execution_fabric.packets;
       if (Array.isArray(packets)) {
+        routeContext = packets.slice(0, 24).map((p) => {
+          const title = String(p.title || p.id || "packet").replace(/\s+/g, " ").slice(0, 160);
+          const card = p.card ? ` [agent:${String(p.card).slice(0, 100)}]` : "";
+          return `- ${title}${card}`;
+        }).join("\n");
         for (const p of packets.slice(0, 12)) {
           ui.line("  " + ui.c.emerald("▸ ") + ui.c.text(String(p.title || p.id || "packet")) + (p.card ? ui.c.dim("  " + p.card) : ""));
         }
@@ -294,13 +354,28 @@ function create(deps) {
       const raw = (result.stdout || result.stderr || "").trim();
       if (raw) ui.markdown(raw.slice(0, 4000));
     }
-    if (result.code !== 0 && !json) ui.error(`hephaestus exited ${result.code}`);
-    return { ok: result.code === 0, json };
+    if (result.code !== 0 && !json) {
+      ui.warn(`Hephaestus route evidence unavailable (${result.code}); Agentlas parent planner will continue from the original goal.`);
+    }
+
+    const harnessResult = await swarmRun(db, goal, {
+      ...ctx,
+      ui,
+      cwd,
+      runtimeOverride: ctx.runtimeOverride,
+      stormbreaker: true,
+      executionHarness,
+      routeContext,
+    });
+    return { ...harnessResult, routeDecision: json };
   }
 
   async function cmdStorm(db, args, runtimeOverride) {
     const rest = [];
-    const ctx = { cwd: D.runCwd() };
+    const ctx = {
+      cwd: typeof D.projectCwd === "function" ? D.projectCwd() : D.runCwd(),
+      runtimeOverride,
+    };
     for (let i = 0; i < args.length; i++) {
       if (args[i] === "--research" || args[i] === "--research-evidence") ctx.research = true;
       else if (args[i] === "--background") ctx.background = true;
@@ -372,11 +447,16 @@ function create(deps) {
   }
 
   // ── swarm — 앱 swarm-run.ts 프로토콜의 CLI 포트 ──
-  function swarmProtocol(goal, tasks, task) {
+  function swarmProtocol(goal, tasks, task, liveRuntimeInventory) {
     const doneList = tasks
       .filter((t) => t.status === "done")
       .slice(-8)
       .map((t) => `- ${t.title}`)
+      .join("\n");
+    const assignedList = tasks
+      .filter((t) => t.id !== task.id && t.status !== "failed")
+      .slice(0, 24)
+      .map((t) => `- [${t.status}] ${t.title}${t.brief ? ` — ${t.brief}` : ""}`)
       .join("\n");
     return [
       "You are one worker in an EMERGENT AGENT SWARM collaborating on a shared goal.",
@@ -387,16 +467,18 @@ function create(deps) {
       task.brief ? `- Details: ${task.brief}` : "",
       "",
       doneList ? `Already completed by peers (recent):\n${doneList}` : "No peer results yet — you may be first.",
+      assignedList ? `WORK ALREADY ASSIGNED TO PEERS (never duplicate these packets):\n${assignedList}` : "",
       "",
       "RULES:",
       "1. Do your task concretely with available tools/files in the current working folder.",
+      `LIVE_RUNTIME_INVENTORY=${JSON.stringify(liveRuntimeInventory || [])}`,
       "2. If the goal needs MORE work beyond your task — split into concrete next steps — end your",
-      "   message with a `## Spawn` block. Every child MUST be one JSON object with a higher-level AI allocation:",
+      "   message with a `## Spawn` block. Every child MUST be one JSON object with a higher-level AI allocation. Choose runtimeId and exactModelId only from LIVE_RUNTIME_INVENTORY:",
       "   ## Spawn",
-      '   - {"role":"webmaster","brief":"build the landing page structure","allocation":{"schema":"agentlas.workload-allocation.v1","tier":"balanced","effort":"high","phase":"delegate","reasonCodes":["complex-reasoning"],"rationale":"requires coordinated implementation","requiredCapabilities":["code","tools"]}}',
-      '   - {"brief":"run focused tests","allocation":{"schema":"agentlas.workload-allocation.v1","tier":"economy","effort":"low","phase":"delegate","reasonCodes":["bounded-scope"],"rationale":"bounded verification","requiredCapabilities":["code","tools"]}}',
-      "   Choose each tier/effort from the actual child difficulty; do not copy one allocation to every child.",
-      "   (role is optional. Do NOT spawn if the goal is already met.)",
+      '   - {"role":"webmaster","brief":"build the landing page structure","allocation":{"schema":"agentlas.workload-allocation.v1","runtimeId":"runtime-1","exactModelId":"model-from-inventory","tier":"balanced","effort":"high","phase":"delegate","reasonCodes":["complex-reasoning"],"rationale":"requires coordinated implementation","requiredCapabilities":["code","tools"]}}',
+      '   - {"brief":"run focused tests","allocation":{"schema":"agentlas.workload-allocation.v1","runtimeId":"runtime-2","exactModelId":"model-from-inventory","tier":"economy","effort":"low","phase":"delegate","reasonCodes":["bounded-scope"],"rationale":"bounded verification","requiredCapabilities":["code","tools"]}}',
+      "   Choose each exact runtime/model and effort from the actual child difficulty; do not copy one allocation to every child.",
+      "   (role is optional. Do NOT spawn if the goal is already met or another pending/running/done packet already owns that work.)",
       "3. Do NOT restate the whole goal. Do NOT invent work that isn't needed — over-spawning wastes the user's money.",
       "4. Everything above the `## Spawn` block is your result and is shared with peers on the blackboard.",
     ]
@@ -460,8 +542,23 @@ function create(deps) {
       return { ok: false };
     }
     const runtime = ctx.runtime || D.resolveRuntime(db, ctx.runtimeOverride);
+    const stormbreaker = ctx.stormbreaker === true;
+    const executionHarness = stormbreaker ? ctx.executionHarness : null;
+    if (stormbreaker && (!executionHarness || typeof executionHarness.system_prompt !== "string")) {
+      ui.error("Stormbreaker requires the canonical Goal + UltraCode harness from Agentlas Core.");
+      return { ok: false, error: "stormbreaker-core-harness-unavailable" };
+    }
+    const coreHarnessPrompt = executionHarness && executionHarness.system_prompt;
     const permission = ctx.permission || "write";
-    const cwd = ctx.cwd || D.runCwd();
+    const discoveredRuntimes = ctx.runtimes && ctx.runtimes.length
+      ? ctx.runtimes
+      : typeof D.listAvailableRuntimes === "function"
+        ? D.listAvailableRuntimes(db, runtime)
+        : [runtime];
+    const runtimes = discoveredRuntimes
+      .map((candidate, index) => ({ ...candidate, runtimeId: candidate.runtimeId || `runtime-${index + 1}` }));
+    const liveRuntimeInventory = workloadRouting.runtimeInventory(runtimes);
+    const cwd = ctx.cwd || (typeof D.projectCwd === "function" ? D.projectCwd() : D.runCwd());
     const concurrency = Math.max(1, Math.min(8, Number(ctx.concurrency) || 3));
     const env = await D.buildChildEnvCli(db, {
       projectPath: ctx.projectPath || null,
@@ -506,8 +603,9 @@ function create(deps) {
     }
 
     async function runAllocatedWorker(system, prompt, task, stage, parentTaskId = null) {
-      const resolution = workloadRouting.resolveAllocation({
-        runtime,
+      const resolution = workloadRouting.resolveAllocationAcrossRuntimes({
+        runtimes,
+        fallbackRuntime: runtime,
         decision: task.allocation,
         modelPin: ctx.modelPin,
         effortPin: ctx.effortPin,
@@ -516,10 +614,19 @@ function create(deps) {
       });
       recordAllocation(task, stage, task.allocation, resolution, parentTaskId);
       if (resolution.fallbackReason) {
-        ui.info(`model route: ${resolution.source} · ${resolution.model || runtime.kind || runtime.backend} · ${resolution.fallbackReason}`);
+        ui.info(`model route: ${resolution.source} · ${resolution.runtimeId || "current"} · ${resolution.model || runtime.kind || runtime.backend} · ${resolution.fallbackReason}`);
       }
-      if (runtime.mode === "cli") {
-        return await D.captureRuntime(runtime.kind, system, prompt, {
+      const selectedRuntime = resolution.runtime || runtime;
+      task.resolvedAllocation = {
+        runtimeId: resolution.runtimeId || selectedRuntime.runtimeId || null,
+        runtimeKind: selectedRuntime.kind || selectedRuntime.backend || null,
+        model: resolution.model || selectedRuntime.model || null,
+        effort: resolution.effort ?? null,
+        source: resolution.source,
+        fallbackReason: resolution.fallbackReason || null,
+      };
+      if (selectedRuntime.mode === "cli") {
+        return await D.captureRuntime(selectedRuntime.kind, system, prompt, {
           cwd,
           env,
           permission,
@@ -527,25 +634,31 @@ function create(deps) {
           effort: resolution.effort,
         });
       }
-      const text = await D.runApi(runtime.backend, resolution.model || runtime.model, system, prompt);
+      const text = await D.runApi(selectedRuntime.backend, resolution.model || selectedRuntime.model, system, prompt);
       return typeof text === "string" ? text : (text && text.text) || "";
     }
 
     const label = runtime.mode === "cli" ? runtime.kind : runtime.backend;
     ui.line("");
-    ui.line(ui.c.paw("◤ ") + ui.c.bold(ui.c.text("swarm")) + ui.c.dim(`  ${label} · x${concurrency} · max ${SWARM_MAX_TASKS} tasks`));
+    ui.line(ui.c.paw("◤ ") + ui.c.bold(ui.c.text(stormbreaker ? "stormbreaker" : "swarm")) + ui.c.dim(`  Agentlas harness · ${label} · x${concurrency} · max ${SWARM_MAX_TASKS} tasks`));
     ui.info(goal.slice(0, 120));
 
     ui.startSpinner(ui.lang === "ko" ? "상위 AI가 작업별 모델 비용을 배정 중…" : "Higher-level AI is allocating task models…");
     let planned = null;
     try {
       const plannerText = await runBaseWorker(
-        workloadRouting.plannerSystemPrompt({
-          language: ui.lang === "ko" ? "Korean" : "English",
-          maxTasks: Math.min(SWARM_SPAWN_PER_TURN, SWARM_MAX_TASKS),
-          mode: "swarm",
-        }),
-        goal,
+        [
+          coreHarnessPrompt,
+          workloadRouting.plannerSystemPrompt({
+            language: ui.lang === "ko" ? "Korean" : "English",
+            maxTasks: Math.min(SWARM_SPAWN_PER_TURN, SWARM_MAX_TASKS),
+            mode: stormbreaker ? "stormbreaker-goal-ultracode" : "swarm",
+            liveRuntimeInventory,
+          }),
+        ].filter(Boolean).join("\n\n"),
+        ctx.routeContext
+          ? `${goal}\n\nHEPHAESTUS ROUTE EVIDENCE (advisory; the Agentlas parent owns the final plan):\n${ctx.routeContext}`
+          : goal,
       );
       planned = workloadRouting.normalizePlan(plannerText, { maxTasks: SWARM_SPAWN_PER_TURN });
     } catch (error) {
@@ -553,6 +666,17 @@ function create(deps) {
     }
     ui.stopSpinner();
     if (!planned) ui.warn(ui.lang === "ko" ? "모델 배정 JSON이 유효하지 않아 현재 모델로 투명하게 폴백합니다." : "Invalid allocation JSON; transparently falling back to the current model.");
+    if (planned) {
+      ui.line("");
+      ui.info(stormbreaker
+        ? (ui.lang === "ko" ? "Stormbreaker Goal/UltraCode 실행 계획:" : "Stormbreaker Goal/UltraCode execution plan:")
+        : (ui.lang === "ko" ? "스웜 실행 계획:" : "Swarm execution plan:"));
+      for (const task of planned.tasks) {
+        const allocation = task.allocation;
+        ui.line(`  ${ui.c.emerald("▸ ")}${ui.c.text(task.title)}${ui.c.dim(`  ${allocation.runtimeId || "current"} · ${allocation.exactModelId || allocation.tier} · ${allocation.effort}`)}`);
+      }
+      ui.line(`  ${ui.c.emerald("◆ ")}${ui.c.text("synthesis")}${ui.c.dim(`  ${planned.synthesis.runtimeId || "current"} · ${planned.synthesis.exactModelId || planned.synthesis.tier} · ${planned.synthesis.effort}`)}`);
+    }
 
     let seq = 0;
     const initialTasks = planned
@@ -572,7 +696,13 @@ function create(deps) {
           task.status = "running";
           active++;
           ui.tool(`⚑ ${task.title}` + (task.role ? `  (${task.role})` : ""));
-          runAllocatedWorker(swarmProtocol(goal, tasks, task), task.brief || task.title, task, "worker", task.parentTaskId)
+          runAllocatedWorker(
+            [coreHarnessPrompt, swarmProtocol(goal, tasks, task, liveRuntimeInventory)].filter(Boolean).join("\n\n"),
+            task.brief || task.title,
+            task,
+            "worker",
+            task.parentTaskId,
+          )
             .then((text) => {
               const parsed = parseSwarmOutput(text);
               task.status = "done";
@@ -609,7 +739,11 @@ function create(deps) {
     }
 
     ui.startSpinner(ui.lang === "ko" ? "스웜 결과 종합 중…" : "Synthesizing swarm results…");
-    const pieces = done.map((t, i) => `### ${i + 1}. ${t.title}\n${t.result}`).join("\n\n");
+    const pieces = done.map((t, i) => [
+      `### ${i + 1}. ${t.title}`,
+      `HOST-VERIFIED ALLOCATION: ${JSON.stringify(t.resolvedAllocation || null)}`,
+      t.result,
+    ].join("\n")).join("\n\n");
     let finalText;
     try {
       const synthesisTask = {
@@ -620,6 +754,7 @@ function create(deps) {
       };
       finalText = await runAllocatedWorker(
         [
+          coreHarnessPrompt,
           "You are the synthesizer of an agent swarm. Below are the results your peers produced for the shared goal.",
           "Integrate them into ONE coherent final answer for the user. Reconcile overlaps, note anything incomplete.",
           "Do not just concatenate. Do not include a `## Spawn` block.",
