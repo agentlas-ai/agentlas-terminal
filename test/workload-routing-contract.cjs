@@ -222,8 +222,8 @@ async function main() {
   const redactedJson = JSON.stringify(redactedReceipt);
   assert.doesNotMatch(redactedJson, /\/Users\/example|user@example\.com|sk-abcdefghijklmnop|another task/);
   assert.doesNotMatch(redactedJson, /userPrompt|brief|history|systemPrompt|toolData/i);
-  assert.equal(fs.statSync(receiptFile).mode & 0o777, 0o600);
   if (process.platform !== "win32") {
+    assert.equal(fs.statSync(receiptFile).mode & 0o777, 0o600);
     const target = path.join(tmp, "target.jsonl");
     fs.writeFileSync(target, "");
     const link = path.join(tmp, "link.jsonl");
