@@ -4,9 +4,9 @@
  * AI-authored workload allocation for Terminal system agents.
  *
  * Important boundary: this module NEVER judges a task from words or regexes. A
- * parent LLM writes the tier/effort decision. Deterministic code only validates
- * that decision, applies user pins/policy/capability constraints, and translates
- * the tier to a model family exposed by the selected provider.
+ * parent LLM writes the exact live-inventory decision. Host policy code only
+ * validates that decision and applies pins/policy/capability constraints. It
+ * never manufactures a provider model id from a tier.
  */
 const crypto = require("node:crypto");
 const fs = require("node:fs");
@@ -21,37 +21,13 @@ const EFFORTS = Object.freeze(["none", "minimal", "low", "medium", "high", "xhig
 const CAPABILITIES = new Set(["code", "image", "tools", "long-context"]);
 const PHASES = new Set(["plan", "delegate", "synthesize"]);
 
-const MODEL_FAMILY_TIER = Object.freeze({
-  haiku: "economy",
-  luna: "economy",
-  sonnet: "balanced",
-  tera: "balanced",
-  terra: "balanced",
-  opus: "frontier",
-  sol: "frontier",
-});
-
-const PROVIDER_MODELS = Object.freeze({
-  "claude-code": Object.freeze({
-    economy: Object.freeze({ id: "haiku", capabilities: ["code", "tools", "long-context"], costTier: "economy", contextWindow: 200_000, efforts: ["low", "medium", "high", "max"] }),
-    balanced: Object.freeze({ id: "sonnet", capabilities: ["code", "tools", "long-context"], costTier: "balanced", contextWindow: 200_000, efforts: ["low", "medium", "high", "max"] }),
-    frontier: Object.freeze({ id: "opus", capabilities: ["code", "tools", "long-context"], costTier: "frontier", contextWindow: 200_000, efforts: ["low", "medium", "high", "max"] }),
-  }),
-  codex: Object.freeze({
-    economy: Object.freeze({ id: "gpt-5.6-luna", capabilities: ["code", "tools", "image", "long-context"], costTier: "economy", contextWindow: 372_000, efforts: ["low", "medium", "high", "xhigh", "max"] }),
-    balanced: Object.freeze({ id: "gpt-5.6-terra", capabilities: ["code", "tools", "image", "long-context"], costTier: "balanced", contextWindow: 372_000, efforts: ["low", "medium", "high", "xhigh", "max"] }),
-    frontier: Object.freeze({ id: "gpt-5.6-sol", capabilities: ["code", "tools", "image", "long-context"], costTier: "frontier", contextWindow: 372_000, efforts: ["low", "medium", "high", "xhigh", "max"] }),
-  }),
-});
-
 function cleanText(value, max = 240) {
   return String(value || "").replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
 }
 
 function normalizeTier(value) {
   const v = String(value || "").toLowerCase().trim();
-  if (TIERS.includes(v)) return v;
-  return MODEL_FAMILY_TIER[v] || null;
+  return TIERS.includes(v) ? v : null;
 }
 
 function normalizeEffort(value) {
@@ -77,7 +53,7 @@ function normalizeReasonCodes(value) {
 
 function normalizeAllocation(value, expectedPhase = null) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const tier = normalizeTier(value.tier || value.model || value.modelFamily || value.model_family);
+  const tier = normalizeTier(value.tier || value.modelTier || value.model_tier);
   const effort = normalizeEffort(value.effort);
   const reason = cleanText(value.rationale || value.reason, 240);
   if (!tier || !effort || !reason) return null;
@@ -147,13 +123,20 @@ function runtimeProvider(runtime) {
 
 function defaultAvailableModels(runtime) {
   const provider = runtimeProvider(runtime);
-  const models = PROVIDER_MODELS[provider];
-  if (!models) return [];
   if (provider === "codex") {
-    const detected = readCodexModelInventory();
-    if (detected.length) return detected;
+    return readCodexModelInventory();
   }
-  return Object.entries(models).map(([tier, model]) => ({ tier, ...model }));
+  if (runtime && runtime.model) {
+    return normalizeAvailableModels([{
+      id: runtime.model,
+      tier: runtime.modelTier || runtime.tier || null,
+      capabilities: runtime.capabilities || [],
+      contextWindow: runtime.contextWindow || null,
+      efforts: runtime.efforts || [],
+      description: runtime.modelDescription || "host-selected current model",
+    }]);
+  }
+  return [];
 }
 
 function readCodexModelInventory(codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex")) {
@@ -169,20 +152,26 @@ function readCodexModelInventory(codexHome = process.env.CODEX_HOME || path.join
       if (!model || model.visibility !== "list" || typeof model.slug !== "string") continue;
       const id = model.slug.trim();
       if (!/^[a-z0-9][a-z0-9._-]{0,127}$/.test(id) || seen.has(id)) continue;
-      const tier = normalizeTier(id.split(/[^a-z0-9]+/).filter(Boolean).at(-1));
-      if (!tier) continue;
       seen.add(id);
-      const fallback = PROVIDER_MODELS.codex[tier];
+      const contextWindow = Number.isSafeInteger(model.context_window) && model.context_window > 0
+        ? model.context_window
+        : Number.isSafeInteger(model.max_context_window) && model.max_context_window > 0
+          ? model.max_context_window
+          : null;
+      const capabilities = ["code"];
+      if (model.tool_mode || model.shell_type || model.supports_parallel_tool_calls) capabilities.push("tools");
+      if (Array.isArray(model.input_modalities) && model.input_modalities.includes("image")) capabilities.push("image");
+      if (contextWindow) capabilities.push("long-context");
       out.push({
-        ...fallback,
         id,
-        tier,
-        contextWindow: Number.isSafeInteger(model.context_window) && model.context_window > 0
-          ? model.context_window
-          : fallback.contextWindow,
+        tier: normalizeTier(model.tier || model.cost_tier),
+        capabilities,
+        contextWindow,
         efforts: Array.isArray(model.supported_reasoning_levels)
           ? model.supported_reasoning_levels.map((item) => normalizeEffort(item && item.effort)).filter(Boolean)
-          : fallback.efforts,
+          : [],
+        description: cleanText(model.description, 300) || null,
+        priority: Number.isFinite(Number(model.priority)) ? Number(model.priority) : null,
       });
     }
     return out;
@@ -198,8 +187,8 @@ function normalizeAvailableModels(models) {
     const value = typeof item === "string" ? { id: item } : item;
     if (!value || typeof value !== "object") continue;
     const id = cleanText(value.id || value.model, 160);
-    const tier = normalizeTier(value.tier || value.family || id.split("-").pop());
-    if (!id || !tier) continue;
+    const tier = normalizeTier(value.tier || value.costTier || value.cost_tier);
+    if (!id) continue;
     const contextWindow = Number.isSafeInteger(Number(value.contextWindow)) && Number(value.contextWindow) > 0
       ? Number(value.contextWindow)
       : null;
@@ -210,6 +199,8 @@ function normalizeAvailableModels(models) {
       costTier: normalizeTier(value.costTier) || tier,
       contextWindow,
       efforts: Array.isArray(value.efforts) ? value.efforts.map(normalizeEffort).filter(Boolean) : [],
+      description: cleanText(value.description, 300) || null,
+      priority: Number.isFinite(Number(value.priority)) ? Number(value.priority) : null,
     });
   }
   return out;
@@ -229,6 +220,9 @@ function runtimeInventory(runtimes) {
       efforts: model.efforts,
       capabilities: model.capabilities,
       contextWindow: model.contextWindow,
+      tier: model.tier,
+      description: model.description,
+      priority: model.priority,
     })),
   }));
 }
@@ -287,20 +281,14 @@ function resolveAllocation(options = {}) {
     reasons.push("cost_policy_clamped");
   }
 
-  const available = normalizeAvailableModels(options.availableModels || defaultAvailableModels(runtime));
-  // A live parent decision can name an exact model.  Validate it against the
-  // inventory rather than inferring a model name from a tier.
+  const available = normalizeAvailableModels(options.availableModels || runtime && runtime.availableModels || defaultAvailableModels(runtime));
+  // A live parent decision names an exact model. Validate it against inventory;
+  // never choose the first model in a tier or sort models into a hidden fallback.
   let selected = decision.exactModelId
     ? available.find((item) => item.id === decision.exactModelId) || null
-    : available.find((item) => item.tier === tier) || null;
+    : null;
   if (decision.exactModelId && !selected) reasons.push("parent_model_not_in_live_inventory");
-  const satisfies = (item) => {
-    if (!item) return false;
-    const caps = new Set(item.capabilities);
-    if (decision.requiredCapabilities.some((required) => !caps.has(required))) return false;
-    if (decision.estimatedContextTokens != null && item.contextWindow != null && decision.estimatedContextTokens > item.contextWindow) return false;
-    return true;
-  };
+  if (!decision.exactModelId) reasons.push("parent_exact_model_required");
   if (selected && decision.requiredCapabilities.length) {
     const caps = new Set(selected.capabilities);
     if (decision.requiredCapabilities.some((required) => !caps.has(required))) {
@@ -312,20 +300,21 @@ function resolveAllocation(options = {}) {
     selected = null;
     reasons.push("context_window_exceeded");
   }
-  if (!selected && available.length) {
-    const ceiling = maxTier ? TIER_RANK[maxTier] : TIER_RANK.frontier;
-    const alternate = available
-      .filter((item) => TIER_RANK[item.tier] >= TIER_RANK[tier] && TIER_RANK[item.tier] <= ceiling && satisfies(item))
-      .sort((left, right) => TIER_RANK[left.tier] - TIER_RANK[right.tier])[0];
-    if (alternate) {
-      selected = alternate;
-      tier = alternate.tier;
-      reasons.push("capability_or_context_adjusted");
-    }
+  if (selected && maxTier && !selected.tier) {
+    selected = null;
+    reasons.push("selected_model_cost_tier_unknown");
+  }
+  if (selected && maxTier && TIER_RANK[selected.tier] > TIER_RANK[maxTier]) {
+    selected = null;
+    reasons.push("selected_model_exceeds_cost_policy");
+  }
+  if (selected && selected.tier && selected.tier !== tier) {
+    selected = null;
+    reasons.push("selected_model_tier_mismatch");
   }
 
   let model = selected && selected.id;
-  let source = decision.exactModelId ? "parent-ai-exact" : "ai";
+  let source = decision.exactModelId ? "parent-ai-exact" : "fallback";
   if (modelPin) {
     model = modelPin;
     source = "user-pin";
@@ -333,17 +322,17 @@ function resolveAllocation(options = {}) {
   } else if (!model) {
     model = (runtime && runtime.model) || null;
     source = "fallback";
-    if (!reasons.length) reasons.push(available.length ? "requested_tier_unavailable" : "provider_family_unavailable");
+    if (!reasons.length) reasons.push(available.length ? "requested_tier_unavailable" : "live_inventory_unavailable");
   }
 
   let effort;
   if (effortPinPresent) {
-    effort = effortPin === "none" ? null : resolveEffort(provider, effortPin, selected && selected.efforts);
+    effort = effortPin === "none" ? null : resolveEffort(provider, effortPin, selected && selected.efforts || []);
     source = source === "user-pin" ? source : "user-pin";
     reasons.push("explicit_effort_pin");
     if (effortPin !== "none" && effort == null) reasons.push("effort_pin_unsupported_by_provider");
   } else {
-    effort = resolveEffort(provider, decision.effort, selected && selected.efforts);
+    effort = resolveEffort(provider, decision.effort, selected && selected.efforts || []);
     if (effort == null && decision.effort !== "none") reasons.push("effort_unsupported_by_provider");
   }
 
@@ -490,7 +479,6 @@ module.exports = {
   ALLOCATION_SCHEMA,
   TIERS,
   EFFORTS,
-  PROVIDER_MODELS,
   normalizeTier,
   normalizeEffort,
   normalizeAllocation,

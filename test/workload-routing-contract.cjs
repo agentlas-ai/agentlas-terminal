@@ -21,28 +21,45 @@ function uiStub() {
 }
 
 async function main() {
-  assert.equal(routing.normalizeTier("haiku"), "economy");
-  assert.equal(routing.normalizeTier("luna"), "economy");
-  assert.equal(routing.normalizeTier("sonnet"), "balanced");
-  assert.equal(routing.normalizeTier("tera"), "balanced", "the common tera spelling aliases to terra's balanced tier");
-  assert.equal(routing.normalizeTier("terra"), "balanced");
-  assert.equal(routing.normalizeTier("opus"), "frontier");
-  assert.equal(routing.normalizeTier("sol"), "frontier");
+  assert.equal(routing.normalizeTier("economy"), "economy");
+  assert.equal(routing.normalizeTier("balanced"), "balanced");
+  assert.equal(routing.normalizeTier("frontier"), "frontier");
+  assert.equal(routing.normalizeTier("haiku"), null, "vendor model names must never imply cost tiers");
+  assert.equal(routing.normalizeTier("terra"), null, "live model ids must never be parsed into cost tiers");
+  assert.equal(routing.normalizeTier("opus"), null, "vendor model names must never imply cost tiers");
 
-  const economy = { tier: "economy", effort: "low", reason: "bounded independent verification" };
-  const frontier = { tier: "frontier", effort: "max", reason: "high-risk cross-system synthesis" };
-  const codexRuntime = { mode: "cli", kind: "codex" };
-  const claudeRuntime = { mode: "cli", kind: "claude-code" };
+  const economy = { tier: "economy", exactModelId: "codex-live-economy", effort: "low", reason: "bounded independent verification" };
+  const frontier = { tier: "frontier", exactModelId: "codex-live-frontier", effort: "max", reason: "high-risk cross-system synthesis" };
+  const claudeFrontier = { tier: "frontier", exactModelId: "claude-live-frontier", effort: "max", reason: "high-risk cross-system synthesis" };
+  const codexRuntime = {
+    mode: "cli",
+    kind: "codex",
+    model: "codex-live-economy",
+    availableModels: [
+      { id: "codex-live-economy", tier: "economy", capabilities: ["code", "tools"], efforts: ["low", "high", "max"] },
+      { id: "codex-live-balanced", tier: "balanced", capabilities: ["code", "tools"], efforts: ["low", "high", "max"] },
+      { id: "codex-live-frontier", tier: "frontier", capabilities: ["code", "tools"], efforts: ["low", "high", "max"] },
+    ],
+  };
+  const claudeRuntime = {
+    mode: "cli",
+    kind: "claude-code",
+    model: "claude-live-frontier",
+    availableModels: [
+      { id: "claude-live-economy", tier: "economy", capabilities: ["code", "tools"], efforts: ["low", "high", "max"] },
+      { id: "claude-live-frontier", tier: "frontier", capabilities: ["code", "tools"], efforts: ["low", "high", "max"] },
+    ],
+  };
 
   assert.deepEqual(
     routing.resolveAllocation({ runtime: codexRuntime, decision: economy }),
     {
       ok: true,
       tier: "economy",
-      model: "gpt-5.6-luna",
+      model: "codex-live-economy",
       effort: "low",
       provider: "codex",
-      source: "ai",
+      source: "parent-ai-exact",
       fallbackReason: null,
       aiReason: economy.reason,
       requested: {
@@ -53,7 +70,7 @@ async function main() {
         ...economy,
         modelClass: null,
         runtimeId: null,
-        exactModelId: null,
+        exactModelId: "codex-live-economy",
         phase: null,
         reasonCodes: ["ai-assigned"],
         requiredCapabilities: [],
@@ -61,15 +78,15 @@ async function main() {
       },
     },
   );
-  assert.equal(routing.resolveAllocation({ runtime: claudeRuntime, decision: frontier }).model, "opus");
+  assert.equal(routing.resolveAllocation({ runtime: claudeRuntime, decision: claudeFrontier }).model, "claude-live-frontier");
   assert.equal(routing.resolveAllocation({ runtime: codexRuntime, decision: frontier }).effort, "max", "current Codex inventory advertises max directly");
 
   // The parent is given the live inventory and chooses an exact executable
   // runtime/model pair. The host validates that choice; it does not recreate a
   // model id from a tier or task keyword.
   const liveRuntimes = [
-    { ...codexRuntime, runtimeId: "runtime-1", availableModels: [{ id: "codex-live-small", tier: "economy", capabilities: ["code", "tools"], efforts: ["low", "high"] }] },
-    { ...claudeRuntime, runtimeId: "runtime-2", availableModels: [{ id: "claude-live-frontier", tier: "frontier", capabilities: ["code", "tools"], efforts: [] }] },
+    { ...codexRuntime, runtimeId: "runtime-1" },
+    { ...claudeRuntime, runtimeId: "runtime-2" },
   ];
   const exact = routing.resolveAllocationAcrossRuntimes({
     runtimes: liveRuntimes,
@@ -80,7 +97,7 @@ async function main() {
   assert.equal(exact.model, "claude-live-frontier");
   assert.equal(exact.effort, "high");
   assert.equal(exact.source, "parent-selected-live-runtime-model");
-  assert.equal(routing.runtimeInventory(liveRuntimes)[1].models[0].id, "claude-live-frontier");
+  assert.ok(routing.runtimeInventory(liveRuntimes)[1].models.some((model) => model.id === "claude-live-frontier"));
 
   const pinned = routing.resolveAllocation({
     runtime: codexRuntime,
@@ -99,20 +116,21 @@ async function main() {
 
   const costClamped = routing.resolveAllocation({ runtime: codexRuntime, decision: frontier, maxTier: "economy" });
   assert.equal(costClamped.tier, "economy");
-  assert.equal(costClamped.model, "gpt-5.6-luna");
+  assert.equal(costClamped.model, "codex-live-economy");
   assert.match(costClamped.fallbackReason, /cost_policy_clamped/);
+  assert.match(costClamped.fallbackReason, /selected_model_exceeds_cost_policy/);
 
   const contextAdjusted = routing.resolveAllocation({
     runtime: codexRuntime,
-    decision: { ...economy, estimatedContextTokens: 5_000, requiredCapabilities: ["long-context"] },
+    decision: { ...economy, exactModelId: "tiny", estimatedContextTokens: 5_000, requiredCapabilities: ["long-context"] },
     availableModels: [
       { id: "tiny", tier: "economy", contextWindow: 2_000, capabilities: ["code"] },
       { id: "roomy", tier: "balanced", contextWindow: 10_000, capabilities: ["code", "long-context"] },
     ],
   });
-  assert.equal(contextAdjusted.model, "roomy");
-  assert.equal(contextAdjusted.tier, "balanced");
-  assert.match(contextAdjusted.fallbackReason, /capability_or_context_adjusted/);
+  assert.equal(contextAdjusted.model, "codex-live-economy", "host must preserve current instead of auto-picking another model");
+  assert.equal(contextAdjusted.tier, "economy");
+  assert.match(contextAdjusted.fallbackReason, /capability_mismatch/);
 
   const unsupported = routing.resolveAllocation({
     runtime: { mode: "cli", kind: "gemini", model: "gemini-current" },
@@ -120,7 +138,7 @@ async function main() {
   });
   assert.equal(unsupported.model, "gemini-current", "unmapped provider must preserve the active model");
   assert.equal(unsupported.source, "fallback");
-  assert.match(unsupported.fallbackReason, /provider_family_unavailable/);
+  assert.match(unsupported.fallbackReason, /parent_model_not_in_live_inventory/);
 
   const invalid = routing.resolveAllocation({ runtime: codexRuntime, decision: { tier: "frontier" } });
   assert.equal(invalid.ok, false);
@@ -141,14 +159,16 @@ async function main() {
   assert.equal(plan.tasks[1].allocation.tier, "frontier");
   assert.equal(plan.synthesis.tier, "balanced");
 
-  // Deterministic routing receives a parent decision, not task text. Identical
-  // decisions resolve identically for semantically unrelated tasks: no keyword heuristic.
+  // Policy validation receives a parent decision, not task text. The exact live
+  // model choice is authored by the parent, never reconstructed from keywords.
   assert.equal(
     routing.resolveAllocation({ runtime: codexRuntime, decision: economy }).model,
     routing.resolveAllocation({ runtime: codexRuntime, decision: economy }).model,
   );
   const source = fs.readFileSync(require.resolve("../engine/agentlas-workload-routing.cjs"), "utf8");
   assert.doesNotMatch(source, /TASK_KEYWORDS|ROLE_TO_MODEL|keyword.*tier/i);
+  assert.doesNotMatch(source, /gpt-5\.6-(?:luna|terra|sol)|\bid:\s*["'](?:haiku|sonnet|opus)["']/, "Terminal allocator must not embed provider model ids");
+  assert.doesNotMatch(source, /MODEL_FAMILY_TIER|available\.find\(\(item\) => item\.tier === tier\)/, "Terminal allocator must not map vendor classes or choose the first model in a tier");
   const terminalSource = fs.readFileSync(require.resolve("../engine/agentlas.cjs"), "utf8");
   assert.doesNotMatch(
     terminalSource,
@@ -266,8 +286,8 @@ async function main() {
     prefsLang: () => "en",
     resolveRuntime: () => codexRuntime,
     listAvailableRuntimes: () => [
-      { ...codexRuntime, runtimeId: "runtime-1", availableModels: routing.defaultAvailableModels(codexRuntime) },
-      { ...claudeRuntime, runtimeId: "runtime-2", availableModels: routing.defaultAvailableModels(claudeRuntime) },
+      { ...codexRuntime, runtimeId: "runtime-1" },
+      { ...claudeRuntime, runtimeId: "runtime-2" },
     ],
     runCwd: () => tmp,
     buildChildEnvCli: async () => ({}),
@@ -276,10 +296,10 @@ async function main() {
       if (/higher-level workload allocator/.test(system)) {
         return JSON.stringify({
           tasks: [
-            { title: "cheap audit", brief: "audit fixtures", allocation: { ...economy, runtimeId: "runtime-1", exactModelId: "gpt-5.6-luna" } },
-            { title: "hard repair", brief: "repair architecture", allocation: { ...frontier, runtimeId: "runtime-2", exactModelId: "opus" } },
+            { title: "cheap audit", brief: "audit fixtures", allocation: { ...economy, runtimeId: "runtime-1", exactModelId: "codex-live-economy" } },
+            { title: "hard repair", brief: "repair architecture", allocation: { ...frontier, runtimeId: "runtime-2", exactModelId: "claude-live-frontier" } },
           ],
-          synthesis: { tier: "balanced", effort: "high", reason: "merge conflicting evidence", runtimeId: "runtime-1", exactModelId: "gpt-5.6-terra" },
+          synthesis: { tier: "balanced", effort: "high", reason: "merge conflicting evidence", runtimeId: "runtime-1", exactModelId: "codex-live-balanced" },
         });
       }
       if (/synthesizer of an agent swarm/.test(system)) return "integrated answer";
@@ -310,7 +330,7 @@ async function main() {
   });
   assert.equal(result.ok, true);
   const executionCalls = calls.filter((call) => !/higher-level workload allocator/.test(call.system));
-  assert.deepEqual(executionCalls.map((call) => call.options.model).sort(), ["gpt-5.6-luna", "gpt-5.6-terra", "opus"].sort());
+  assert.deepEqual(executionCalls.map((call) => call.options.model).sort(), ["codex-live-economy", "codex-live-balanced", "claude-live-frontier"].sort());
   assert.deepEqual(executionCalls.map((call) => call.kind).sort(), ["claude-code", "codex", "codex"].sort(), "each exact parent runtime selection invokes that runtime CLI");
   const synthesisCall = calls.find((call) => /synthesizer of an agent swarm/.test(call.system));
   assert.match(synthesisCall.prompt, /HOST-VERIFIED ALLOCATION:/);

@@ -152,6 +152,33 @@ async function captureCoreJson(moduleName, args, opts = {}, explicitRoot) {
   return json;
 }
 
+function captureCoreJsonSync(moduleName, args, opts = {}, explicitRoot) {
+  const root = resolveCoreRuntimeRoot(explicitRoot);
+  const python = resolvePython();
+  if (!root || !python) throw new Error("Agentlas Core runtime or Python 3.9+ is unavailable.");
+  const result = spawnSync(
+    python.executable,
+    [...python.prefix, "-c", PY_BOOTSTRAP, moduleName, ...args],
+    {
+      ...opts,
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: opts.timeout || 120_000,
+      env: {
+        ...(opts.env || process.env),
+        HEPHAESTUS_RUNTIME_ROOT: root,
+        PYTHONUTF8: "1",
+        PYTHONIOENCODING: "utf-8",
+      },
+    },
+  );
+  const json = parseJsonOutput(result.stdout);
+  if (result.status !== 0 || !json) {
+    throw new Error(String(result.stderr || result.error?.message || `Agentlas Core ${moduleName} did not return JSON.`).trim());
+  }
+  return json;
+}
+
 async function loadCoreStormbreakerHarness(cwd, explicitRoot) {
   const harness = await captureCoreJson(
     "agentlas_cloud",
@@ -173,5 +200,6 @@ module.exports = {
   parseJsonOutput,
   validateCoreStormbreakerHarness,
   captureCoreJson,
+  captureCoreJsonSync,
   loadCoreStormbreakerHarness,
 };

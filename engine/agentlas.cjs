@@ -34,6 +34,7 @@ const terminalExperienceExchange = require("./agentlas-experience-exchange.cjs")
 const desktopOntologyLoadout = require("./agentlas-desktop-loadout.cjs");
 const workloadRouting = require("./agentlas-workload-routing.cjs");
 const terminalExperienceIntake = require("./agentlas-experience-intake.cjs");
+const { captureCoreJsonSync } = require("./agentlas-core-harness.cjs");
 
 // ── 앱과 동일한 userData 경로 (electron app.getPath('userData')와 일치) ──
 function userDataDir() {
@@ -7680,9 +7681,32 @@ function contextLine(json) {
     return "";
   }
 }
-// 작업 폴더 반복 방문 → 활성화(.agentlas 생성). 앱의 activation.ts와 동일한 정책(2회).
+const coreProjectBootstraps = new Set();
+
+function ensureCoreProjectCli(projectPath) {
+  if (coreProjectBootstraps.has(projectPath)) return true;
+  try {
+    const result = captureCoreJsonSync(
+      "agentlas_cloud",
+      ["project", "ensure", "--project", projectPath, "--reason", "terminal-first-contact"],
+      { cwd: projectPath },
+    );
+    if (result && result.status === "active") {
+      coreProjectBootstraps.add(projectPath);
+      return true;
+    }
+  } catch {
+    // Installed Core can lag the Terminal briefly during an update. Keep the
+    // old merge-only seed as a fallback and retry Core on the next invocation.
+  }
+  ensureProjectMemoryCli(projectPath);
+  return false;
+}
+
+// 작업 폴더 첫 접촉 → Core canonical 프로젝트 아키텍처를 즉시 활성화.
 function recordCliFolderVisit(db, projectPath) {
-  if (!tableExists(db, "folder_activity")) return { activated: false };
+  ensureCoreProjectCli(projectPath);
+  if (!tableExists(db, "folder_activity")) return { activated: true };
   const now = new Date().toISOString();
   try {
     const row = db.prepare("SELECT visits, activated_at FROM folder_activity WHERE path=?").get(projectPath);
@@ -7694,9 +7718,8 @@ function recordCliFolderVisit(db, projectPath) {
       visits = 1; activatedAt = null;
       db.prepare("INSERT INTO folder_activity (path, visits, activated_at, first_seen, last_seen) VALUES (?,?,NULL,?,?)").run(projectPath, visits, now, now);
     }
-    if (!activatedAt && visits >= 2) {
+    if (!activatedAt) {
       db.prepare("UPDATE folder_activity SET activated_at=? WHERE path=?").run(now, projectPath);
-      ensureProjectMemoryCli(projectPath);
       activatedAt = now;
     }
     return { activated: !!activatedAt };
@@ -7910,7 +7933,7 @@ function listAvailableRuntimes(db, fallbackRuntime = null) {
     const availableModels = discovered.length
       ? discovered
       : runtime.model
-        ? [{ id: runtime.model, tier: "balanced", capabilities: ["code", "tools"], efforts: [] }]
+        ? [{ id: runtime.model, capabilities: runtime.capabilities || [], efforts: runtime.efforts || [] }]
         : [];
     candidates.push({ ...runtime, key, availableModels });
   };
@@ -11032,6 +11055,7 @@ module.exports = {
   approximatePromptTokens,
   memoryEmitterPromptFor,
   credentialIndexReminderFor,
+  ensureCoreProjectCli,
   DEFAULT_API_MODEL,
   ANTHROPIC_COMPAT_API,
   // 자동 라우팅 회귀 테스트 표면 — 약한 매치 직답/오라우팅 방지 규칙 검증용.
