@@ -17,6 +17,15 @@ Claude Code style, standalone: **no desktop app required.**
 Agentlas Terminal is the already-shipped independent terminal product. It is
 not a Desktop `cli/` mirror and does not require the Desktop app to run.
 
+> **Current release status (2026-07-13):** GitHub `v0.8.0` · npm `0.7.0` ·
+> `main` `0.8.1` (unreleased). `npm install -g agentlas` currently installs
+> **`0.7.0`**; the `main` version is not published yet.
+
+Release history and the source-versus-registry boundary are recorded in
+[CHANGELOG.md](CHANGELOG.md). A published version must always come from its
+exact tag: post-tag `main` changes are the next version and must never be
+republished under an older version number.
+
 > **We are Agent Trust. Your agent is not a program. It is an asset. — Agentlas —**
 
 Agent Trust means owner-scoped, portable, inspectable, and restorable agent
