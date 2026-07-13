@@ -8,6 +8,7 @@ const path = require("node:path");
 const routing = require("../engine/agentlas-workload-routing.cjs");
 const { buildArgs } = require("../engine/agentlas.cjs");
 const { create: createParity } = require("../engine/agentlas-parity.cjs");
+const { loadCoreStormbreakerHarness } = require("../engine/agentlas-core-harness.cjs");
 
 function uiStub() {
   const id = (value) => String(value);
@@ -155,6 +156,7 @@ async function main() {
     "Terminal allocation call sites must never pass raw task text into a receipt builder",
   );
   const paritySource = fs.readFileSync(require.resolve("../engine/agentlas-parity.cjs"), "utf8");
+  const coreHarnessSource = fs.readFileSync(require.resolve("../engine/agentlas-core-harness.cjs"), "utf8");
   assert.doesNotMatch(paritySource, /["']--auto-run["']/, "agentlas storm must execute in its own harness, not Hephaestus CLI auto-run");
   assert.match(paritySource, /stormbreaker:\s*true/);
   assert.match(paritySource, /typeof D\.projectCwd === "function" \? D\.projectCwd\(\) : D\.runCwd\(\)/, "storm/swarm workers must execute in the user's actual project folder");
@@ -168,7 +170,11 @@ async function main() {
   assert.match(stormPlanner, /runtimeId.*exactModelId/s);
   assert.doesNotMatch(paritySource, /["']GOAL MODE:/, "Terminal workers must not define a local Goal mode prompt");
   assert.doesNotMatch(paritySource, /["']ULTRACODE MODE:/, "Terminal workers must not define a local UltraCode mode prompt");
-  assert.match(paritySource, /\["stormbreaker", "harness"\]/, "Terminal storm must load its prompt from Agentlas Core");
+  assert.match(paritySource, /loadCoreStormbreakerHarness/, "Terminal storm must load its prompt from Agentlas Core");
+  assert.match(coreHarnessSource, /\["stormbreaker", "harness"\]/, "Core bridge must call the canonical harness command");
+  assert.match(coreHarnessSource, /process\.platform === "win32" \? \["python", "py", "python3"\]/, "Core bridge must resolve Python on Windows");
+  assert.doesNotMatch(coreHarnessSource, /["']GOAL MODE:\s+[^"']+/, "Terminal Core bridge must not copy the Goal mode prompt");
+  assert.doesNotMatch(coreHarnessSource, /["']ULTRACODE MODE:\s+[^"']+/, "Terminal Core bridge must not copy the UltraCode mode prompt");
 
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agentlas-workload-routing-"));
   const codexHome = path.join(tmp, "codex-home");
@@ -239,19 +245,23 @@ async function main() {
   // different worker and synthesis models, and each execution gets a receipt.
   const calls = [];
   const integratedReceiptFile = path.join(tmp, "swarm-receipts.jsonl");
-  const coreHarnessPrompt = [
+  const fixtureHarnessPrompt = [
     "You are executing inside the Agentlas-owned STORMBREAKER GOAL + ULTRACODE HARNESS.",
     "GOAL MODE: fixture goal contract.",
     "ULTRACODE MODE: fixture implementation contract.",
     "CORE_TERMINAL_HARNESS_FIXTURE_EXACT_A921",
   ].join("\n");
-  const executionHarness = {
+  let executionHarness = {
     schema_version: "agentlas.stormbreaker.goal-ultracode-harness.v1",
     harness_id: "agentlas-core/stormbreaker-goal-ultracode",
     mode: "stormbreaker-goal-ultracode",
-    system_prompt: coreHarnessPrompt,
-    prompt_sha256: require("node:crypto").createHash("sha256").update(coreHarnessPrompt).digest("hex"),
+    system_prompt: fixtureHarnessPrompt,
+    prompt_sha256: require("node:crypto").createHash("sha256").update(fixtureHarnessPrompt).digest("hex"),
   };
+  if (process.env.HEPHAESTUS_RUNTIME_ROOT) {
+    executionHarness = await loadCoreStormbreakerHarness(tmp, process.env.HEPHAESTUS_RUNTIME_ROOT);
+  }
+  const coreHarnessPrompt = executionHarness.system_prompt;
   const parity = createParity({
     prefsLang: () => "en",
     resolveRuntime: () => codexRuntime,

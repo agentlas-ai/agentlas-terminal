@@ -6,7 +6,8 @@
     "agentlas": "bin/agentlas.cjs"
   },
   "scripts": {
-    "smoke": "sh test/smoke.sh"
+    "smoke": "sh test/smoke.sh",
+    "test:stormbreaker-core": "node test/stormbreaker-core-contract.cjs && node test/workload-routing-contract.cjs"
   },
   "engines": {
     "node": ">=20"

@@ -1,0 +1,78 @@
+name: Cross-platform Core harness
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "engine/agentlas-core-harness.cjs"
+      - "engine/agentlas-parity.cjs"
+      - "engine/agentlas-workload-routing.cjs"
+      - "test/stormbreaker-core-contract.cjs"
+      - "test/workload-routing-contract.cjs"
+      - ".github/workflows/cross-platform-harness.yml"
+  push:
+    branches: [main]
+    paths:
+      - "engine/agentlas-core-harness.cjs"
+      - "engine/agentlas-parity.cjs"
+      - "engine/agentlas-workload-routing.cjs"
+      - "test/stormbreaker-core-contract.cjs"
+      - "test/workload-routing-contract.cjs"
+      - ".github/workflows/cross-platform-harness.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  terminal-harness:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: agentlas-terminal
+      - uses: actions/checkout@v4
+        with:
+          repository: agentlas-ai/Agentlas-OS
+          path: Agentlas-OS
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: agentlas-terminal/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Terminal dependencies
+        working-directory: agentlas-terminal
+        run: npm ci
+      - name: Verify exact Core harness and worker prompt propagation
+        working-directory: agentlas-terminal
+        env:
+          HEPHAESTUS_RUNTIME_ROOT: ${{ github.workspace }}/Agentlas-OS
+          HEPHAESTUS_PYTHON: python
+          AGENTLAS_HARNESS_PROOF_PATH: ${{ runner.temp }}/terminal-harness-proof.json
+        run: |
+          node test/stormbreaker-core-contract.cjs
+          node test/workload-routing-contract.cjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: terminal-harness-proof-${{ runner.os }}
+          path: ${{ runner.temp }}/terminal-harness-proof.json
+          if-no-files-found: error
+
+  compare-terminal-proofs:
+    name: Compare Terminal prompt bytes
+    needs: terminal-harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: terminal-harness-proof-*
+          path: proofs
+      - run: node test/compare-stormbreaker-platform-proofs.cjs proofs

@@ -19,6 +19,11 @@ const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
 const { Ui } = require("./agentlas-ui.cjs");
 const workloadRouting = require("./agentlas-workload-routing.cjs");
+const {
+  loadCoreStormbreakerHarness,
+  resolveCoreRuntimeRoot,
+  spawnCoreModule,
+} = require("./agentlas-core-harness.cjs");
 
 // ── 스웜 상수 (앱 mcp/swarm-run.ts 와 동일한 안전 상한) ──
 const SWARM_MAX_TASKS = 24;
@@ -131,7 +136,7 @@ function create(deps) {
       process.env.HEPHAESTUS_BIN,
       path.join(os.homedir(), ".agentlas", "runtime", "current", "bin", "hephaestus"),
     ];
-    for (const c of candidates) {
+    for (const c of process.platform === "win32" ? [] : candidates) {
       try {
         if (c && fs.existsSync(c)) {
           fs.accessSync(c, fs.constants.X_OK);
@@ -139,15 +144,8 @@ function create(deps) {
         }
       } catch { /* 다음 후보 */ }
     }
-    // 앱 번들 (Resources/Hephaestus) — python3 로 bin/hephaestus 와 동일한 부트스트랩 실행
-    const roots = [];
-    if (process.resourcesPath) roots.push(path.join(process.resourcesPath, "Hephaestus"));
-    if (process.platform === "darwin") roots.push("/Applications/Agentlas.app/Contents/Resources/Hephaestus");
-    for (const root of roots) {
-      try {
-        if (fs.existsSync(path.join(root, "agentlas_cloud", "__main__.py"))) return { kind: "python", root };
-      } catch { /* 다음 후보 */ }
-    }
+    const root = resolveCoreRuntimeRoot();
+    if (root) return { kind: "python", root };
     return null;
   }
 
@@ -180,65 +178,11 @@ function create(deps) {
     return null;
   }
 
-  const PY_BOOTSTRAP =
-    "import os, runpy, sys; " +
-    'cwd=os.getcwd(); root=os.environ["HEPHAESTUS_RUNTIME_ROOT"]; ' +
-    'sys.path=[p for p in sys.path if p not in ("", cwd, root)]; ' +
-    "sys.path.insert(0, root); " +
-    "sys.argv=sys.argv[1:]; " +
-    'runpy.run_module(sys.argv[0], run_name="__main__", alter_sys=True)';
-
   function spawnHephaestus(args, opts) {
     const found = hephaestusBin();
     if (!found) return null;
     if (found.kind === "bin") return spawn(found.exec, args, opts);
-    return spawn("python3", ["-c", PY_BOOTSTRAP, "agentlas_cloud", ...args], {
-      ...opts,
-      env: { ...(opts && opts.env ? opts.env : process.env), HEPHAESTUS_RUNTIME_ROOT: found.root },
-    });
-  }
-
-  function parseHephaestusJson(stdout) {
-    const text = String(stdout || "");
-    const start = text.indexOf("{");
-    const end = text.lastIndexOf("}");
-    if (start < 0 || end <= start) return null;
-    try { return JSON.parse(text.slice(start, end + 1)); } catch { return null; }
-  }
-
-  async function loadCoreStormbreakerHarness(cwd) {
-    const child = spawnHephaestus(
-      ["stormbreaker", "harness"],
-      { cwd, stdio: ["ignore", "pipe", "pipe"] },
-    );
-    if (!child) throw new Error("Agentlas Core / Hephaestus runtime is not installed.");
-    const result = await new Promise((resolve) => {
-      let stdout = "";
-      let stderr = "";
-      child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
-      child.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString()).slice(-4000); });
-      child.on("error", (error) => resolve({ code: 1, stdout, stderr: String(error.message) }));
-      child.on("close", (code) => resolve({ code: code ?? 0, stdout, stderr }));
-    });
-    const harness = parseHephaestusJson(result.stdout);
-    if (result.code !== 0 || !harness) {
-      throw new Error(result.stderr.trim() || "Agentlas Core did not return a Stormbreaker harness.");
-    }
-    if (
-      harness.schema_version !== "agentlas.stormbreaker.goal-ultracode-harness.v1" ||
-      harness.harness_id !== "agentlas-core/stormbreaker-goal-ultracode" ||
-      harness.mode !== "stormbreaker-goal-ultracode" ||
-      typeof harness.system_prompt !== "string" ||
-      !harness.system_prompt.trim() ||
-      typeof harness.prompt_sha256 !== "string"
-    ) {
-      throw new Error("Agentlas Core returned an invalid Stormbreaker harness contract.");
-    }
-    const digest = crypto.createHash("sha256").update(harness.system_prompt, "utf8").digest("hex");
-    if (digest !== harness.prompt_sha256) {
-      throw new Error("Agentlas Core Stormbreaker harness failed its SHA-256 integrity check.");
-    }
-    return harness;
+    return spawnCoreModule("agentlas_cloud", args, opts, found.root);
   }
 
   // ── storm — Agentlas 자체 Goal/UltraCode 하네스 ──
@@ -409,11 +353,11 @@ function create(deps) {
     const child =
       found.kind === "bin"
         ? spawn(found.exec, isCareerGraph ? args.slice(1) : args, { cwd, stdio: "inherit" })
-        : spawn("python3", ["-c", PY_BOOTSTRAP, moduleName, ...moduleArgs], {
-            cwd,
-            stdio: "inherit",
-            env: { ...process.env, HEPHAESTUS_RUNTIME_ROOT: found.root },
-          });
+        : spawnCoreModule(moduleName, moduleArgs, { cwd, stdio: "inherit" }, found.root);
+    if (!child) {
+      process.stderr.write("Hephaestus 실행 실패: Python 3.9+를 찾을 수 없습니다.\n");
+      return Promise.resolve(1);
+    }
     return new Promise((resolve) => {
       child.on("error", (e) => {
         process.stderr.write(`Hephaestus 실행 실패: ${e.message}\n`);
