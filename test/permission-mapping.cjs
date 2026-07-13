@@ -14,7 +14,15 @@ const {
 const permissions = require("../engine/agentlas-permissions.cjs");
 const { buildArgs: legacyBuildArgs } = require("../engine/agentlas.cjs");
 
-const mcpServers = [{ name: "playwright", command: "npx", args: ["@playwright/mcp"] }];
+const mcpServers = [{
+  id: "playwright",
+  catalog_id: "playwright",
+  name: "playwright",
+  transport: "stdio",
+  command: "playwright-mcp",
+  args_json: "[]",
+  enabled: 1,
+}];
 
 function hasPair(args, flag, value) {
   const index = args.indexOf(flag);
@@ -88,7 +96,9 @@ function testGemini() {
     const index = args.indexOf("--allowed-mcp-server-names");
     assert.ok(index >= 0 && /^__agentlas_no_mcp_[0-9a-f-]+__$/.test(String(args[index + 1])), "Gemini read/write must use an exclusive empty MCP allow-list");
   }
-  assert.equal(full.includes("--allowed-mcp-server-names"), false, "Gemini full may use the user's explicitly configured MCP servers");
+  const fullAllowlist = full.indexOf("--allowed-mcp-server-names");
+  assert.ok(fullAllowlist >= 0, "Gemini full must use the same host-owned exact server-name boundary");
+  assert.equal(full[fullAllowlist + 1], "playwright", "Gemini full must not inherit arbitrary user/global MCP definitions");
 }
 
 function testCodexIsolatedHome() {
@@ -146,7 +156,7 @@ function testBackgroundAndSwarmCapturePath() {
     const full = legacyBuildArgs(kind, "system", "prompt", "full");
     assert.equal(includesExternalMcp(read), false, `${kind} read capture must not inject MCP`);
     assert.equal(includesExternalMcp(write), false, `${kind} write capture must not inject MCP`);
-    if (kind !== "gemini") assert.equal(includesExternalMcp(full), true, `${kind} full capture should retain explicit Playwright access`);
+    assert.equal(includesExternalMcp(full), false, `${kind} full capture must not seed an unapproved Playwright server`);
   }
 
   const claudeWrite = legacyBuildArgs("claude-code", "system", "prompt", "write");

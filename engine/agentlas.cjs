@@ -30,6 +30,10 @@ const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 const { compareSemVer, normalizeSemVer, parseSemVer } = require("./semver.cjs");
 const terminalAssets = require("./agentlas-experience-mcp.cjs");
+const terminalExperienceExchange = require("./agentlas-experience-exchange.cjs");
+const desktopOntologyLoadout = require("./agentlas-desktop-loadout.cjs");
+const workloadRouting = require("./agentlas-workload-routing.cjs");
+const terminalExperienceIntake = require("./agentlas-experience-intake.cjs");
 
 // ── 앱과 동일한 userData 경로 (electron app.getPath('userData')와 일치) ──
 function userDataDir() {
@@ -666,6 +670,40 @@ function agentFolder(agent) {
   if (exists(path.join(cloudRoot, CLOUD_RESTORE_MARKER_PATH))) return cloudRoot;
   return path.join(userDataDir(), "agents", agent.slug);
 }
+function exactAgentBaseForExecution(db, agent, runtimeExperience = null) {
+  if (!agent || agent.builtin) return null;
+  const portableId = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{2,255}$/;
+  let binding = null;
+  try {
+    if (tableExists(db, "installed_agent_hub_bindings")) {
+      binding = db.prepare(
+        "SELECT agent_definition_id,agent_release_id FROM installed_agent_hub_bindings WHERE installed_agent_id=?",
+      ).get(agent.id) || null;
+    }
+  } catch { binding = null; }
+  const route = routesMap()[agent.id] || {};
+  const markerResult = terminalExperienceExchange.readExactLocalBaseMarker(agentFolder(agent), agent.slug);
+  const marker = markerResult.marker;
+  const rawHash = String(marker?.packageHash || route.packageHash || route.definitionHash || "").replace(/^sha256:/i, "").toLowerCase();
+  const packageHash = /^[a-f0-9]{64}$/.test(rawHash) ? `sha256:${rawHash}` : null;
+  const explicitDefinition = String(runtimeExperience?.agentDefinitionId || "");
+  const explicitRelease = String(runtimeExperience?.baseAgentReleaseId || "");
+  if (portableId.test(explicitDefinition) && portableId.test(explicitRelease)) {
+    return { agentDefinitionId: explicitDefinition, agentReleaseId: explicitRelease, packageHash, authority: "explicit-runtime-binding" };
+  }
+  if (binding && portableId.test(String(binding.agent_definition_id)) && portableId.test(String(binding.agent_release_id))) {
+    return { agentDefinitionId: binding.agent_definition_id, agentReleaseId: binding.agent_release_id, packageHash, authority: "installed-hub-binding" };
+  }
+  if (!packageHash) return null;
+  const definitionDigest = sha(`terminal-local-definition\0${agent.id}\0${agent.slug}`);
+  const releaseDigest = sha(`terminal-local-release\0${definitionDigest}\0${packageHash}`);
+  return {
+    agentDefinitionId: `local-agent-definition:${definitionDigest.slice(0, 32)}`,
+    agentReleaseId: `local-agent-release:${releaseDigest.slice(0, 32)}`,
+    packageHash,
+    authority: "exact-local-package-hash",
+  };
+}
 function agentSystemPromptCli(agent) {
   return agent && agent.system_prompt ? agent.system_prompt : `You are ${agent?.name || "an Agentlas agent"}.`;
 }
@@ -905,6 +943,7 @@ const CLOUD_AGENT_FILES = new Set(["AGENT.md", "AGENTS.md", "CLAUDE.md", "GEMINI
 const CLOUD_SKIP_DIRS = new Set([".git", ".next", ".studio-runtime", ".turbo", "build", "coverage", "dist", "node_modules", "out", "release"]);
 const CLOUD_BLOCKED_FILE_RE = [/^\.env(?:\..*)?$/i, /^id_rsa(?:\.pub)?$/i, /^credentials(?:\..*)?$/i, /^secrets?(?:\..*)?$/i, /^cloud-asset-state\.v1\.json$/i, /(?:^|[._-])service-account(?:[._-]|$)/i, /\.(?:key|pem|p12|pfx|mobileprovision)$/i];
 const CLOUD_ROUTING_CARD_PATH = ".agentlas/routing-card.json";
+const CLOUD_LOCAL_EXPERIENCE_LINEAGE_PATH = ".agentlas/experience-relations.jsonl";
 const CLOUD_ROUTING_CARD_CAPABILITY_RE = /^[a-z][a-z0-9]*(_[a-z0-9]+)+$/;
 const CLOUD_ROUTING_CARD_STATUSES = new Set(["draft", "searchable", "candidate", "routing_ready", "trusted"]);
 const CLOUD_SECRET_RE = [
@@ -1694,6 +1733,12 @@ function scanCloudFolderCli(rootPath) {
       if (entry.name.startsWith("._")) continue;
       const abs = path.join(dir, entry.name);
       const rel = path.relative(rootPath, abs).split(path.sep).join("/");
+      if (cloudIsLocalExperienceLineagePath(rel)) {
+        let bytes = 0;
+        try { bytes = Number(fs.lstatSync(abs).size) || 0; } catch { /* excluded local state */ }
+        files.push({ path: rel, bytes, sha256: "", kind: "text", included: false, reason: "experience-lineage-separate-asset" });
+        continue;
+      }
       if (cloudPortablePathKey(rel) === cloudPortablePathKey(CLOUD_RESTORE_MARKER_PATH)) {
         // Local restore/CAS metadata is runtime state, never portable asset
         // data, but it must be captured with the same no-follow stability gate.
@@ -2794,6 +2839,13 @@ function printCloudPackageResult(result) {
 function cloudPackageSnapshot(files) {
   return new Map(files.map((file) => [file.path, file]));
 }
+function cloudIsLocalExperienceLineagePath(value) {
+  const normalized = cloudPortablePathKey(String(value || "").replace(/\\/g, "/"));
+  const canonical = cloudPortablePathKey(CLOUD_LOCAL_EXPERIENCE_LINEAGE_PATH);
+  return normalized === canonical
+    || normalized.startsWith(`${canonical}.`)
+    || normalized.startsWith(cloudPortablePathKey(".agentlas/.experience-relations.jsonl."));
+}
 function cloudReadPublicCareerCard(snapshot, findings) {
   const relativePath = ".agentlas/public-career-card.json";
   const file = snapshot.get(relativePath);
@@ -2986,7 +3038,7 @@ function cloudHashPackage(files, version = CLOUD_PACKAGE_HASH_V1) {
   // 서버 package-contract.ts와 바이트 동일해야 한다: 경로 코드포인트 순 정렬.
   // 정렬 없이 스캔 순서로 해시하면 대소문자 혼합 경로 패키지(AGENTS.md + agents/…)가
   // 전부 package_hash_mismatch로 거절된다(2026-07-02 근본 수정).
-  for (const file of [...files].sort(cloudCodePointPathOrder)) {
+  for (const file of [...files].filter((file) => !cloudIsLocalExperienceLineagePath(file.path)).sort(cloudCodePointPathOrder)) {
     h.update(file.path);
     h.update("\0");
     h.update(file.sha256);
@@ -7705,6 +7757,10 @@ function curateCliReply(db, text, ctx) {
   const arch = loadArch();
   const { randomUUID } = require("node:crypto");
   const now = new Date().toISOString();
+  const rememberCurated = (memory) => {
+    if (!ctx || !Array.isArray(ctx.curatedMemories) || !memory) return;
+    if (!ctx.curatedMemories.some((item) => item.id === memory.id)) ctx.curatedMemories.push(memory);
+  };
   for (const ev of events) {
     const content = ev && typeof ev.content === "string" ? ev.content.trim() : "";
     if (!content) continue;
@@ -7720,9 +7776,16 @@ function curateCliReply(db, text, ctx) {
     const ppath = scope === "project" ? ctx.projectPath : null;
     const requestContext = normalizeRequestContext(ev, ctx, ppath);
     try {
-      const dup = db.prepare("SELECT 1 FROM memory_entries WHERE scope=? AND kind=? AND lower(trim(content))=? AND superseded_at IS NULL AND (project_path IS ? OR project_path=?) LIMIT 1").get(scope, kind, content.toLowerCase(), ppath, ppath);
-      if (dup) continue;
-      db.prepare("INSERT INTO memory_entries (id,scope,kind,content,project_id,project_path,agent_id,chat_id,confidence,sensitivity,evidence_json,context_json,superseded_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)").run(randomUUID(), scope, kind, content, ctx.projectId || null, ppath, ctx.agentId || null, null, ev.confidence || "medium", ev.sensitivity || "internal", JSON.stringify(Array.isArray(ev.evidence_refs) ? ev.evidence_refs : []), JSON.stringify(requestContext), now);
+      const dup = db.prepare("SELECT id,scope,kind,content,confidence,sensitivity,context_json FROM memory_entries WHERE scope=? AND kind=? AND lower(trim(content))=? AND superseded_at IS NULL AND (project_path IS ? OR project_path=?) LIMIT 1").get(scope, kind, content.toLowerCase(), ppath, ppath);
+      if (dup) {
+        rememberCurated({ ...dup, requestContext });
+        continue;
+      }
+      const memoryId = randomUUID();
+      const confidence = ev.confidence || "medium";
+      const sensitivity = ev.sensitivity || "internal";
+      db.prepare("INSERT INTO memory_entries (id,scope,kind,content,project_id,project_path,agent_id,chat_id,confidence,sensitivity,evidence_json,context_json,superseded_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)").run(memoryId, scope, kind, content, ctx.projectId || null, ppath, ctx.agentId || null, null, confidence, sensitivity, JSON.stringify(Array.isArray(ev.evidence_refs) ? ev.evidence_refs : []), JSON.stringify(requestContext), now);
+      rememberCurated({ id: memoryId, scope, kind, content, confidence, sensitivity, requestContext });
       logCli(ctx.projectPath, { action: "written", scope, kind, content, request_context: requestContext, at: now });
     } catch { /* ignore */ }
   }
@@ -7741,7 +7804,44 @@ function prefsLang() {
   }
 }
 
-function augmentSystem(db, baseSystem, ctx, withEmitter) {
+const TERMINAL_MEMORY_CORE_MAX_TOKENS = 150;
+const TERMINAL_MEMORY_CORE = [
+  "## Memory",
+  "Only for a durable decision, fact, preference, risk, or reusable procedure, end with `## Memory Events` plus a fenced JSON array; otherwise emit nothing.",
+  "Each item: memory_kind, content, suggested_scope. Never include secrets, credentials, prompts, transcripts, or raw logs; the curator validates scope.",
+].join("\n");
+const MEMORY_DETAIL_RE = /\b(?:remember|memory|save this|record this|memory event)\b|기억|메모리|저장해|기록해|남겨/i;
+const CREDENTIAL_INDEX_RE = /\b(?:deploy|release|billing|auth|oauth|credential|api key|secret key|cloud)\b|배포|릴리스|출시|결제|인증|자격 증명|API\s*키|시크릿|클라우드/i;
+
+function approximatePromptTokens(text) {
+  return Math.ceil(Buffer.byteLength(String(text || ""), "utf8") / 3);
+}
+if (approximatePromptTokens(TERMINAL_MEMORY_CORE) > TERMINAL_MEMORY_CORE_MAX_TOKENS) {
+  throw new Error("Terminal always-on memory core exceeds 150 tokens");
+}
+
+function memoryEmitterPromptFor(request, arch = loadArch()) {
+  if (!MEMORY_DETAIL_RE.test(String(request || ""))) return TERMINAL_MEMORY_CORE;
+  const full = String(arch?.emitterBlock || "");
+  if (!full) return TERMINAL_MEMORY_CORE;
+  // Credential lookup is a separate triggered concern. Remove the legacy
+  // always-on paragraph from the full memory schema too.
+  return full.replace(
+    /\n- Real credential values may live only[\s\S]*?before saying a credential is missing\.\n/,
+    "\n",
+  ).trim();
+}
+
+function credentialIndexReminderFor(request) {
+  if (!CREDENTIAL_INDEX_RE.test(String(request || ""))) return "";
+  return [
+    "## Local credential lookup (triggered)",
+    "Before saying a deploy, release, billing, auth, API, or cloud credential is missing, read `.agentlas/local-credentials.map.json` and the Local Credential Index in `.agentlas/project-soul-memory.md`.",
+    "Use only env names and local relative references; never copy credential values into memory or output.",
+  ].join("\n");
+}
+
+function augmentSystem(db, baseSystem, ctx, withEmitter, request = "") {
   const arch = loadArch();
   let sys = baseSystem || "";
   // 언어/말투 지시를 맨 앞에 둔다. imported/cloud/company agents도 같은 전역 계약을 따른다.
@@ -7751,7 +7851,11 @@ function augmentSystem(db, baseSystem, ctx, withEmitter) {
   if (connectionSkill) sys += "\n\n" + connectionSkill;
   const mem = cliMemoryContext(db, ctx && ctx.projectPath);
   if (mem) sys += "\n\n" + mem;
-  if (withEmitter && arch.emitterBlock) sys += "\n\n" + arch.emitterBlock;
+  if (withEmitter) {
+    sys += "\n\n" + memoryEmitterPromptFor(request, arch);
+    const credentialReminder = credentialIndexReminderFor(request);
+    if (credentialReminder) sys += "\n\n" + credentialReminder;
+  }
   return sys;
 }
 
@@ -7945,13 +8049,112 @@ async function runApi(backend, model, system, prompt, options) {
 
 // 1회 실행 — CLI면 spawn(스트리밍 stdout), API면 호출 후 텍스트 출력. 종료코드 반환.
 // ctx = { projectPath, agentId } — 메모리 주입/큐레이션에 사용.
+function finalizeExperienceExecutionCli(db, input) {
+  if (!input.agentId) return null;
+  let agent;
+  try { agent = db.prepare("SELECT * FROM installed_agents WHERE id=?").get(input.agentId); }
+  catch { return null; }
+  if (!agent) return null;
+  const exactBase = exactAgentBaseForExecution(db, agent, input.runtimeExperience);
+  if (!exactBase) return null;
+  const runtime = input.runtime || {};
+  const provider = runtime.mode === "cli" ? runtime.kind : runtime.backend;
+  const modelId = input.model || runtime.model || provider;
+  const usage = input.usage || {};
+  try {
+    return terminalExperienceIntake.finalizeAgentExecution({
+      db,
+      userDataDir: userDataDir(),
+      cwd: input.cwd || input.projectPath || projectCwd(),
+      agent,
+      exactBase,
+      environment: { runtime: provider || "terminal", os: process.platform, arch: process.arch },
+      model: { provider: provider || "terminal-runtime", modelId: modelId || "terminal-runtime" },
+      mcp: (input.mcpServers || []).flatMap((server) => {
+        const catalogId = server.catalog_id || server.catalogId;
+        // A reviewed runtime allowlist proves approval, not that this turn's
+        // child completed an MCP initialize/tool call. Do not inflate it into
+        // connected evidence without an exact runtime signal.
+        return catalogId ? [{ catalogId, status: "approved" }] : [];
+      }),
+      outcome: input.outcome,
+      metrics: {
+        promptTokens: usage.input_tokens || usage.prompt_tokens || 0,
+        completionTokens: usage.output_tokens || usage.completion_tokens || 0,
+        totalTokens: usage.total_tokens || 0,
+        durationMs: input.durationMs || usage.duration_ms || 0,
+        retryCount: 0,
+      },
+      curatedMemories: input.curatedMemories || [],
+      taskHint: input.taskHint,
+      taskSignatures: input.runtimeExperience?.taskSignatures || [],
+      experiencePackReleaseId: input.runtimeExperience?.experiencePackReleaseIds?.[0] || null,
+      locale: input.lang || prefsLang(),
+      runId: input.runId,
+      createdAt: input.createdAt,
+    });
+  } catch (error) {
+    process.stderr.write(`▸ local Experience intake skipped · ${String((error && error.message) || error).slice(0, 180)}\n`);
+    return null;
+  }
+}
+
 async function executeOnce(db, system, prompt, override, ctx) {
   ctx = ctx || { projectPath: null, agentId: null };
+  const runStartedAt = Date.now();
+  const experienceRunId = `terminal-run:${crypto.randomUUID()}`;
+  const curatedMemories = [];
+  ctx.curatedMemories = curatedMemories;
   if (!ctx.cwdAtRequest) ctx.cwdAtRequest = projectCwd();
+  let runtimeSystem = system;
+  let localExperienceContext = null;
+  if (ctx.runtimeExperience?.disabled === true && ctx.runtimeExperience.observableReason) {
+    process.stderr.write(`▸ local Experience skipped · ${ctx.runtimeExperience.observableReason}\n`);
+  } else if (ctx.runtimeExperience && ctx.runtimeExperience.disabled !== true) {
+    const runtimeExperience = ctx.runtimeExperience;
+    const augmented = terminalExperienceExchange.augmentRuntimeSystemWithLocalExperience(system, {
+      userDataDir: userDataDir(),
+      cwd: ctx.projectPath || ctx.cwdAtRequest,
+      baseAgentReleaseId: runtimeExperience.baseAgentReleaseId,
+      agentDefinitionId: runtimeExperience.agentDefinitionId,
+      experiencePackReleaseIds: runtimeExperience.experiencePackReleaseIds || [],
+      taskSignatures: runtimeExperience.taskSignatures || [],
+      environmentTags: Array.isArray(runtimeExperience.environmentTags) && runtimeExperience.environmentTags.length
+        ? runtimeExperience.environmentTags
+        : terminalExperienceExchange.defaultEnvironmentTags(),
+      reservedTokens: ctx.runtimeExperience?.tasteRuntimeOverlay?.estimatedTokens ?? 0,
+    });
+    runtimeSystem = augmented.systemPrompt;
+    localExperienceContext = augmented.experienceContext;
+    if (localExperienceContext.itemIds.length) {
+      const source = runtimeExperience.loadoutAuthority === "desktop-terminal-exact-loadout"
+        ? "Desktop-approved exact Experience"
+        : "local Experience advisory";
+      process.stderr.write(`▸ ${source} · ${localExperienceContext.itemIds.length} item(s) · ~${localExperienceContext.estimatedTokens} tokens · no server rental receipt\n`);
+    }
+  }
+  const tasteTaskResolution = terminalExperienceExchange.deriveCanonicalTaskClasses(prompt);
+  if (
+    ctx.runtimeExperience?.tasteRuntimeOverlay &&
+    desktopOntologyLoadout.tasteRuntimeOverlayMatchesTask(
+      ctx.runtimeExperience.tasteRuntimeOverlay,
+      tasteTaskResolution.taskIds,
+      prompt,
+    )
+  ) {
+    const tasteDirective = desktopOntologyLoadout.renderTasteRuntimeDirective(
+      ctx.runtimeExperience.tasteRuntimeOverlay,
+    );
+    runtimeSystem = `${runtimeSystem}\n\n${tasteDirective}`;
+    process.stderr.write(
+      `▸ Desktop-approved exact Taste · ${ctx.runtimeExperience.tasteRuntimeOverlay.releaseId} · ~${ctx.runtimeExperience.tasteRuntimeOverlay.estimatedTokens} tokens · session snapshot\n`,
+    );
+  }
   const rt = resolveRuntime(db, override);
   if (rt.mode === "cli") {
-    // 네이티브 CLI는 자체 세션을 가지므로 emitter는 넣지 않고(노이즈 방지) 메모리 컨텍스트만 주입.
-    const sys = augmentSystem(db, system, ctx, false);
+    // 네이티브 CLI에도 같은 Memory emitter를 주입하되 guard가 화면의 JSON 블록을 숨긴다.
+    // 큐레이터가 만든 구조화 Memory만 성공 RunReceipt 이후 Experience intake로 전달된다.
+    const sys = augmentSystem(db, runtimeSystem, ctx, true, prompt);
     const cwd = ctx.projectPath || projectCwd();
     const permission = ctx.permission || "write";
     const env = await buildChildEnvCli(db, { ...ctx, cwd });
@@ -7959,14 +8162,22 @@ async function executeOnce(db, system, prompt, override, ctx) {
     // one-shot(`agentlas "작업"`)도 REPL과 동일한 리치 렌더(⏺ 툴 / └ 결과 / 토큰)로 출력한다.
     const { runNativeTurn } = require("./agentlas-native-host.cjs");
     const { Ui } = require("./agentlas-ui.cjs");
+    const { makeMemoryGuard } = require("./agentlas-repl.cjs");
     const ui = new Ui({ lang: prefsLang() });
     let mcpServers = [];
     if (permission === "full") {
-      try {
-        mcpServers = db.prepare("SELECT id, name, transport, command, args_json, enabled FROM mcp_servers WHERE enabled=1 AND transport='stdio'").all();
-      } catch { /* ignore */ }
+      if (Array.isArray(ctx.mcpServers)) {
+        // Build's reviewed host allowlist is authoritative, including the valid
+        // empty list. Never fall back to every enabled registry row.
+        mcpServers = ctx.mcpServers;
+      } else {
+        try {
+          mcpServers = terminalAssets.readConsentedSystemMcpServers(db, { userDataDir: userDataDir() });
+        } catch { /* ignore */ }
+      }
     }
     ui.beginTurn();
+    const memoryGuard = makeMemoryGuard(ui, loadArch().eventsHeading);
     const res = await runNativeTurn({
       kind: rt.kind,
       bin: which(RUNTIME_BIN[rt.kind]) || RUNTIME_BIN[rt.kind],
@@ -7975,24 +8186,218 @@ async function executeOnce(db, system, prompt, override, ctx) {
       cwd,
       permission,
       session: {},
-      model: null,
-      effort: null,
+      model: ctx.model || null,
+      effort: ctx.effort || null,
       mcpServers,
+      mcpAllowlistMode: ctx.mcpAllowlistMode,
       env,
-      ui,
+      ui: memoryGuard,
     });
     ui.endTurn();
+    curateCliReply(db, res.text || "", ctx);
+    finalizeExperienceExecutionCli(db, {
+      agentId: ctx.agentId,
+      projectPath: ctx.projectPath,
+      cwd,
+      runtime: rt,
+      model: ctx.model || rt.model,
+      runtimeExperience: ctx.runtimeExperience,
+      mcpServers,
+      curatedMemories,
+      taskHint: prompt,
+      outcome: { status: res.error ? "failed" : "succeeded", failureCode: res.error ? "runtime-error" : null },
+      usage: res.usage,
+      durationMs: Date.now() - runStartedAt,
+      runId: experienceRunId,
+      lang: ctx.lang,
+    });
     return res.error ? 1 : 0;
   }
   // API 경로 — emitter 동봉 → 답변에서 메모리 이벤트를 파싱·큐레이션하고 블록은 제거.
-  const sys = augmentSystem(db, system, ctx, true);
+  const sys = augmentSystem(db, runtimeSystem, ctx, true, prompt);
   const env = await buildChildEnvCli(db, { ...ctx, cwd: ctx.cwd || projectCwd() });
   Object.assign(process.env, env);
-  process.stderr.write(`▸ ${rt.backend}${rt.model ? " · " + rt.model : ""}\n`);
-  const text = await runApi(rt.backend, rt.model, sys, prompt);
+  const selectedModel = ctx.model || rt.model;
+  process.stderr.write(`▸ ${rt.backend}${selectedModel ? " · " + selectedModel : ""}\n`);
+  let text;
+  try {
+    text = await runApi(rt.backend, selectedModel, sys, prompt);
+  } catch (error) {
+    finalizeExperienceExecutionCli(db, {
+      agentId: ctx.agentId,
+      projectPath: ctx.projectPath,
+      cwd: ctx.cwd || projectCwd(),
+      runtime: rt,
+      model: selectedModel,
+      runtimeExperience: ctx.runtimeExperience,
+      curatedMemories,
+      taskHint: prompt,
+      outcome: { status: "failed", failureCode: "runtime-error" },
+      durationMs: Date.now() - runStartedAt,
+      runId: experienceRunId,
+      lang: ctx.lang,
+    });
+    throw error;
+  }
   const cleaned = curateCliReply(db, text || "", ctx);
+  finalizeExperienceExecutionCli(db, {
+    agentId: ctx.agentId,
+    projectPath: ctx.projectPath,
+    cwd: ctx.cwd || projectCwd(),
+    runtime: rt,
+    model: selectedModel,
+    runtimeExperience: ctx.runtimeExperience,
+    curatedMemories,
+    taskHint: prompt,
+    outcome: { status: "succeeded", failureCode: null },
+    durationMs: Date.now() - runStartedAt,
+    runId: experienceRunId,
+    lang: ctx.lang,
+  });
   process.stdout.write((cleaned || "").trim() + "\n");
   return 0;
+}
+
+async function runTerminalBuilder(db, request, metadata = {}, runtimeOverride = null, cwd = projectCwd()) {
+  const builder = resolveMetaBuilder(db);
+  if (!builder) throw new Error("Agentlas Core Engine Meta-Agent is unavailable; Build did not start.");
+  const runtime = resolveRuntime(db, runtimeOverride);
+  const routingOptions = metadata.workloadRouting && typeof metadata.workloadRouting === "object"
+    ? metadata.workloadRouting
+    : {};
+  let allocation = null;
+  try {
+    const plannerSystem = workloadRouting.plannerSystemPrompt({
+      language: prefsLang() === "ko" ? "Korean" : "English",
+      maxTasks: 1,
+      mode: "builder",
+    });
+    let plannerText;
+    if (runtime.mode === "cli") {
+      const env = await buildChildEnvCli(db, { projectPath: cwd, agentId: builder.id, permission: "read", cwd });
+      plannerText = await captureRuntime(runtime.kind, plannerSystem, request, {
+        cwd,
+        env,
+        permission: "read",
+        model: routingOptions.modelPin || runtime.model || null,
+        effort: routingOptions.effortPin === undefined ? null : routingOptions.effortPin,
+      });
+    } else {
+      plannerText = await runApi(runtime.backend, routingOptions.modelPin || runtime.model, plannerSystem, request);
+    }
+    const plan = workloadRouting.normalizePlan(plannerText, { maxTasks: 1 });
+    allocation = plan && plan.tasks[0] && plan.tasks[0].allocation;
+  } catch (error) {
+    process.stderr.write(`▸ builder model planner fallback · ${String((error && error.message) || error).slice(0, 160)}\n`);
+  }
+  const resolution = workloadRouting.resolveAllocation({
+    runtime,
+    decision: allocation,
+    modelPin: routingOptions.modelPin,
+    effortPin: routingOptions.effortPin,
+    maxTier: routingOptions.maxTier || process.env.AGENTLAS_MODEL_MAX_TIER,
+  });
+  const receipt = workloadRouting.createDecisionReceipt({
+    taskId: "builder-execution",
+    stage: "builder",
+    decision: allocation,
+    resolution,
+  });
+  try {
+    workloadRouting.appendDecisionReceipt(receipt, path.join(userDataDir(), "model-routing-receipts.jsonl"));
+  } catch (error) {
+    process.stderr.write(`▸ builder model routing receipt failed · ${String((error && error.message) || error).slice(0, 120)}\n`);
+  }
+  process.stderr.write(
+    `▸ builder model route · ${resolution.source} · ${resolution.model || runtime.kind || runtime.backend}` +
+      `${resolution.effort ? ` · ${resolution.effort}` : ""}` +
+      `${resolution.fallbackReason ? ` · ${resolution.fallbackReason}` : ""}\n`,
+  );
+  const code = await executeOnce(db, agentSystemPromptCli(builder), request, runtimeOverride, {
+    projectPath: cwd,
+    agentId: builder.id,
+    permission: "full",
+    // This is an exact private host object created after consent. An empty array
+    // deliberately overrides all global/project/default MCP configuration.
+    mcpServers: Array.isArray(metadata.mcpServers) ? metadata.mcpServers : [],
+    mcpAllowlistMode: "exact",
+    model: resolution.model,
+    effort: resolution.effort,
+  });
+  if (code !== 0) throw new Error(`Agentlas builder runtime exited ${code}`);
+  return code;
+}
+
+async function allocateSingleWorkloadCli(db, request, options = {}) {
+  const runtime = options.runtime || resolveRuntime(db, options.runtimeOverride);
+  const cwd = options.cwd || projectCwd();
+  let allocation = null;
+  try {
+    const plannerSystem = workloadRouting.plannerSystemPrompt({
+      language: options.lang === "ko" ? "Korean" : "English",
+      maxTasks: 1,
+      mode: options.mode || "team",
+    });
+    let plannerText;
+    if (runtime.mode === "cli") {
+      const env = await buildChildEnvCli(db, {
+        projectPath: options.projectPath || null,
+        agentId: options.agentId || null,
+        permission: "read",
+        cwd,
+      });
+      plannerText = await captureRuntime(runtime.kind, plannerSystem, request, {
+        cwd,
+        env,
+        permission: "read",
+        model: options.modelPin || runtime.model || null,
+        effort: options.effortPin === undefined ? null : options.effortPin,
+      });
+    } else {
+      plannerText = await runApi(runtime.backend, options.modelPin || runtime.model, plannerSystem, request);
+    }
+    const plan = workloadRouting.normalizePlan(plannerText, { maxTasks: 1 });
+    allocation = plan && plan.tasks[0] && plan.tasks[0].allocation;
+  } catch (error) {
+    if (options.onWarning) options.onWarning(`model planner fallback: ${String((error && error.message) || error).slice(0, 160)}`);
+  }
+  const resolution = workloadRouting.resolveAllocation({
+    runtime,
+    decision: allocation,
+    modelPin: options.modelPin,
+    effortPin: options.effortPin,
+    availableModels: options.availableModels,
+    maxTier: options.maxTier || process.env.AGENTLAS_MODEL_MAX_TIER,
+  });
+  const receipt = workloadRouting.createDecisionReceipt({
+    taskId: options.taskId || `${options.mode || "team"}-execution`,
+    stage: options.mode || "team",
+    decision: allocation,
+    resolution,
+  });
+  try {
+    workloadRouting.appendDecisionReceipt(receipt, options.receiptFile || path.join(userDataDir(), "model-routing-receipts.jsonl"));
+  } catch (error) {
+    if (options.onWarning) options.onWarning(`model routing receipt failed: ${String((error && error.message) || error).slice(0, 120)}`);
+  }
+  return { allocation, resolution, receipt };
+}
+
+async function probeApprovedTerminalMcp(db, server, runtimeOverride, cwd, probeOptions = {}) {
+  const runtime = resolveRuntime(db, runtimeOverride);
+  if (runtime.mode !== "cli") return { connected: false, reason: "runtime_incompatible" };
+  const env = await buildChildEnvCli(db, { cwd, permission: "full" });
+  if (runtime.kind === "gemini") {
+    const readiness = require("./agentlas-native-host.cjs").geminiMcpIsolationReadiness(env);
+    if (!readiness.ready) return { connected: false, reason: "runtime_isolation_unavailable" };
+  }
+  return terminalAssets.probeSystemMcpServerConnection(server, {
+    cwd,
+    env,
+    userDataDir: userDataDir(),
+    timeoutMs: probeOptions.timeoutMs,
+    signal: probeOptions.signal,
+  });
 }
 
 // API 백엔드용 간이 대화형 REPL (네이티브 인터랙티브가 없는 BYOK/Ollama).
@@ -8009,7 +8414,7 @@ function apiRepl(db, backend, model, system, label, ctx) {
       if (tt === "/exit" || tt === "/quit") return rl.close();
       if (!tt) return ask();
       try {
-        const sys = augmentSystem(db, system, ctx, true);
+        const sys = augmentSystem(db, system, ctx, true, tt);
         const text = await runApi(backend, model, sys, tt);
         const cleaned = curateCliReply(db, text || "", ctx);
         process.stdout.write("\n" + (cleaned || "").trim() + "\n");
@@ -8054,12 +8459,6 @@ function runCwd() {
     return os.homedir();
   }
 }
-
-function cliMcpConfigPath() {
-  return require("./agentlas-native-host.cjs").cliMcpConfigPath([]).file;
-}
-
-const CODEX_PLAYWRIGHT_MCP_ARGS = require("./agentlas-native-host.cjs").codexMcpArgs([]);
 
 // 에이전트가 실제로 실행될 작업 폴더 = 사용자가 명령을 친 현재 디렉터리(= 대상 프로젝트).
 // 단, home/userData/agent-cwd 같은 "프로젝트 아님" 위치면 안전한 전용 폴더로 폴백한다.
@@ -8216,25 +8615,33 @@ async function buildChildEnvCli(db, ctx) {
 
 // One-shot/background capture uses the same permission truth as the interactive host.
 // Keep its plain-output argument shape, but never duplicate the security mapping here.
-function buildArgs(kind, systemPrompt, prompt, permission) {
+function buildArgs(kind, systemPrompt, prompt, permission, runtimeOptions = {}) {
   const native = require("./agentlas-native-host.cjs");
   const level = require("./agentlas-permissions.cjs").normalize(permission);
+  const model = runtimeOptions.model ? String(runtimeOptions.model) : null;
+  const effort = runtimeOptions.effort ? String(runtimeOptions.effort) : null;
   if (kind === "claude-code") {
     const perm = native.claudePermissionArgs(level);
-    const mcp = level === "full"
-      ? ["--strict-mcp-config", "--mcp-config", cliMcpConfigPath(), "--allowedTools", "mcp__playwright"]
-      : native.claudeMcpIsolationArgs();
-    return ["-p", prompt, "--append-system-prompt", systemPrompt, ...perm, ...mcp];
+    // Background/capture has no one-pass reviewed server list. Full permission
+    // changes tool authority, not MCP consent, so this path remains exact-empty.
+    const mcp = native.claudeMcpIsolationArgs();
+    const thinking = effort === "max" || effort === "xhigh" ? "Ultrathink. " : effort === "high" ? "Think hard. " : effort === "medium" ? "Think. " : "";
+    return ["-p", thinking + prompt, "--append-system-prompt", systemPrompt, ...(model ? ["--model", model] : []), ...perm, ...mcp];
   }
   if (kind === "codex") {
     const perm = native.codexPermissionArgs(level);
-    const mcp = level === "full" ? CODEX_PLAYWRIGHT_MCP_ARGS : [];
-    return ["exec", "--skip-git-repo-check", ...perm, ...mcp, `[SYSTEM]\n${systemPrompt}\n\n${prompt}`];
+    const mcp = [];
+    const modelArgs = model ? ["-m", model] : [];
+    const effortArgs = effort ? ["-c", `model_reasoning_effort="${effort}"`] : [];
+    return ["exec", "--skip-git-repo-check", ...modelArgs, ...effortArgs, ...perm, ...mcp, `[SYSTEM]\n${systemPrompt}\n\n${prompt}`];
   }
   if (kind === "gemini") {
     const perm = native.geminiPermissionArgs(level);
-    const mcp = level === "full" ? [] : native.geminiMcpIsolationArgs();
-    return ["--prompt", `[SYSTEM]\n${systemPrompt}\n\n${prompt}`, ...perm, ...mcp];
+    // Legacy/background capture has no structured reviewed server list. Even
+    // at full permission it must stay exact-empty instead of inheriting the
+    // user's global Gemini MCP definitions with the provider credential env.
+    const mcp = native.geminiMcpIsolationArgs();
+    return ["--prompt", `[SYSTEM]\n${systemPrompt}\n\n${prompt}`, ...(model ? ["-m", model] : []), ...perm, ...mcp];
   }
   return [prompt];
 }
@@ -8261,7 +8668,7 @@ function buildHelpers(db) {
   return {
     which,
     RUNTIME_BIN,
-    augmentSystem: (db_, base, ctx, emit) => augmentSystem(db_, base, ctx, emit),
+    augmentSystem: (db_, base, ctx, emit, request) => augmentSystem(db_, base, ctx, emit, request),
     curateCliReply: (db_, text, ctx) => curateCliReply(db_, text, ctx),
     detectResponseLanguage: (prompt, fallback) => require("./agentlas-style.cjs").detectResponseLanguage(prompt, fallback),
     sanitizeAssistantText: (text) => require("./agentlas-style.cjs").sanitizeAssistantText(text),
@@ -8269,6 +8676,8 @@ function buildHelpers(db) {
     eventsHeading: () => loadArch().eventsHeading,
     defaultApiModel: (backend) => DEFAULT_API_MODEL[backend],
     buildChildEnv: (db_, ctx) => buildChildEnvCli(db_, ctx),
+    allocateWorkload: (db_, request, ctx) => allocateSingleWorkloadCli(db_, request, ctx),
+    finalizeExperienceRun: (db_, input) => finalizeExperienceExecutionCli(db_, input),
     multimodalStatus: (db_) => multimodalStatusCli(db_),
     setMultimodal: (db_, modality, providerId) => setMultimodalCli(db_, modality, providerId),
     resolveAgent,
@@ -8317,7 +8726,22 @@ function buildHelpers(db) {
     },
     mcpServers: (db_) => {
       try {
-        return db_.prepare("SELECT id, name, name_en, transport, command, args_json, url, env_keys_json, enabled FROM mcp_servers ORDER BY installed_at ASC").all();
+        const consentedIds = new Set(
+          terminalAssets.readConsentedSystemMcpServers(db_, { userDataDir: userDataDir(), createRuntimeHome: false })
+            .map((server) => server.id),
+        );
+        return db_.prepare("SELECT id, catalog_id, name, name_en, transport, command, args_json, url, env_keys_json, enabled FROM mcp_servers ORDER BY installed_at ASC")
+          .all()
+          .map((row) => {
+            const runtime = terminalAssets.materializeTrustedSystemMcpServer(row, { userDataDir: userDataDir(), createRuntimeHome: false });
+            Object.defineProperty(row, "runtimeEligible", { value: Boolean(runtime), enumerable: false });
+            Object.defineProperty(row, "runtimeConsented", { value: Boolean(runtime && consentedIds.has(String(row.id))), enumerable: false });
+            if (runtime) {
+              Object.defineProperty(row, "credentialKeyNames", { value: runtime.credentialKeyNames, enumerable: false });
+              if (runtime.mcpRuntimeHome) Object.defineProperty(row, "mcpRuntimeHome", { value: runtime.mcpRuntimeHome, enumerable: false });
+            }
+            return row;
+          });
       } catch {
         return [];
       }
@@ -8332,6 +8756,24 @@ function buildHelpers(db) {
     // 패리티: REPL의 /storm·/swarm·/build·/route·/research 가 그대로 호출한다.
     stormRun: (db_, goal, ctx) => parity().stormRun(db_, goal, ctx),
     swarmRun: (db_, goal, ctx) => parity().swarmRun(db_, goal, ctx),
+    terminalBuild: (db_, args, ctx = {}) => terminalAssets.cmdBuild({
+      db: db_,
+      args: Array.isArray(args) ? args : terminalAssets.tokenizeBuildCommandLine(String(args || "")),
+      userDataDir: userDataDir(),
+      cwd: ctx.cwd || projectCwd(),
+      input: ctx.input || process.stdin,
+      promptOutput: ctx.promptOutput || process.stderr,
+      out: ctx.out || out,
+      probeMcpServer: (server, probeOptions) => probeApprovedTerminalMcp(db_, server, null, ctx.cwd || projectCwd(), probeOptions),
+      invokeBuild: (request, metadata) => runTerminalBuilder(db_, request, {
+        ...metadata,
+        workloadRouting: {
+          modelPin: ctx.modelPin || null,
+          effortPin: ctx.effortPin,
+          maxTier: ctx.maxTier,
+        },
+      }, null, ctx.cwd || projectCwd()),
+    }),
     hepRun: (args, opts) => parity().runHephaestusInteractive(args, opts),
     cloudSearch: (db_, args) => parity().cloudSearch(db_, args),
     careerGraphCommand: (text, ctx) => runCareerGraphNaturalCli(text, {
@@ -8420,7 +8862,11 @@ function spawnRuntime(kind, systemPrompt, prompt, opts) {
   const cwd = opts.cwd || runCwd();
   return new Promise((resolve) => {
     const bin = which(RUNTIME_BIN[kind]) || RUNTIME_BIN[kind];
-    const env = require("./agentlas-native-host.cjs").runtimeEnvForKind(kind, opts.env || process.env);
+    const env = require("./agentlas-native-host.cjs").runtimeEnvForKind(kind, opts.env || process.env, {
+      permission: opts.permission,
+      mcpServers: [],
+      mcpAllowlistMode: kind === "gemini" ? "exact" : undefined,
+    });
     const child = spawn(bin, buildArgs(kind, systemPrompt, prompt, opts.permission), {
       cwd,
       stdio: ["ignore", "inherit", "inherit"],
@@ -8457,8 +8903,12 @@ function captureRuntime(kind, systemPrompt, prompt, opts) {
     let child;
     try {
       const spawnImpl = opts.spawn || spawn;
-      const env = require("./agentlas-native-host.cjs").runtimeEnvForKind(kind, opts.env || process.env);
-      child = spawnImpl(bin, buildArgs(kind, systemPrompt, prompt, opts.permission), {
+      const env = require("./agentlas-native-host.cjs").runtimeEnvForKind(kind, opts.env || process.env, {
+        permission: opts.permission,
+        mcpServers: [],
+        mcpAllowlistMode: kind === "gemini" ? "exact" : undefined,
+      });
+      child = spawnImpl(bin, buildArgs(kind, systemPrompt, prompt, opts.permission, { model: opts.model, effort: opts.effort }), {
         cwd,
         stdio: ["ignore", "pipe", "pipe"],
         env,
@@ -8603,6 +9053,7 @@ function parity() {
       projectCwd,
       runCwd,
       userDataDir,
+      modelRoutingReceiptPath: () => path.join(userDataDir(), "model-routing-receipts.jsonl"),
       resolveAgent,
       resolveFirm,
       listAgents,
@@ -8680,22 +9131,123 @@ function cmdCd(db, query) {
   process.stdout.write(folder + "\n");
 }
 
-async function cmdRun(db, query, prompt, runtimeOverride) {
+function parseRunExperienceArgs(args) {
+  const prompt = [];
+  const experience = { taskSignatures: [], declaredTaskClasses: [], environmentTags: [], experiencePackReleaseIds: [] };
+  let passthrough = false;
+  const addList = (target, value) => {
+    for (const item of String(value || "").split(",").map((entry) => entry.trim()).filter(Boolean)) {
+      if (!target.includes(item)) target.push(item);
+    }
+  };
+  for (let index = 0; index < args.length; index += 1) {
+    const token = String(args[index]);
+    if (passthrough) { prompt.push(token); continue; }
+    if (token === "--") { passthrough = true; continue; }
+    const take = () => index + 1 < args.length ? String(args[++index]) : "";
+    if (token === "--experience-base-release") experience.baseAgentReleaseId = take();
+    else if (token.startsWith("--experience-base-release=")) experience.baseAgentReleaseId = token.slice(26);
+    else if (token === "--experience-pack-release") addList(experience.experiencePackReleaseIds, take());
+    else if (token.startsWith("--experience-pack-release=")) addList(experience.experiencePackReleaseIds, token.slice(26));
+    else if (token === "--experience-agent-definition") experience.agentDefinitionId = take();
+    else if (token.startsWith("--experience-agent-definition=")) experience.agentDefinitionId = token.slice(30);
+    else if (token === "--experience-task-signature") addList(experience.taskSignatures, take());
+    else if (token.startsWith("--experience-task-signature=")) addList(experience.taskSignatures, token.slice(28));
+    else if (token === "--experience-task-class") addList(experience.declaredTaskClasses, take());
+    else if (token.startsWith("--experience-task-class=")) addList(experience.declaredTaskClasses, token.slice(24));
+    else if (token === "--experience-environment") addList(experience.environmentTags, take());
+    else if (token.startsWith("--experience-environment=")) addList(experience.environmentTags, token.slice(25));
+    else if (token === "--experience-desktop-loadout") experience.desktopLoadout = true;
+    else if (
+      token === "--experience-loadout" || token === "--experience-loadout-file" ||
+      token.startsWith("--experience-loadout=") || token.startsWith("--experience-loadout-file=")
+    ) {
+      throw new Error("Custom Experience loadout paths are no longer supported; use --experience-desktop-loadout.");
+    }
+    else if (token === "--no-experience") experience.disabled = true;
+    else prompt.push(token);
+  }
+  return { prompt: prompt.join(" "), experience };
+}
+
+function resolveRuntimeExperienceCli(agent, prompt, requested, cwd, overrides = {}) {
+  const prepared = desktopOntologyLoadout.prepareDesktopLoadoutRequest({
+    db: overrides.db,
+    agent,
+    userDataDir: overrides.userDataDir || userDataDir(),
+    requested: requested || {},
+    now: overrides.now,
+  });
+  if (prepared.mode === "skip") {
+    return { disabled: true, observableReason: prepared.reason, resolution: "skipped" };
+  }
+  const resolved = terminalExperienceExchange.resolveRuntimeExperienceForAgent({
+    userDataDir: overrides.userDataDir || userDataDir(),
+    cwd,
+    prompt,
+    requested: prepared.requested || requested || {},
+    agent,
+    agentRoot: agent ? (overrides.agentRoot || agentFolder(agent)) : null,
+    ...(overrides.platform ? { platform: overrides.platform } : {}),
+    ...(overrides.arch ? { arch: overrides.arch } : {}),
+    ...(overrides.runtime ? { runtime: overrides.runtime } : {}),
+  });
+  if (prepared.mode !== "resolved") return resolved;
+  const authority = prepared.authority;
+  const tasteRuntime = {
+    tasteRuntimeOverlay: authority.tasteRuntimeOverlay || null,
+    loadoutAuthority: "desktop-terminal-exact-loadout",
+    projectionRevision: authority.projectionRevision,
+    loadoutRevision: authority.loadoutRevision,
+  };
+  if (!authority.experiencePackReleaseId) {
+    return {
+      disabled: true,
+      resolution: "desktop-loadout-taste-only",
+      ...tasteRuntime,
+    };
+  }
+  if (resolved.disabled === true) return { ...resolved, ...tasteRuntime };
+  if (
+    resolved.agentDefinitionId !== authority.agentDefinitionId ||
+    resolved.baseAgentReleaseId !== authority.baseAgentReleaseId ||
+    !Array.isArray(resolved.experiencePackReleaseIds) ||
+    resolved.experiencePackReleaseIds.length !== 1 ||
+    resolved.experiencePackReleaseIds[0] !== authority.experiencePackReleaseId
+  ) {
+    return {
+      disabled: true,
+      observableReason: "desktop-loadout-runtime-resolution-mismatch",
+      resolution: "skipped",
+      ...tasteRuntime,
+    };
+  }
+  return {
+    ...resolved,
+    ...tasteRuntime,
+  };
+}
+
+async function cmdRun(db, query, prompt, runtimeOverride, runtimeExperience = null) {
   const agent = resolveAgent(db, query);
   if (!agent) {
     const routedPrompt = [query, prompt].filter(Boolean).join(" ").trim() || (await readStdin());
     if (!routedPrompt || !routedPrompt.trim()) fail("프롬프트가 비어 있습니다. agentlas run <agent> \"...\" 또는 agentlas run \"...\" 형식으로 입력하세요.");
-    return cmdAutoRun(db, routedPrompt.trim(), runtimeOverride);
+    return cmdAutoRun(db, routedPrompt.trim(), runtimeOverride, runtimeExperience);
   }
   let userPrompt = prompt;
   if (!userPrompt) userPrompt = await readStdin();
   if (!userPrompt || !userPrompt.trim()) fail("프롬프트가 비어 있습니다. agentlas run <agent> \"...\" 또는 stdin으로 전달하세요.");
   process.stderr.write(`▸ ${agent.name}\n`);
-  const code = await executeOnce(db, agentSystemPromptCli(agent), userPrompt.trim(), runtimeOverride, { projectPath: activeProjectPath(db), agentId: agent.id, permission: PERMISSION });
+  const cwd = activeProjectPath(db) || projectCwd();
+  const resolvedExperience = resolveRuntimeExperienceCli(agent, userPrompt.trim(), runtimeExperience, cwd, { db });
+  const code = await executeOnce(db, agentSystemPromptCli(agent), userPrompt.trim(), runtimeOverride, {
+    projectPath: activeProjectPath(db), agentId: agent.id, permission: PERMISSION, runtimeExperience: resolvedExperience,
+  });
   process.exit(code);
 }
 
-async function cmdAutoRun(db, prompt, runtimeOverride) {
+async function cmdAutoRun(db, prompt, runtimeOverride, runtimeExperience = null) {
   const lang = prefsLang();
   const choice = autoRouteAgent(db, prompt, lang);
   if (!choice) fail("자동 라우팅할 에이전트가 없습니다. agentlas list로 설치 상태를 확인하세요.");
@@ -8704,20 +9256,26 @@ async function cmdAutoRun(db, prompt, runtimeOverride) {
     process.stderr.write(`▸ direct (no agent)\n`);
     process.stderr.write(`  ${autoRouteNote(choice, lang)}\n`);
     const sys = `${autoRoutePreamble(choice, lang)}\n\n${directSystemPrompt(lang)}`;
+    const cwd = activeProjectPath(db) || projectCwd();
+    const resolvedExperience = resolveRuntimeExperienceCli(null, prompt.trim(), runtimeExperience, cwd, { db });
     const code = await executeOnce(db, sys, prompt.trim(), runtimeOverride, {
       projectPath: activeProjectPath(db),
       agentId: null,
       permission: PERMISSION,
+      runtimeExperience: resolvedExperience,
     });
     process.exit(code);
   }
   process.stderr.write(`▸ ${choice.agent.name} (auto)\n`);
   process.stderr.write(`  ${autoRouteNote(choice, lang)}\n`);
   const sys = `${autoRoutePreamble(choice, lang)}\n\n${agentSystemPromptCli(choice.agent)}`;
+  const cwd = activeProjectPath(db) || projectCwd();
+  const resolvedExperience = resolveRuntimeExperienceCli(choice.agent, prompt.trim(), runtimeExperience, cwd, { db });
   const code = await executeOnce(db, sys, prompt.trim(), runtimeOverride, {
     projectPath: activeProjectPath(db),
     agentId: choice.agent.id,
     permission: PERMISSION,
+    runtimeExperience: resolvedExperience,
   });
   process.exit(code);
 }
@@ -8768,7 +9326,28 @@ async function cmdFirm(db, query, prompt, runtimeOverride) {
   const sys = firmSystemPrompt(db, firm);
   if (prompt && prompt.trim()) {
     process.stderr.write(`▸ ${firm.name} CEO\n`);
-    const code = await executeOnce(db, sys, prompt.trim(), runtimeOverride, { projectPath: activeProjectPath(db), agentId: firm.ceo_agent_id, permission: PERMISSION });
+    const runtime = resolveRuntime(db, runtimeOverride);
+    const allocated = await allocateSingleWorkloadCli(db, prompt.trim(), {
+      runtime,
+      cwd: projectCwd(),
+      projectPath: activeProjectPath(db),
+      agentId: firm.ceo_agent_id,
+      lang: prefsLang(),
+      mode: "team",
+      onWarning: (message) => process.stderr.write(`▸ ${message}\n`),
+    });
+    process.stderr.write(
+      `▸ team model route · ${allocated.resolution.source} · ${allocated.resolution.model || runtime.kind || runtime.backend}` +
+        `${allocated.resolution.effort ? ` · ${allocated.resolution.effort}` : ""}` +
+        `${allocated.resolution.fallbackReason ? ` · ${allocated.resolution.fallbackReason}` : ""}\n`,
+    );
+    const code = await executeOnce(db, sys, prompt.trim(), runtimeOverride, {
+      projectPath: activeProjectPath(db),
+      agentId: firm.ceo_agent_id,
+      permission: PERMISSION,
+      model: allocated.resolution.model,
+      effort: allocated.resolution.effort,
+    });
     process.exit(code);
   }
   // 대화형 — agentlas TUI. CEO 페르소나를 system으로, 작업은 현재 폴더에서.
@@ -10099,6 +10678,8 @@ function cmdHelp() {
       hdr("TALK & RUN"),
       "  <agent>                  jump into a chat with one agent (e.g. agentlas seo)",
       "  run [agent] [prompt]     one-shot — omit agent to auto-route (reads stdin if no prompt)",
+      "    --experience-desktop-loadout  use Desktop's fresh exact Operational/Taste loadout receipt",
+      "    --no-experience               highest precedence; do not read or inject a loadout",
       "  firm <firm> [cmd]        delegate to a company's CEO (interactive if no cmd)",
       "  chats [n]                recent conversations   ·   chat resume in REPL: /resume",
       "",
@@ -10111,7 +10692,8 @@ function cmdHelp() {
       "  connect [<sub>]          wire Telegram / platforms to an agent team       (hep-connect)",
       "  import <path>            import a local agent/team folder",
       "  list                     installed agents/companies + active runtime",
-      "  experience <sub>         local Experience Pack intent: list|inspect|publish|unpublish",
+      "  experience <sub>         portable Experience: list|inspect|validate|save|publish|status|export|unpublish",
+      "                            legacy local intents require explicit legacy-* commands",
       "  variant resolve          local variant selection: selected|fallback|base-only|error",
       "",
       hdr("EXECUTE"),
@@ -10215,8 +10797,10 @@ async function main() {
       return cmdImport(db, rest[1]);
     case "cd":
       return cmdCd(db, rest[1]);
-    case "run":
-      return cmdRun(db, rest[1], rest.slice(2).join(" "), runtimeOverride);
+    case "run": {
+      const runInput = parseRunExperienceArgs(rest.slice(2));
+      return cmdRun(db, rest[1], runInput.prompt, runtimeOverride, runInput.experience);
+    }
     case "chat":
     case "open":
       return cmdOpen(db, rest[1], runtimeOverride);
@@ -10261,14 +10845,19 @@ async function main() {
         input: process.stdin,
         promptOutput: process.stderr,
         out,
-        invokeBuild: (request) => parity().cmdHep(db, request ? ["hep-build", request] : ["hep-build"]),
+        probeMcpServer: (server, probeOptions) => probeApprovedTerminalMcp(db, server, runtimeOverride, projectCwd(), probeOptions),
+        invokeBuild: (request, metadata) => runTerminalBuilder(db, request, metadata, runtimeOverride, projectCwd()),
       });
     case "experience":
-      return terminalAssets.cmdExperience({
+      return terminalExperienceExchange.cmdExperienceExchange({
         args: rest.slice(1),
         userDataDir: userDataDir(),
         cwd: projectCwd(),
         out,
+        env: process.env,
+        getSessionCookie: cloudSessionCookieCli,
+        fetchHub: (url, init) => fetchHubCli(url, init),
+        legacyCommand: (legacyOptions) => terminalAssets.cmdExperience(legacyOptions),
       });
     case "variant":
       return terminalAssets.cmdVariant({
@@ -10398,6 +10987,19 @@ module.exports = {
   cloudPackageHashVersion,
   cloudPortablePathConflict,
   cloudPortableExecutableForFile,
+  parseRunExperienceArgs,
+  resolveRuntimeExperienceCli,
+  runTerminalBuilder,
+  probeApprovedTerminalMcp,
+  finalizeExperienceExecutionCli,
+  buildChildEnvCli,
+  augmentSystem,
+  curateCliReply,
+  TERMINAL_MEMORY_CORE,
+  TERMINAL_MEMORY_CORE_MAX_TOKENS,
+  approximatePromptTokens,
+  memoryEmitterPromptFor,
+  credentialIndexReminderFor,
   DEFAULT_API_MODEL,
   ANTHROPIC_COMPAT_API,
   // 자동 라우팅 회귀 테스트 표면 — 약한 매치 직답/오라우팅 방지 규칙 검증용.

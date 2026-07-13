@@ -19,6 +19,7 @@ const os = require("node:os");
 const path = require("node:path");
 const permissions = require("./agentlas-permissions.cjs");
 const i18n = require("./agentlas-i18n.cjs");
+const { wrapStdioServer } = require("./agentlas-mcp-env.cjs");
 
 function uiText(ui, key, ...args) {
   return ui && typeof ui.t === "function" ? ui.t(key, ...args) : i18n.t("en", key, ...args);
@@ -152,27 +153,45 @@ function prepareCodexRuntimeEnv(env = process.env) {
   return base;
 }
 
-function runtimeEnvForKind(kind, env = process.env) {
-  return kind === "codex" ? prepareCodexRuntimeEnv(env) : env;
+function runtimeEnvForKind(kind, env = process.env, options = {}) {
+  if (kind === "codex") return prepareCodexRuntimeEnv(env);
+  if (kind === "gemini") return prepareGeminiRuntimeEnv(env, options);
+  return env;
 }
 
 // MCP 서버 이름 → TOML/JSON 안전 키 (하이픈/공백 → _).
 function mcpKey(s) {
-  return String((s && (s.name || s.id)) || "mcp").toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/^_+|_+$/g, "") || "mcp";
+  return String((s && (s.catalog_id || s.id || s.name)) || "mcp").toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/^_+|_+$/g, "") || "mcp";
 }
-function mcpStdioArgs(s) {
-  try { return JSON.parse((s && s.args_json) || "[]"); } catch { return []; }
+function selectedMcpServers(servers, options = {}) {
+  const selected = [];
+  for (const server of servers || []) {
+    if (!server || server.enabled === 0 || server.transport !== "stdio" || !server.command) continue;
+    selected.push(server);
+  }
+  return selected;
 }
-// Full-access turns only: claude --mcp-config with Playwright + enabled DB stdio servers.
-function cliMcpConfigPath(servers) {
-  const dir = path.join(userDataDir(), "mcp");
+function wrappedMcpServerMap(servers, options = {}) {
+  const result = {};
+  for (const server of selectedMcpServers(servers, options)) {
+    const wrapped = wrapStdioServer(server, { dataDir: userDataDir(options.env || process.env) });
+    const baseKey = mcpKey(server);
+    let key = baseKey;
+    if (Object.prototype.hasOwnProperty.call(result, key)) {
+      const identity = String(server.catalog_id || server.id || server.name || server.command);
+      key = `${baseKey}_${crypto.createHash("sha256").update(identity, "utf8").digest("hex").slice(0, 8)}`;
+    }
+    result[key] = { command: wrapped.command, args: wrapped.args };
+  }
+  return result;
+}
+// Full-access turns only: claude --mcp-config with the exact host-authorized
+// stdio servers. Empty means empty; there is no legacy or provider seed.
+function cliMcpConfigPath(servers, options = {}) {
+  const dir = path.join(userDataDir(options.env || process.env), "mcp");
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   try { fs.chmodSync(dir, 0o700); } catch { /* Windows/best-effort */ }
-  const mcpServers = { playwright: { command: "npx", args: ["-y", "@playwright/mcp@latest"] } };
-  for (const s of servers || []) {
-    if (!s || s.enabled === 0 || s.transport !== "stdio" || !s.command) continue;
-    mcpServers[mcpKey(s)] = { command: s.command, args: mcpStdioArgs(s) };
-  }
+  const mcpServers = wrappedMcpServerMap(servers, options);
   const body = JSON.stringify({ mcpServers }, null, 2);
   // 서로 다른 동시 실행이 하나의 agentlas-cli-mcp.json을 덮어쓰지 않도록 내용 주소 파일을 쓴다.
   const digest = crypto.createHash("sha256").update(body).digest("hex").slice(0, 20);
@@ -191,17 +210,13 @@ function cliMcpConfigPath(servers) {
   try { fs.chmodSync(file, 0o600); } catch { /* Windows/best-effort */ }
   return { file, names: Object.keys(mcpServers) };
 }
-// Full-access turns only: codex -c mcp_servers.* with Playwright + enabled DB stdio servers.
-function codexMcpArgs(servers) {
-  const out = [
-    "-c", 'mcp_servers.playwright.command="npx"',
-    "-c", 'mcp_servers.playwright.args=["-y","@playwright/mcp@latest"]',
-  ];
-  for (const s of servers || []) {
-    if (!s || s.enabled === 0 || s.transport !== "stdio" || !s.command) continue;
-    const k = mcpKey(s);
-    out.push("-c", `mcp_servers.${k}.command=${JSON.stringify(s.command)}`);
-    out.push("-c", `mcp_servers.${k}.args=${JSON.stringify(mcpStdioArgs(s))}`);
+// Full-access turns only: codex -c mcp_servers.* with the same exact Build
+// allowlist semantics as Claude.
+function codexMcpArgs(servers, options = {}) {
+  const out = [];
+  for (const [key, server] of Object.entries(wrappedMcpServerMap(servers, options))) {
+    out.push("-c", `mcp_servers.${key}.command=${JSON.stringify(server.command)}`);
+    out.push("-c", `mcp_servers.${key}.args=${JSON.stringify(server.args)}`);
   }
   return out;
 }
@@ -276,7 +291,7 @@ function claudePermissionArgs(permission) {
   return ["--permission-mode", "plan"];
 }
 
-function claudeArgs({ prompt, systemPrompt, permission, session, model, effort, mcpServers }) {
+function claudeArgs({ prompt, systemPrompt, permission, session, model, effort, mcpServers, mcpAllowlistMode, env }) {
   const level = permissions.normalize(permission);
   const perm = claudePermissionArgs(level);
   // /effort → Claude Code는 think 키워드로 reasoning 예산을 올린다(전용 CLI 플래그 없음).
@@ -294,8 +309,9 @@ function claudeArgs({ prompt, systemPrompt, permission, session, model, effort, 
   // MCP tools can mutate state outside the workspace sandbox. Until the desktop schema
   // carries a trustworthy readOnlyHint per tool, only explicit full access may inject them.
   if (level === "full") {
-    const mcpCfg = cliMcpConfigPath(mcpServers);
-    args.push("--strict-mcp-config", "--mcp-config", mcpCfg.file, "--allowedTools", mcpCfg.names.map((n) => "mcp__" + n).join(","));
+    const mcpCfg = cliMcpConfigPath(mcpServers, { exactAllowlist: mcpAllowlistMode === "exact", env });
+    args.push("--strict-mcp-config", "--mcp-config", mcpCfg.file);
+    if (mcpCfg.names.length) args.push("--allowedTools", mcpCfg.names.map((n) => "mcp__" + n).join(","));
   } else {
     args.push(...claudeMcpIsolationArgs());
   }
@@ -433,13 +449,14 @@ function codexPermissionArgs(permission) {
   return ["--sandbox", level === "write" ? "workspace-write" : "read-only", "-c", 'approval_policy="never"'];
 }
 
-function codexArgs({ prompt, systemPrompt, permission, session, cwd, model, effort, mcpServers }) {
+function codexArgs({ prompt, systemPrompt, permission, session, cwd, model, effort, mcpServers, mcpAllowlistMode, env }) {
   const level = permissions.normalize(permission);
   const sandbox = codexPermissionArgs(level);
-  const mcp = level === "full" ? codexMcpArgs(mcpServers) : [];
+  const mcp = level === "full" ? codexMcpArgs(mcpServers, { exactAllowlist: mcpAllowlistMode === "exact", env }) : [];
   const mdl = model ? ["-m", model] : []; // /model parity
-  // /effort parity → codex reasoning effort (low|medium|high). max는 high로 매핑.
-  const eff = effort ? ["-c", `model_reasoning_effort="${effort === "max" ? "high" : effort}"`] : [];
+  // Current Codex model inventory advertises max directly; preserve the user's
+  // explicit pin instead of silently weakening it to high.
+  const eff = effort ? ["-c", `model_reasoning_effort="${effort}"`] : [];
   const full = systemPrompt && !(session && session.id) ? `[SYSTEM]\n${systemPrompt}\n\n${prompt}` : prompt;
   // -C/--sandbox/--skip-git-repo-check 는 `codex exec` 옵션이라 `resume <id>` 토큰 *앞에* 와야 한다.
   // (codex-cli 0.133: resume 뒤에 두면 `unexpected argument` 로 거부 → 멀티턴 전부 실패. 실측 검증됨.)
@@ -582,22 +599,84 @@ function truncateLines(s, n) {
 
 // ── gemini (stream-json 구조화 렌더 — claude/codex와 동일 파리티) ──
 // gemini-cli는 -o stream-json 으로 init/message(delta)/tool_use/tool_result/result 이벤트를 낸다(실측).
+function geminiSystemSettingsSourcePath(env = process.env) {
+  if (env.GEMINI_CLI_SYSTEM_SETTINGS_PATH) return path.resolve(env.GEMINI_CLI_SYSTEM_SETTINGS_PATH);
+  if (process.platform === "darwin") return "/Library/Application Support/GeminiCli/settings.json";
+  if (process.platform === "win32") return "C:\\ProgramData\\gemini-cli\\settings.json";
+  return "/etc/gemini-cli/settings.json";
+}
+
+function geminiSystemDefaultsSourcePath(env = process.env) {
+  if (env.GEMINI_CLI_SYSTEM_DEFAULTS_PATH) return path.resolve(env.GEMINI_CLI_SYSTEM_DEFAULTS_PATH);
+  return path.join(path.dirname(geminiSystemSettingsSourcePath(env)), "system-defaults.json");
+}
+
+function geminiMcpIsolationReadiness(env = process.env) {
+  const managed = path.resolve(userDataDir(env), "mcp");
+  for (const source of [geminiSystemSettingsSourcePath(env), geminiSystemDefaultsSourcePath(env)]) {
+    let stat;
+    try { stat = fs.lstatSync(source); }
+    catch (error) {
+      if (error && error.code === "ENOENT") continue;
+      return { ready: false, reason: "system-settings-unreadable" };
+    }
+    const relative = path.relative(managed, path.resolve(source));
+    const insideManaged = relative && !path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`);
+    if (insideManaged && stat.isFile() && !stat.isSymbolicLink()) continue;
+    // Replacing a real organization system policy/defaults file would weaken
+    // policy. A Gemini Build therefore degrades to empty-MCP on this host.
+    return { ready: false, reason: "system-settings-conflict" };
+  }
+  return { ready: true, reason: "no-system-settings-conflict" };
+}
+
+function prepareGeminiRuntimeEnv(env = process.env, options = {}) {
+  const base = { ...env };
+  const exactAllowlist = options.mcpAllowlistMode === "exact";
+  const mcpServers = wrappedMcpServerMap(options.mcpServers, { exactAllowlist, env: base });
+  if (!Object.keys(mcpServers).length) return base;
+  const readiness = geminiMcpIsolationReadiness(base);
+  if (!readiness.ready) {
+    const error = new Error("Gemini MCP isolation is unavailable because host system settings must be preserved");
+    error.code = "AGENTLAS_GEMINI_MCP_ISOLATION_UNAVAILABLE";
+    throw error;
+  }
+  const dir = path.join(userDataDir(base), "mcp");
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(dir, 0o700); } catch { /* Windows/best-effort */ }
+  const names = Object.keys(mcpServers);
+  const body = JSON.stringify({ mcpServers, mcp: { allowed: names } }, null, 2);
+  const digest = crypto.createHash("sha256").update(body).digest("hex").slice(0, 20);
+  const file = path.join(dir, `agentlas-gemini-mcp-${digest}.json`);
+  let current = null;
+  try { current = fs.readFileSync(file, "utf8"); } catch { /* first write */ }
+  if (current !== body) writeManagedFile(file, body);
+  base.GEMINI_CLI_SYSTEM_SETTINGS_PATH = file;
+  return base;
+}
+
 function geminiPermissionArgs(permission) {
   const level = permissions.normalize(permission);
   const approvalMode = level === "full" ? "yolo" : level === "write" ? "auto_edit" : "plan";
   return ["--approval-mode", approvalMode];
 }
 
-function geminiArgs({ prompt, systemPrompt, permission, model }) {
+function geminiArgs({ prompt, systemPrompt, permission, model, mcpServers, mcpAllowlistMode, env }) {
   const level = permissions.normalize(permission);
   // Gemini CLI 0.50 exposes three matching modes: plan, auto_edit, and yolo.
   const approval = geminiPermissionArgs(level);
   const mdl = model ? ["-m", model] : []; // /model parity
+  const allowedMcpNames = level === "full"
+    ? Object.keys(wrappedMcpServerMap(mcpServers, { exactAllowlist: mcpAllowlistMode === "exact", env }))
+    : [];
+  const exactMcp = level === "full"
+    ? ["--allowed-mcp-server-names", allowedMcpNames.join(",") || `__agentlas_no_mcp_${crypto.randomUUID()}__`]
+    : [];
   return [
     "--output-format", "stream-json",
     "--skip-trust", // 헤드리스: 이 세션 동안 워크스페이스 신뢰 (untrusted dir exit 55 방지)
     ...approval,
-    ...(level === "full" ? [] : geminiMcpIsolationArgs()),
+    ...(level === "full" ? exactMcp : geminiMcpIsolationArgs()),
     ...mdl,
     "--prompt", systemPrompt ? `[SYSTEM]\n${systemPrompt}\n\n${prompt}` : prompt,
   ];
@@ -691,6 +770,15 @@ function handleGeminiLine(line, st, ui) {
 function runNativeTurn(req) {
   const { kind, bin, ui } = req;
   const cwd = req.cwd;
+  let launchReq = req;
+  if (
+    kind === "gemini" && permissions.normalize(req.permission) === "full" &&
+    selectedMcpServers(req.mcpServers, { exactAllowlist: req.mcpAllowlistMode === "exact" }).length &&
+    !geminiMcpIsolationReadiness(req.env || process.env).ready
+  ) {
+    ui.warn("Gemini system policy settings are present; MCP attachment was isolated to empty mode for this turn.");
+    launchReq = { ...req, mcpServers: [], mcpAllowlistMode: "exact" };
+  }
   const st = {
     text: "",
     finalText: "",
@@ -710,13 +798,13 @@ function runNativeTurn(req) {
   let plainStream = false;
   try {
     if (kind === "claude-code") {
-      args = claudeArgs(req);
+      args = claudeArgs(launchReq);
       lineHandler = (l) => handleClaudeLine(l, st, ui);
     } else if (kind === "codex") {
-      args = codexArgs({ ...req, cwd });
+      args = codexArgs({ ...launchReq, cwd });
       lineHandler = (l) => handleCodexLine(l, st, ui);
     } else if (kind === "gemini") {
-      args = geminiArgs(req);
+      args = geminiArgs(launchReq);
       lineHandler = (l) => handleGeminiLine(l, st, ui);
     } else {
       return Promise.resolve({ text: "", session: st.session, error: `unknown runtime: ${kind}` });
@@ -733,9 +821,9 @@ function runNativeTurn(req) {
     let child;
     try {
       const spawnImpl = req.spawn || spawn;
-      const childEnv = req.prepareRuntimeEnv === false
-        ? (req.env || process.env)
-        : runtimeEnvForKind(kind, req.env || process.env);
+      const childEnv = launchReq.prepareRuntimeEnv === false
+        ? (launchReq.env || process.env)
+        : runtimeEnvForKind(kind, launchReq.env || process.env, launchReq);
       child = spawnImpl(bin, args, {
         cwd,
         stdio: ["ignore", "pipe", "pipe"],
@@ -902,6 +990,8 @@ module.exports = {
   claudeMcpIsolationArgs,
   geminiMcpIsolationArgs,
   prepareCodexRuntimeEnv,
+  prepareGeminiRuntimeEnv,
+  geminiMcpIsolationReadiness,
   runtimeEnvForKind,
   cliMcpConfigPath,
   codexMcpArgs,

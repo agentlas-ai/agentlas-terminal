@@ -466,7 +466,12 @@ async function main() {
   console.log("terminal-ui-regression: PASS");
 }
 
-main().catch((error) => {
+main().then(() => {
+  // Fake TTY/PipeWrap resources used by this regression can remain referenced
+  // after every awaited assertion has completed. Exit only after main resolves
+  // so the aggregate smoke runner does not hang at an already-passed suite.
+  process.exit(0);
+}).catch((error) => {
   console.error(error);
-  process.exitCode = 1;
+  process.exit(1);
 });

@@ -14,10 +14,17 @@
  */
 
 const crypto = require("node:crypto");
+const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const readline = require("node:readline");
+const {
+  buildMcpChildEnv,
+  hasSensitiveRuntimeArgument,
+  mcpRuntimeHome,
+  normalizeCredentialKeyNames,
+} = require("./agentlas-mcp-env.cjs");
 
 const TOKEN_BUDGET = Object.freeze({
   coreMemoryMaxTokens: 150,
@@ -30,9 +37,14 @@ const HASH_RE = /^sha256:[0-9a-f]{64}$/;
 const ENV_RE = /^[A-Z][A-Z0-9_]*$/;
 const EXPERIENCE_STATE_SCHEMA = "agentlas.terminal-experience-intents.v1";
 const EXPERIENCE_INTENT_SCHEMA = "agentlas.terminal-experience-intent.v1";
+const MCP_CONSENT_STATE_SCHEMA = "agentlas.terminal-mcp-consents.v1";
+const MCP_CONSENT_RECEIPT_SCHEMA = "agentlas.terminal-mcp-consent.v1";
 const MAX_JSON_BYTES = 2 * 1024 * 1024;
 const MAX_BUILD_DIRECTIVE_CHARS = 1400;
 const MAX_APPROVED_MCP_PER_BUILD = 8;
+const MCP_PROBE_CONCURRENCY = 3;
+const MCP_PROBE_PER_SERVER_TIMEOUT_MS = 8_000;
+const MCP_PROBE_TOTAL_TIMEOUT_MS = 12_000;
 const EXPERIENCE_LOCK_STALE_MS = 30_000;
 const EXPERIENCE_LOCK_WAIT_MS = 2_000;
 
@@ -56,7 +68,7 @@ const UNSAFE_TEXT_PATTERNS = [
   { code: "private-key", re: /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/i },
   { code: "credential", re: /(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|password|private[_ -]?key|authorization)\s*[:=]\s*\S+/i },
   { code: "bearer", re: /\bbearer\s+[A-Za-z0-9._~+/=-]{8,}/i },
-  { code: "private-path", re: /(?:file:\/\/|(?:^|\s)(?:~\/|\/(?:Users|home|private|Volumes|var\/folders)\/|[A-Za-z]:\\(?:Users|Documents|Desktop)\\))/i },
+  { code: "private-path", re: /(?:file:\/\/|(?:^|[\s"'`()\[\]{}=:,;])(?:\.\.[/\\]|~[/\\]|\/(?!\/|\s)(?:[^/\s"'`<>]+\/)*[^/\s"'`<>]+|[A-Za-z]:[/\\]\S+|\\\\[^\\/\s]+[\\/][^\\/\s]+))/i },
   { code: "email", re: /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i },
   { code: "phone", re: /(?:\+?\d[\d .()-]{8,}\d)/ },
   { code: "account-id", re: /\b(?:account|customer|client|user)[ _-]?(?:id|number|no)\s*[:=#]?\s*[A-Za-z0-9_-]{4,}\b|(?:계정|고객|사용자)[ _-]?(?:id|아이디|번호)\s*[:=#]?\s*[A-Za-z0-9_-]{4,}/i },
@@ -231,10 +243,86 @@ function experienceStatePath(userDataDir) {
   return path.join(userDataDir, "terminal", "experience-intents-v1.json");
 }
 
+function mcpConsentStatePath(userDataDir) {
+  return path.join(userDataDir, "terminal", "mcp-consents-v1.json");
+}
+
 function waitSync(milliseconds) {
   // Atomics.wait is a bounded, non-spinning sleep available in supported Node 20+.
   const signal = new Int32Array(new SharedArrayBuffer(4));
   Atomics.wait(signal, 0, 0, milliseconds);
+}
+
+function emptyMcpConsentState() {
+  return { schemaVersion: MCP_CONSENT_STATE_SCHEMA, updatedAt: null, receipts: [] };
+}
+
+function validateMcpConsentReceipt(receipt, index) {
+  const label = `Terminal MCP consent.receipts[${index}]`;
+  const keys = ["schemaVersion", "catalogId", "registryServerId", "consentFingerprint", "source", "consentedAt"];
+  assertExactKeys(receipt, new Set(keys), keys, label);
+  if (receipt.schemaVersion !== MCP_CONSENT_RECEIPT_SCHEMA) throw new Error(`${label}.schemaVersion is invalid`);
+  assertId(receipt.catalogId, `${label}.catalogId`);
+  assertId(receipt.registryServerId, `${label}.registryServerId`);
+  if (!/^[0-9a-f]{64}$/.test(String(receipt.consentFingerprint || ""))) throw new Error(`${label}.consentFingerprint is invalid`);
+  if (receipt.source !== "terminal-build-one-pass") throw new Error(`${label}.source is invalid`);
+  if (typeof receipt.consentedAt !== "string" || !receipt.consentedAt) throw new Error(`${label}.consentedAt is invalid`);
+  assertIsoDateOrNull(receipt.consentedAt, `${label}.consentedAt`);
+  return receipt;
+}
+
+function loadMcpConsentState(userDataDir) {
+  const file = mcpConsentStatePath(userDataDir);
+  if (!fs.existsSync(file)) return emptyMcpConsentState();
+  const stat = fs.lstatSync(file);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0 || stat.size > MAX_JSON_BYTES) {
+    throw new Error("Terminal MCP consent state is unsafe or too large");
+  }
+  const state = JSON.parse(fs.readFileSync(file, "utf8"));
+  assertExactKeys(state, new Set(["schemaVersion", "updatedAt", "receipts"]), ["schemaVersion", "updatedAt", "receipts"], "Terminal MCP consent state");
+  if (state.schemaVersion !== MCP_CONSENT_STATE_SCHEMA || !Array.isArray(state.receipts) || state.receipts.length > 256) {
+    throw new Error("Terminal MCP consent state schema is invalid");
+  }
+  assertIsoDateOrNull(state.updatedAt, "Terminal MCP consent state.updatedAt");
+  state.receipts.forEach(validateMcpConsentReceipt);
+  return state;
+}
+
+function withMcpConsentStateLock(userDataDir, action) {
+  const stateFile = mcpConsentStatePath(userDataDir);
+  const dir = path.dirname(stateFile);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(dir, 0o700); } catch { /* best effort */ }
+  const lockFile = `${stateFile}.lock`;
+  const deadline = Date.now() + EXPERIENCE_LOCK_WAIT_MS;
+  let descriptor = null;
+  while (descriptor == null) {
+    try {
+      descriptor = fs.openSync(lockFile, "wx", 0o600);
+      fs.writeFileSync(descriptor, `${process.pid}\n${new Date().toISOString()}\n`, "utf8");
+    } catch (error) {
+      if (!error || error.code !== "EEXIST") throw error;
+      try {
+        const stat = fs.lstatSync(lockFile);
+        if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Terminal MCP consent lock is unsafe");
+        if (Date.now() - stat.mtimeMs > EXPERIENCE_LOCK_STALE_MS) {
+          fs.unlinkSync(lockFile);
+          continue;
+        }
+      } catch (statError) {
+        if (statError && statError.code === "ENOENT") continue;
+        throw statError;
+      }
+      if (Date.now() >= deadline) throw new Error("Terminal MCP consent state is busy; retry the command");
+      waitSync(25);
+    }
+  }
+  try {
+    return action();
+  } finally {
+    try { fs.closeSync(descriptor); } catch { /* noop */ }
+    try { fs.unlinkSync(lockFile); } catch { /* crash recovery handles leftovers */ }
+  }
 }
 
 function withExperienceStateLock(userDataDir, action) {
@@ -529,8 +617,7 @@ function collectSystemMcpInventory(db, options = {}) {
     try {
       if (String(row.env_keys_json || "[]").length > 64 * 1024) throw new Error("credential metadata too large");
       const parsed = JSON.parse(row.env_keys_json || "[]");
-      if (!Array.isArray(parsed) || parsed.some((key) => !ENV_RE.test(String(key)))) credentialMetadataStatus = "unavailable";
-      else keyNames = [...new Set(parsed.map(String))];
+      keyNames = normalizeCredentialKeyNames(parsed);
     } catch { credentialMetadataStatus = "unavailable"; }
     const item = {
       catalogId,
@@ -541,7 +628,13 @@ function collectSystemMcpInventory(db, options = {}) {
       keyPresent: credentialMetadataStatus === "complete" && (keyNames.length === 0 || keyNames.every((key) => credentialNames.has(key))),
       credentialMetadataStatus,
     };
+    Object.defineProperty(item, "registryServerId", { value: String(row.id), enumerable: false });
+    Object.defineProperty(item, "transport", { value: String(row.transport || ""), enumerable: false });
     Object.defineProperty(item, "credentialKeyNames", { value: keyNames, enumerable: false });
+    Object.defineProperty(item, "credentialKeyFingerprint", {
+      value: crypto.createHash("sha256").update(JSON.stringify(keyNames), "utf8").digest("hex"),
+      enumerable: false,
+    });
     inventory.push(item);
   }
   Object.defineProperty(inventory, "registryStatus", { value: registryStatus, enumerable: false });
@@ -630,10 +723,15 @@ function indexInventory(inventory) {
 function resolveMcpRequirement(requirement, inventoryById) {
   const order = [requirement.catalogId, ...(requirement.alternatives || [])];
   const attempted = [];
+  const candidates = [];
   for (const catalogId of order) {
     const item = inventoryById.get(catalogId);
     if (!item) {
       attempted.push({ catalogId, status: "unavailable" });
+      continue;
+    }
+    if (item.transport !== "stdio") {
+      attempted.push({ catalogId, status: "runtime-incompatible" });
       continue;
     }
     const keyRequired = requirement.requiresKey || item.keyRequired;
@@ -644,12 +742,22 @@ function resolveMcpRequirement(requirement, inventoryById) {
       attempted.push({ catalogId, status: "missing-key" });
       continue;
     }
-    return { selected: item, status: "available", attempted, keyRequired, keyPresent: true };
+    candidates.push({ item, keyRequired, keyPresent: true });
+  }
+  if (candidates.length) {
+    return {
+      selected: candidates[0].item,
+      candidates,
+      status: "available",
+      attempted,
+      keyRequired: candidates[0].keyRequired,
+      keyPresent: true,
+    };
   }
   const primary = inventoryById.get(requirement.catalogId);
   const keyRequired = requirement.requiresKey || Boolean(primary && primary.keyRequired);
   const missingKey = attempted.some((attempt) => attempt.status === "missing-key");
-  return { selected: null, status: missingKey ? "missing-key" : "unavailable", attempted, keyRequired, keyPresent: false };
+  return { selected: null, candidates: [], status: missingKey ? "missing-key" : "unavailable", attempted, keyRequired, keyPresent: false };
 }
 
 function buildMcpPlan(options) {
@@ -670,7 +778,7 @@ function buildMcpPlan(options) {
   const entries = requirements
     .map((requirement) => {
       const resolution = resolveMcpRequirement(requirement, inventoryById);
-      return {
+      const entry = {
         requirementId: requirement.requirementId,
         requestedCatalogId: requirement.catalogId,
         resolvedCatalogId: resolution.selected ? resolution.selected.catalogId : null,
@@ -685,19 +793,40 @@ function buildMcpPlan(options) {
         permissions: [...(requirement.permissions || [])],
         permissionBasis: "package-declared",
         permissionEnforced: false,
+        fallbackCatalogIds: resolution.candidates.slice(1).map((candidate) => candidate.item.catalogId),
         alternativesTried: resolution.attempted.map((attempt) => ({ catalogId: attempt.catalogId, status: attempt.status })),
         unavailableBuildPolicy: "degrade",
       };
+      Object.defineProperty(entry, "registryServerId", {
+        value: resolution.selected?.registryServerId || null,
+        enumerable: false,
+      });
+      Object.defineProperty(entry, "credentialKeyFingerprint", {
+        value: resolution.selected?.credentialKeyFingerprint || null,
+        enumerable: false,
+      });
+      Object.defineProperty(entry, "runtimeCandidates", {
+        value: resolution.candidates.map((candidate) => ({
+          resolvedCatalogId: candidate.item.catalogId,
+          registryServerId: candidate.item.registryServerId || null,
+          credentialKeyFingerprint: candidate.item.credentialKeyFingerprint || null,
+        })),
+        enumerable: false,
+      });
+      return entry;
     })
     .sort((a, b) => Number(b.required) - Number(a.required) || a.priority - b.priority || a.requestedCatalogId.localeCompare(b.requestedCatalogId));
   return {
     schemaVersion: "agentlas.terminal-mcp-build-plan.v1",
+    planId: crypto.randomUUID(),
     registryStatus: options.registryStatus || inventory.registryStatus || "complete",
     registryResolutionOrder: options.policy ? [...options.policy.registryResolutionOrder] : ["system-global"],
     discoveryNetworkUsed: false,
     consentMode: "one-pass",
     entries,
-    availableCatalogIds: [...new Set(entries.filter((entry) => entry.status === "available").map((entry) => entry.resolvedCatalogId))],
+    availableCatalogIds: [...new Set(entries.flatMap((entry) =>
+      entry.status === "available" ? (entry.runtimeCandidates || []).map((candidate) => candidate.resolvedCatalogId) : []
+    ))],
     maxApprovedMcp: MAX_APPROVED_MCP_PER_BUILD,
     shortages: entries.filter((entry) => entry.status !== "available").map((entry) => ({
       requirementId: entry.requirementId,
@@ -709,23 +838,445 @@ function buildMcpPlan(options) {
   };
 }
 
+function parseRuntimeServerArgs(value) {
+  if (typeof value !== "string" || value.length > 64 * 1024) return null;
+  try {
+    const parsed = JSON.parse(value || "[]");
+    if (!Array.isArray(parsed) || parsed.length > 128 || parsed.some((item) => typeof item !== "string" || item.length > 4096 || /[\u0000\r\n]/.test(item))) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function materializeTrustedSystemMcpServer(row, options = {}) {
+  const catalogId = safeCatalogId(row?.catalog_id) || safeCatalogId(row?.id);
+  const registryServerId = String(row?.id || "");
+  const args = parseRuntimeServerArgs(row?.args_json || "[]");
+  let credentialKeyNames = null;
+  try {
+    if (String(row?.env_keys_json || "[]").length > 64 * 1024) throw new Error("credential metadata too large");
+    credentialKeyNames = normalizeCredentialKeyNames(JSON.parse(row?.env_keys_json || "[]"));
+  } catch { /* fail closed below */ }
+  if (
+    !row || !catalogId || !ID_RE.test(registryServerId) || Number(row.enabled) === 0 || row.transport !== "stdio" || typeof row.command !== "string" ||
+    !row.command.trim() || row.command.length > 4096 || /[\u0000\r\n]/.test(row.command) || !args ||
+    !credentialKeyNames || hasSensitiveRuntimeArgument(row.command, args)
+  ) return null;
+  const server = {
+    id: registryServerId,
+    catalog_id: catalogId,
+    name: catalogId,
+    transport: "stdio",
+    command: row.command,
+    args_json: JSON.stringify(args),
+    enabled: 1,
+  };
+  Object.defineProperty(server, "credentialKeyNames", { value: credentialKeyNames, enumerable: false });
+  Object.defineProperty(server, "credentialKeyFingerprint", {
+    value: crypto.createHash("sha256").update(JSON.stringify(credentialKeyNames), "utf8").digest("hex"),
+    enumerable: false,
+  });
+  Object.defineProperty(server, "consentFingerprint", {
+    value: crypto.createHash("sha256").update(JSON.stringify({
+      schemaVersion: "agentlas.terminal-mcp-consent-fingerprint.v1",
+      registryServerId,
+      catalogId,
+      transport: "stdio",
+      command: row.command,
+      args,
+      credentialKeyNames,
+    }), "utf8").digest("hex"),
+    enumerable: false,
+  });
+  if (options.createRuntimeHome !== false) {
+    Object.defineProperty(server, "mcpRuntimeHome", {
+      value: mcpRuntimeHome(options.userDataDir, `${catalogId}\0${row.id}`),
+      enumerable: false,
+    });
+  }
+  return server;
+}
+
+function persistMcpConsentReceipts(userDataDir, servers) {
+  if (!userDataDir || !(servers || []).length) return false;
+  withMcpConsentStateLock(userDataDir, () => {
+    const state = loadMcpConsentState(userDataDir);
+    const now = new Date().toISOString();
+    for (const server of servers) {
+      if (!server || !ID_RE.test(String(server.id || "")) || !safeCatalogId(server.catalog_id) || !/^[0-9a-f]{64}$/.test(String(server.consentFingerprint || ""))) continue;
+      const receipt = {
+        schemaVersion: MCP_CONSENT_RECEIPT_SCHEMA,
+        catalogId: server.catalog_id,
+        registryServerId: server.id,
+        consentFingerprint: server.consentFingerprint,
+        source: "terminal-build-one-pass",
+        consentedAt: now,
+      };
+      const existing = state.receipts.findIndex((item) => item.catalogId === receipt.catalogId && item.registryServerId === receipt.registryServerId);
+      if (existing >= 0) state.receipts[existing] = receipt;
+      else state.receipts.push(receipt);
+    }
+    state.receipts.sort((a, b) => String(b.consentedAt).localeCompare(String(a.consentedAt)) || a.catalogId.localeCompare(b.catalogId));
+    state.receipts = state.receipts.slice(0, 256);
+    state.updatedAt = now;
+    writePrivateJsonAtomic(mcpConsentStatePath(userDataDir), state);
+  });
+  return true;
+}
+
+function readConsentedSystemMcpServers(db, options = {}) {
+  let state;
+  try { state = loadMcpConsentState(options.userDataDir); }
+  catch { return []; }
+  const servers = [];
+  const seen = new Set();
+  for (const receipt of state.receipts) {
+    if (seen.has(receipt.catalogId)) continue;
+    let row = null;
+    try {
+      row = db.prepare(
+        "SELECT id, catalog_id, name, name_en, transport, command, args_json, env_keys_json, enabled FROM mcp_servers WHERE id=? LIMIT 1",
+      ).get(receipt.registryServerId);
+    } catch { continue; }
+    const server = materializeTrustedSystemMcpServer(row, options);
+    if (
+      !server || server.id !== receipt.registryServerId || server.catalog_id !== receipt.catalogId ||
+      server.consentFingerprint !== receipt.consentFingerprint
+    ) continue;
+    seen.add(receipt.catalogId);
+    servers.push(server);
+  }
+  return servers;
+}
+
+/**
+ * Post-consent only. Re-read the exact trusted system-global row with executable
+ * fields; no package/catalog content can supply this material.
+ */
+function readApprovedSystemMcpServer(db, entry, options = {}) {
+  if (!entry?.registryServerId || !entry.resolvedCatalogId) return null;
+  let row = null;
+  try {
+    row = db.prepare(
+      "SELECT id, catalog_id, name, name_en, transport, command, args_json, env_keys_json, enabled FROM mcp_servers WHERE id=? LIMIT 1",
+    ).get(entry.registryServerId);
+  } catch {
+    return null;
+  }
+  const server = materializeTrustedSystemMcpServer(row, options);
+  if (
+    !server || String(row.id) !== entry.registryServerId || server.catalog_id !== entry.resolvedCatalogId ||
+    !entry.credentialKeyFingerprint || server.credentialKeyFingerprint !== entry.credentialKeyFingerprint
+  ) return null;
+  return server;
+}
+
+function probeSystemMcpServerConnection(server, options = {}) {
+  const requestedTimeout = Number(options.timeoutMs);
+  const timeoutMs = Number.isFinite(requestedTimeout)
+    ? Math.max(50, Math.min(30_000, Math.trunc(requestedTimeout)))
+    : MCP_PROBE_PER_SERVER_TIMEOUT_MS;
+  const spawnImpl = options.spawn || spawn;
+  return new Promise((resolve) => {
+    let child = null;
+    let settled = false;
+    let buffer = Buffer.alloc(0);
+    let totalBytes = 0;
+    let initialized = false;
+    let abortHandler = null;
+    let forceKillTimer = null;
+    let childClosed = false;
+    const terminateChild = (signal) => {
+      const pid = Number(child?.pid);
+      if (process.platform !== "win32" && Number.isInteger(pid) && pid > 1) {
+        try { process.kill(-pid, signal); return; } catch { /* fall through */ }
+      }
+      try { child?.kill(signal); } catch { /* noop */ }
+    };
+    const finish = (connected, reason) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (options.signal && abortHandler) options.signal.removeEventListener?.("abort", abortHandler);
+      try { child?.stdin?.end(); } catch { /* noop */ }
+      if (!childClosed) {
+        terminateChild("SIGTERM");
+        forceKillTimer = setTimeout(() => terminateChild("SIGKILL"), 250);
+        forceKillTimer.unref?.();
+      }
+      resolve({ connected, reason });
+    };
+    const onMessage = (message) => {
+      if (!message || message.jsonrpc !== "2.0") return;
+      if (message.id === 1) {
+        if (message.error || !message.result) return finish(false, "initialize_failed");
+        initialized = true;
+        try {
+          child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} })}\n`);
+          child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} })}\n`);
+        } catch {
+          finish(false, "connection_failed");
+        }
+      } else if (message.id === 2 && initialized) {
+        finish(!message.error && Boolean(message.result), message.error ? "tools_list_failed" : "connected");
+      }
+    };
+    const drain = () => {
+      while (buffer.length) {
+        const header = buffer.toString("ascii", 0, Math.min(buffer.length, 64 * 1024)).match(/^Content-Length:\s*(\d+)\r?\n\r?\n/i);
+        if (header) {
+          const headerBytes = Buffer.byteLength(header[0], "ascii");
+          const bodyBytes = Number(header[1]);
+          if (!Number.isSafeInteger(bodyBytes) || bodyBytes < 0 || bodyBytes > 1024 * 1024) return finish(false, "invalid_protocol_frame");
+          if (buffer.length < headerBytes + bodyBytes) return;
+          const body = buffer.subarray(headerBytes, headerBytes + bodyBytes).toString("utf8");
+          buffer = buffer.subarray(headerBytes + bodyBytes);
+          try { onMessage(JSON.parse(body)); } catch { /* ignore non-JSON noise */ }
+          continue;
+        }
+        const newline = buffer.indexOf(0x0a);
+        if (newline < 0) return;
+        const line = buffer.subarray(0, newline).toString("utf8").trim();
+        buffer = buffer.subarray(newline + 1);
+        if (!line || /^Content-Length:/i.test(line)) continue;
+        try { onMessage(JSON.parse(line)); } catch { /* ignore banners */ }
+      }
+    };
+    const timer = setTimeout(() => finish(false, "connection_timeout"), timeoutMs);
+    try {
+      child = spawnImpl(server.command, parseRuntimeServerArgs(server.args_json) || [], {
+        cwd: options.cwd || process.cwd(),
+        env: buildMcpChildEnv(options.env || process.env, server.credentialKeyNames || [], {
+          runtimeHome: server.mcpRuntimeHome || mcpRuntimeHome(options.userDataDir, server.catalog_id || server.id || server.command),
+        }),
+        detached: process.platform !== "win32",
+        stdio: ["pipe", "pipe", "ignore"],
+      });
+      child.once("error", () => finish(false, "connection_failed"));
+      child.once("close", () => {
+        childClosed = true;
+        if (forceKillTimer) clearTimeout(forceKillTimer);
+        forceKillTimer = null;
+        finish(false, "connection_closed");
+      });
+      child.stdout.on("data", (chunk) => {
+        totalBytes += chunk.length;
+        if (totalBytes > 1024 * 1024) return finish(false, "protocol_output_limit");
+        buffer = Buffer.concat([buffer, Buffer.from(chunk)]);
+        drain();
+      });
+      child.stdin.write(`${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "agentlas-terminal-build", version: "1" },
+        },
+      })}\n`);
+      if (options.signal) {
+        abortHandler = () => finish(false, "connection_timeout");
+        if (options.signal.aborted) abortHandler();
+        else options.signal.addEventListener?.("abort", abortHandler, { once: true });
+      }
+    } catch {
+      finish(false, "connection_failed");
+    }
+  });
+}
+
+async function resolveApprovedMcpRuntimeAllowlist(options) {
+  const approved = new Set(options.approvedIds || []);
+  const selectedGroups = (options.plan?.entries || []).map((entry) => {
+    if (entry.status !== "available") return null;
+    const candidates = Array.isArray(entry.runtimeCandidates) && entry.runtimeCandidates.length
+      ? entry.runtimeCandidates
+      : [{
+          resolvedCatalogId: entry.resolvedCatalogId,
+          registryServerId: entry.registryServerId,
+          credentialKeyFingerprint: entry.credentialKeyFingerprint,
+        }];
+    const approvedCandidates = candidates.filter(
+      (candidate) => candidate.resolvedCatalogId && approved.has(candidate.resolvedCatalogId),
+    );
+    return approvedCandidates.length ? { entry, candidates: approvedCandidates } : null;
+  }).filter(Boolean);
+  const probe = options.probeServer || ((server, probeOptions = {}) => probeSystemMcpServerConnection(server, {
+    cwd: options.cwd,
+    env: options.env,
+    userDataDir: options.userDataDir,
+    timeoutMs: probeOptions.timeoutMs,
+    signal: probeOptions.signal,
+  }));
+  const bounded = (value, fallback, min, max) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? Math.max(min, Math.min(max, Math.trunc(parsed))) : fallback;
+  };
+  const concurrency = bounded(options.probeConcurrency, MCP_PROBE_CONCURRENCY, 1, MAX_APPROVED_MCP_PER_BUILD);
+  const perServerTimeoutMs = bounded(options.probeTimeoutMs, MCP_PROBE_PER_SERVER_TIMEOUT_MS, 50, 30_000);
+  const totalTimeoutMs = bounded(options.totalProbeTimeoutMs, MCP_PROBE_TOTAL_TIMEOUT_MS, 50, 60_000);
+  const deadline = Date.now() + totalTimeoutMs;
+  const outcomes = new Array(selectedGroups.length);
+  let nextIndex = 0;
+
+  const probeCandidate = async (candidate) => {
+    let server = null;
+    try { server = readApprovedSystemMcpServer(options.db, candidate, { userDataDir: options.userDataDir }); }
+    catch { /* one unsafe/unwritable runtime boundary excludes only this server */ }
+    if (!server) return { candidate, server: null, status: { connected: false, reason: "registry_row_unavailable" } };
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) return { candidate, server, status: { connected: false, reason: "probe_total_deadline" } };
+    const timeoutMs = Math.min(perServerTimeoutMs, remainingMs);
+    const controller = new AbortController();
+    let timer = null;
+    let status;
+    try {
+      status = await Promise.race([
+        Promise.resolve(probe(server, { timeoutMs, signal: controller.signal })),
+        new Promise((resolve) => {
+          timer = setTimeout(() => {
+            controller.abort();
+            resolve({ connected: false, reason: "connection_timeout" });
+          }, timeoutMs);
+        }),
+      ]);
+    } catch {
+      status = { connected: false, reason: "connection_failed" };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    return { candidate, server, status };
+  };
+
+  // Different requirements use a small worker pool. Alternatives for one
+  // requirement are deliberately sequential so a failed primary cannot fan
+  // out package-manager processes or affect unrelated server groups.
+  const work = async () => {
+    while (true) {
+      const index = nextIndex++;
+      if (index >= selectedGroups.length) return;
+      const group = selectedGroups[index];
+      const attempts = [];
+      for (const candidate of group.candidates) {
+        const outcome = await probeCandidate(candidate);
+        attempts.push(outcome);
+        if (outcome.status?.connected) break;
+      }
+      outcomes[index] = { entry: group.entry, attempts };
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, selectedGroups.length) }, () => work()));
+
+  const attached = [];
+  const failed = [];
+  const servers = [];
+  for (let index = 0; index < outcomes.length; index += 1) {
+    const outcome = outcomes[index] || {
+      entry: selectedGroups[index]?.entry,
+      attempts: [],
+    };
+    for (const attempt of outcome.attempts) {
+      const catalogId = attempt.candidate.resolvedCatalogId;
+      if (!attempt.status?.connected) {
+        failed.push({ catalogId, reason: safeCatalogId(attempt.status?.reason) || "connection_failed" });
+        continue;
+      }
+      attached.push({ catalogId, registryServerId: attempt.server.id, status: "connected" });
+      servers.push(attempt.server);
+      break;
+    }
+  }
+  let consentPersisted = servers.length === 0;
+  if (servers.length) {
+    try { consentPersisted = persistMcpConsentReceipts(options.userDataDir, servers); }
+    catch { consentPersisted = false; }
+  }
+  const receipt = {
+    schemaVersion: "agentlas.terminal-mcp-runtime-allowlist.v1",
+    planId: options.plan?.planId || null,
+    approvedCatalogIds: [...approved].sort(),
+    attached,
+    failed,
+    emptyMode: attached.length === 0,
+    consentPersisted,
+  };
+  Object.defineProperty(receipt, "servers", { value: servers, enumerable: false });
+  return receipt;
+}
+
 function parseIdList(value) {
   if (!value || value === true) return [];
   return [...new Set(String(value).split(",").map((item) => item.trim()).filter(Boolean))];
 }
 
+function tokenizeBuildCommandLine(value) {
+  const tokens = [];
+  let current = "";
+  let quote = null;
+  const source = String(value || "");
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "\\" && quote !== "'") {
+      const next = source[index + 1];
+      if (next && (/\s/.test(next) || next === "\\" || next === '"' || next === "'")) {
+        current += next;
+        index += 1;
+      } else {
+        // Preserve Windows paths and ordinary backslashes. This parser only
+        // consumes escapes needed to group command-line tokens; it never
+        // applies shell expansion or command substitution.
+        current += "\\";
+      }
+      continue;
+    }
+    if (quote) {
+      if (char === quote) quote = null;
+      else current += char;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (current) tokens.push(current), current = "";
+      continue;
+    }
+    current += char;
+  }
+  if (quote) throw new Error("unterminated quote in /build command");
+  if (current) tokens.push(current);
+  return tokens;
+}
+
 function parseBuildArgs(args) {
+  const buildArgs = args;
   const options = {
     task: [], requiredIds: [], recommendedIds: [], approvedIds: [],
-    approveAll: false, noMcp: false, planOnly: false, json: false,
+    experienceTaskSignatures: [], experienceEnvironmentTags: [],
+    experiencePackReleaseIds: [], experienceBaseReleaseId: null, experienceAgentDefinitionId: null,
+    approveAll: false, noMcp: false, noExperience: false, planOnly: false, json: false,
   };
-  for (let index = 0; index < args.length; index += 1) {
-    const token = String(args[index]);
-    const take = () => (index + 1 < args.length ? String(args[++index]) : "");
+  for (let index = 0; index < buildArgs.length; index += 1) {
+    const token = String(buildArgs[index]);
+    const take = () => (index + 1 < buildArgs.length ? String(buildArgs[++index]) : "");
     if (token === "--mcp-plan-only") options.planOnly = true;
     else if (token === "--mcp-json") options.json = true;
     else if (token === "--approve-all-mcp") options.approveAll = true;
     else if (token === "--no-mcp") options.noMcp = true;
+    else if (token === "--no-experience") options.noExperience = true;
+    else if (token === "--experience-base-release") options.experienceBaseReleaseId = take();
+    else if (token.startsWith("--experience-base-release=")) options.experienceBaseReleaseId = token.slice(26);
+    else if (token === "--experience-pack-release") options.experiencePackReleaseIds.push(...parseIdList(take()));
+    else if (token.startsWith("--experience-pack-release=")) options.experiencePackReleaseIds.push(...parseIdList(token.slice(26)));
+    else if (token === "--experience-agent-definition") options.experienceAgentDefinitionId = take();
+    else if (token.startsWith("--experience-agent-definition=")) options.experienceAgentDefinitionId = token.slice(30);
+    else if (token === "--experience-task-signature") options.experienceTaskSignatures.push(...parseIdList(take()));
+    else if (token.startsWith("--experience-task-signature=")) options.experienceTaskSignatures.push(...parseIdList(token.slice(28)));
+    else if (token === "--experience-environment") options.experienceEnvironmentTags.push(...parseIdList(take()));
+    else if (token.startsWith("--experience-environment=")) options.experienceEnvironmentTags.push(...parseIdList(token.slice(25)));
     else if (token === "--approve-mcp") options.approvedIds.push(...parseIdList(take()));
     else if (token.startsWith("--approve-mcp=")) options.approvedIds.push(...parseIdList(token.slice(14)));
     else if (token === "--require-mcp") options.requiredIds.push(...parseIdList(take()));
@@ -738,6 +1289,12 @@ function parseBuildArgs(args) {
   options.requiredIds = [...new Set(options.requiredIds)];
   options.recommendedIds = [...new Set(options.recommendedIds)];
   options.approvedIds = [...new Set(options.approvedIds)];
+  options.experienceTaskSignatures = [...new Set(options.experienceTaskSignatures)];
+  options.experienceEnvironmentTags = [...new Set(options.experienceEnvironmentTags)];
+  options.experiencePackReleaseIds = [...new Set(options.experiencePackReleaseIds)];
+  if (options.experienceBaseReleaseId) assertId(options.experienceBaseReleaseId, "--experience-base-release");
+  if (options.experienceAgentDefinitionId) assertId(options.experienceAgentDefinitionId, "--experience-agent-definition");
+  options.experiencePackReleaseIds.forEach((id) => assertId(id, "--experience-pack-release"));
   return options;
 }
 
@@ -751,9 +1308,11 @@ function renderMcpPlan(plan) {
     const permissions = entry.permissions.length ? entry.permissions.join(",") : "none";
     lines.push(`- P${entry.priority} ${entry.name} [${entry.resolvedCatalogId || entry.requestedCatalogId}] · ${requirement} · ${entry.status} · ${key}`);
     lines.push(`  ${entry.reason}`);
+    if (entry.fallbackCatalogIds?.length) lines.push(`  approved fallback order: ${entry.fallbackCatalogIds.join(",")}`);
     lines.push(`  permissions: ${permissions} · declared only; host enforcement not yet verified`);
   }
   if (plan.shortages.length) lines.push(`Shortages are isolated: ${plan.shortages.length} requirement(s) degrade only; the build does not abort.`);
+  lines.push("Recommendation only: no MCP is attached until one explicit consent; this plan performs no network key probe or install.");
   return lines.join("\n");
 }
 
@@ -821,16 +1380,31 @@ function fitApprovedMcpIds(plan, requestedIds) {
   return accepted;
 }
 
-function renderBuildMcpResult(plan, approvedIds) {
+function renderBuildMcpResult(plan, approvedIds, runtimeAllowlist = null) {
   const approved = new Set(approvedIds || []);
+  const attached = new Set((runtimeAllowlist?.attached || []).map((item) => item.catalogId));
+  const failed = new Map((runtimeAllowlist?.failed || []).map((item) => [item.catalogId, item.reason]));
   const lines = ["MCP BUILD RESULT"];
   for (const entry of plan.entries) {
     let status = entry.status;
-    if (entry.status === "available") status = approved.has(entry.resolvedCatalogId) ? "approved-for-builder-resolution" : "skipped";
+    if (entry.status === "available") {
+      const candidateIds = [entry.resolvedCatalogId, ...(entry.fallbackCatalogIds || [])].filter(Boolean);
+      const attachedId = candidateIds.find((id) => attached.has(id));
+      const approvedId = candidateIds.find((id) => approved.has(id));
+      const failedId = candidateIds.find((id) => failed.has(id));
+      status = attachedId
+        ? attachedId === entry.resolvedCatalogId ? "connected-and-allowlisted" : `fallback-connected-and-allowlisted:${attachedId}`
+        : failedId
+          ? `failed-isolated:${failedId}:${failed.get(failedId)}`
+          : approvedId
+            ? "approved-but-not-attached"
+            : "skipped";
+    }
     lines.push(`- ${entry.resolvedCatalogId || entry.requestedCatalogId}: ${status}`);
   }
-  if (!plan.entries.length || !approved.size) lines.push("- Build continued in empty-MCP mode.");
-  lines.push("Connection/tool-call success was not claimed; only the trusted host can emit that receipt.");
+  if (!runtimeAllowlist || runtimeAllowlist.emptyMode) lines.push("- Build continued in empty-MCP mode.");
+  if (runtimeAllowlist && runtimeAllowlist.consentPersisted === false) lines.push("- Runtime consent was one-pass only because its local fingerprint receipt could not be saved.");
+  lines.push("Only the post-consent host allowlist reached the builder; tool-call success is not implied by connection readiness.");
   return lines.join("\n");
 }
 
@@ -853,13 +1427,50 @@ async function cmdBuild(options) {
     else approvedIds = await askMcpConsentOnce(plan, { input: options.input, output: options.promptOutput });
   }
   approvedIds = fitApprovedMcpIds(plan, approvedIds);
-  const directive = buildMcpDirective(plan, approvedIds);
-  const builderRequest = parsed.request
-    ? `${parsed.request}\n\n${directive}`
-    : (plan.entries.length || approvedIds.length ? directive : "");
-  if (typeof options.invokeBuild === "function") await options.invokeBuild(builderRequest, { plan, approvedIds });
-  emit(renderBuildMcpResult(plan, approvedIds));
-  return { plan, approvedIds, invoked: typeof options.invokeBuild === "function" };
+  const runtimeAllowlist = await resolveApprovedMcpRuntimeAllowlist({
+    db: options.db,
+    plan,
+    approvedIds,
+    cwd: options.cwd || process.cwd(),
+    userDataDir: options.userDataDir,
+    env: options.runtimeEnv || options.env || process.env,
+    probeServer: options.probeMcpServer,
+  });
+  const attachedIds = runtimeAllowlist.attached.map((item) => item.catalogId);
+  const directive = buildMcpDirective(plan, attachedIds);
+  let experienceContext = { text: "", itemIds: [], estimatedTokens: 0, authority: "local-advisory", serverRentalResolutionReceiptPresent: false };
+  if (
+    !parsed.noExperience &&
+    parsed.experienceBaseReleaseId &&
+    parsed.experienceTaskSignatures.length &&
+    parsed.experiencePackReleaseIds.length === 1
+  ) {
+    const exchange = require("./agentlas-experience-exchange.cjs");
+    experienceContext = exchange.buildLocalExperienceAdvisory({
+      userDataDir: options.userDataDir,
+      cwd: options.cwd || process.cwd(),
+      baseAgentReleaseId: parsed.experienceBaseReleaseId,
+      agentDefinitionId: parsed.experienceAgentDefinitionId,
+      experiencePackReleaseIds: parsed.experiencePackReleaseIds,
+      taskSignatures: parsed.experienceTaskSignatures,
+      environmentTags: parsed.experienceEnvironmentTags.length
+        ? parsed.experienceEnvironmentTags
+        : exchange.defaultEnvironmentTags(),
+    });
+  }
+  const builderRequest = [parsed.request, directive, experienceContext.text].filter(Boolean).join("\n\n");
+  if (typeof options.invokeBuild === "function") {
+    await options.invokeBuild(builderRequest, {
+      plan,
+      approvedIds,
+      experienceContext,
+      mcpRuntimeAllowlist: runtimeAllowlist,
+      mcpServers: runtimeAllowlist.servers,
+    });
+  }
+  emit(renderBuildMcpResult(plan, approvedIds, runtimeAllowlist));
+  if (experienceContext.itemIds.length) emit(`Local Experience advisory attached: ${experienceContext.itemIds.length} item(s), ~${experienceContext.estimatedTokens} tokens · no server rental-resolution receipt.`);
+  return { plan, approvedIds, mcpRuntimeAllowlist: runtimeAllowlist, experienceContext, invoked: typeof options.invokeBuild === "function" };
 }
 
 function validateVariantCandidate(candidate, index) {
@@ -1052,6 +1663,9 @@ function buildExperienceContext(items, options = {}) {
 
 module.exports = {
   TOKEN_BUDGET,
+  MCP_PROBE_CONCURRENCY,
+  MCP_PROBE_PER_SERVER_TIMEOUT_MS,
+  MCP_PROBE_TOTAL_TIMEOUT_MS,
   validateExperiencePack,
   validateMcpRequirement,
   validateMcpPolicy,
@@ -1065,10 +1679,19 @@ module.exports = {
   resolveMcpRequirement,
   buildMcpPlan,
   parseBuildArgs,
+  tokenizeBuildCommandLine,
   normalizeConsentAnswer,
   askMcpConsentOnce,
   fitApprovedMcpIds,
   buildMcpDirective,
+  mcpConsentStatePath,
+  loadMcpConsentState,
+  materializeTrustedSystemMcpServer,
+  persistMcpConsentReceipts,
+  readConsentedSystemMcpServers,
+  readApprovedSystemMcpServer,
+  probeSystemMcpServerConnection,
+  resolveApprovedMcpRuntimeAllowlist,
   cmdBuild,
   resolveVariantCandidates,
   cmdVariant,

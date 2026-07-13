@@ -18,6 +18,7 @@ const fs = require("node:fs");
 const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
 const { Ui } = require("./agentlas-ui.cjs");
+const workloadRouting = require("./agentlas-workload-routing.cjs");
 
 // ── 스웜 상수 (앱 mcp/swarm-run.ts 와 동일한 안전 상한) ──
 const SWARM_MAX_TASKS = 24;
@@ -390,11 +391,12 @@ function create(deps) {
       "RULES:",
       "1. Do your task concretely with available tools/files in the current working folder.",
       "2. If the goal needs MORE work beyond your task — split into concrete next steps — end your",
-      "   message with a `## Spawn` block, one task per line as `role? | brief`:",
+      "   message with a `## Spawn` block. Every child MUST be one JSON object with a higher-level AI allocation:",
       "   ## Spawn",
-      "   - webmaster | build the landing page structure",
-      "   - | run the tests and report failures",
-      "   (role is optional; omit it for any-worker tasks. Do NOT spawn if the goal is already met.)",
+      '   - {"role":"webmaster","brief":"build the landing page structure","allocation":{"schema":"agentlas.workload-allocation.v1","tier":"balanced","effort":"high","phase":"delegate","reasonCodes":["complex-reasoning"],"rationale":"requires coordinated implementation","requiredCapabilities":["code","tools"]}}',
+      '   - {"brief":"run focused tests","allocation":{"schema":"agentlas.workload-allocation.v1","tier":"economy","effort":"low","phase":"delegate","reasonCodes":["bounded-scope"],"rationale":"bounded verification","requiredCapabilities":["code","tools"]}}',
+      "   Choose each tier/effort from the actual child difficulty; do not copy one allocation to every child.",
+      "   (role is optional. Do NOT spawn if the goal is already met.)",
       "3. Do NOT restate the whole goal. Do NOT invent work that isn't needed — over-spawning wastes the user's money.",
       "4. Everything above the `## Spawn` block is your result and is shared with peers on the blackboard.",
     ]
@@ -415,6 +417,23 @@ function create(deps) {
         continue;
       }
       const body = line.replace(/^-\s*/, "");
+      if (body.startsWith("{")) {
+        const item = workloadRouting.extractJsonObject(body);
+        if (item && typeof item === "object" && !Array.isArray(item)) {
+          const brief = String(item.brief || "").trim();
+          const allocation = workloadRouting.normalizeAllocation(item.allocation || item, "delegate");
+          if (brief) {
+            spawn.push({
+              title: String(item.title || brief).trim().slice(0, 80),
+              brief: brief.slice(0, 8_000),
+              role: item.role ? String(item.role).trim().slice(0, 80) : undefined,
+              allocation,
+            });
+          }
+        }
+        if (spawn.length >= SWARM_SPAWN_PER_TURN) break;
+        continue;
+      }
       const parts = body.split("|");
       let role;
       let brief;
@@ -424,7 +443,9 @@ function create(deps) {
       } else {
         brief = body.trim();
       }
-      if (brief) spawn.push({ title: brief.slice(0, 80), brief, role });
+      // Legacy text remains parseable, but it has no AI-authored allocation and
+      // therefore runs on the current model with an observable fallback receipt.
+      if (brief) spawn.push({ title: brief.slice(0, 80), brief, role, allocation: null });
       if (spawn.length >= SWARM_SPAWN_PER_TURN) break;
     }
     return { result, spawn };
@@ -450,11 +471,63 @@ function create(deps) {
       lang: ui.lang,
     });
 
-    async function runWorker(system, prompt) {
+    async function runBaseWorker(system, prompt) {
       if (runtime.mode === "cli") {
-        return await D.captureRuntime(runtime.kind, system, prompt, { cwd, env, permission });
+        return await D.captureRuntime(runtime.kind, system, prompt, {
+          cwd,
+          env,
+          permission,
+          model: ctx.modelPin || runtime.model || null,
+          effort: ctx.effortPin === undefined ? null : ctx.effortPin,
+        });
       }
-      const text = await D.runApi(runtime.backend, runtime.model, system, prompt);
+      const text = await D.runApi(runtime.backend, ctx.modelPin || runtime.model, system, prompt);
+      return typeof text === "string" ? text : (text && text.text) || "";
+    }
+
+    function recordAllocation(task, stage, decision, resolution, parentTaskId = null) {
+      const receipt = workloadRouting.createDecisionReceipt({
+        taskId: `${stage}-${task.id || "synthesis"}`,
+        parentTaskId,
+        taskText: task.brief || task.title || goal,
+        stage,
+        decision,
+        resolution,
+      });
+      try {
+        workloadRouting.appendDecisionReceipt(
+          receipt,
+          ctx.receiptFile || (D.modelRoutingReceiptPath && D.modelRoutingReceiptPath()),
+        );
+      } catch (error) {
+        ui.warn(`model routing receipt failed: ${String((error && error.message) || error).slice(0, 120)}`);
+      }
+      return receipt;
+    }
+
+    async function runAllocatedWorker(system, prompt, task, stage, parentTaskId = null) {
+      const resolution = workloadRouting.resolveAllocation({
+        runtime,
+        decision: task.allocation,
+        modelPin: ctx.modelPin,
+        effortPin: ctx.effortPin,
+        availableModels: ctx.availableModels,
+        maxTier: ctx.maxTier || process.env.AGENTLAS_MODEL_MAX_TIER,
+      });
+      recordAllocation(task, stage, task.allocation, resolution, parentTaskId);
+      if (resolution.fallbackReason) {
+        ui.info(`model route: ${resolution.source} · ${resolution.model || runtime.kind || runtime.backend} · ${resolution.fallbackReason}`);
+      }
+      if (runtime.mode === "cli") {
+        return await D.captureRuntime(runtime.kind, system, prompt, {
+          cwd,
+          env,
+          permission,
+          model: resolution.model,
+          effort: resolution.effort,
+        });
+      }
+      const text = await D.runApi(runtime.backend, resolution.model || runtime.model, system, prompt);
       return typeof text === "string" ? text : (text && text.text) || "";
     }
 
@@ -463,9 +536,30 @@ function create(deps) {
     ui.line(ui.c.paw("◤ ") + ui.c.bold(ui.c.text("swarm")) + ui.c.dim(`  ${label} · x${concurrency} · max ${SWARM_MAX_TASKS} tasks`));
     ui.info(goal.slice(0, 120));
 
+    ui.startSpinner(ui.lang === "ko" ? "상위 AI가 작업별 모델 비용을 배정 중…" : "Higher-level AI is allocating task models…");
+    let planned = null;
+    try {
+      const plannerText = await runBaseWorker(
+        workloadRouting.plannerSystemPrompt({
+          language: ui.lang === "ko" ? "Korean" : "English",
+          maxTasks: Math.min(SWARM_SPAWN_PER_TURN, SWARM_MAX_TASKS),
+          mode: "swarm",
+        }),
+        goal,
+      );
+      planned = workloadRouting.normalizePlan(plannerText, { maxTasks: SWARM_SPAWN_PER_TURN });
+    } catch (error) {
+      ui.warn(`workload planner failed: ${String((error && error.message) || error).slice(0, 160)}`);
+    }
+    ui.stopSpinner();
+    if (!planned) ui.warn(ui.lang === "ko" ? "모델 배정 JSON이 유효하지 않아 현재 모델로 투명하게 폴백합니다." : "Invalid allocation JSON; transparently falling back to the current model.");
+
     let seq = 0;
-    const tasks = [{ id: ++seq, title: goal.slice(0, 80), brief: goal, role: undefined, status: "pending", result: "" }];
-    const seen = new Set([goal.slice(0, 80).toLowerCase()]);
+    const initialTasks = planned
+      ? planned.tasks
+      : [{ title: goal.slice(0, 80), brief: goal, role: undefined, allocation: null }];
+    const tasks = initialTasks.map((task) => ({ id: ++seq, ...task, status: "pending", result: "", parentTaskId: null }));
+    const seen = new Set(tasks.map((task) => task.title.toLowerCase()));
     let active = 0;
     let failed = 0;
 
@@ -478,7 +572,7 @@ function create(deps) {
           task.status = "running";
           active++;
           ui.tool(`⚑ ${task.title}` + (task.role ? `  (${task.role})` : ""));
-          runWorker(swarmProtocol(goal, tasks, task), task.brief || task.title)
+          runAllocatedWorker(swarmProtocol(goal, tasks, task), task.brief || task.title, task, "worker", task.parentTaskId)
             .then((text) => {
               const parsed = parseSwarmOutput(text);
               task.status = "done";
@@ -488,7 +582,7 @@ function create(deps) {
                 const key = s.title.toLowerCase();
                 if (tasks.length >= SWARM_MAX_TASKS || seen.has(key)) continue;
                 seen.add(key);
-                tasks.push({ id: ++seq, title: s.title, brief: s.brief, role: s.role, status: "pending", result: "" });
+                tasks.push({ id: ++seq, title: s.title, brief: s.brief, role: s.role, allocation: s.allocation, status: "pending", result: "", parentTaskId: `worker-${task.id}` });
                 ui.info(`+ spawn: ${s.title}`);
               }
             })
@@ -518,7 +612,13 @@ function create(deps) {
     const pieces = done.map((t, i) => `### ${i + 1}. ${t.title}\n${t.result}`).join("\n\n");
     let finalText;
     try {
-      finalText = await runWorker(
+      const synthesisTask = {
+        id: "final",
+        title: "swarm synthesis",
+        brief: goal,
+        allocation: planned && planned.synthesis,
+      };
+      finalText = await runAllocatedWorker(
         [
           "You are the synthesizer of an agent swarm. Below are the results your peers produced for the shared goal.",
           "Integrate them into ONE coherent final answer for the user. Reconcile overlaps, note anything incomplete.",
@@ -527,6 +627,8 @@ function create(deps) {
           `Answer in the user's language (${ui.lang === "ko" ? "Korean" : "English"}).`,
         ].join("\n"),
         pieces,
+        synthesisTask,
+        "synthesis",
       );
     } catch (e) {
       ui.stopSpinner();

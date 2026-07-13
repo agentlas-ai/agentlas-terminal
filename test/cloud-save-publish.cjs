@@ -156,6 +156,40 @@ function close(server) {
     assert.equal(binary.executable, false);
     assert.equal(privateBundle.files.find((file) => file.path === "run.sh")?.executable, true);
     assert.equal(privateBundle.files.some((file) => file.path === ".agentlas-cloud-package.json"), false);
+
+    // Experience lineage is local, rebuildable, and owned separately from the
+    // immutable base Agent package. Canonical, backup, and crash-safe hidden
+    // temp siblings must neither ship nor perturb the base package hash.
+    const lineageDir = path.join(privateRoot, ".agentlas");
+    fs.mkdirSync(lineageDir, { recursive: true });
+    const lineagePaths = [
+      "experience-relations.jsonl",
+      "experience-relations.jsonl.previous",
+      ".experience-relations.jsonl.1234.tmp",
+      ".experience-relations.jsonl.tmp-recovery",
+    ];
+    for (const [index, name] of lineagePaths.entries()) {
+      fs.writeFileSync(path.join(lineageDir, name), `private-lineage-${index}\n`, "utf8");
+    }
+    const lineageExcluded = await packageCloudAgentCli(null, privateRoot, { dryRun: true, llmReview: false });
+    const lineageBundle = JSON.parse(fs.readFileSync(lineageExcluded.bundlePath, "utf8"));
+    assert.equal(lineageBundle.manifest.packageHash, privateBundle.manifest.packageHash, "local lineage must not change the base hash");
+    for (const name of lineagePaths) {
+      assert.equal(lineageBundle.files.some((file) => file.path === `.agentlas/${name}`), false, `${name} must not ship`);
+      assert.equal(lineageExcluded.files.find((file) => file.path === `.agentlas/${name}`)?.reason, "experience-lineage-separate-asset");
+      fs.appendFileSync(path.join(lineageDir, name), "changed-without-base-release\n", "utf8");
+    }
+    const lineageChanged = await packageCloudAgentCli(null, privateRoot, { dryRun: true, llmReview: false });
+    assert.equal(lineageChanged.manifest.packageHash, privateBundle.manifest.packageHash, "lineage mutation must not create a new base release identity");
+    assert.equal(
+      cloudHashPackage([...privateBundle.files, {
+        path: ".agentlas/experience-relations.jsonl.previous",
+        sha256: "f".repeat(64),
+        executable: false,
+      }], privateBundle.manifest.packageHashVersion),
+      privateBundle.manifest.packageHash,
+      "hash helper must defensively omit local Experience lineage siblings",
+    );
     assert.equal(
       cloudPortablePathConflict(["Skills/writer/SKILL.md", "skills/reviewer/SKILL.md"])?.code,
       "path-alias-collision",

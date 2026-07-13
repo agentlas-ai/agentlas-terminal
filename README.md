@@ -33,6 +33,17 @@ agentlas
 Type a task and it auto-routes to the right agent. Your model, your choice:
 Claude Code / Codex / Gemini CLI subscriptions or BYOK API keys.
 
+For team, builder, and swarm decomposition, the higher-level LLM also assigns
+each child an `economy`, `balanced`, or `frontier` tier plus reasoning effort.
+Terminal validates that structured decision and maps it within the active
+provider (`haiku/luna`, `sonnet/terra`, `opus/sol`). It does not infer model
+quality from task keywords. `/model <id>` and `/effort <level>` are explicit
+user pins and always win; `/model auto` and `/effort auto` return control to the
+allocator. `/effort off` is an explicit no-effort pin. Unavailable families
+fall back visibly to the current model. Decision receipts contain a task hash,
+not the raw prompt, in the private Agentlas user-data directory. Operators can
+set `AGENTLAS_MODEL_MAX_TIER=economy|balanced|frontier` as a hard cost ceiling.
+
 ---
 
 **Agentlas 터미널 CLI** — Claude Code(`claude`), Codex(`codex`)처럼
@@ -87,21 +98,54 @@ agentlas import <폴더>             # 로컬 에이전트/팀 임포트
 agentlas list                      # 설치된 에이전트/회사 + 활성 런타임
 ```
 
-**경험 팩과 Variant (Terminal 로컬 제어면)**
+**Portable Experience Bundle과 Variant**
 ```sh
 agentlas experience list
-agentlas experience inspect <pack-id|release-id>
-agentlas experience publish .agentlas/experience-pack.json
-agentlas experience unpublish <pack-id|release-id>
+agentlas experience inspect <exact-release-id|bundle-id|upload-id>
+agentlas experience validate <bundle.agentlas-experience.json>
+agentlas experience save <bundle> --base-cloud-id <id> --base-package-hash sha256:<hash>
+agentlas experience publish <bundle> --visibility unlisted \
+  --base-cloud-id <id> --base-package-hash sha256:<hash>
+agentlas experience status <bundle-id|upload-id>
+agentlas experience export <bundle-id|upload-id> [--out <file>] [--overwrite]
+agentlas experience unpublish <exact-release-id|bundle-id|upload-id> [--dry-run]
+# withdraw는 unpublish와 같은 exact receipt/revision 계약의 호환 별칭
+agentlas experience withdraw <exact-release-id|bundle-id|upload-id>
+
+# 로컬 0600 캐시만 만들고 Hub에는 보내지 않음
+agentlas experience save <bundle> --local-only
+
+# 이전 pack-only 로컬 의도 호환 명령
+agentlas experience legacy-list
+agentlas experience legacy-inspect <pack-id|release-id>
+agentlas experience legacy-publish .agentlas/experience-pack.json
+agentlas experience legacy-unpublish <pack-id|release-id>
 
 agentlas variant resolve --candidates variants.json --base-release <release-id>
 ```
 
-`experience publish|unpublish`는 Terminal의 **로컬 의도만** 0600 상태 파일에
-기록한다. Hub API를 호출하거나 원격 발행/회수를 성공했다고 표시하지 않으며, 실제
-Hub 영수증이 없다는 사실을 항상 출력한다. Terminal 경험 상태는 Desktop DB를
-복제하지 않는다. Experience Pack은 base release를 참조할 뿐 base package를 복사하지
-않는다.
+`validate`는 256 items/3 MiB 한도, NFC canonical hash, 비밀값·PII·raw prompt/transcript·
+로컬 경로·base package·MCP 실행 정의 유입을 모델 호출 없이 검사한다. `save`는 정확한
+Cloud base artifact를 서버에서 확인한 뒤 owner-private `draft-saved`로 저장한다.
+`publish`도 곧바로 공개하지 않고 `verification-requested`까지만 요청한다. evaluator가
+검증한 새 release와 별도 Variant가 없으면 공개 활성·평판·자동대여 권위가 생기지 않는다.
+모든 변경 요청은 기존 로그인 세션, Idempotency-Key, exact revision ETag를 사용하고,
+Terminal은 서버 영수증과 별도의 0600 로컬 상태만 보관한다. `--dry-run`은 로그인 확인,
+네트워크, 로컬 저장을 모두 하지 않는다.
+`list`와 `inspect`는 현재 프로젝트에 저장된 Portable Bundle만 다시 검증해 보여주며,
+owner/account, 로컬 경로, raw content, prompt/transcript, credential은 출력하지 않는다.
+pack ID가 여러 release를 가리키면 최신 것을 임의 선택하지 않고 정확한 release/bundle/
+upload ID를 요구한다. `unpublish --dry-run`은 로컬에서 검증된 exact server receipt와
+revision이 있을 때만 조건부 삭제 계획을 보여주며 네트워크와 로컬 쓰기를 모두 0으로
+유지한다. 실제 `unpublish`는 그 revision을 `If-Match`로 보내고 서버의 새 `withdrawn`
+영수증을 검증한 뒤에만 로컬 상태를 전진시킨다.
+`export`는 서버가 돌려준 bundle hash/semantic content/영수증 owner를 다시 검증한 뒤
+0600 파일로 원자적으로 저장한다. 기본은 기존 출력 파일을 덮어쓰지 않고 symlink는
+항상 거절하며, 같은 일반 파일을 명시적으로 교체할 때만 `--overwrite`를 사용한다.
+
+이전 pack-only 동작은 `legacy-list|legacy-inspect|legacy-publish|legacy-unpublish`로만
+명시적으로 접근한다. full Portable Bundle을 `publish`하면 새 서버 교환 경로를 사용한다. Experience Bundle은
+base release를 참조할 뿐 base package를 복사하지 않는다.
 
 `variant resolve`도 로컬 호환성 미리보기다. 후보 JSON의 `score`나
 `compatibilityStatus: verified`는 사용자가 직접 쓸 수 있으므로 평판·결제·대여·실행
@@ -113,16 +157,97 @@ receipt가 별도로 필요하다.
 agentlas build "GitHub 이슈를 정리하는 에이전트" --mcp-plan-only
 agentlas build "GitHub 이슈를 정리하는 에이전트" --approve-mcp github
 agentlas build "오프라인 에이전트" --no-mcp
+agentlas build "Windows 셸 에이전트" \
+  --experience-base-release <exact-release-id> \
+  --experience-pack-release <exact-experience-release-id> \
+  --experience-task-signature agentlas.task.v1/debugging \
+  --experience-environment agentlas.env.v1/os/windows,agentlas.env.v1/arch/x64,agentlas.env.v1/runtime/terminal
+agentlas run <agent> "Windows 오류를 디버깅해줘" \
+  --experience-base-release <exact-release-id> \
+  --experience-pack-release <exact-experience-release-id> \
+  --experience-task-signature agentlas.task.v1/debugging \
+  --experience-environment agentlas.env.v1/os/windows,agentlas.env.v1/arch/x64,agentlas.env.v1/runtime/terminal
+
+# Desktop에서 사용자가 이미 승인해 현재 장착된 exact loadout만 명시적으로 사용
+agentlas run <agent> "Windows 오류를 디버깅해줘" --experience-desktop-loadout
 ```
 
+로컬에 호환 Experience가 저장되어 있다는 사실만으로는 장착으로 보지 않는다. 빌드와
+실행은 사용자가 선택했거나 권위 있는 loadout이 넘긴 정확한 Experience release ID가
+있을 때만 그 릴리스의 항목을 조회한다. 응답 유실이나 재시작도 다른 릴리스를 대신
+붙이는 근거가 되지 않는다.
+
+Desktop 연동도 자동 장착이 아니다. `--experience-desktop-loadout`을 준 그 실행에서만
+Desktop이 canonical `terminal-bridge/ontology-loadout-v2.json`에 원자적으로 쓴 0600
+로컬 권위 receipt를 읽는다. 임의 receipt 경로는 지원하지 않는다. Terminal은 로컬 DB의
+exact 설치 에이전트 ↔ Hub base release 결속, Desktop 설치 authority instance와 단조
+sequence를 다시 확인한다. 5분이 지난 receipt, 권한이 넓은 파일, symlink, 손상·변조된
+JSON, 다른 Desktop 설치에서 복사한 receipt, rollback된 sequence, 다른 설치 에이전트,
+다른 base release는 모두 Experience 없는 안전 모드로 건너뛴다. 이 receipt는 Hub 서버
+서명이 아니라 같은 로컬 Agentlas DB에 결속된 Desktop 권위 증명이다. 같은 OS 사용자
+권한으로 DB와 canonical receipt를 함께 완전히 장악한 경우는 로컬 호스트 침해로 간주한다.
+수동 exact 플래그가 receipt와 다르면 둘 중 하나를 추정하지 않고 Experience를 끈다.
+`--no-experience`가 항상 최우선이다.
+
+설치 에이전트의 성공한 실행이 새 `procedure|decision|risk` Memory를 큐레이션하면,
+Terminal은 exact 에이전트/base release/현재 OS·arch·runtime에 묶인 Operational Experience
+후보를 기존 로컬 exchange store에 `private + draft + candidate`로 저장한다. 실행 자체는
+검증 통과로 간주하지 않으므로 후보는 자동 장착·promote·publish·Hub 전송되지 않는다.
+raw prompt/transcript, 로컬 경로, URL, 이메일·전화·고객 식별자, credential, base package
+재료가 감지되면 내용은 복사하지 않고 reason code만 로컬 run ledger에 남긴다. 같은
+실행/Memory/base/environment 재처리는 같은 후보를 재사용한다. 실패 실행과 큐레이션된
+근거가 없는 성공 실행은 RunReceipt만 남기며 후보를 만들지 않는다. `preference`는
+Operational 후보에 섞지 않고 내용 없는 로컬 Taste observation으로만 분리한다.
+
 빌드 전에는 Agentlas 시스템 전역 MCP 레지스트리의 메타데이터를 먼저 읽고, 관련
-MCP·키 필요 여부·키 존재 여부만 한 번에 보여 준다. 명령, 인자, URL, 키 값은 빌더에
-전달하지 않는다. 비대화형 실행은 묻지 않고 기본적으로 아무 MCP도 승인하지 않아
+MCP·키 필요 여부·키 존재 여부만 한 번에 보여 준다. 승인 뒤에만 정확한 시스템 전역
+DB 행을 다시 읽어 MCP initialize/tools-list 연결을 개별 검사한다. 성공한 행만 private
+structured allowlist로 native 빌더 경계에 전달되며, 자연어 prompt는 실행 권한이 아니다.
+이 첫 출력은 추천일 뿐이다. 한 번의 명시 동의 전에는 어떤 MCP도 붙이지 않고,
+네트워크 key probe나 설치도 수행하지 않는다.
+성공한 Build 승인에는 서버 ID·transport·command·args·키 이름을 묶은 비밀 없는 지문만
+로컬 영수증으로 남는다. 이후 일반 `full` 턴은 enabled 상태와 이 exact 지문이 모두 맞는
+서버만 붙이며, 행이 바뀌거나 비활성화되면 자동으로 empty-MCP로 돌아간다. Playwright를
+포함한 어떤 서버도 legacy 기본값으로 자동 주입하지 않는다.
+명령·인자는 로컬 host config에만 있고 package/prompt/영수증에는 들어가지 않으며 URL·키
+값은 전달하지 않는다. LLM provider는 자기 로그인 환경을 유지하지만 실제 MCP 자식은
+Agentlas 소유 wrapper를 거쳐 별도 HOME과 최소 실행 환경을 받는다. 이때 post-consent
+레지스트리의 `env_keys_json`에 적힌 키 이름만 값이 전달되고, 나머지 process/global/project/
+agent 자격증명은 상속되지 않는다. wrapper 설정과 로그에는 키 값이 기록되지 않는다.
+HOME과 임시 폴더도 서버별 전용 디렉터리다. PATH/OS 실행 필수값 외의 proxy·TLS override·
+NODE_OPTIONS 같은 host-control 변수는 `env_keys_json`에 적혀 있어도 거절한다.
+최대 3개 probe만 병렬 실행하고 전체 12초 deadline을 적용하므로 8개 서버가 순차로 64초를
+소모하지 않는다. 한 probe의 timeout/실패는 그 서버에만 남는다. 비대화형 실행은 묻지 않고 기본적으로 아무 MCP도 승인하지 않아
 CI가 멈추지 않는다. 한 MCP가 없거나 키가 없어도 그 기능만 degraded가 되며 빌드는
-empty-MCP 모드로 계속된다. `--require-mcp <catalog-id>`는 빌드 전체를 중단시키지 않고
+나머지 연결 또는 empty-MCP 모드로 계속된다. `--require-mcp <catalog-id>`는 빌드 전체를 중단시키지 않고
 Variant 대여 판단에서 해당 Variant만 제외하는 계약을 만든다.
+한 requirement에 승인된 alternatives가 있으면 primary 실패 뒤 같은 12초 deadline 안에서
+그 그룹만 순차 fallback하며, 다른 requirement의 probe와 결과는 격리한다.
 시스템 전역 레지스트리를 읽지 못한 경우도 `registry: unavailable`로 명확히 구분하고,
 설치나 네트워크 폴백 없이 empty-MCP 모드로 계속한다.
+REPL의 `/build`도 top-level `agentlas build`와 같은 계획·한 번 동의·결과 경로를
+사용하며, MCP 사전 계획을 건너뛰는 별도 builder 지름길은 없다.
+로컬 promoted Experience도 같은 handler에서 사용자가 고른 exact Experience release,
+exact base release, 현재 프로젝트, task signature, environment constraint가 모두 맞을 때만
+조회한다. 일반 `agentlas run`의 내부 loadout 경로 역시 설치된 Cloud package marker와
+로컬의 서버 확인 baseResolution이 hash/slug/release까지 정확히 같고, 권위 있는 loadout이
+정확한 Experience release ID를 넘긴 경우에만 후보가 된다. 현재 요청은 고정된 양언어
+키워드 표로 분류하며 허용된 `agentlas.task.v1/<class>` ID가 그 장착 릴리스의 item에 있을
+때만 조회한다. 환경도 현재 host가 만든 `agentlas.env.v1/os|arch|runtime/...` 태그와 정확히
+맞아야 한다. opaque hash, `general`, legacy signature/constraint는 저장·교환은 가능하지만
+활성하지 않고 stderr에 skip reason을 남긴다. 동의어·embedding 추정은 쓰지 않으며 CLI의
+명시 task class는 자동 분류보다 우선한다.
+분류표는 `engine/experience-taxonomy-v1.json`의 checksum
+`sha256:413833472e423352518f9591cd0e051c5bc0a7971e53ab3dc7b5aaf7d50c37ab`으로 고정한다.
+OS는 macos/windows/linux/ios/android/unknown, arch는 arm64/x64/unknown만 허용하고 runtime은
+최소 2자다. 알 수 없는 OS/arch는 해당 item만 `unknown`/ineligible 처리하며 base agent는 유지한다.
+합계 8개/800
+추정 토큰을 넘지 않으며, prompt에는 `NO SERVER RENTAL-RESOLUTION RECEIPT`가 표시되어
+로컬 사용자 증언을 서버 검증 평판처럼 오인하지 않게 한다.
+
+API/BYOK 경로의 항상 켜진 Memory emitter는 UTF-8 bytes/3 기준 150토큰 이하 core만
+주입한다. 전체 Memory Events schema는 기억·메모리 작업에서만, 로컬 credential index
+안내는 deploy/release/billing/auth/API/cloud 작업에서만 별도로 로드한다.
 
 **내 Agent Cloud 자산**
 ```sh
@@ -134,6 +259,8 @@ agentlas cloud restore <slug>      # 전체 hash 검증 후 이 컴퓨터에 exa
 
 비공개 저장도 업로드 전 로컬에서 비밀값, 안전하지 않은 경로, 파일별 hash와
 전체 package hash를 검사한다. 공개 Hub 발행에만 라우팅 카드와 공개 검토가 붙는다.
+`.agentlas/experience-relations.jsonl`과 `.previous`/hidden temp siblings는 로컬에서
+재생성되는 Experience 관계 인덱스이므로 base Agent hash와 Cloud bundle에서 제외된다.
 
 `agentlas cloud install <slug>`은 기존 호환 명령이며 공개 Hub 설치다. 비공개
 Agent Cloud 소유자 복원은 반드시 `agentlas cloud restore <slug>`를 사용한다.
@@ -147,6 +274,12 @@ agentlas call "a,b" "컨텍스트"      # 지정 에이전트 호출            
 agentlas browser                   # 실제 브라우저 하드포인트          (hep-browser)
 agentlas route "요청"              # 라우팅 미리보기 (실행 없음)
 ```
+
+`swarm`은 먼저 상위 LLM이 독립 작업과 의존성을 나누고 각 워커 및 최종 종합에
+서로 다른 모델 tier/effort를 지정한다. 터미널 코드는 이 판단을 키워드 규칙으로
+대체하지 않고, 사용 가능한 provider 모델·capability·context·비용 상한과 명시적
+사용자 고정만 검증한다. 배정 JSON이 깨지거나 provider family가 없으면 현재 모델로
+폴백하고 그 이유를 화면과 비공개 영수증에 남긴다.
 
 **지식 & 리서치**
 ```sh
@@ -185,8 +318,8 @@ REPL 안에서는 `/`로 명령 팔레트 (`/build` `/search` `/storm` `/network
 | `write` | `acceptEdits` | `workspace-write` sandbox | `auto_edit` |
 | `full` | permission 검사 우회 | approval + sandbox 우회 | `yolo` |
 
-`write`는 무제한 권한의 다른 이름이 아니다. 외부 상태를 바꿀 수 있는 MCP/Playwright
-도구는 `full` 턴에서만 주입한다. 입력창에서 `Shift-Tab`으로 권한을 순환할 수 있지만,
+`write`는 무제한 권한의 다른 이름이 아니다. 외부 상태를 바꿀 수 있는 MCP 도구는
+`full`이면서 exact 동의 지문이 유효한 턴에만 주입한다. 입력창에서 `Shift-Tab`으로 권한을 순환할 수 있지만,
 `write → full`은 5초 안에 두 번 연속 눌러야 하며 이 변경은 현재 세션에만 적용된다.
 실행 중 `Ctrl-T`는 Claude Todo/Task, Codex `todo_list`, Gemini `write_todos`가 실제로
 보낸 체크리스트만 열고 접는다. 일반 Bash/Read 실행을 계획 항목처럼 꾸며내지 않는다.

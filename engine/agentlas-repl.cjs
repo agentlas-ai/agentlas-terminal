@@ -176,6 +176,8 @@ function startRepl(opts) {
     projectPath: opts.projectPath || null,
     routePreambleOnce: null,
     effort: prefs.effort || null, // /effort: low|medium|high|max → 런타임별 reasoning 강도
+    modelPinned: false, // true only after an explicit /model <id>; /model auto clears it
+    effortPinned: prefs.effortPinned === true || Boolean(prefs.effort), // /effort auto is the only automatic mode
     cost: {}, // runtimeLabel → { turns, in, out, cost, ms } — session usage ledger
   };
 
@@ -298,6 +300,10 @@ function startRepl(opts) {
     busy = true;
     currentAbort = new AbortController();
     const signal = currentAbort.signal;
+    const experienceRunId = `terminal-run:${require("node:crypto").randomUUID()}`;
+    const runStartedAt = Date.now();
+    let experienceFinalized = false;
+    let experienceContext = null;
     try {
       ui.beginTurn({
         ...composerMeta(),
@@ -310,9 +316,32 @@ function startRepl(opts) {
       }); // 작업 중에도 composer/status bar와 실제 runtime task 목록을 화면 하단에 유지
       const recordHistoryEntry = !runOptions.side;
       const targetLang = H.detectResponseLanguage ? H.detectResponseLanguage(prompt, ui.lang) : ui.lang;
-      const ctx = { ...ctxNow(), lang: targetLang, uiLang: ui.lang };
+      const curatedMemories = [];
+      const ctx = { ...ctxNow(), lang: targetLang, uiLang: ui.lang, curatedMemories };
       const rt = state.runtime;
-      const costLabel = runtimeLabel(rt);
+      let workloadResolution = null;
+      if (state.subject && state.subject.kind === "firm" && typeof H.allocateWorkload === "function") {
+        ui.status(targetLang === "ko" ? "상위 AI가 팀 작업의 모델 비용을 배정 중…" : "Higher-level AI is allocating the team model…");
+        const planned = await H.allocateWorkload(db, prompt, {
+          runtime: rt,
+          cwd: state.cwd,
+          projectPath: state.projectPath,
+          agentId: state.subject.id,
+          lang: targetLang,
+          mode: "team",
+          modelPin: state.modelPinned ? rt.model : null,
+          effortPin: state.effortPinned ? (state.effort || "none") : undefined,
+          onWarning: (message) => ui.warn(message),
+        });
+        workloadResolution = planned && planned.resolution;
+        if (workloadResolution && workloadResolution.fallbackReason) {
+          ui.info(`model route: ${workloadResolution.source} · ${workloadResolution.model || runtimeLabel(rt)} · ${workloadResolution.fallbackReason}`);
+        }
+      }
+      const selectedModel = (workloadResolution && workloadResolution.model) || rt.model || null;
+      const selectedEffort = workloadResolution ? workloadResolution.effort : state.effort || null;
+      const costLabel = selectedModel ? `${runtimeLabel(rt)} · ${selectedModel}` : runtimeLabel(rt);
+      experienceContext = { ctx, rt, selectedModel, curatedMemories, targetLang };
       const runEnv = H.buildChildEnv ? await H.buildChildEnv(db, { ...ctx, cwd: state.cwd }) : process.env;
       ui._lastUsage = null;
       const assistantUi = makeStyleGuard(ui);
@@ -325,12 +354,17 @@ function startRepl(opts) {
           ? `${state.routePreambleOnce}\n\n${state.subject.system}`
           : state.subject.system;
         state.routePreambleOnce = null;
-        const sys = H.augmentSystem(db, subjectSystem, ctx, false);
+        const sys = H.augmentSystem(db, subjectSystem, ctx, true, prompt);
         // claude(--resume)·codex(resume <thread_id>)만 서버측에서 대화를 이어받아 이전 턴의
         // 시스템 프롬프트를 유지한다(native-host.cjs claudeArgs/codexArgs). gemini CLI는 resume
         // 플래그가 없어 매 턴이 새 프로세스 — session.id로 시스템 프롬프트를 비우면 2턴째부터
         // 페르소나가 통째로 사라진다. 그래서 gemini는 매 턴 시스템 프롬프트를 다시 보낸다.
         const resumesServerSide = rt.kind === "claude-code" || rt.kind === "codex";
+        const memoryGuard = makeMemoryGuard(assistantUi, H.eventsHeading());
+        const connectedMcpServers = state.permission === "full" && H.mcpServers
+          ? H.mcpServers(db).filter((server) =>
+            server.enabled && server.transport === "stdio" && server.runtimeEligible === true && server.runtimeConsented === true)
+          : [];
         const res = await runNativeTurn({
           kind: rt.kind,
           bin,
@@ -339,26 +373,41 @@ function startRepl(opts) {
           cwd: state.cwd,
           permission: state.permission,
           session,
-          model: rt.model || null, // /model (claude --model, codex -m, gemini -m)
-          effort: state.effort || null, // /effort (codex reasoning effort, claude think-keyword)
-          mcpServers:
-            state.permission === "full" && H.mcpServers
-              ? H.mcpServers(db).filter((s) => s.enabled && s.transport === "stdio")
-              : [],
+          model: selectedModel, // explicit /model pin or higher-level AI allocation
+          effort: selectedEffort, // explicit /effort pin or higher-level AI allocation
+          mcpServers: connectedMcpServers,
           env: runEnv,
-          ui: assistantUi,
+          ui: memoryGuard,
           signal,
         });
-        const at = (res.text || "").trim();
+        const at = (H.curateCliReply(db, res.text || "", ctx) || "").trim();
         if (recordHistoryEntry && at && !res.error) state.history.push({ role: "user", text: prompt }, { role: "assistant", text: at });
         recordCost(costLabel, res.usage);
         if (!runOptions.side && session.id && !res.error) persistSession(rt.kind, session.id, prompt);
+        if (typeof H.finalizeExperienceRun === "function") {
+          H.finalizeExperienceRun(db, {
+            agentId: ctx.agentId,
+            projectPath: ctx.projectPath,
+            cwd: state.cwd,
+            runtime: rt,
+            model: selectedModel,
+            mcpServers: connectedMcpServers,
+            curatedMemories,
+            taskHint: prompt,
+            outcome: { status: res.error ? "failed" : "succeeded", failureCode: res.error ? "runtime-error" : null },
+            usage: res.usage,
+            durationMs: Date.now() - runStartedAt,
+            runId: experienceRunId,
+            lang: targetLang,
+          });
+          experienceFinalized = true;
+        }
       } else {
         const subjectSystem = state.routePreambleOnce
           ? `${state.routePreambleOnce}\n\n${state.subject.system}`
           : state.subject.system;
         state.routePreambleOnce = null;
-        const sys = H.augmentSystem(db, subjectSystem, ctx, true);
+        const sys = H.augmentSystem(db, subjectSystem, ctx, true, prompt);
         let apiKey = null;
         if (rt.backend !== "ollama") {
           apiKey = await H.apiKey(rt.backend);
@@ -374,7 +423,7 @@ function startRepl(opts) {
         const guard = makeMemoryGuard(assistantUi, H.eventsHeading());
         const res = await runApiTurn({
           backend: rt.backend,
-          model: rt.model || H.defaultApiModel(rt.backend),
+          model: selectedModel || H.defaultApiModel(rt.backend),
           apiKey,
           system: sys,
           messages,
@@ -385,9 +434,42 @@ function startRepl(opts) {
         const cleaned = (H.curateCliReply(db, res.text || "", ctx) || "").trim();
         if (recordHistoryEntry && cleaned) state.history.push({ role: "user", text: prompt }, { role: "assistant", text: cleaned });
         recordCost(costLabel, ui._lastUsage);
+        if (typeof H.finalizeExperienceRun === "function") {
+          H.finalizeExperienceRun(db, {
+            agentId: ctx.agentId,
+            projectPath: ctx.projectPath,
+            cwd: state.cwd,
+            runtime: rt,
+            model: selectedModel,
+            curatedMemories,
+            taskHint: prompt,
+            outcome: { status: "succeeded", failureCode: null },
+            usage: ui._lastUsage,
+            durationMs: Date.now() - runStartedAt,
+            runId: experienceRunId,
+            lang: targetLang,
+          });
+          experienceFinalized = true;
+        }
       }
     } catch (e) {
       ui.stopSpinner();
+      if (!experienceFinalized && experienceContext && typeof H.finalizeExperienceRun === "function") {
+        H.finalizeExperienceRun(db, {
+          agentId: experienceContext.ctx.agentId,
+          projectPath: experienceContext.ctx.projectPath,
+          cwd: state.cwd,
+          runtime: experienceContext.rt,
+          model: experienceContext.selectedModel,
+          curatedMemories: experienceContext.curatedMemories,
+          taskHint: prompt,
+          outcome: { status: signal.aborted ? "cancelled" : "failed", failureCode: signal.aborted ? "operator-cancelled" : "runtime-error" },
+          durationMs: Date.now() - runStartedAt,
+          runId: experienceRunId,
+          lang: experienceContext.targetLang,
+        });
+        experienceFinalized = true;
+      }
       if (signal.aborted) {
         // user Ctrl-C — SIGINT handler already printed
       } else if (e && e.name === "AbortError") {
@@ -412,6 +494,7 @@ function startRepl(opts) {
       const bin = H.which(H.RUNTIME_BIN[a]);
       if (!bin) return ui.error(ui.t("runtimeNotInstalled", a));
       state.runtime = { mode: "cli", kind: a };
+      state.modelPinned = false;
       baseRuntime = state.runtime; // 명시적 /runtime 은 세션 기본으로 고정 (이후 auto-route가 덮어쓰지 않게)
       state.native = {};
       return ui.ok(ui.t("runtimeSet", a));
@@ -421,6 +504,7 @@ function startRepl(opts) {
         a === "ollama"
           ? { mode: "api", backend: "ollama", model: state.runtime.backend === "ollama" ? state.runtime.model : null }
           : { mode: "api", backend: a, model: null };
+      state.modelPinned = false;
       baseRuntime = state.runtime; // 명시적 /runtime 은 세션 기본으로 고정
       return ui.ok(ui.t("runtimeSet", runtimeLabel(state.runtime)));
     }
@@ -443,6 +527,7 @@ function startRepl(opts) {
     if (pinned && pinned !== "auto") spec = pinned;
     else spec = caps.autoRuntimeFor(subject.capAgent, { installedKinds: installedKinds(), activeSpec: caps.specOf(baseRuntime) });
     state.runtime = caps.runtimeFromSpec(spec);
+    state.modelPinned = false;
     state.native = {};
   }
   // Tell the user when we routed to an image-capable runtime, or when the current one can't make images.
@@ -783,7 +868,15 @@ function startRepl(opts) {
       case "build": {
         if (!arg) return ui.warn("usage: /build <만들고 싶은 에이전트/팀 설명>"), true;
         ui.line("");
-        await H.hepRun(["hep-build", arg], { cwd: state.cwd });
+        if (typeof H.terminalBuild !== "function") throw new Error("Terminal MCP build preflight is unavailable");
+        await H.terminalBuild(db, arg, {
+          cwd: state.cwd,
+          modelPin: state.modelPinned ? state.runtime.model : null,
+          effortPin: state.effortPinned ? (state.effort || "none") : undefined,
+          input: process.stdin,
+          promptOutput: process.stderr,
+          out: (line) => ui.line(String(line)),
+        });
         return true;
       }
       case "route": {
@@ -838,27 +931,36 @@ function startRepl(opts) {
           concurrency,
           agent: state.subject && state.subject.capAgent,
           projectPath: state.projectPath,
+          modelPin: state.modelPinned ? state.runtime.model : null,
+          effortPin: state.effortPinned ? (state.effort || "none") : undefined,
         });
         return true;
       }
-      case "model":
+      case "model": {
         // CLI(claude/codex/gemini)와 BYOK/Ollama 모두 지원 — 각 런타임의 모델 플래그로 전달.
-        state.runtime.model = arg || null;
+        const requested = (arg || "").trim();
+        state.runtime.model = !requested || requested.toLowerCase() === "auto" ? null : requested;
+        state.modelPinned = Boolean(state.runtime.model);
         state.native = {}; // 새 모델로 세션 리셋
-        ui.ok(ui.t("modelSet", state.runtime.model || ui.t("modelDefault")));
+        ui.ok(ui.t("modelSet", state.runtime.model || "auto"));
         return true;
+      }
       case "effort": {
         const lv = (arg || "").toLowerCase().trim();
         if (!lv) {
-          ui.info(ui.t("effortCurrent", state.effort || ui.t("modelDefault")));
+          ui.info(ui.t("effortCurrent", state.effortPinned ? (state.effort || "off") : "auto"));
           return true;
         }
         if (!["low", "medium", "high", "max", "auto", "off"].includes(lv)) {
           return ui.warn(ui.t("effortUsage")), true;
         }
         state.effort = lv === "auto" || lv === "off" ? null : lv;
+        state.effortPinned = lv !== "auto";
+        prefs.effort = state.effort;
+        prefs.effortPinned = state.effortPinned;
+        if (opts.savePrefs) opts.savePrefs(prefs);
         state.native = {};
-        ui.ok(ui.t("effortSet", state.effort || ui.t("modelDefault")));
+        ui.ok(ui.t("effortSet", state.effortPinned ? (state.effort || "off") : "auto"));
         return true;
       }
       case "permission":
@@ -979,16 +1081,15 @@ function startRepl(opts) {
         const servers = H.mcpServers ? H.mcpServers(db) : [];
         ui.line("");
         ui.rule("MCP");
-        ui.line("   " + ui.c.emerald(ui.t("mcp.playwright").padEnd(22)) + ui.c.blue("stdio  ") + ui.c.green("on ") + ui.c.dim("  " + ui.t("mcp.fullOnly")));
         for (const s of servers) {
           let envKeys = [];
           try { envKeys = JSON.parse(s.env_keys_json || "[]"); } catch { /* ignore */ }
           const name = ui.lang === "en" ? (s.name_en || s.name) : s.name;
-          const on = s.enabled ? ui.c.green("on ") : ui.c.faint("off");
+          const on = s.enabled && s.runtimeConsented ? ui.c.green("on ") : s.enabled ? ui.c.faint("consent") : ui.c.faint("off");
           const envStr = envKeys.length ? envKeys.join(", ") : "no key";
           ui.line("   " + ui.c.emerald(String(name).padEnd(22)) + ui.c.blue(String(s.transport || "").padEnd(7)) + on + ui.c.dim("  " + envStr));
         }
-        const wired = servers.filter((s) => s.enabled && s.transport === "stdio").length + 1; // +1 = full-only Playwright
+        const wired = servers.filter((s) => s.enabled && s.transport === "stdio" && s.runtimeEligible === true && s.runtimeConsented === true).length;
         ui.line("   " + ui.c.faint(ui.t("mcp.wired", String(wired))));
         ui.line("   " + ui.c.faint(ui.t("mcp.usage")));
         return true;

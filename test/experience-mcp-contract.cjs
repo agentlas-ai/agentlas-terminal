@@ -3,6 +3,7 @@
 
 const assert = require("node:assert/strict");
 const { spawn } = require("node:child_process");
+const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -18,15 +19,20 @@ fs.mkdirSync(project, { recursive: true });
 fs.writeFileSync(path.join(userData, "credentials.env"), "GITHUB_TOKEN=super-secret-value\n", { mode: 0o600 });
 
 const mcpRows = [
-  { id: "github", catalog_id: "github", name: "GitHub", name_en: "GitHub", transport: "stdio", env_keys_json: '["GITHUB_TOKEN"]', enabled: 1 },
-  { id: "playwright", catalog_id: "playwright", name: "Playwright", name_en: "Playwright", transport: "stdio", env_keys_json: "[]", enabled: 1 },
-  { id: "database", catalog_id: "database", name: "Database", name_en: "Database", transport: "stdio", env_keys_json: '["DATABASE_TOKEN"]', enabled: 1 },
-  { id: "disabled", catalog_id: "disabled", name: "Disabled", name_en: "Disabled", transport: "stdio", env_keys_json: "[]", enabled: 0 },
+  { id: "github", catalog_id: "github", name: "GitHub", name_en: "GitHub", transport: "stdio", command: "github-mcp", args_json: '["--stdio"]', env_keys_json: '["GITHUB_TOKEN"]', enabled: 1 },
+  { id: "playwright", catalog_id: "playwright", name: "Playwright", name_en: "Playwright", transport: "stdio", command: "playwright-mcp", args_json: "[]", env_keys_json: "[]", enabled: 1 },
+  { id: "database", catalog_id: "database", name: "Database", name_en: "Database", transport: "stdio", command: "database-mcp", args_json: "[]", env_keys_json: '["DATABASE_TOKEN"]', enabled: 1 },
+  { id: "disabled", catalog_id: "disabled", name: "Disabled", name_en: "Disabled", transport: "stdio", command: "disabled-mcp", args_json: "[]", env_keys_json: "[]", enabled: 0 },
 ];
 const db = {
   prepare(sql) {
-    assert.doesNotMatch(sql, /command|args_json|\burl\b/i, "inventory query must not read executable or endpoint data");
-    return { all: () => mcpRows };
+    if (!/\bcommand\b|args_json/i.test(sql)) {
+      assert.doesNotMatch(sql, /\burl\b/i, "inventory query must not read endpoint data");
+      return { all: () => mcpRows.map(({ command, args_json, ...row }) => row) };
+    }
+    assert.match(sql, /WHERE id=\? LIMIT 1/, "executable fields may be read only for one exact post-consent registry row");
+    assert.doesNotMatch(sql, /\burl\b/i);
+    return { get: (id) => mcpRows.find((row) => row.id === id) || null };
   },
 };
 const emptyDb = { prepare: () => ({ all: () => [] }) };
@@ -154,6 +160,9 @@ function check(fn) { fn(); checks += 1; }
     const unsafeFile = path.join(project, "unsafe-pack.json");
     fs.writeFileSync(unsafeFile, JSON.stringify(unsafe));
     check(() => assert.throws(() => terminal.publishExperienceIntent(userData, unsafeFile, project), /not public-safe/));
+    const unsafePath = structuredClone(pack);
+    unsafePath.mcpRequirements[0].reason = "source:/Library/Application Support/private.db";
+    check(() => assert.throws(() => terminal.validateExperiencePack(unsafePath), /not public-safe/));
     const copiedBase = structuredClone(pack);
     copiedBase.containsBasePackageMaterial = true;
     check(() => assert.throws(() => terminal.validateExperiencePack(copiedBase), /copied base material is forbidden/));
@@ -179,6 +188,29 @@ function check(fn) { fn(); checks += 1; }
     check(() => assert.equal(networkCalls, 0));
     check(() => assert.deepEqual(plan.availableCatalogIds, ["github"]));
     check(() => assert.equal(plan.discoveryNetworkUsed, false));
+
+    const probeChild = new EventEmitter();
+    probeChild.stdin = new PassThrough();
+    probeChild.stdout = new PassThrough();
+    probeChild.kill = () => true;
+    let probeInput = "";
+    probeChild.stdin.on("data", (chunk) => {
+      probeInput += String(chunk);
+      const lines = probeInput.split("\n");
+      probeInput = lines.pop();
+      for (const line of lines.filter(Boolean)) {
+        const message = JSON.parse(line);
+        if (message.id === 1) probeChild.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, result: { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "fixture", version: "1" } } })}\n`);
+        if (message.id === 2) probeChild.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, result: { tools: [] } })}\n`);
+      }
+    });
+    const probeResult = await terminal.probeSystemMcpServerConnection({ command: "fixture-mcp", args_json: "[]" }, {
+      timeoutMs: 500,
+      spawn: () => probeChild,
+      env: {},
+      cwd: project,
+    });
+    check(() => assert.deepEqual(probeResult, { connected: true, reason: "connected" }));
 
     const permissionRequirement = requirement("github", false, true);
     permissionRequirement.priority = 7;
@@ -220,6 +252,7 @@ function check(fn) { fn(); checks += 1; }
 
     let invoked = 0;
     let builderRequest = "";
+    let builderMetadata = null;
     const buildOutput = [];
     const nonTtyInput = { isTTY: false };
     const nonTtyOutput = { isTTY: false };
@@ -232,10 +265,12 @@ function check(fn) { fn(); checks += 1; }
       input: nonTtyInput,
       promptOutput: nonTtyOutput,
       out: (line) => buildOutput.push(line),
-      invokeBuild: async (request) => { invoked += 1; builderRequest = request; },
+      invokeBuild: async (request, metadata) => { invoked += 1; builderRequest = request; builderMetadata = metadata; },
     });
     check(() => assert.equal(invoked, 1));
     check(() => assert.deepEqual(buildResult.approvedIds, [], "non-TTY must fail safe without prompting/auto-approval"));
+    check(() => assert.deepEqual(builderMetadata.mcpServers, [], "zero approval must cross the actual builder boundary as an exact empty allowlist"));
+    check(() => assert.equal(buildResult.mcpRuntimeAllowlist.emptyMode, true));
     check(() => assert.match(builderRequest, /Approved catalog IDs: none/));
     check(() => assert.doesNotMatch(builderRequest + buildOutput.join("\n"), /super-secret-value|GITHUB_TOKEN|command|args_json|https?:\/\//));
     check(() => assert.match(buildOutput.at(-1), /empty-MCP mode/));
@@ -266,10 +301,48 @@ function check(fn) { fn(); checks += 1; }
       input: nonTtyInput,
       promptOutput: nonTtyOutput,
       out: () => {},
-      invokeBuild: async (request) => { builderRequest = request; },
+      probeMcpServer: async () => ({ connected: true, reason: "connected" }),
+      invokeBuild: async (request, metadata) => { builderRequest = request; builderMetadata = metadata; },
     });
     check(() => assert.deepEqual(approvedResult.approvedIds, ["github"]));
     check(() => assert.match(builderRequest, /Approved catalog IDs: github/));
+    check(() => assert.deepEqual(builderMetadata.mcpServers.map((server) => server.catalog_id), ["github"]));
+    check(() => assert.equal(builderMetadata.mcpServers.some((server) => server.catalog_id === "playwright"), false, "an unapproved system-global row must not reach the runtime"));
+    check(() => assert.doesNotMatch(JSON.stringify(approvedResult.mcpRuntimeAllowlist), /github-mcp|--stdio|command|args_json|GITHUB_TOKEN/));
+
+    let isolatedBuilderCalls = 0;
+    let isolatedMetadata = null;
+    const isolatedFailure = await terminal.cmdBuild({
+      db,
+      args: ["browser repository agent", "--recommend-mcp", "github,playwright", "--approve-mcp", "github,playwright"],
+      userDataDir: userData,
+      cwd: project,
+      env: {},
+      input: nonTtyInput,
+      promptOutput: nonTtyOutput,
+      out: () => {},
+      probeMcpServer: async (server) => server.catalog_id === "github"
+        ? { connected: false, reason: "connection_failed" }
+        : { connected: true, reason: "connected" },
+      invokeBuild: async (_request, metadata) => { isolatedBuilderCalls += 1; isolatedMetadata = metadata; },
+    });
+    check(() => assert.equal(isolatedBuilderCalls, 1, "one failed MCP must not abort the build"));
+    check(() => assert.deepEqual(isolatedMetadata.mcpServers.map((server) => server.catalog_id), ["playwright"]));
+    check(() => assert.deepEqual(isolatedFailure.mcpRuntimeAllowlist.attached.map((item) => item.catalogId), ["playwright"]));
+    check(() => assert.deepEqual(isolatedFailure.mcpRuntimeAllowlist.failed, [{ catalogId: "github", reason: "connection_failed" }]));
+    check(() => assert.deepEqual(
+      terminal.tokenizeBuildCommandLine('"GitHub 이슈 에이전트" --approve-mcp github --no-mcp'),
+      ["GitHub 이슈 에이전트", "--approve-mcp", "github", "--no-mcp"],
+    ));
+    check(() => assert.deepEqual(
+      terminal.tokenizeBuildCommandLine('Windows C:\\Users\\mason\\project 자동화 --no-mcp'),
+      ["Windows", "C:\\Users\\mason\\project", "자동화", "--no-mcp"],
+    ));
+    check(() => assert.throws(() => terminal.tokenizeBuildCommandLine('"닫히지 않은 요청'), /unterminated quote/));
+    const replFlagParse = terminal.parseBuildArgs(terminal.tokenizeBuildCommandLine('"문서 자동화 에이전트" --no-mcp --mcp-plan-only'));
+    check(() => assert.equal(replFlagParse.request, "문서 자동화 에이전트"));
+    check(() => assert.equal(replFlagParse.noMcp, true));
+    check(() => assert.equal(replFlagParse.planOnly, true));
 
     const longIds = Array.from({ length: 10 }, (_, index) => `catalog-${index}-${"a".repeat(170)}`);
     const longPlan = { availableCatalogIds: longIds, shortages: [], entries: [], maxApprovedMcp: 8 };
@@ -361,6 +434,15 @@ function check(fn) { fn(); checks += 1; }
     check(() => assert.ok(context.estimatedTokens <= terminal.TOKEN_BUDGET.experienceRetrievalMaxTokens));
     check(() => assert.equal(context.estimatedTokens, terminal.estimateTokens(context.text)));
     check(() => assert.deepEqual(terminal.TOKEN_BUDGET, { coreMemoryMaxTokens: 150, experienceRetrievalMaxTokens: 800, experienceRetrievalMaxItems: 8 }));
+    const replSource = fs.readFileSync(path.join(__dirname, "../engine/agentlas-repl.cjs"), "utf8");
+    const mainSource = fs.readFileSync(path.join(__dirname, "../engine/agentlas.cjs"), "utf8");
+    const replBuildCase = replSource.slice(replSource.indexOf('case "build"'), replSource.indexOf('case "route"'));
+    check(() => assert.match(replBuildCase, /H\.terminalBuild\(/, "REPL /build must use the same Terminal-owned MCP preflight as top-level build"));
+    check(() => assert.doesNotMatch(replBuildCase, /H\.hepRun\(\["hep-build"/, "REPL /build must not bypass MCP consent/receipt planning"));
+    check(() => assert.match(mainSource, /terminalBuild:\s*\(db_, args, ctx = \{\}\) => terminalAssets\.cmdBuild/, "main helper must expose the shared Terminal build command"));
+    check(() => assert.match(mainSource, /invokeBuild:\s*\(request, metadata\) => runTerminalBuilder/, "both Build surfaces must cross the structured native builder boundary"));
+    check(() => assert.match(mainSource, /mcpServers:\s*Array\.isArray\(metadata\.mcpServers\)/, "native Build must consume only the private reviewed server list"));
+    check(() => assert.match(mainSource, /mcpAllowlistMode:\s*"exact"/, "native Build must suppress default/global MCP fallback"));
 
     console.log(JSON.stringify({ ok: true, checks }, null, 2));
   } finally {
