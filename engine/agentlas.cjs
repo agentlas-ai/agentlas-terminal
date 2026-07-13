@@ -7910,7 +7910,21 @@ function ensureCoreProjectCli(projectPath, options = {}) {
       { cwd: root },
       coreRoot,
     );
-    if (result && result.status === "active") {
+    const canonical = Boolean(
+      result
+      && result.schemaVersion === "agentlas.project-bootstrap.v1"
+      && ["active", "privacy_warning"].includes(result.status)
+      && result.mergeOnly === true
+      && result.privacyBlockInstalled === true
+      && result.privateModeCompliant === true
+      && Array.isArray(result.missing)
+      && result.missing.length === 0
+      && Array.isArray(result.overwritten)
+      && result.overwritten.length === 0
+      && Array.isArray(result.permissionIssues)
+      && result.permissionIssues.length === 0
+    );
+    if (canonical) {
       // Core owns the canonical seed. Terminal adds one intentionally broader
       // guard so future local memory files are private without a release update.
       ensureAgentlasProjectStateIgnoreCli(root);
