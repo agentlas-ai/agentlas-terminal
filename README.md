@@ -17,8 +17,9 @@ Claude Code style, standalone: **no desktop app required.**
 Agentlas Terminal is the already-shipped independent terminal product. It is
 not a Desktop `cli/` mirror and does not require the Desktop app to run.
 
-> **Current release status (2026-07-14):** GitHub `v0.8.1` · npm `0.8.1` ·
-> `main` `0.8.1`. `npm install -g agentlas` installs the same immutable release.
+> **Current source release (2026-07-14):** `v0.8.2`. The GitHub tag is the
+> immutable source; verify the independently published npm version with
+> `npm view agentlas version` before installation.
 
 Release history and the source-versus-registry boundary are recorded in
 [CHANGELOG.md](CHANGELOG.md). A published version must always come from its

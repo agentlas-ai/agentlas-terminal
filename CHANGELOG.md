@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.8.2 — 2026-07-14
+
+- Include the post-`v0.8.1` hardened execution boundary: read-only discovery
+  remains passive, while the first real write/full run installs the complete
+  Core-owned project soul, memory, code map, ontology, Career Graph, and
+  privacy-first `.gitignore` contract.
+- Fail closed when the parent AI's exact model choice is absent from live
+  inventory, exceeds a cost ceiling, or lacks required capabilities/context;
+  no provider alias or tier-to-model table chooses a model for the AI.
+- Pin the cross-platform release gate to Agentlas OS v1.1.27 commit
+  `e024b68821b28aa40c7a22c94ac3832fed4155dd`, including the Windows ACL/POSIX
+  mode correction, and require the same Goal + UltraCode prompt bytes on all
+  three operating systems.
+
+GitHub and npm publication remain separate operations. The registry version is
+authoritative for `npm install -g agentlas` and must be verified after publish.
+
 ## 0.8.1 — 2026-07-14
 
 - Load the canonical, digest-addressed Stormbreaker Goal + UltraCode harness
@@ -19,8 +36,9 @@
 - Gate the Terminal release contract on the pinned Agentlas Core
   project-bootstrap surface across macOS, Linux, and Windows.
 
-GitHub release and npm package: `v0.8.1` / `agentlas@0.8.1`. Both are built
-from the exact immutable tag.
+GitHub tag: `v0.8.1`. The npm registry remained on `0.7.0`; the attempted
+`0.8.1` publication was rejected by the registry's OTP gate and was never
+reported as installed.
 
 ## 0.8.0 — 2026-07-13
 

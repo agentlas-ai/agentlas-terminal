@@ -46,7 +46,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: agentlas-ai/Agentlas-OS
-          ref: 1228f3179fc84c8be7b4f3351359492ac73d9dae
+          ref: e024b68821b28aa40c7a22c94ac3832fed4155dd
           path: Agentlas-OS
       - uses: actions/setup-node@v4
         with:
