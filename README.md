@@ -21,6 +21,12 @@ not a Desktop `cli/` mirror and does not require the Desktop app to run.
 > immutable source; verify the independently published npm version with
 > `npm view agentlas version` before installation.
 
+Release tags are published to npm through the repository's OIDC trusted
+publisher workflow. The workflow accepts only an exact immutable `vX.Y.Z` tag,
+runs the Core/project-bootstrap contracts and smoke suite, and verifies the
+registry result after publishing. No long-lived npm publish token is stored in
+GitHub.
+
 Release history and the source-versus-registry boundary are recorded in
 [CHANGELOG.md](CHANGELOG.md). A published version must always come from its
 exact tag: post-tag `main` changes are the next version and must never be

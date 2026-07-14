@@ -1,0 +1,126 @@
+name: Publish npm package
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Exact immutable release tag to publish (for example v0.8.2)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: npm-publish-${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AGENTLAS_CORE_COMMIT: e024b68821b28aa40c7a22c94ac3832fed4155dd
+      HEPHAESTUS_RUNTIME_ROOT: ${{ github.workspace }}/Agentlas-OS
+      HEPHAESTUS_PYTHON: python
+    steps:
+      - name: Resolve immutable release tag
+        id: release
+        env:
+          REQUESTED_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$REQUESTED_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Expected an exact vX.Y.Z release tag, got: $REQUESTED_REF" >&2
+            exit 1
+          fi
+          echo "tag=$REQUESTED_REF" >> "$GITHUB_OUTPUT"
+          echo "version=${REQUESTED_REF#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.release.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/checkout@v6
+        with:
+          repository: agentlas-ai/Agentlas-OS
+          ref: ${{ env.AGENTLAS_CORE_COMMIT }}
+          path: Agentlas-OS
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Pin npm trusted-publishing client
+        run: |
+          npm install --global npm@11.7.0
+          test "$(npm --version)" = "11.7.0"
+
+      - name: Verify tag and package identity
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(git describe --tags --exact-match HEAD)" = "$RELEASE_TAG"
+          test "$(node -p "require('./package.json').name")" = "agentlas"
+          test "$(node -p "require('./package.json').version")" = "$RELEASE_VERSION"
+          test "$(node -p "require('./package.json').repository.url")" = "git+https://github.com/agentlas-ai/agentlas-terminal.git"
+          test "$(git -C "$HEPHAESTUS_RUNTIME_ROOT" rev-parse HEAD)" = "$AGENTLAS_CORE_COMMIT"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify release contracts
+        run: npm run test:release-contracts
+
+      - name: Run smoke suite
+        run: npm run smoke
+
+      - name: Verify package contents
+        run: npm pack --dry-run --json > "$RUNNER_TEMP/npm-pack.json"
+
+      - name: Check registry state
+        id: registry
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          if npm view "agentlas@$RELEASE_VERSION" version --json >/dev/null 2>&1; then
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish with npm trusted publishing
+        if: steps.registry.outputs.already_published != 'true'
+        run: npm publish --access public
+
+      - name: Verify registry publication
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          for attempt in {1..12}; do
+            published="$(npm view "agentlas@$RELEASE_VERSION" version --json 2>/dev/null | tr -d '"' || true)"
+            if [ "$published" = "$RELEASE_VERSION" ]; then
+              npm view "agentlas@$RELEASE_VERSION" dist.tarball dist.integrity --json
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "agentlas@$RELEASE_VERSION did not become visible in the registry" >&2
+          exit 1
