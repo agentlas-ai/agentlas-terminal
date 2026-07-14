@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.3 — 2026-07-14
+
+- Pin all release and npm publication gates to Agentlas OS v1.1.28 commit
+  `d741da796289678c38fac1059f0473f271d0f7e9`. Codex, Claude Code, MCP,
+  Network, owner Cloud, and Storm plugin contacts now synchronously install the
+  same Core-owned project soul memory, code map, ontology runtime, CareerGraph,
+  and full `.agentlas/` privacy block before agent work starts.
+- Ship the repository's npm OIDC trusted-publishing workflow. It accepts only
+  an exact immutable release tag, reruns the Core contracts and 45-case smoke
+  suite, and verifies registry visibility without storing a long-lived npm
+  publish token in GitHub.
+
 ## 0.8.2 — 2026-07-14
 
 - Include the post-`v0.8.1` hardened execution boundary: read-only discovery
