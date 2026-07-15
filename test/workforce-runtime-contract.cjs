@@ -872,6 +872,22 @@ function portableContractFailsClosed() {
     () => _test.validateWorkOrder(extraWorkOrderKey),
     (error) => error.code === "work_order_invalid" && /direct WorkOrder/.test(error.message),
   );
+  const globalCommunityConflict = structuredClone(f.workOrder);
+  globalCommunityConflict.forbiddenCommunities.push(globalCommunityConflict.roleSlots[0].requiredCommunities[0]);
+  const globalCommunityConflictBefore = structuredClone(globalCommunityConflict);
+  assert.throws(
+    () => _test.validateWorkOrder(globalCommunityConflict),
+    (error) => error.code === "work_order_invalid" && /cannot contain a community required or optionally preferred/.test(error.message),
+  );
+  assert.deepEqual(globalCommunityConflict, globalCommunityConflictBefore, "the host must reject, not remove, a contradictory global exclusion");
+  const slotCommunityConflict = structuredClone(f.workOrder);
+  slotCommunityConflict.roleSlots[0].excludedCommunities.push(slotCommunityConflict.roleSlots[0].requiredCommunities[0]);
+  const slotCommunityConflictBefore = structuredClone(slotCommunityConflict);
+  assert.throws(
+    () => _test.validateWorkOrder(slotCommunityConflict),
+    (error) => error.code === "work_order_invalid" && /cannot exclude a community it requires or optionally prefers/.test(error.message),
+  );
+  assert.deepEqual(slotCommunityConflict, slotCommunityConflictBefore, "the host must reject, not remove, a contradictory slot exclusion");
   const legacyEnvelope = JSON.parse(nestedNameEnvelope("workforce.search_candidates", "workOrder", f.workOrder));
   assert.throws(
     () => _test.validateWorkOrder(legacyEnvelope),
@@ -934,6 +950,15 @@ function sourceBoundaryContract() {
   assert.match(prompts.selectionSystem, /Return the direct Selection JSON object only/);
   assert.match(prompts.searchSchemaRequirements, /host invokes workforce\.search_candidates/);
   assert.match(prompts.selectionSchemaRequirements, /host invokes workforce\.validate_selection/);
+  assert.match(prompts.searchSystem, /forbiddenCommunities is not the inverse of selected communities and not an exhaustive list/);
+  assert.match(prompts.searchSystem, /Empty exclusion arrays are correct/);
+  assert.match(prompts.searchSystem, /Never forbid or exclude a broad ancestor, descendant, adjacent, or legitimately co-occurring community/);
+  assert.match(prompts.searchSystem, /requiredRoles must default to \[\]/);
+  assert.match(prompts.searchSystem, /there is no optionalRoles field/);
+  assert.doesNotMatch(prompts.searchSystem, /put communities unrelated to the whole project in forbiddenCommunities/);
+  assert.match(prompts.refinementSystem, /Preserve community prohibitions explicitly stated in the redacted taskBrief/);
+  assert.match(prompts.refinementSystem, /correct exclusions inferred by the prior job analysis/);
+  assert.match(prompts.refinementSystem, /coverage gap codes show forbidden-community exclusion/);
   assert.doesNotMatch(prompts.searchSystem, /Return exactly one envelope/);
   assert.doesNotMatch(prompts.selectionSystem, /Return exactly one envelope/);
 }
