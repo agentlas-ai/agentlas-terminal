@@ -9,6 +9,11 @@
 - Persist every benchmark run as a scorer-ready, private JSON artifact with the
   work order, content-only candidate set, host selection, three MCP receipts,
   and real planner/worker/synthesis/verifier execution evidence.
+- Give the host LLM one bounded schema-only repair attempt for malformed work
+  orders, selections, or delegation plans. Every attempt is digest-audited;
+  Terminal never fills a missing hard field, retries transport failures, falls
+  back to a lexical router, or persists raw prior model output, and exhaustion
+  still writes a failed benchmark artifact before stopping.
 - Ordinary `/network`, `/taskforce`, and `/workforce` requests now use the
   Agent Workforce Ontology protocol. The active host LLM creates the pinned
   work order and selects exact AgentRelease IDs from the Hub candidate menu;

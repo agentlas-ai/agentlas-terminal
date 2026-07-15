@@ -309,6 +309,99 @@ async function successContract() {
   assert.equal(h.benchmarkArtifacts[0].executionReceipt.status, "passed");
 }
 
+async function malformedStructuredStagesRepairOnceAndSucceed() {
+  const f = fixture();
+  const malformedWorkOrder = structuredClone(f.workOrder);
+  delete malformedWorkOrder.roleSlots[0].requiredRoles;
+  const malformedSelection = structuredClone(f.selection);
+  delete malformedSelection.edges;
+  const malformedPlan = structuredClone(f.plan);
+  delete malformedPlan.packets[0].expectedOutput;
+  const h = harness({
+    modelOutputs: [
+      JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.search_candidates", arguments: { workOrder: malformedWorkOrder } } }),
+      JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.search_candidates", arguments: { workOrder: f.workOrder } } }),
+      JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.validate_selection", arguments: { selection: malformedSelection } } }),
+      JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.validate_selection", arguments: { selection: f.selection } } }),
+      JSON.stringify(malformedPlan),
+      JSON.stringify(f.plan),
+      "Backend handoff: idempotency key state machine and serializable transaction boundary.",
+      "Verifier handoff: replay, partial-failure, forged-key, and concurrent-commit adversarial cases.",
+      "Integrated deliverable with transaction design, adversarial tests, and explicit limitations.",
+      JSON.stringify({
+        schemaVersion: "agentlas.workforce-verification.v1",
+        status: "passed",
+        checks: [{ checkId: "check:repair", status: "passed", evidence: "all repaired stages retained exact releases" }],
+        issues: [],
+      }),
+    ],
+  });
+  const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true, concurrency: 2 });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  assert.equal(h.modelCalls.length, 10);
+  assert.deepEqual(h.hubCalls.map((row) => row.name), [
+    "workforce.search_candidates",
+    "workforce.validate_selection",
+    "workforce.prepare_execution",
+  ]);
+  for (const phase of ["leader-work-order", "leader-selection", "planner"]) {
+    const attempts = result.receipt.structuredModelAttempts.filter((row) => row.phase === phase);
+    assert.deepEqual(attempts.map((row) => row.status), ["rejected", "accepted"]);
+    assert.deepEqual(attempts.map((row) => row.attempt), [1, 2]);
+    assert.equal(attempts[0].retryScheduled, true);
+    assert.equal(attempts[1].repairAttempt, true);
+    assert.equal(attempts[1].priorOutputIncluded, true);
+    assert.equal(attempts.every((row) => row.hostMutationApplied === false && row.fallbackUsed === false), true);
+  }
+  for (const repairCall of [h.modelCalls[1], h.modelCalls[3], h.modelCalls[5]]) {
+    assert.match(repairCall.system, /STRUCTURED OUTPUT REPAIR MODE/);
+    assert.match(repairCall.prompt, /^VALIDATION=/);
+    assert.match(repairCall.prompt, /EXACT_SCHEMA_REQUIREMENTS=/);
+    assert.match(repairCall.prompt, /PRIOR_MODEL_OUTPUT_DATA=/);
+    assert.doesNotMatch(repairCall.prompt, /ORIGINAL_STAGE_INPUT|error\.details/i);
+  }
+  assert.doesNotMatch(h.modelCalls[3].prompt, /WORK_ORDER_DATA=|CANDIDATE_SET_DATA=/);
+  assert.doesNotMatch(h.modelCalls[5].prompt, /ACCEPTED_SELECTION_DATA=|PREPARED_RELEASE_PINS=/);
+  assert.equal(result.receipt.planner.structuredAttemptCount, 2);
+  assert.equal(result.receipt.planner.structuredRepairCount, 1);
+  assert.equal(result.receipt.benchmarkAudit.structuredAttemptAuditPassed, true);
+  assert.equal(result.receipt.benchmarkAudit.structuredRepairCount, 3);
+  assert.equal(result.receipt.benchmarkAudit.passed, true);
+  assert.equal(h.benchmarkArtifacts.length, 1);
+  assert.equal(h.benchmarkArtifacts[0].executionReceipt.structuredModelAttempts.length, 6);
+  assert.deepEqual(
+    h.benchmarkArtifacts[0].selectionReceipt.leaderInvocations.filter((row) => row.status === "completed").map((row) => row.phase),
+    ["work-order", "selection"],
+  );
+}
+
+async function structuredRepairExhaustionFailsBeforeHubAndPersistsArtifact() {
+  const f = fixture();
+  const malformedWorkOrder = structuredClone(f.workOrder);
+  delete malformedWorkOrder.roleSlots[0].requiredRoles;
+  const invalidEnvelope = JSON.stringify({
+    schemaVersion: "agentlas.workforce-leader-call.v1",
+    toolCall: { name: "workforce.search_candidates", arguments: { workOrder: malformedWorkOrder } },
+  });
+  const h = harness({ modelOutputs: [invalidEnvelope, invalidEnvelope] });
+  const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "invalid_contract");
+  assert.equal(result.error.details.structuredRetryExhausted, true);
+  assert.equal(result.error.details.phase, "leader-work-order");
+  assert.equal(result.error.details.attempts, 2);
+  assert.deepEqual(h.hubCalls, []);
+  assert.deepEqual(result.receipt.structuredModelAttempts.map((row) => row.status), ["rejected", "rejected"]);
+  assert.equal(result.receipt.structuredModelAttempts[1].retryScheduled, false);
+  assert.equal(result.receipt.benchmarkAudit.passed, false);
+  assert.equal(result.receipt.benchmarkAudit.structuredAttemptAuditPassed, false);
+  assert.equal(h.benchmarkArtifacts.length, 1);
+  assert.equal(result.benchmarkArtifactPath, "/tmp/workforce-benchmark-fixture.json");
+  assert.equal(h.benchmarkArtifacts[0].workOrder, null);
+  assert.equal(h.benchmarkArtifacts[0].executionReceipt.status, "failed");
+  assert.equal(h.benchmarkArtifacts[0].executionReceipt.structuredModelAttempts.length, 2);
+}
+
 async function digestMismatchFailsClosed() {
   const h = harness({ prepareMutation: (prepared) => { prepared.executionRoster[0].packageHash = HASH_D; } });
   const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true });
@@ -320,11 +413,13 @@ async function digestMismatchFailsClosed() {
 
 async function invalidPlannerNeverFallsBack() {
   const f = fixture();
+  const rawPriorMarker = "RAW_PRIOR_MUST_NOT_BE_PERSISTED_7419";
   const h = harness({
     modelOutputs: [
       JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.search_candidates", arguments: { workOrder: f.workOrder } } }),
       JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.validate_selection", arguments: { selection: f.selection } } }),
-      "I refuse to emit the requested plan JSON",
+      `I refuse to emit the requested plan JSON ${rawPriorMarker}`,
+      `I still refuse to emit the requested plan JSON ${rawPriorMarker}`,
     ],
   });
   const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true });
@@ -334,6 +429,13 @@ async function invalidPlannerNeverFallsBack() {
   assert.equal(result.receipt.planner.fallbackUsed, false);
   assert.deepEqual(result.receipt.workers, []);
   assert.equal(result.receipt.benchmarkAudit.passed, false);
+  assert.equal(result.receipt.planner.structuredAttemptCount, 2);
+  assert.equal(result.receipt.planner.structuredRepairCount, 1);
+  assert.deepEqual(result.receipt.structuredModelAttempts.filter((row) => row.phase === "planner").map((row) => row.status), ["rejected", "rejected"]);
+  assert.equal(h.benchmarkArtifacts.length, 1);
+  assert.deepEqual(h.benchmarkArtifacts[0].selection, f.selection);
+  assert.doesNotMatch(JSON.stringify(result.receipt), new RegExp(rawPriorMarker));
+  assert.doesNotMatch(JSON.stringify(h.benchmarkArtifacts[0]), new RegExp(rawPriorMarker));
 }
 
 async function outsideCandidateNeverReachesHubValidation() {
@@ -343,12 +445,33 @@ async function outsideCandidateNeverReachesHubValidation() {
     modelOutputs: [
       JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.search_candidates", arguments: { workOrder: f.workOrder } } }),
       JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.validate_selection", arguments: { selection: f.selection } } }),
+      JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.validate_selection", arguments: { selection: f.selection } } }),
     ],
   });
   const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true });
   assert.equal(result.ok, false);
   assert.equal(result.error.code, "selection_outside_candidate_set");
   assert.deepEqual(h.hubCalls.map((row) => row.name), ["workforce.search_candidates"]);
+}
+
+async function candidateExpansionRemainsLeaderDecision() {
+  const f = fixture();
+  f.selection.requestExpansionForSlots = ["slot:backend"];
+  const h = harness({
+    modelOutputs: [
+      JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.search_candidates", arguments: { workOrder: f.workOrder } } }),
+      JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.validate_selection", arguments: { selection: f.selection } } }),
+    ],
+  });
+  const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "candidate_expansion_required");
+  assert.equal(h.modelCalls.length, 2, "a valid leader expansion decision must not be coerced through schema repair");
+  assert.deepEqual(h.hubCalls.map((row) => row.name), ["workforce.search_candidates"]);
+  const attempt = result.receipt.structuredModelAttempts.find((row) => row.phase === "leader-selection");
+  assert.equal(attempt.status, "rejected");
+  assert.equal(attempt.repairEligible, false);
+  assert.equal(attempt.retryScheduled, false);
 }
 
 function benchmarkAuditFailsForMissingReceipts() {
@@ -416,9 +539,12 @@ function workforcePreferenceDefaults() {
 
 async function main() {
   await successContract();
+  await malformedStructuredStagesRepairOnceAndSucceed();
+  await structuredRepairExhaustionFailsBeforeHubAndPersistsArtifact();
   await digestMismatchFailsClosed();
   await invalidPlannerNeverFallsBack();
   await outsideCandidateNeverReachesHubValidation();
+  await candidateExpansionRemainsLeaderDecision();
   benchmarkAuditFailsForMissingReceipts();
   portableContractFailsClosed();
   sourceBoundaryContract();
