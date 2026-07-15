@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Exact immutable release tag to publish (for example v0.8.3)"
+        description: "Exact immutable release tag to publish (for example v0.8.4)"
         required: true
         type: string
 
@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      AGENTLAS_CORE_COMMIT: d741da796289678c38fac1059f0473f271d0f7e9
+      AGENTLAS_CORE_COMMIT: 23f441d3f3ea8db126103475a5c4857148c8ce0b
       HEPHAESTUS_RUNTIME_ROOT: ${{ github.workspace }}/Agentlas-OS
       HEPHAESTUS_PYTHON: python
     steps:
@@ -114,7 +114,7 @@ jobs:
           RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
           set -euo pipefail
-          for attempt in {1..12}; do
+          for _attempt in {1..12}; do
             published="$(npm view "agentlas@$RELEASE_VERSION" version --json 2>/dev/null | tr -d '"' || true)"
             if [ "$published" = "$RELEASE_VERSION" ]; then
               npm view "agentlas@$RELEASE_VERSION" dist.tarball dist.integrity --json

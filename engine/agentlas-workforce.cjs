@@ -30,6 +30,14 @@ const FORBIDDEN_FIT_FIELDS = new Set([
 const MAX_SLOTS = 32;
 const MAX_ASSIGNMENTS = 64;
 const MAX_MODEL_OUTPUT = 2 * 1024 * 1024;
+const WORKFORCE_ONTOLOGY_VERSION = "awo:2026-07-15.1";
+const WORKFORCE_ONTOLOGY_MENU = [
+  "Controlled communities: community:software-engineering, community:backend-engineering, community:frontend-engineering, community:database-engineering, community:payments-engineering, community:quality-engineering, community:security-engineering, community:data-engineering, community:ai-engineering, community:devops, community:product-design, community:research, community:marketing, community:finance, community:corporate-development, community:insurance, community:insurance-actuarial, community:insurance-claims, community:insurance-underwriting, community:human-resources, community:information-technology, community:legal, community:travel, community:operations, community:agent-systems.",
+  "Controlled roles: role:software-architect, role:backend-engineer, role:frontend-engineer, role:database-engineer, role:payments-engineer, role:quality-engineer, role:security-engineer, role:ontology-architect, role:agent-runtime-engineer, role:researcher, role:ma-diligence-lead, role:insurance-actuary, role:claims-diligence-specialist, role:underwriting-diligence-specialist, role:travel-planner.",
+  "Canonical skills: skill:software-architecture, skill:api-design, skill:server-implementation, skill:frontend-implementation, skill:data-modeling, skill:database-querying, skill:billing-integration, skill:transaction-integrity, skill:test-design, skill:verification, skill:security-review, skill:ontology-modeling, skill:knowledge-graph-design, skill:multi-agent-orchestration, skill:runtime-integration, skill:evidence-synthesis, skill:deal-diligence, skill:valuation, skill:actuarial-reserving, skill:solvency-analysis, skill:claims-liability-assessment, skill:underwriting-portfolio-analysis, skill:travel-planning.",
+  "Canonical tool capabilities: tool:file-system, tool:file-read, tool:file-write, tool:shell, tool:web-search, tool:browser, tool:mongodb, tool:database, tool:github, tool:payments.",
+  "Use artifact:<kind> for consumes, produces and edge artifactKinds. If no controlled role precisely applies, leave requiredRoles empty and express the job through a controlled community, canonical skills and task text; never invent a near-synonym role ID.",
+].join("\n");
 
 class WorkforceContractError extends Error {
   constructor(code, message, details = null) {
@@ -200,6 +208,9 @@ function validateWorkOrder(value) {
   assertId(order.workOrderId, "workOrder.workOrderId");
   assertString(order.taskBrief, "workOrder.taskBrief", 4_000);
   if (order.redacted !== true) fail("work_order_not_redacted", "work order must be explicitly redacted before Hub search");
+  if (order.ontologyVersion !== WORKFORCE_ONTOLOGY_VERSION) {
+    fail("work_order_ontology_stale", `work order must use ontology ${WORKFORCE_ONTOLOGY_VERSION}`);
+  }
   const slots = assertArray(order.roleSlots, "workOrder.roleSlots", MAX_SLOTS, { min: 1 });
   const seen = new Set();
   for (let index = 0; index < slots.length; index += 1) {
@@ -619,6 +630,7 @@ function buildPrompts(task, identity) {
     workOrderId: "work-order:<unique-id>",
     taskBrief: "redacted task brief safe for Hub retrieval",
     redacted: true,
+    ontologyVersion: WORKFORCE_ONTOLOGY_VERSION,
     roleSlots: [{
       slotId: "slot:<role>", title: "role title", task: "bounded responsibility", cardinality: 1, criticality: "required",
       requiredCommunities: [], optionalCommunities: [], excludedCommunities: [], requiredRoles: [], requiredSkills: [], optionalSkills: [],
@@ -634,6 +646,8 @@ function buildPrompts(task, identity) {
       "Analyze the actual work like an HR project staffing decision. Decompose only genuinely distinct responsibilities.",
       "Return exactly one JSON tool-call envelope. Do not choose agents yet. Do not use ratings, popularity, invocation history, or revenue.",
       "Never copy secrets, local file contents, account identifiers, or private memory into taskBrief; summarize them as local protected inputs and set redacted=true.",
+      `ontologyVersion must be exactly ${WORKFORCE_ONTOLOGY_VERSION}.`,
+      WORKFORCE_ONTOLOGY_MENU,
       `Envelope: {\"schemaVersion\":\"agentlas.workforce-leader-call.v1\",\"toolCall\":{\"name\":\"workforce.search_candidates\",\"arguments\":{\"workOrder\":${JSON.stringify(workOrderShape)}}}}`,
     ].join("\n"),
     searchUser: task,

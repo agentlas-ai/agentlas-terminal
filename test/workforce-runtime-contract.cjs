@@ -40,9 +40,10 @@ function fixture() {
     workOrderId: "work-order:hard-payment",
     taskBrief: "Build and adversarially verify an idempotent payment API.",
     redacted: true,
+    ontologyVersion: "awo:2026-07-15.1",
     roleSlots: [
       slot("slot:backend", "payment backend", ["community:backend-engineering"], ["role:backend-engineer"], ["skill:api-design"]),
-      slot("slot:verification", "independent verifier", ["community:quality-assurance"], ["role:quality-engineer"], ["skill:adversarial-testing"]),
+      slot("slot:verification", "independent verifier", ["community:quality-engineering"], ["role:quality-engineer"], ["skill:test-design"]),
     ],
     edges: [{ from: "slot:verification", to: "slot:backend", relation: "reviews", artifactKinds: ["artifact:source-code"] }],
     forbiddenCommunities: ["community:travel"],
@@ -52,7 +53,7 @@ function fixture() {
     schemaVersion: "agentlas.workforce-candidate-set.v1",
     selectionSessionId: "selection-session:hard-payment",
     workOrderId: workOrder.workOrderId,
-    ontologyVersion: "ontology:awo-v1",
+    ontologyVersion: "awo:2026-07-15.1",
     candidateSetDigest: HASH_A,
     decisionOwner: "host_llm",
     historyInfluence: "none",
@@ -93,15 +94,15 @@ function fixture() {
           contentDigest: HASH_D,
           entityKind: "agent",
           name: "Adversarial Verifier",
-          communities: ["community:quality-assurance", "community:security-engineering"],
-          fitEvidence: ["fit:adversarial-testing"],
+          communities: ["community:quality-engineering", "community:security-engineering"],
+          fitEvidence: ["fit:test-design"],
           qualificationEvidence: ["eval:verifier-hard"],
           optionalGaps: [],
           operational: { callable: true, installable: true, unavailableReasons: [] },
           semanticSnapshot: {
             summaries: ["Independent adversarial correctness verifier"],
             roles: ["role:quality-engineer"],
-            skills: [{ concept: "skill:adversarial-testing", level: "demonstrated" }],
+            skills: [{ concept: "skill:test-design", level: "demonstrated" }],
             toolCapabilities: [], consumes: [], produces: [], authorities: [], runtimes: ["terminal"], languages: ["en"],
           },
         }],
@@ -285,6 +286,10 @@ async function successContract() {
   assert.equal(h.receipts[0].orchestrator.status, "completed");
   assert.equal(h.receipts[0].planner.parseSuccess, true);
   assert.equal(h.receipts[0].workers.every((row) => row.status === "completed" && row.modelId && row.invocationId && row.handoffArtifactRefs.length), true);
+  assert.match(h.modelCalls[0].system, /awo:2026-07-15\.1/);
+  assert.match(h.modelCalls[0].system, /role:payments-engineer/);
+  assert.match(h.modelCalls[0].system, /role:quality-engineer/);
+  assert.match(h.modelCalls[0].system, /community:payments-engineering/);
   assert.equal(h.modelCalls.some((call) => /travel/i.test(call.system) && /PINNED_RELEASE/.test(call.system)), false);
   assert.match(h.modelCalls.find((call) => /PINNED_RELEASE=release:backend-v3/.test(call.system)).system, /exact backend release/i);
   assert.match(h.modelCalls.find((call) => /PINNED_RELEASE=release:verifier-v7/.test(call.system)).system, /exact verifier release/i);
@@ -348,6 +353,10 @@ function benchmarkAuditFailsForMissingReceipts() {
 function portableContractFailsClosed() {
   const f = fixture();
   const observedAt = new Date("2026-07-15T00:00:00.000Z");
+  assert.throws(
+    () => _test.validateWorkOrder({ ...f.workOrder, ontologyVersion: "awo:stale" }),
+    (error) => error.code === "work_order_ontology_stale",
+  );
   assert.throws(
     () => _test.validateCandidateSet({ ...f.candidates, issuedAt: undefined }, f.workOrder, observedAt),
     (error) => error.code === "invalid_contract" && /issuedAt/.test(error.message),

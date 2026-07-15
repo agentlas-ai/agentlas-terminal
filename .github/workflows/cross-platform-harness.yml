@@ -7,10 +7,14 @@ on:
       - "engine/agentlas-core-harness.cjs"
       - "engine/agentlas-parity.cjs"
       - "engine/agentlas-workload-routing.cjs"
+      - "engine/agentlas-workforce.cjs"
+      - "engine/agentlas-input.cjs"
+      - "engine/agentlas-i18n.cjs"
       - "engine/agentlas.cjs"
       - "engine/agentlas-repl.cjs"
       - "test/stormbreaker-core-contract.cjs"
       - "test/workload-routing-contract.cjs"
+      - "test/workforce-runtime-contract.cjs"
       - "test/project-bootstrap-contract.cjs"
       - "package.json"
       - ".github/workflows/cross-platform-harness.yml"
@@ -20,10 +24,14 @@ on:
       - "engine/agentlas-core-harness.cjs"
       - "engine/agentlas-parity.cjs"
       - "engine/agentlas-workload-routing.cjs"
+      - "engine/agentlas-workforce.cjs"
+      - "engine/agentlas-input.cjs"
+      - "engine/agentlas-i18n.cjs"
       - "engine/agentlas.cjs"
       - "engine/agentlas-repl.cjs"
       - "test/stormbreaker-core-contract.cjs"
       - "test/workload-routing-contract.cjs"
+      - "test/workforce-runtime-contract.cjs"
       - "test/project-bootstrap-contract.cjs"
       - "package.json"
       - ".github/workflows/cross-platform-harness.yml"
@@ -46,7 +54,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: agentlas-ai/Agentlas-OS
-          ref: d741da796289678c38fac1059f0473f271d0f7e9
+          ref: 23f441d3f3ea8db126103475a5c4857148c8ce0b
           path: Agentlas-OS
       - uses: actions/setup-node@v4
         with:
@@ -68,6 +76,7 @@ jobs:
         run: |
           node test/stormbreaker-core-contract.cjs
           node test/workload-routing-contract.cjs
+          node test/workforce-runtime-contract.cjs
           node test/project-bootstrap-contract.cjs --strict
       - uses: actions/upload-artifact@v4
         with:

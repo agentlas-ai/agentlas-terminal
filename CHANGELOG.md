@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.8.4 — 2026-07-16
+
+- Ordinary `/network`, `/taskforce`, and `/workforce` requests now use the
+  Agent Workforce Ontology protocol. The active host LLM creates the pinned
+  work order and selects exact AgentRelease IDs from the Hub candidate menu;
+  Terminal only validates and executes that choice.
+- Require the exact three workforce MCP calls, a real manager plan, distinct
+  pinned worker executions, synthesis, verifier, and auditable receipts. Stale
+  ontology versions, history or popularity influence, silent substitution,
+  planner fallback, and single-model masquerading fail closed.
+- Keep the retired lexical router available only through explicit
+  `/legacy-network`. Cross-platform and npm release gates now exercise the
+  workforce runtime contract on Agentlas OS v1.1.38 at immutable commit
+  `23f441d3f3ea8db126103475a5c4857148c8ce0b`.
+- This source commit does not prove a GitHub release or npm publication; both
+  remain separate immutable-tag gates.
+
 ## 0.8.3 — 2026-07-14
 
 - Pin all release and npm publication gates to Agentlas OS v1.1.28 commit
