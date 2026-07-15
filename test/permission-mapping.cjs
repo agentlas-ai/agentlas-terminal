@@ -182,7 +182,7 @@ function testBackgroundAndSwarmCapturePath() {
   assert.ok(hasPair(invalid, "--sandbox", "read-only"), "capture path must also fail closed");
 }
 
-function testWorkforceNoAuthorityCapturePath() {
+function testWorkforceDefenseInDepthCaptureArgs() {
   const claude = legacyBuildArgs("claude-code", "system", "prompt", "full", {
     authorityMode: "no-authority",
   });
@@ -207,6 +207,9 @@ function testWorkforceNoAuthorityCapturePath() {
   }
   assert.ok(hasPair(codex, "--sandbox", "read-only"));
   assert.equal(codex.includes("--dangerously-bypass-approvals-and-sandbox"), false);
+  // These flags are defense in depth, not authority proof. The Workforce runtime
+  // separately fails closed for Codex because 0.144.4 still exposed a live
+  // collaboration tool surface with every known multi-agent flag disabled.
 
   const captured = codexCaptureAgentText([
     JSON.stringify({ type: "thread.started", thread_id: "thread:fixture" }),
@@ -224,5 +227,5 @@ testCodexIsolatedHome();
 testFailClosedAndCopy();
 testShiftTabFullConfirmation();
 testBackgroundAndSwarmCapturePath();
-testWorkforceNoAuthorityCapturePath();
+testWorkforceDefenseInDepthCaptureArgs();
 console.log("permission-mapping: PASS");

@@ -1,6 +1,9 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 const { create, _test } = require("../engine/agentlas-workforce.cjs");
 
 const HASH_A = `sha256:${"a".repeat(64)}`;
@@ -531,6 +534,64 @@ async function successContract() {
   assert.equal(h.benchmarkArtifacts[0].executionReceipt.status, "passed");
   assert.equal(h.benchmarkArtifacts[0].preparedExecution.schemaVersion, "agentlas.workforce-execution-plan.v5");
   assert.equal(h.benchmarkArtifacts[0].toolInventorySnapshot.schemaVersion, "agentlas.workforce-tool-inventory.v1");
+}
+
+async function codexCliFailsClosedBeforeAnyModelOrHubCall() {
+  let captureCalls = 0;
+  let hubCalls = 0;
+  const auditReceipts = [];
+  const runtime = create({
+    resolveRuntime: () => ({ mode: "cli", kind: "codex", model: "gpt-5.6-terra", version: "0.144.4" }),
+    buildChildEnv: async () => ({}),
+    captureRuntime: async () => {
+      captureCalls += 1;
+      return "must never execute";
+    },
+    callHubTool: async () => {
+      hubCalls += 1;
+      throw new Error("must never execute");
+    },
+    appendAuditReceipt: (receipt) => auditReceipts.push(structuredClone(receipt)),
+    now: () => new Date("2026-07-15T00:00:00.000Z"),
+  });
+  const result = await runtime.workforceRun({}, "Codex isolation regression benchmark", {
+    silent: true,
+    benchmark: false,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "workforce_runtime_isolation_unverified");
+  assert.match(result.error.message, /collaboration/);
+  assert.equal(captureCalls, 0, "unverified Codex must be blocked before exposing the task to a model call");
+  assert.equal(hubCalls, 0, "unverified Codex must be blocked before Hub candidate search");
+  assert.equal(result.receipt.orchestrator.status, "blocked");
+  assert.deepEqual(result.receipt.workers, []);
+  assert.equal(result.receipt.executionReceipt, null, "blocked Codex must never emit a falsely enforced execution receipt");
+  assert.equal(auditReceipts.length, 1);
+  assert.equal(auditReceipts[0].failure.code, "workforce_runtime_isolation_unverified");
+}
+
+async function failedBenchmarkArtifactsNeverOverwriteEachOther() {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agentlas-workforce-failure-artifacts-"));
+  try {
+    const runtime = create({
+      resolveRuntime: () => ({ mode: "cli", kind: "codex", model: "gpt-5.6-terra", version: "0.144.4" }),
+      buildChildEnv: async () => ({}),
+      captureRuntime: async () => "must never execute",
+      callHubTool: async () => { throw new Error("must never execute"); },
+      receiptFile: () => path.join(directory, "workforce-execution-receipts.jsonl"),
+      now: () => new Date("2026-07-15T00:00:00.000Z"),
+    });
+    const first = await runtime.workforceRun({}, "first blocked Codex benchmark", { silent: true, benchmark: true });
+    const second = await runtime.workforceRun({}, "second blocked Codex benchmark", { silent: true, benchmark: true });
+    assert.equal(first.ok, false);
+    assert.equal(second.ok, false);
+    assert.notEqual(first.benchmarkArtifactPath, second.benchmarkArtifactPath);
+    assert.notEqual(path.basename(first.benchmarkArtifactPath), "workforce-run.json");
+    assert.equal(fs.existsSync(first.benchmarkArtifactPath), true);
+    assert.equal(fs.existsSync(second.benchmarkArtifactPath), true);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 }
 
 async function nestedTeamGraphExecutesEveryDeclaredWorkerWithoutFlattening() {
@@ -1731,6 +1792,8 @@ async function privateWorkOrderRepairsLocallyAndNeverCallsHubOnExhaustion() {
 
 async function main() {
   await successContract();
+  await codexCliFailsClosedBeforeAnyModelOrHubCall();
+  await failedBenchmarkArtifactsNeverOverwriteEachOther();
   await nestedTeamGraphExecutesEveryDeclaredWorkerWithoutFlattening();
   await requiredToolBindingUsesOnlyPrivateExactInventoryAndNativeGrant();
   await requiredToolWithoutReadyInventoryFailsBeforePlannerOrWorker();

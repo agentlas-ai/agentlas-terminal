@@ -1634,6 +1634,12 @@ function create(deps = {}) {
     if (typeof D.runModel === "function") return normalizeModelText(await D.runModel({ runtime, system, prompt, context }));
     if (runtime.mode === "cli") {
       const authorityMode = context.authorityMode || "no-authority";
+      if (runtime.kind === "codex" && authorityMode === "no-authority") {
+        fail(
+          "workforce_runtime_isolation_unverified",
+          "Codex CLI workforce execution is blocked until this host proves an empty built-in, collaboration, and MCP tool inventory; feature-disable flags and an isolated CODEX_HOME are not sufficient proof",
+        );
+      }
       if (runtime.kind === "gemini" && authorityMode === "no-authority") {
         fail(
           "workforce_runtime_isolation_unverified",
@@ -1710,11 +1716,14 @@ function create(deps = {}) {
     fs.appendFileSync(file, `${JSON.stringify(audit)}\n`, { encoding: "utf8", mode: 0o600 });
   }
 
-  function persistBenchmarkArtifact(artifact) {
-    if (typeof D.persistBenchmarkArtifact === "function") return D.persistBenchmarkArtifact(artifact);
+  function persistBenchmarkArtifact(artifact, executionIdHint) {
+    if (typeof D.persistBenchmarkArtifact === "function") return D.persistBenchmarkArtifact(artifact, executionIdHint);
     const directory = path.join(path.dirname(receiptFile()), "workforce-benchmarks");
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-    const executionId = String(artifact?.executionReceipt?.executionId || "workforce-run")
+    // A failed run has no executionReceipt. Use the already-created orchestration
+    // run id so repeated failures remain separate forensic artifacts instead of
+    // silently overwriting workforce-run.json.
+    const executionId = String(artifact?.executionReceipt?.executionId || executionIdHint || `workforce-run:${crypto.randomUUID()}`)
       .replace(/[^A-Za-z0-9._-]+/g, "-")
       .slice(0, 180);
     const file = path.join(directory, `${executionId}.json`);
@@ -2855,7 +2864,7 @@ function create(deps = {}) {
       persistReceipt(receipt.executionReceipt);
       persistOrchestrationAudit(receipt);
       const benchmarkArtifactPath = ctx.benchmark === true
-        ? persistBenchmarkArtifact(currentBenchmarkArtifact())
+        ? persistBenchmarkArtifact(currentBenchmarkArtifact(), receipt.runId)
         : null;
       if (!ctx.silent) {
         ui.line("");
@@ -2891,7 +2900,7 @@ function create(deps = {}) {
       }
       let benchmarkArtifactPath = null;
       if (ctx.benchmark === true) {
-        try { benchmarkArtifactPath = persistBenchmarkArtifact(currentBenchmarkArtifact()); } catch (persistError) {
+        try { benchmarkArtifactPath = persistBenchmarkArtifact(currentBenchmarkArtifact(), receipt.runId); } catch (persistError) {
           receipt.failure.benchmarkPersistenceError = String((persistError && persistError.message) || persistError).slice(0, 500);
         }
       }
