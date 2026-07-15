@@ -10,10 +10,18 @@
   work order, content-only candidate set, host selection, three MCP receipts,
   and real planner/worker/synthesis/verifier execution evidence.
 - Give the host LLM one bounded schema-only repair attempt for malformed work
-  orders, selections, or delegation plans. Every attempt is digest-audited;
-  Terminal never fills a missing hard field, retries transport failures, falls
-  back to a lexical router, or persists raw prior model output, and exhaustion
-  still writes a failed benchmark artifact before stopping.
+  orders, selections, or delegation plans, plus at most one semantic WorkOrder
+  refinement from redacted coverage-gap codes when required cardinality cannot
+  be filled. Every attempt is digest-audited; Terminal never fills a missing
+  hard field, exposes candidate identities to refinement, falls back to a
+  lexical router, or persists raw prior model output. Only the idempotent Hub
+  search may replay once after an outer transport/JSON ambiguity; validation
+  and preparation remain single-shot.
+- Require direct WorkOrder and Selection objects from the active host LLM and
+  reject ceremonial tool-call envelopes, unknown keys, contradictory community
+  exclusions, and exhaustive "everything else" exclusion lists. Explicit user
+  prohibitions remain hard constraints while unused or adjacent communities do
+  not become accidental disqualifiers.
 - Ordinary `/network`, `/taskforce`, and `/workforce` requests now use the
   Agent Workforce Ontology protocol. The active host LLM creates the pinned
   work order and selects exact AgentRelease IDs from the Hub candidate menu;
@@ -24,8 +32,8 @@
   planner fallback, and single-model masquerading fail closed.
 - Keep the retired lexical router available only through explicit
   `/legacy-network`. Cross-platform and npm release gates now exercise the
-  workforce runtime contract on Agentlas OS v1.1.39 at immutable commit
-  `cf71b8be1732f249b4d79d66246f7d3c0cd0790f`, including canonical ontology
+  workforce runtime contract on Agentlas OS v1.1.40 at immutable commit
+  `14fc67e5d6741cf83910b5161c68c09718cc5ab1`, including canonical ontology
   `awo:2026-07-15.2` and its reviewed singular payment/security aliases.
 - This source commit does not prove a GitHub release or npm publication; both
   remain separate immutable-tag gates.
