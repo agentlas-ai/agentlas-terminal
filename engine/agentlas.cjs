@@ -260,7 +260,7 @@ function saveMultimodalSettingsCli(db, patch) {
     db.prepare("INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
       .run(MULTIMODAL_META_KEY, JSON.stringify(next));
   } catch (e) {
-    fail("multimodal settings 저장 실패: " + e.message);
+    fail("Failed to save multimodal settings: " + e.message);
   }
   return next;
 }
@@ -812,7 +812,7 @@ function buildImportSystemPrompt(dir, name, kind) {
 }
 function importLocalFolderCli(db, absPath) {
   const dir = path.resolve(absPath);
-  if (!isDir(dir)) fail(`폴더가 아닙니다: ${absPath}`);
+  if (!isDir(dir)) fail(`Not a directory: ${absPath}`);
   const labels = detectRuntimeLabels(dir);
   const runtime = labels[0];
   const kind = detectKind(dir);
@@ -917,15 +917,15 @@ function upsertLocalTeamFirmCli(db, dir, ceoAgentId, agentSlug, name, tagline) {
   return { id, slug: firmSlug };
 }
 function cmdImport(db, absPath) {
-  if (!absPath) fail("사용법: agentlas import <폴더경로>");
+  if (!absPath) fail("Usage: agentlas import <folder-path>");
   const r = importLocalFolderCli(db, absPath);
-  out(`${r.updated ? "갱신" : "임포트"} 완료: ${r.name}  (${r.kind})`);
+  out(`${r.updated ? "Updated" : "Imported"}: ${r.name}  (${r.kind})`);
   out(`  slug:    ${r.slug}`);
   out(`  runtime: ${r.runtime}  [${r.labels.join(", ")}]`);
   out(`  path:    ${r.path}`);
-  if (r.firmSlug) out(`  firm:    ${r.firmSlug}  (FIRMS 등록됨 — 앱 사이드바 + 'agentlas firm ${r.firmSlug}')`);
+  if (r.firmSlug) out(`  firm:    ${r.firmSlug}  (registered in Firms — Desktop sidebar + 'agentlas firm ${r.firmSlug}')`);
   out("");
-  out(`실행: agentlas ${r.slug} "..."   ·   agentlas run ${r.slug} "..."   (대상 프로젝트 폴더에서 실행)`);
+  out(`Run: agentlas ${r.slug} "..."   ·   agentlas run ${r.slug} "..."   (run from the target project folder)`);
 }
 
 // ── Agentlas Cloud packaging / marketplace ────────────────────────────────
@@ -1001,7 +1001,7 @@ function hubTimeoutError(kind, ms) {
 /** Hub/Cloud fetch + body reader. Headers 전 connect, chunk 사이 idle, 전 구간 total timeout. */
 async function fetchHubCli(url, init = {}, options = {}) {
   const fetchImpl = options.fetch || globalThis.fetch;
-  if (typeof fetchImpl !== "function") throw new Error("이 런타임에 fetch가 없습니다.");
+  if (typeof fetchImpl !== "function") throw new Error("fetch is unavailable in this runtime.");
   const timeout = options.timeoutConfig ? directHubTimeoutConfig(options.timeoutConfig) : hubTimeoutConfig(options.env || process.env);
   const controller = new AbortController();
   const upstreamSignal = init.signal;
@@ -1065,7 +1065,7 @@ async function fetchHubCli(url, init = {}, options = {}) {
     } else {
       const raw = Buffer.from(await Promise.race([response.arrayBuffer(), terminal]));
       bytes = raw.length;
-      if (bytes > HUB_RESPONSE_MAX_BYTES) throw new Error(`Hub 응답이 허용 크기(${HUB_RESPONSE_MAX_BYTES} bytes)를 초과했습니다.`);
+      if (bytes > HUB_RESPONSE_MAX_BYTES) throw new Error(`Hub response exceeds the allowed size (${HUB_RESPONSE_MAX_BYTES} bytes).`);
       chunks.push(raw);
     }
     if (idleTimer) clearTimeout(idleTimer);
@@ -1090,7 +1090,7 @@ function parseHubJsonCli(response, label) {
   try {
     return JSON.parse(response.text || "null");
   } catch {
-    throw new Error(`${label} 응답 JSON 형식이 올바르지 않습니다.`);
+    throw new Error(`${label} returned invalid JSON.`);
   }
 }
 
@@ -1164,6 +1164,7 @@ async function cmdCloud(db, args, runtimeOverride) {
       "  list [--json]                       list packages in your private Agent Cloud",
       "  restore <slug> [--json]             restore an owned Cloud package on this machine",
       "  install <slug>                      compatibility alias: install from the public Hub",
+      "  plugin add <slug>                   install a Hub plugin (MCP servers)",
       "  delete <slug> [--scope owner-private|hub-public] [--json]",
       "                                      conditionally delete one exact observed Cloud revision",
       "  search \"<what you need>\" [--limit 10]",
@@ -1182,7 +1183,7 @@ async function cmdCloud(db, args, runtimeOverride) {
     const result = await listOwnedCloudAgentsCli(Number(flags.limit || 100));
     if (flags.json) return out(JSON.stringify(result, null, 2));
     const agents = Array.isArray(result.results) ? result.results : [];
-    if (!agents.length) return out("Private Agent Cloud에 저장된 에이전트가 없습니다.");
+    if (!agents.length) return out("No agents are stored in Private Agent Cloud.");
     for (const agent of agents) out(`${agent.slug}\t${agent.name || agent.nameEn || agent.slug}\t${agent.entityKind || "agent"}`);
     return;
   }
@@ -1278,8 +1279,8 @@ async function cmdCloud(db, args, runtimeOverride) {
 async function packageCloudAgentCli(db, root, opts) {
   const requestedRoot = path.resolve(root);
   let st;
-  try { st = fs.lstatSync(requestedRoot); } catch { throw new Error(`폴더를 찾을 수 없습니다: ${root}`); }
-  if (!st.isDirectory() || st.isSymbolicLink()) throw new Error(`실제 폴더가 아닙니다: ${root}`);
+  try { st = fs.lstatSync(requestedRoot); } catch { throw new Error(`Folder not found: ${root}`); }
+  if (!st.isDirectory() || st.isSymbolicLink()) throw new Error(`Not a real directory: ${root}`);
   const rootPath = fs.realpathSync.native(requestedRoot);
   const visibility = opts.visibility || "private-link";
   const isPublicHubPublish = visibility === "marketplace";
@@ -1978,19 +1979,19 @@ function cloudCasResponseErrorCli(response, label) {
   let body = null;
   try { body = JSON.parse(response.text || "null"); } catch { /* generic below */ }
   const code = body && typeof body.code === "string" ? body.code : "cloud_request_failed";
-  let message = `${label} 실패 ${response.status}`;
+  let message = `${label} failed with HTTP ${response.status}`;
   if (response.status === 412 && code === "cloud_agent_revision_conflict") {
     const current = body && body.current ? body.current : body && body.conflict && body.conflict.current;
     message = current
       ? `다른 PC에서 이 Agent Cloud 자산이 변경되었습니다. 자동 덮어쓰기는 중단했습니다. \`agentlas cloud list\`로 최신 revision을 확인하고 \`agentlas cloud restore ${current.slug || "<slug>"}\`로 복원한 뒤 변경 사항을 병합하세요.`
       : "이 Agent Cloud 자산은 다른 PC에서 삭제되었거나 다른 식별자로 다시 생성되었습니다. 자동 재생성은 중단했습니다. `agentlas cloud list`로 현재 상태를 확인하세요.";
   } else if (response.status === 428 && code === "client_upgrade_required") {
-    message = "기존 Cloud 자산을 안전하게 갱신할 base revision이 없습니다. 서버 revision을 자동 복사하지 않습니다. `agentlas cloud list`로 확인하고 `agentlas cloud restore <slug>`로 복원한 뒤 다시 저장하세요.";
+    message = "No base revision is available to safely update the existing Cloud asset. The server revision will not be copied automatically. Check `agentlas cloud list`, restore with `agentlas cloud restore <slug>`, then save again.";
   } else if (response.status === 503 && code === "cloud_mutations_maintenance") {
     const retryAfter = response.headers && typeof response.headers.get === "function" ? response.headers.get("retry-after") : null;
-    message = `Agent Cloud 저장/삭제가 잠시 점검 중입니다${retryAfter ? ` (약 ${retryAfter}초 후 재시도)` : ""}. 읽기·목록·복원은 계속 사용할 수 있습니다.`;
+    message = `Agent Cloud save/delete is temporarily under maintenance${retryAfter ? ` (retry in about ${retryAfter} seconds)` : ""}. Read, list, and restore remain available.`;
   } else if (body && typeof body.error === "string") {
-    message = `${label} 실패 ${response.status}: ${body.error.slice(0, 300)}`;
+    message = `${label} failed with HTTP ${response.status}: ${body.error.slice(0, 300)}`;
   }
   const error = new Error(message);
   error.code = code;
@@ -2002,8 +2003,8 @@ function cloudCasResponseErrorCli(response, label) {
 
 async function registerCloudAgentCli(manifest, bundlePath, review, visibility, options = {}) {
   const cookie = await cloudSessionCookieCli();
-  if (!cookie) fail("agentlas.cloud 로그인이 필요합니다. 데스크톱 앱에서 로그인하거나 AGENTLAS_SESSION을 설정하세요.");
-  if (typeof fetch !== "function") fail("이 런타임에 fetch가 없습니다(앱 런타임으로 실행 필요).");
+  if (!cookie) fail("Agent Cloud sign-in is required. Sign in through Desktop or set AGENTLAS_SESSION.");
+  if (typeof fetch !== "function") fail("fetch is unavailable in this runtime (run through the app runtime).");
   const base = (process.env.AGENTLAS_WEB_BASE_URL || "https://agentlas.cloud").replace(/\/$/, "");
   const bundle = JSON.parse(fs.readFileSync(bundlePath, "utf8"));
   const expectedScope = cloudScopeForVisibility(visibility);
@@ -2076,8 +2077,8 @@ async function deleteCloudAgentCli(slug, options = {}) {
   const safeSlug = String(slug || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64);
   if (!safeSlug) fail("usage: agentlas cloud delete <slug> [--json]");
   const cookie = await cloudSessionCookieCli();
-  if (!cookie) fail("agentlas.cloud 로그인이 필요합니다. 데스크톱 앱에서 로그인하거나 AGENTLAS_SESSION을 설정하세요.");
-  if (typeof fetch !== "function") fail("이 런타임에 fetch가 없습니다(앱 런타임으로 실행 필요).");
+  if (!cookie) fail("Agent Cloud sign-in is required. Sign in through Desktop or set AGENTLAS_SESSION.");
+  if (typeof fetch !== "function") fail("fetch is unavailable in this runtime (run through the app runtime).");
   const scope = options.scope == null ? null : normalizeCloudScopeFlagCli(options.scope);
   if (options.scope != null && !scope) throw new Error("--scope must be owner-private or hub-public");
   const localEntry = findCloudAssetDescriptorCli(safeSlug, scope);
@@ -2180,28 +2181,121 @@ async function cloudSessionCookieCli() {
 async function cmdCloudInstall(db, slug) {
   if (!slug) fail("usage: agentlas cloud install <slug>");
   const listing = await fetchCloudManifestCli(slug);
-  if (!listing) fail(`Hub agent를 찾을 수 없습니다: ${slug}`);
+  if (!listing) fail(`Hub agent not found: ${slug}`);
   if (listing.delivery && listing.delivery.mode === "call_only") {
-    fail(`이 Hub 에이전트는 소스 설치가 허용되지 않은 call-only 자산입니다. 실행: agentlas call ${slug}`);
+    fail(`This Hub agent is call-only and cannot be installed from source. Run: agentlas call ${slug}`);
   }
   const agent = persistCloudListingCli(db, listing);
   out(`✓ Hub installed ${agent.slug} — ${agent.name}`);
   if (agent.localPath) out(`  files: ${agent.localPath}`);
 }
 
+// ── Hub 플러그인 설치 ────────────────────────────────────────────────────────
+// 서버는 처음부터 준비돼 있었다: /api/plugins/<slug>가 agentlas.plugin/v1 매니페스트를 주고,
+// 그 라우트 주석이 이 CLI(`agentlas plugin add <slug>`)를 소비자로 지목한다. 그런데 이 명령이
+// 구현된 적이 없어서, 카탈로그 146개가 전부 "존재하지 않는 설치 명령"을 광고하고 있었다.
+// (`agentlas install`은 marketplace.get_manifest{kind:"agent"} 고정이라 플러그인엔 안 먹는다.)
+async function fetchPluginManifestCli(slug) {
+  const base = (process.env.AGENTLAS_WEB_BASE_URL || "https://agentlas.cloud").replace(/\/$/, "");
+  const resp = await fetchHubCli(`${base}/api/plugins/${encodeURIComponent(slug)}`, {
+    headers: { accept: "application/json" },
+  });
+  if (resp.status === 404) return null;
+  if (!resp.ok) fail(`plugin lookup failed with HTTP ${resp.status}`);
+  const manifest = parseHubJsonCli(resp, "plugin manifest");
+  if (!manifest || manifest.schema !== "agentlas.plugin/v1") {
+    fail(`Unexpected plugin manifest schema for ${slug}.`);
+  }
+  return manifest;
+}
+
+/** 매니페스트의 mcp[] 항목을 mcp_servers 행으로 정규화. stdio(command)와 remote(url)를 구분한다. */
+function pluginMcpRowCli(slug, entry, index) {
+  const source = typeof entry?.source === "string" ? entry.source.trim() : "";
+  const name = (typeof entry?.name === "string" && entry.name.trim()) || `${slug}-${index + 1}`;
+  const remote = /^https?:\/\//i.test(source);
+  // 원격은 URL, stdio는 실행 커맨드다. 둘을 섞으면 codex config.toml 스키마 위반으로
+  // 런타임이 통째로 죽는다(Runtime Doctor가 반복해서 잡던 사고 계열).
+  if (!remote && !source) return null;
+  const argv = remote ? [] : source.split(/\s+/).filter(Boolean);
+  return {
+    id: require("node:crypto").randomUUID(),
+    catalogId: `hub:${slug}:${name}`,
+    name,
+    transport: remote ? "http" : "stdio",
+    command: remote ? null : (argv[0] ?? null),
+    argsJson: JSON.stringify(remote ? [] : argv.slice(1)),
+    url: remote ? source : null,
+    envKeysJson: JSON.stringify(
+      Array.isArray(entry?.envKeys) ? entry.envKeys.filter((key) => typeof key === "string") : [],
+    ),
+  };
+}
+
+async function cmdPluginAdd(db, slug) {
+  if (!slug) fail('usage: agentlas plugin add <slug>   (run agentlas plugin list first)');
+  const manifest = await fetchPluginManifestCli(slug);
+  if (!manifest) fail(`Hub plugin not found: ${slug}`);
+  const entries = Array.isArray(manifest.mcp) ? manifest.mcp : [];
+  const rows = entries.map((entry, index) => pluginMcpRowCli(slug, entry, index)).filter(Boolean);
+  if (!rows.length) {
+    // 설치할 MCP 서버가 없으면 조용히 성공했다고 하지 않는다 — 사용자는 이 플러그인이
+    // 붙었다고 믿고 도구를 기대하게 된다.
+    fail(
+      `${slug} ships no MCP server to install (skills-only or source-link plugin). ` +
+        `Nothing was registered. See: ${manifest.source?.repo || manifest.source?.homepage || "the plugin page"}`,
+    );
+  }
+  let installed = 0;
+  let reused = 0;
+  for (const row of rows) {
+    const existing = db.prepare("SELECT id FROM mcp_servers WHERE catalog_id = ? LIMIT 1").get(row.catalogId);
+    if (existing) { reused += 1; continue; } // 멱등: 재설치가 중복 행을 만들지 않는다
+    db.prepare(
+      `INSERT INTO mcp_servers (id, catalog_id, name, name_en, transport, command, args_json, url, env_keys_json, enabled, installed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+    ).run(
+      row.id, row.catalogId, row.name, row.name, row.transport,
+      row.command, row.argsJson, row.url, row.envKeysJson, new Date().toISOString(),
+    );
+    installed += 1;
+  }
+  out(`✓ Plugin installed ${manifest.slug} — ${manifest.name}`);
+  out(`  MCP servers: ${installed} added${reused ? `, ${reused} already present` : ""}`);
+  const authKind = manifest.auth?.kind;
+  if (authKind && authKind !== "none") {
+    out(`  ⚠ Requires ${authKind} — set credentials before use (agentlas creds).`);
+  }
+  if (Array.isArray(manifest.skills) && manifest.skills.length) {
+    out(`  skills declared: ${manifest.skills.map((skill) => skill.name).filter(Boolean).join(", ")}`);
+  }
+  out("  Only full-access turns wire active stdio servers into the runtime (agentlas mcp).");
+}
+
+async function cmdPluginList() {
+  const result = await callAgentlasMcpToolCli("marketplace.list_plugins", {});
+  const plugins = (result && (result.plugins || result.results)) || [];
+  if (!plugins.length) return out("No Hub plugins are available.");
+  for (const plugin of plugins.slice(0, 60)) {
+    out(`${String(plugin.slug || "").padEnd(32).slice(0, 32)} ${String(plugin.name || "").slice(0, 44)}`);
+  }
+  out("");
+  out("Install: agentlas plugin add <slug>");
+}
+
 async function callAgentlasMcpToolCli(name, args, { requireSession = false } = {}) {
-  if (typeof fetch !== "function") fail("이 런타임에 fetch가 없습니다(앱 런타임으로 실행 필요).");
+  if (typeof fetch !== "function") fail("fetch is unavailable in this runtime (run through the app runtime).");
   const base = process.env.AGENTLAS_MCP_BASE_URL || "https://agentlas.cloud/api/mcp/v1";
   const headers = { "content-type": "application/json" };
   const cookie = await cloudSessionCookieCli();
-  if (requireSession && !cookie) fail("Agent Cloud에는 로그인이 필요합니다. 먼저 `agentlas login`을 실행하세요.");
+  if (requireSession && !cookie) fail("Agent Cloud sign-in is required. Run `agentlas login` first.");
   if (cookie) headers.cookie = cookie;
   const resp = await fetchHubCli(`${base.replace(/\/$/, "")}/tools/call`, {
     method: "POST",
     headers,
     body: JSON.stringify({ method: name, params: { name, arguments: args || {} } }),
   });
-  if (!resp.ok) fail(`${name} 실패 ${resp.status}`);
+  if (!resp.ok) fail(`${name} failed with HTTP ${resp.status}`);
   const json = parseHubJsonCli(resp, name);
   if (json.error) fail(`${name}: ${json.error.message || "unknown error"}`);
   return json.result || null;
@@ -8175,7 +8269,7 @@ function resolveRuntime(db, override) {
       }
     : null;
   if (override) {
-    if (!RUNTIME_BIN[override]) fail(`알 수 없는 런타임: ${override} (claude-code|codex|gemini)`);
+    if (!RUNTIME_BIN[override]) fail(`Unknown runtime: ${override} (claude-code|codex|gemini)`);
     return activeCli && activeCli.kind === override ? activeCli : { mode: "cli", kind: override };
   }
   if (activeCli) return activeCli;
@@ -8185,7 +8279,7 @@ function resolveRuntime(db, override) {
   for (const kind of Object.keys(RUNTIME_BIN)) {
     if (which(RUNTIME_BIN[kind])) return { mode: "cli", kind };
   }
-  fail("사용할 런타임이 없습니다. CLI(claude/codex/gemini)를 설치하거나 앱에서 API 키/Ollama를 설정하세요.");
+  fail("No runtime is available. Install a CLI (claude/codex/gemini) or configure an API key/Ollama in the app.");
 }
 
 // Build the executable runtime inventory for the parent allocator.  It is
@@ -8275,14 +8369,14 @@ function normalizeCustomApiBaseUrl(raw) {
   try {
     parsed = new URL(value);
   } catch {
-    throw new Error("Custom API base URL이 올바르지 않습니다.");
+    throw new Error("Custom API base URL is invalid.");
   }
   const host = parsed.hostname.toLowerCase();
   const isLoopback = host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]";
   const isPrivateLan =
     /^10\./.test(host) || /^192\.168\./.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host);
   if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && (isLoopback || isPrivateLan))) {
-    throw new Error("Custom API base URL은 HTTPS 또는 localhost/LAN의 HTTP여야 합니다.");
+    throw new Error("Custom API base URL must use HTTPS or HTTP on localhost/LAN.");
   }
   return value.replace(/\/+$/, "");
 }
@@ -8308,7 +8402,7 @@ function readCustomApiBaseUrl() {
       raw = "";
     }
   } catch (e) {
-    throw new Error(`Custom API base URL을 공유 DB에서 읽지 못했습니다: ${(e && e.message) || e}`);
+    throw new Error(`Could not read the Custom API base URL from the shared database: ${(e && e.message) || e}`);
   } finally {
     try { if (db && typeof db.close === "function") db.close(); } catch { /* ignore close failure */ }
   }
@@ -8324,22 +8418,22 @@ async function runApi(backend, model, system, prompt, options) {
   options = options || {};
   model = model || DEFAULT_API_MODEL[backend];
   const fetchImpl = options.fetch || globalThis.fetch;
-  if (typeof fetchImpl !== "function") throw new Error("이 런타임에 fetch가 없습니다(앱 런타임으로 실행 필요).");
+  if (typeof fetchImpl !== "function") throw new Error("fetch is unavailable in this runtime (run through the app runtime).");
   if (backend === "ollama") {
     const resp = await fetchImpl("http://127.0.0.1:11434/api/chat", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ model, stream: false, messages: [{ role: "system", content: system }, { role: "user", content: prompt }] }),
     });
-    if (!resp.ok) throw new Error(`Ollama ${resp.status} — 'ollama serve' 실행/모델 확인`);
+    if (!resp.ok) throw new Error(`Ollama ${resp.status} — run 'ollama serve' and check the model`);
     const j = await resp.json();
     return (j.message && j.message.content) || "";
   }
   const supported = backend === "anthropic" || backend === "openai" || backend === "google" ||
     backend === "upstage" || backend === "custom" || !!ANTHROPIC_COMPAT_API[backend];
-  if (!supported) throw new Error("지원하지 않는 backend: " + backend);
+  if (!supported) throw new Error("Unsupported backend: " + backend);
   const key = Object.prototype.hasOwnProperty.call(options, "apiKey") ? options.apiKey : await apiKey(backend);
-  if (!key) throw new Error(`${backend} API 키가 없습니다. 앱 설정 → BYOK에서 키를 등록하세요.`);
+  if (!key) throw new Error(`${backend} API key is missing. Register it in App settings → BYOK.`);
 
   const anthropicCompat = ANTHROPIC_COMPAT_API[backend];
   if (backend === "anthropic" || anthropicCompat) {
@@ -8387,7 +8481,7 @@ async function runApi(backend, model, system, prompt, options) {
     const c = j.candidates && j.candidates[0];
     return (c && c.content && c.content.parts && c.content.parts[0] && c.content.parts[0].text) || "";
   }
-  throw new Error("지원하지 않는 backend: " + backend);
+  throw new Error("Unsupported backend: " + backend);
 }
 
 // 1회 실행 — CLI면 spawn(스트리밍 stdout), API면 호출 후 텍스트 출력. 종료코드 반환.
@@ -8766,7 +8860,7 @@ function apiRepl(db, backend, model, system, label, ctx) {
   ctx = ctx || { projectPath: null, agentId: null };
   if (!ctx.cwdAtRequest) ctx.cwdAtRequest = ctx.cwd || projectCwd();
   const readline = require("node:readline");
-  process.stderr.write(`▸ ${label} (${backend}${model ? " · " + model : ""}) — 종료: /exit\n`);
+  process.stderr.write(`▸ ${label} (${backend}${model ? " · " + model : ""}) — type /exit to stop\n`);
   const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
   const ask = () =>
     rl.question("\nyou › ", async (line) => {
@@ -9099,7 +9193,7 @@ function buildHelpers(db) {
     importLocal: (db_, p) => importLocalFolderCli(db_, p),
     // REPL-safe public Hub install: fail()(process.exit) 대신 Error를 throw 해 REPL이 직접 렌더하게 한다.
     cloudInstall: async (db_, slug) => {
-      if (typeof fetch !== "function") throw new Error("이 런타임에 fetch가 없습니다(앱 런타임 필요).");
+      if (typeof fetch !== "function") throw new Error("fetch is unavailable in this runtime (app runtime required).");
       const base = process.env.AGENTLAS_MCP_BASE_URL || "https://agentlas.cloud/api/mcp/v1";
       const headers = { "content-type": "application/json" };
       const cookie = await cloudSessionCookieCli();
@@ -9112,18 +9206,18 @@ function buildHelpers(db) {
           body: JSON.stringify({ method: "marketplace.get_manifest", params: { name: "marketplace.get_manifest", arguments: { kind: "agent", slug } } }),
         });
       } catch (e) {
-        throw new Error(`Hub 연결 실패: ${(e && e.message) || e}`);
+        throw new Error(`Hub connection failed: ${(e && e.message) || e}`);
       }
       if (!resp.ok) {
         const authHint = resp.status === 401 || resp.status === 403 ? " — 로그인이 필요합니다 (앱에서 로그인 또는 AGENTLAS_SESSION 설정)" : "";
-        throw new Error(`Hub 응답 ${resp.status}${authHint}`);
+        throw new Error(`Hub returned HTTP ${resp.status}${authHint}`);
       }
       const json = parseHubJsonCli(resp, "marketplace.get_manifest");
       if (json.error) throw new Error(json.error.message || "Hub error");
       const listing = json.result;
-      if (!listing) throw new Error(`Hub에서 찾을 수 없음: ${slug}`);
+      if (!listing) throw new Error(`Not found in Hub: ${slug}`);
       if (listing.delivery && listing.delivery.mode === "call_only") {
-        throw new Error(`이 Hub 에이전트는 call-only 자산입니다. 실행: agentlas call ${slug}`);
+        throw new Error(`This Hub agent is call-only. Run: agentlas call ${slug}`);
       }
       return persistCloudListingCli(db_, listing);
     },
@@ -9206,9 +9300,9 @@ function buildHelpers(db) {
     doctor: async (db_, ui) => {
       ui.line("");
       ui.info("userData: " + userDataDir());
-      ui.info("db: " + (fs.existsSync(dbPath()) ? "OK" : "없음"));
+      ui.info("db: " + (fs.existsSync(dbPath()) ? "OK" : "missing"));
       const ar = activeRuntime(db_);
-      ui.info("활성 런타임: " + (ar ? ar.kind : "(없음)"));
+      ui.info("Active runtime: " + (ar ? ar.kind : "(none)"));
       // CLI 런타임: 설치 + 로그인(인증 파일) 휴리스틱
       const home = os.homedir();
       const authFiles = {
@@ -9220,17 +9314,17 @@ function buildHelpers(db) {
       for (const [kind, bin] of Object.entries(RUNTIME_BIN)) {
         const installed = !!which(bin);
         const authed = (authFiles[kind] || []).some(has);
-        ui.info(`  ${kind.padEnd(12)} ${!installed ? "미설치" : authed ? "설치됨 · 로그인" : "설치됨 · 로그인 미확인"}`);
+        ui.info(`  ${kind.padEnd(12)} ${!installed ? "not installed" : authed ? "installed · signed in" : "installed · sign-in unverified"}`);
       }
       // BYOK 키 (keytar) + 클라우드 세션
       const byok = [];
       for (const b of ["anthropic", "openai", "google", "upstage"]) {
         try { if (await apiKey(b)) byok.push(b); } catch { /* keytar 미사용 */ }
       }
-      ui.info("BYOK 키: " + (byok.length ? byok.join(", ") : "(없음 — 앱 설정 → BYOK)"));
+      ui.info("BYOK keys: " + (byok.length ? byok.join(", ") : "(none — App settings → BYOK)"));
       let cloud = false;
       try { cloud = !!(await cloudSessionCookieCli()); } catch { /* ignore */ }
-      ui.info("클라우드 세션: " + (cloud ? "로그인됨" : "로그아웃"));
+      ui.info("Cloud session: " + (cloud ? "signed in" : "signed out"));
     },
   };
 }
@@ -9282,7 +9376,7 @@ function spawnRuntime(kind, systemPrompt, prompt, opts) {
       env,
     });
     child.on("error", (err) => {
-      process.stderr.write(`\n실행 실패(${kind}): ${err.message}\n`);
+      process.stderr.write(`\nExecution failed (${kind}): ${err.message}\n`);
       resolve(1);
     });
     child.on("close", (code) => resolve(code ?? 0));
@@ -9634,11 +9728,11 @@ function writeIfMissing(file, content) {
 
 function cmdCd(db, query) {
   const agent = resolveAgent(db, query);
-  if (!agent) fail(`에이전트를 찾을 수 없습니다: ${query}`);
+  if (!agent) fail(`Agent not found: ${query}`);
   const folder = agentFolder(agent);
   ensureNativeFiles(agent, folder);
   // 경로만 stdout으로 (cd "$(agentlas cd seo)") — 안내는 stderr로.
-  process.stderr.write(`# ${agent.name} — 네이티브 CLI 컨텍스트(CLAUDE.md/AGENTS.md/GEMINI.md) 준비됨\n`);
+  process.stderr.write(`# ${agent.name} — native CLI context ready (CLAUDE.md/AGENTS.md/GEMINI.md)\n`);
   process.stdout.write(folder + "\n");
 }
 
@@ -9743,12 +9837,12 @@ async function cmdRun(db, query, prompt, runtimeOverride, runtimeExperience = nu
   const agent = resolveAgent(db, query);
   if (!agent) {
     const routedPrompt = [query, prompt].filter(Boolean).join(" ").trim() || (await readStdin());
-    if (!routedPrompt || !routedPrompt.trim()) fail("프롬프트가 비어 있습니다. agentlas run <agent> \"...\" 또는 agentlas run \"...\" 형식으로 입력하세요.");
+    if (!routedPrompt || !routedPrompt.trim()) fail("Prompt is empty. Use agentlas run <agent> \"...\" or agentlas run \"...\".");
     return cmdAutoRun(db, routedPrompt.trim(), runtimeOverride, runtimeExperience);
   }
   let userPrompt = prompt;
   if (!userPrompt) userPrompt = await readStdin();
-  if (!userPrompt || !userPrompt.trim()) fail("프롬프트가 비어 있습니다. agentlas run <agent> \"...\" 또는 stdin으로 전달하세요.");
+  if (!userPrompt || !userPrompt.trim()) fail("Prompt is empty. Pass agentlas run <agent> \"...\" or provide it through stdin.");
   process.stderr.write(`▸ ${agent.name}\n`);
   const projectPath = ensureTerminalProjectForExecutionCli(db, projectCwd(), PERMISSION, "terminal-run");
   const cwd = projectPath || projectCwd();
@@ -9762,7 +9856,7 @@ async function cmdRun(db, query, prompt, runtimeOverride, runtimeExperience = nu
 async function cmdAutoRun(db, prompt, runtimeOverride, runtimeExperience = null) {
   const lang = prefsLang();
   const choice = autoRouteAgent(db, prompt, lang);
-  if (!choice) fail("자동 라우팅할 에이전트가 없습니다. agentlas list로 설치 상태를 확인하세요.");
+  if (!choice) fail("No agent is available for automatic routing. Check installation with agentlas list.");
   if (choice.direct) {
     // 전문 에이전트 확신 없음 → 페르소나/능력 라우팅 없이 현재 런타임으로 직답.
     process.stderr.write(`▸ direct (no agent)\n`);
@@ -9797,7 +9891,7 @@ async function cmdAutoRun(db, prompt, runtimeOverride, runtimeExperience = null)
 // chat / open / 에이전트명 단독 → 네이티브 CLI 대화형 세션 (claude처럼 바로 접속)
 function cmdOpen(db, query, runtimeOverride) {
   const agent = resolveAgent(db, query);
-  if (!agent) fail(`에이전트를 찾을 수 없습니다: ${query}`);
+  if (!agent) fail(`Agent not found: ${query}`);
   launchInteractive(db, agent, runtimeOverride);
 }
 
@@ -9832,11 +9926,11 @@ function firmSystemPrompt(db, firm) {
     /* ignore */
   }
   const base = (ceo && ceo.system_prompt) || `You are the CEO of ${firm.name}.`;
-  return `${base}\n\n[FIRM] 당신은 '${firm.name}' 회사의 CEO입니다. 사용자 명령을 부서에 위임해 처리하세요.\n조직도:\n${roster}`;
+  return `${base}\n\n[FIRM] You are the CEO of '${firm.name}'. Delegate user requests to the appropriate departments.\nOrganization:\n${roster}`;
 }
 async function cmdFirm(db, query, prompt, runtimeOverride) {
   const firm = resolveFirm(db, query);
-  if (!firm) fail(`회사를 찾을 수 없습니다: ${query}`);
+  if (!firm) fail(`Company not found: ${query}`);
   const sys = firmSystemPrompt(db, firm);
   if (prompt && prompt.trim()) {
     process.stderr.write(`▸ ${firm.name} CEO\n`);
@@ -10054,23 +10148,23 @@ async function cmdEnv(db) {
       ...readDotEnvFileCli(path.join(os.homedir(), ".agentlas", "credentials.env")),
     };
     const keys = Object.keys(fromFiles).sort();
-    out(`공유 env 키 ${keys.length}개 (값은 표시 안 함, credentials.env 기준):`);
+    out(`Shared env keys: ${keys.length} (values hidden; from credentials.env):`);
     for (const k of keys) out(`  ${k}`);
     out("");
-    out("키체인 저장 키는 데스크탑 앱의 설정 → 자격증명에서 보입니다.");
+    out("Keychain entries are available in Desktop settings → Credentials.");
     return;
   }
   const keytar = readKeytar();
-  if (!keytar) fail("keytar 모듈을 불러올 수 없습니다(앱 런타임으로 실행 필요).");
+  if (!keytar) fail("The keytar module is unavailable (run through the app runtime).");
   let creds;
   try {
     creds = await keytar.findCredentials(SERVICE);
   } catch (e) {
-    fail("env 조회 실패: " + ((e && e.message) || e));
+    fail("Failed to read environment settings: " + ((e && e.message) || e));
     return;
   }
   const keys = creds.map((c) => c.account).filter((a) => a.startsWith(ENV_PREFIX)).map((a) => a.slice(ENV_PREFIX.length));
-  out(`공유 env 키 ${keys.length}개 (값은 표시 안 함):`);
+  out(`Shared env keys: ${keys.length} (values hidden):`);
   for (const k of keys.sort()) out(`  ${k}`);
 }
 
@@ -10099,7 +10193,7 @@ function setMultimodalCli(db, modality, providerId) {
   const mm = loadMultimodalCatalog();
   if (!["image", "video", "audio"].includes(modality)) fail("usage: agentlas multimodal set <image|video|audio> <provider-id>");
   const provider = mm.MULTIMODAL_PROVIDERS.find((p) => p.id === providerId && p.modality === modality);
-  if (!provider) fail(`provider를 찾을 수 없습니다: ${providerId} (${modality})`);
+  if (!provider) fail(`Provider not found: ${providerId} (${modality})`);
   const key = modality === "image" ? "imageProvider" : modality === "video" ? "videoProvider" : "audioProvider";
   return saveMultimodalSettingsCli(db, { [key]: providerId });
 }
@@ -10162,7 +10256,7 @@ function parseUpdateFlags(args) {
     else if (arg === "--no-launch") flags.launch = false;
     else if (arg === "--url") flags.url = args[++i] || flags.url;
     else if (arg === "--help" || arg === "-h" || arg === "help") flags.help = true;
-    else fail(`알 수 없는 update 옵션: ${arg}`);
+    else fail(`Unknown update option: ${arg}`);
   }
   return flags;
 }
@@ -10237,19 +10331,19 @@ function updateTimeoutError(kind, ms) {
   return updateTransferError(`AGENTLAS_UPDATE_${kind.toUpperCase()}_TIMEOUT`, message);
 }
 
-function parseSafeUpdateUrl(value, label = "업데이트 URL") {
+function parseSafeUpdateUrl(value, label = "update URL") {
   let parsed;
   try {
     parsed = new URL(String(value || ""));
   } catch (error) {
-    throw updateTransferError("AGENTLAS_UPDATE_INVALID_URL", `${label} 형식이 올바르지 않습니다.`, error);
+    throw updateTransferError("AGENTLAS_UPDATE_INVALID_URL", `${label} has an invalid format.`, error);
   }
   const loopback = parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1" || parsed.hostname === "[::1]" || parsed.hostname === "::1";
   if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback)) {
-    throw updateTransferError("AGENTLAS_UPDATE_INSECURE_URL", `${label}은 HTTPS여야 합니다(로컬 루프백 제외).`);
+    throw updateTransferError("AGENTLAS_UPDATE_INSECURE_URL", `${label} must use HTTPS (except local loopback).`);
   }
   if (parsed.username || parsed.password) {
-    throw updateTransferError("AGENTLAS_UPDATE_INVALID_URL", `${label}에 사용자 정보가 포함될 수 없습니다.`);
+    throw updateTransferError("AGENTLAS_UPDATE_INVALID_URL", `${label} cannot contain user information.`);
   }
   return parsed.toString();
 }
@@ -10396,7 +10490,7 @@ async function fetchDesktopRelease(url) {
     return await fetchUpdateMetadata(url, { signal: controller.signal });
   } catch (error) {
     const message = String((error && error.message) || error);
-    fail(`업데이트 확인 실패: ${message}`);
+    fail(`Update check failed: ${message}`);
   }
 }
 
@@ -10435,19 +10529,19 @@ async function cmdUpdateStandalone(flags) {
   if (flags.json) {
     return out(JSON.stringify({ currentVersion, latestVersion, updateAvailable: comparison == null ? null : comparison < 0, channel: "npm" }, null, 2));
   }
-  out(`현재 버전: ${currentVersion}`);
+  out(`Current version: ${currentVersion}`);
   if (!latestVersion) {
-    out("npm 레지스트리에서 최신 버전을 확인하지 못했습니다 (오프라인이거나 아직 미발행).");
-    out("수동 업데이트:  npm i -g agentlas@latest");
+    out("Could not check the latest version on the npm registry (offline or not published yet).");
+    out("Manual update: npm i -g agentlas@latest");
     return;
   }
-  out(`최신 버전: ${latestVersion}`);
+  out(`Latest version: ${latestVersion}`);
   if (comparison == null) {
-    out("버전 형식을 비교하지 못했습니다. 수동 업데이트:  npm i -g agentlas@latest");
+    out("Could not compare version formats. Manual update: npm i -g agentlas@latest");
   } else if (comparison < 0) {
-    out("업데이트:  npm i -g agentlas@latest");
+    out("Update: npm i -g agentlas@latest");
   } else {
-    out("이미 최신 버전입니다.");
+    out("Already on the latest version.");
   }
 }
 
@@ -10462,7 +10556,7 @@ async function cmdUpdate(args) {
   const latestVersion = String(release.version || "");
   const artifact = findCurrentArtifact(release);
   const comparison = compareSemVer(currentVersion, latestVersion);
-  if (comparison == null) fail(`현재/최신 버전이 SemVer 형식이 아닙니다: current=${currentVersion} latest=${latestVersion}`);
+  if (comparison == null) fail(`Current/latest version is not valid SemVer: current=${currentVersion} latest=${latestVersion}`);
   const updateAvailable = comparison < 0;
   const status = {
     currentVersion,
@@ -10480,15 +10574,15 @@ async function cmdUpdate(args) {
   if (flags.json) return out(JSON.stringify(status, null, 2));
   out(formatUpdateSummary(status));
   if (flags.check) return;
-  if (release.ready !== true) fail("최신 릴리즈가 아직 공개 설치 가능 상태가 아닙니다.");
-  if (!updateAvailable && !flags.force) return out("이미 최신 버전입니다.");
-  if (process.platform !== "darwin") return out("이 OS는 아직 자동 설치를 지원하지 않습니다. 위 릴리즈/다운로드 링크에서 최신 설치 파일을 받으세요.");
-  if (!artifact || !artifact.url) fail("현재 Mac에 맞는 DMG를 찾지 못했습니다.");
+  if (release.ready !== true) fail("The latest release is not ready for public installation.");
+  if (!updateAvailable && !flags.force) return out("Already on the latest version.");
+  if (process.platform !== "darwin") return out("Automatic installation is not supported on this OS yet. Use the release/download link above.");
+  if (!artifact || !artifact.url) fail("Could not find a DMG for this Mac.");
   await installMacDesktopUpdate(release, artifact, flags);
 }
 
 function requirePath(commandPath, label) {
-  if (!fs.existsSync(commandPath)) fail(`업데이트에 필요한 도구가 없습니다: ${label}`);
+  if (!fs.existsSync(commandPath)) fail(`Required update tool not found: ${label}`);
   return commandPath;
 }
 
@@ -10824,9 +10918,9 @@ async function installMacDesktopUpdate(release, artifact, flags) {
   const stagingPath = path.join(targetDir, `.${targetName}.installing.${transactionId}.app`);
 
   try {
-    out(`다운로드: ${fileName}`);
+    out(`Download: ${fileName}`);
     await downloadUpdateFile(validatedArtifact.url, dmgPath, validatedArtifact);
-    out("검증: DMG, notarization, Gatekeeper");
+    out("Verify: DMG, notarization, Gatekeeper");
     await runCommand(hdiutil, ["verify", dmgPath]);
     await runCommand(xcrun, ["stapler", "validate", dmgPath]);
     await runCommand(spctl, ["-a", "-t", "open", "--context", "context:primary-signature", "-vv", dmgPath]);
@@ -10835,16 +10929,16 @@ async function installMacDesktopUpdate(release, artifact, flags) {
     mountPoint = parseHdiutilMountPoint(mount.stdout);
     const sourceApp = mountPoint ? path.join(mountPoint, "Agentlas.app") : "";
     if (!sourceApp || !fs.existsSync(sourceApp)) {
-      throw updateTransferError("AGENTLAS_UPDATE_APP_MISSING", "DMG 안에서 Agentlas.app을 찾지 못했습니다.");
+      throw updateTransferError("AGENTLAS_UPDATE_APP_MISSING", "Agentlas.app was not found in the DMG.");
     }
 
     const installedVersion = await runCommand(plistBuddy, ["-c", "Print :CFBundleShortVersionString", path.join(sourceApp, "Contents", "Info.plist")], { capture: true });
     const appVersion = installedVersion.stdout.trim();
     if (appVersion !== String(release.version)) {
-      throw updateTransferError("AGENTLAS_UPDATE_VERSION_MISMATCH", `앱 버전이 릴리즈와 다릅니다: release=${release.version} app=${appVersion}`);
+      throw updateTransferError("AGENTLAS_UPDATE_VERSION_MISMATCH", `App version does not match the release: release=${release.version} app=${appVersion}`);
     }
 
-    out("설치: 기존 Agentlas 종료 후 앱 교체");
+    out("Install: quit the existing Agentlas app and replace it");
     await runCommand(osascript, ["-e", 'tell application "Agentlas" to quit'], { capture: true, allowFailure: true });
     await sleep(2_000);
     const replacement = await replaceMacAppBundle({
@@ -10855,10 +10949,10 @@ async function installMacDesktopUpdate(release, artifact, flags) {
       runCommand,
       commands: { codesign, spctl, ditto, mv, rm },
     });
-    if (replacement.backupRetained) out(`주의: 검증된 새 앱은 설치됐지만 이전 앱 백업을 지우지 못했습니다: ${replacement.backupPath}`);
+    if (replacement.backupRetained) out(`Warning: the verified app was installed, but the previous app backup could not be removed: ${replacement.backupPath}`);
     if (fs.existsSync(lsregister)) await runCommand(lsregister, ["-f", targetApp], { allowFailure: true });
     if (flags.launch) await runCommand(open, ["-a", "Agentlas"], { allowFailure: true });
-    out(`Agentlas ${release.version} 설치 완료.`);
+    out(`Agentlas ${release.version} installed.`);
   } finally {
     if (mountPoint) await runCommand(hdiutil, ["detach", mountPoint], { allowFailure: true });
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -10950,32 +11044,32 @@ function oberonScaffold(args) {
   };
   if (flags.titles) manifest.titles = oberonSampleTitles(title);
   fs.writeFileSync(outPath, JSON.stringify(manifest, null, 2), "utf8");
-  out(`✓ 매니페스트 생성: ${outPath}`);
-  out(`  · 샷 ${shotCount}개 · ${aspect} · ${manifest.provider}`);
-  out(`  · 프롬프트를 채운 뒤:  agentlas oberon render ${path.basename(outPath)}`);
-  out(`  · 또는 에이전트로 채우기:  agentlas run oberon-film-studio "30초 향수 광고 트레일러"`);
-  if (!flags.titles) out(`  · 타이틀/자막 번인 샘플 포함하려면 --titles 플래그`);
+  out(`✓ Manifest created: ${outPath}`);
+  out(`  · ${shotCount} shots · ${aspect} · ${manifest.provider}`);
+  out(`  · fill prompts, then run: agentlas oberon render ${path.basename(outPath)}`);
+  out(`  · or use an agent: agentlas run oberon-film-studio "30-second fragrance ad trailer"`);
+  if (!flags.titles) out(`  · use --titles to include title/subtitle burn-in samples`);
 }
 
 function oberonRender(args) {
   const { flags, rest } = oberonParseFlags(args);
-  if (!rest[0]) fail("렌더할 매니페스트 경로가 필요합니다:  agentlas oberon render <manifest.json>");
+  if (!rest[0]) fail("A manifest path is required: agentlas oberon render <manifest.json>");
   const manifestPath = path.resolve(rest[0]);
-  if (!fs.existsSync(manifestPath)) fail(`매니페스트를 찾을 수 없습니다: ${manifestPath}`);
+  if (!fs.existsSync(manifestPath)) fail(`Manifest not found: ${manifestPath}`);
 
   let manifest;
   try {
     manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
   } catch (e) {
-    return fail(`매니페스트 JSON 파싱 실패: ${e.message}`);
+    return fail(`Failed to parse manifest JSON: ${e.message}`);
   }
-  if (!Array.isArray(manifest.shots) || !manifest.shots.length) fail("매니페스트에 shots[] 가 비어 있습니다.");
+  if (!Array.isArray(manifest.shots) || !manifest.shots.length) fail("The manifest has no shots[].");
 
   const root = oberonRepoRoot();
   const script = path.join(root, "scripts", "render-oberon-live-request.cjs");
   const builtRender = path.join(root, "dist", "electron", "oberon", "render.js");
-  if (!fs.existsSync(script)) fail(`헤드리스 렌더 스크립트가 없습니다(패키지 앱에는 미포함): ${script}`);
-  if (!fs.existsSync(builtRender)) fail(`Electron 빌드가 필요합니다. 먼저:  npm run build:electron   (없는 파일: ${builtRender})`);
+  if (!fs.existsSync(script)) fail(`Headless render script not found (not included in the packaged app): ${script}`);
+  if (!fs.existsSync(builtRender)) fail(`An Electron build is required. Run npm run build:electron first (missing: ${builtRender})`);
 
   // --max-shots 등 오버라이드가 있으면 사용자 매니페스트는 그대로 두고 임시 패치본을 만든다.
   let reqPath = manifestPath;
@@ -11000,18 +11094,18 @@ function oberonRender(args) {
   if (flags["poll-ms"]) childEnv.OBERON_LIVE_POLL_MS = String(flags["poll-ms"]);
   if (flags.open) childEnv.OBERON_LIVE_OPEN_DELIVERY = "1";
 
-  out(`▶ Oberon 렌더: "${manifest.title}"  (${manifest.shots.length}샷, 최대 ${overrides.maxShots ?? manifest.maxShots ?? 3})`);
-  out(`  매니페스트: ${manifestPath}`);
-  out(`  납품 폴더:  ${deliveryDir}`);
-  if (manifest.titles) out(`  타이틀/자막 번인: 활성 → *_titled.mp4 추가 생성`);
+  out(`▶ Oberon render: "${manifest.title}"  (${manifest.shots.length} shots, max ${overrides.maxShots ?? manifest.maxShots ?? 3})`);
+  out(`  Manifest: ${manifestPath}`);
+  out(`  Delivery folder: ${deliveryDir}`);
+  if (manifest.titles) out(`  title/subtitle burn-in: enabled → generating additional *_titled.mp4`);
 
   if (flags["dry-run"]) {
-    out("\n[dry-run] 실행할 명령:");
+    out("\n[dry-run] Command to run:");
     out(`  ${process.execPath} ${script}`);
     out("  env: OBERON_LIVE_VEO=1");
     out(`       OBERON_LIVE_REQUEST_FILE=${reqPath}`);
     out(`       OBERON_LIVE_DELIVERY_DIR=${deliveryDir}`);
-    out("  (full Electron · GEMINI_API_KEY/GOOGLE_CLOUD_PROJECT 볼트 필요)");
+  out("  (full Electron · GEMINI_API_KEY/GOOGLE_CLOUD_PROJECT vault required)");
     return;
   }
 
@@ -11032,11 +11126,11 @@ function oberonRender(args) {
     child.stderr.on("data", (c) => process.stderr.write(c));
     child.on("close", (code) => {
       if (code === 0) {
-        out(`\n✓ 렌더 완료 — 납품 폴더: ${deliveryDir}`);
+        out(`\n✓ Render complete — delivery folder: ${deliveryDir}`);
         const titled = files.filter((f) => f.kind && f.kind.startsWith("titled"));
-        if (titled.length) out(`  타이틀/자막 번인본: ${titled.map((f) => f.name).join(", ")}`);
+        if (titled.length) out(`  title/subtitle burn-in files: ${titled.map((f) => f.name).join(", ")}`);
       } else {
-        process.stderr.write(`\n✖ 렌더 실패 (exit ${code})\n`);
+        process.stderr.write(`\n✖ Render failed (exit ${code})\n`);
         process.exitCode = code || 1;
       }
       resolve();
@@ -11094,7 +11188,7 @@ function slugifyOberon(value) {
 function oberonList() {
   const dir = path.join(userDataDir(), "oberon");
   if (!fs.existsSync(dir)) {
-    out("아직 렌더 산출물이 없습니다.  agentlas oberon scaffold my.json  으로 시작하세요.");
+    out("No render outputs yet. Start with agentlas oberon scaffold my.json.");
     return;
   }
   const entries = fs
@@ -11118,40 +11212,40 @@ function oberonList() {
     .sort((a, b) => b.mtime - a.mtime)
     .slice(0, 15);
   if (!entries.length) {
-    out("아직 렌더 산출물이 없습니다.");
+    out("No render outputs yet.");
     return;
   }
-  out(`최근 Oberon 렌더 (${dir}):\n`);
+  out(`Recent Oberon renders (${dir}):\n`);
   for (const e of entries) {
     const masters = e.files.filter((f) => /master|titled/.test(f) && /\.(mp4|mov)$/.test(f));
     const when = e.mtime ? new Date(e.mtime).toISOString().slice(0, 16).replace("T", " ") : "";
     out(`  ${when}  ${e.name}`);
     if (masters.length) out(`            ${masters.join(", ")}`);
   }
-  out(`\n폴더 열기:  agentlas oberon open`);
+  out(`\nOpen the folder with: agentlas oberon open`);
 }
 
 function oberonOpen(args) {
   const target = args[0] ? path.resolve(args[0]) : path.join(userDataDir(), "oberon");
-  if (!fs.existsSync(target)) fail(`경로가 없습니다: ${target}`);
+  if (!fs.existsSync(target)) fail(`Path not found: ${target}`);
   const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "explorer" : "xdg-open";
   spawn(opener, [target], { detached: true, stdio: "ignore" }).unref();
-  out(`폴더 열기: ${target}`);
+  out(`Opening folder: ${target}`);
 }
 
 function oberonHelp() {
   out(
     [
-      "agentlas oberon — 터미널에서 AI 필름 렌더",
+      "agentlas oberon — AI film rendering from the terminal",
       "",
       "  oberon scaffold [out.json] [--title T] [--aspect 16:9] [--shots N] [--titles]",
-      "                         편집 가능한 렌더 매니페스트 생성 (--titles: 타이틀/자막 번인 샘플 포함)",
+      "                         create an editable render manifest (--titles: include title/subtitle burn-in samples)",
       "  oberon render <manifest.json> [--delivery DIR] [--max-shots N] [--open] [--dry-run]",
-      "                         full Electron 렌더 스폰 + 진행률 스트리밍 (GEMINI_API_KEY 볼트 필요)",
+      "                         spawn full Electron render + stream progress (GEMINI_API_KEY vault required)",
       "  oberon list            최근 렌더 산출물",
       "  oberon open [path]     산출물 폴더 열기",
       "",
-      "프롬프트는 직접 채우거나, 에이전트에게:  agentlas run oberon-film-studio \"30초 향수 광고\"",
+      "Fill prompts directly, or ask an agent: agentlas run oberon-film-studio \"30-second fragrance ad\"",
     ].join("\n"),
   );
 }
@@ -11175,7 +11269,7 @@ async function cmdOberon(args) {
     case "-h":
       return oberonHelp();
     default:
-      fail(`알 수 없는 oberon 하위명령: ${sub}  (scaffold|render|list|open|help)`);
+      fail(`Unknown oberon subcommand: ${sub}  (scaffold|render|list|open|help)`);
   }
 }
 
@@ -11201,6 +11295,7 @@ function cmdHelp() {
       hdr("AGENTS & HUB   (Agentlas OS surface)"),
       "  search \"<what you need>\" discover agents in the Hub + local            (hep-search)",
       "  install <slug>           install an agent from the Hub                    (hep-cloud)",
+      "  plugin add <slug>        install a Hub plugin (MCP servers) into this machine",
       "  build \"<request>\"        build/repair/package an agent or team           (hep-build)",
       "  upload <path>            save owner-private in Agent Cloud (default)       (hep-upload)",
       "    --visibility marketplace  explicit compatibility flag: publish to Hub",
@@ -11279,7 +11374,7 @@ async function main() {
       runtimeOverride = argv[++i];
     } else if (argv[i] === "--permission" || argv[i] === "-P") {
       const p = (argv[++i] || "").toLowerCase();
-      if (!["read", "write", "full"].includes(p)) fail(`알 수 없는 권한: ${p} (read|write|full)`);
+      if (!["read", "write", "full"].includes(p)) fail(`Unknown permission: ${p} (read|write|full)`);
       PERMISSION = p;
       PERMISSION_EXPLICIT = true;
     } else {
@@ -11392,13 +11487,20 @@ async function main() {
         out,
       });
     case "search": // hep-search — 에이전트 디렉터리 발견 (Hub + 로컬)
-      if (!rest[1]) return fail('usage: agentlas search "<찾는 일>" [--limit 10]');
+      if (!rest[1]) return fail('usage: agentlas search "<what you need>" [--limit 10]');
       return parity().cloudSearch(db, rest.slice(1));
     case "install": // public Hub package install — slug로 에이전트 설치
-      if (!rest[1]) return fail('usage: agentlas install <slug>   (먼저 agentlas search "할 일" 로 찾으세요)');
+      if (!rest[1]) return fail('usage: agentlas install <slug>   (run agentlas search "what you need" first)');
       return cmdCloudInstall(db, rest[1]);
+    case "plugin": // Hub 플러그인(MCP 서버 번들) — 에이전트 설치(install)와 다른 카탈로그다
+    case "plugins": {
+      const action = rest[1];
+      if (action === "add") return cmdPluginAdd(db, rest[2]);
+      if (action === "list" || !action) return cmdPluginList();
+      return fail("usage: agentlas plugin add <slug> | agentlas plugin list");
+    }
     case "upload": { // 기본은 owner-private Agent Cloud, public Hub는 명시 flag로만.
-      if (!rest[1]) return fail("usage: agentlas upload <에이전트 폴더 경로> [--visibility marketplace]");
+      if (!rest[1]) return fail("usage: agentlas upload <agent-folder-path> [--visibility marketplace]");
       const uploadArgs = rest.slice(1);
       return cmdCloud(db, [cloudActionForTopLevelUpload(uploadArgs), ...uploadArgs], runtimeOverride);
     }
@@ -11464,7 +11566,7 @@ async function main() {
       if (firm) return cmdFirm(db, cmd, "", runtimeOverride);
       const prompt = rest.join(" ").trim();
       if (prompt) return cmdAutoRun(db, prompt, runtimeOverride);
-      fail(`에이전트/회사를 찾을 수 없습니다: ${cmd}  (agentlas list 로 확인)`);
+      fail(`Agent/company not found: ${cmd}  (check with agentlas list)`);
     }
   }
 }

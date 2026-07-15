@@ -194,7 +194,7 @@ function runRuntimeDoctor(errorMessage) {
       kind,
       summary: hitList.length
         ? `런타임에 미인증 OAuth MCP 플러그인(${hitList.map((h) => h.pluginKey).join(", ")})이 붙어 있어 CLI가 죽었습니다.`
-        : `미인증 OAuth MCP(${hosts.join(", ") || "unknown host"})가 런타임을 죽였지만 어떤 플러그인인지 특정하지 못했습니다.`,
+        : `An unauthenticated OAuth MCP (${hosts.join(", ") || "unknown host"}) crashed the runtime, but the responsible plugin could not be identified.`,
       repaired: repairedAny,
       actions,
     };

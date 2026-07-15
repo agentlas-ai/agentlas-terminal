@@ -94,7 +94,7 @@ function openSqlite(p) {
   } catch { /* optional dep 미설치/ABI 불일치 */ }
   const major = Number(process.versions.node.split(".")[0]);
   if (major < 22) {
-    throw new Error(`Node ${process.version} — better-sqlite3가 없으면 Node 22+ (node:sqlite)가 필요합니다.`);
+    throw new Error(`Node ${process.version} — Node 22+ (node:sqlite) is required when better-sqlite3 is unavailable.`);
   }
   const { DatabaseSync } = loadNodeSqliteQuietly();
   const db = new DatabaseSync(p);
@@ -109,7 +109,7 @@ function bootstrapDbIfMissing() {
   if (exists(p)) return { created: false, path: p };
   const schemaFile = path.join(PKG_ROOT, "engine", "bootstrap-schema.sql");
   if (!exists(schemaFile)) {
-    throw new Error(`부트스트랩 스키마가 없습니다: ${schemaFile}`);
+    throw new Error(`Bootstrap schema not found: ${schemaFile}`);
   }
   fs.mkdirSync(path.dirname(p), { recursive: true });
   const sql = fs.readFileSync(schemaFile, "utf8");
@@ -123,7 +123,7 @@ function bootstrapDbIfMissing() {
   } catch (e) {
     db.close();
     try { fs.rmSync(temp, { force: true }); } catch { /* leave temp for inspection */ }
-    throw new Error(`DB 부트스트랩 실패: ${e.message}`);
+    throw new Error(`Database bootstrap failed: ${e.message}`);
   }
   db.close();
   let created = false;
@@ -132,7 +132,7 @@ function bootstrapDbIfMissing() {
     created = true;
   } catch (e) {
     if (!e || e.code !== "EEXIST") {
-      throw new Error(`DB 원자 부트스트랩 전환 실패: ${e && e.message ? e.message : e}`);
+      throw new Error(`Atomic database bootstrap failed: ${e && e.message ? e.message : e}`);
     }
   } finally {
     try { fs.rmSync(temp, { force: true }); } catch { /* noop */ }
@@ -150,9 +150,9 @@ function main() {
 
   let error = null;
   if (!engineFound) {
-    error = "엔진이 없습니다 (engine/agentlas.cjs). 재설치: npm i -g agentlas";
+    error = "Engine not found (engine/agentlas.cjs). Reinstall with: npm i -g agentlas";
   } else if (!sqliteDriver) {
-    error = `Node ${process.version} — SQLite 드라이버가 없습니다. Node 22.5+ 로 올리거나 'npm i -g agentlas'로 재설치(better-sqlite3 빌드)하세요.`;
+    error = `Node ${process.version} — no SQLite driver. Upgrade to Node 22.5+ or reinstall with 'npm i -g agentlas' to build better-sqlite3.`;
   }
 
   if (args[0] === "--where" || args[0] === "terminal-where") {
@@ -178,7 +178,7 @@ function main() {
   try {
     const boot = bootstrapDbIfMissing();
     if (boot.created) {
-      process.stderr.write(`첫 실행: Agentlas 데이터 초기화 완료 (${boot.path})\n`);
+      process.stderr.write(`First run: initialized Agentlas data (${boot.path})\n`);
     }
   } catch (e) {
     process.stderr.write(`${e.message}\n`);
@@ -201,7 +201,7 @@ function main() {
   }
 
   child.on("error", (err) => {
-    process.stderr.write(`Agentlas 엔진 실행 실패: ${err.message}\n`);
+    process.stderr.write(`Failed to start the Agentlas engine: ${err.message}\n`);
     process.exit(1);
   });
   child.on("exit", (code, signal) => {

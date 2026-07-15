@@ -248,7 +248,7 @@ function sendJson(response, status, body, headers = {}) {
     writePrivateAgent(upgradeRoot, "Upgrade Required Agent");
     await assert.rejects(
       packageCloudAgentCli(null, upgradeRoot, { slug: "upgrade-required-agent", dryRun: false, llmReview: false }),
-      (error) => error.code === "client_upgrade_required" && /자동 복사하지 않습니다/.test(error.message),
+      (error) => error.code === "client_upgrade_required" && /will not be copied automatically/.test(error.message),
     );
     assert.equal(fs.existsSync(path.join(upgradeRoot, ".agentlas-cloud-package.json")), false);
 
@@ -256,7 +256,7 @@ function sendJson(response, status, body, headers = {}) {
     writePrivateAgent(maintenanceRoot, "Maintenance Agent");
     await assert.rejects(
       packageCloudAgentCli(null, maintenanceRoot, { slug: "maintenance-agent", dryRun: false, llmReview: false }),
-      (error) => error.code === "cloud_mutations_maintenance" && /60초.*읽기·목록·복원/.test(error.message),
+      (error) => error.code === "cloud_mutations_maintenance" && /60 seconds.*Read, list, and restore/.test(error.message),
     );
     assert.equal(fs.existsSync(path.join(maintenanceRoot, ".agentlas-cloud-package.json")), false);
 

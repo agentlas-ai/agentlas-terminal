@@ -31,7 +31,7 @@ CREATE TABLE chats (
         id TEXT PRIMARY KEY,
         project_id TEXT,
         agent_id TEXT NOT NULL,
-        title TEXT NOT NULL DEFAULT '새 채팅',
+        title TEXT NOT NULL DEFAULT 'New chat',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL, firm_id TEXT REFERENCES firms(id) ON DELETE SET NULL, archived_at TEXT, working_folder TEXT, kind TEXT NOT NULL DEFAULT 'user', parent_chat_id TEXT, used_at TEXT, agent_group_id TEXT REFERENCES agent_groups(id) ON DELETE SET NULL, continuous_mode INTEGER NOT NULL DEFAULT 0, swarm_mode INTEGER NOT NULL DEFAULT 0,
         FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL,

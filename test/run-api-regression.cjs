@@ -141,14 +141,14 @@ async function testProviderErrorsNeverExitTheHostProcess() {
         apiKey: "",
         fetch: async () => response(200, {}),
       }),
-      /deepseek API \ud0a4/,
+      /deepseek API key/,
     );
     await assert.rejects(
       runApi("unknown", null, "system", "prompt", {
         apiKey: "secret",
         fetch: async () => response(200, {}),
       }),
-      /\uc9c0\uc6d0\ud558\uc9c0 \uc54a\ub294 backend/,
+      /Unsupported backend/,
     );
     assert.equal(exitCalls, 0, "runApi must throw to swarm/automation instead of exiting");
   } finally {

@@ -221,7 +221,7 @@ function close(server) {
       fs.symlinkSync(privateRoot, rootSymlink, "dir");
       await assert.rejects(
         packageCloudAgentCli(null, rootSymlink, { dryRun: true, llmReview: false }),
-        /실제 폴더가 아닙니다/,
+        /Not a real directory/,
       );
     } catch (error) {
       if (!error || !["EPERM", "EACCES"].includes(error.code)) throw error;

@@ -104,7 +104,7 @@ async function main() {
   // Timeout closes the listener and never returns a session.
   const timedOut = startAttempt({ timeoutMs: 25 });
   callbackFromLoginUrl(await timedOut.ready);
-  await assert.rejects(timedOut.result, /대기 시간/);
+  await assert.rejects(timedOut.result, /Login timed out/);
 
   console.log("login-loopback-security: PASS");
 }

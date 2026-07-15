@@ -11,7 +11,7 @@ PKG_ROOT="$(dirname "$SCRIPT_DIR")"
 DB="${1:-$HOME/Library/Application Support/Agentlas/agentlas.sqlite}"
 OUT="$PKG_ROOT/engine/bootstrap-schema.sql"
 
-[ -f "$DB" ] || { echo "DB를 찾을 수 없습니다: $DB" >&2; exit 1; }
+[ -f "$DB" ] || { echo "Database not found: $DB" >&2; exit 1; }
 
 USER_VERSION="$(sqlite3 "$DB" 'PRAGMA user_version;')"
 {

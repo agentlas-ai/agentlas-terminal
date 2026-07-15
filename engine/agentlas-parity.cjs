@@ -42,7 +42,7 @@ const MAX_LOGIN_SESSION_BYTES = 16 * 1024;
 
 function createLoginState(randomBytes = crypto.randomBytes) {
   const bytes = Buffer.from(randomBytes(32));
-  if (bytes.length !== 32) throw new Error("로그인 state 생성에 실패했습니다.");
+  if (bytes.length !== 32) throw new Error("Could not create the login state.");
   return bytes.toString("base64url");
 }
 
@@ -65,7 +65,7 @@ function createLoginCallbackGuard(expectedState) {
       try {
         url = new URL(String(rawUrl || "/"), "http://127.0.0.1");
       } catch {
-        return { handled: true, final: false, ok: false, statusCode: 400, message: "잘못된 로그인 콜백입니다." };
+        return { handled: true, final: false, ok: false, statusCode: 400, message: "Invalid login callback." };
       }
       if (url.pathname !== LOGIN_CALLBACK_PATH) {
         return { handled: false, final: false, ok: false, statusCode: 404, message: "not found" };
@@ -74,7 +74,7 @@ function createLoginCallbackGuard(expectedState) {
         return { handled: true, final: false, ok: false, statusCode: 405, message: "method not allowed" };
       }
       if (consumed) {
-        return { handled: true, final: false, ok: false, statusCode: 410, message: "이미 사용된 로그인 콜백입니다." };
+        return { handled: true, final: false, ok: false, statusCode: 410, message: "Login callback has already been used." };
       }
       consumed = true;
 
@@ -84,7 +84,7 @@ function createLoginCallbackGuard(expectedState) {
           final: true,
           ok: false,
           statusCode: 400,
-          message: "로그인 콜백 state 검증에 실패했습니다. agentlas login을 다시 실행하세요.",
+          message: "Login callback state validation failed. Run agentlas login again.",
         };
       }
       const oauthError = url.searchParams.get("error");
@@ -95,7 +95,7 @@ function createLoginCallbackGuard(expectedState) {
           final: true,
           ok: false,
           statusCode: 400,
-          message: `Agentlas 로그인 거부: ${safeCode}`,
+          message: `Agentlas login denied: ${safeCode}`,
         };
       }
       const value = url.searchParams.get("session") || url.searchParams.get("token") || "";
@@ -105,7 +105,7 @@ function createLoginCallbackGuard(expectedState) {
           final: true,
           ok: false,
           statusCode: 400,
-          message: "콜백에 session 값이 없습니다.",
+          message: "The callback did not include a session value.",
         };
       }
       if (Buffer.byteLength(value, "utf8") > MAX_LOGIN_SESSION_BYTES) {
@@ -114,10 +114,10 @@ function createLoginCallbackGuard(expectedState) {
           final: true,
           ok: false,
           statusCode: 400,
-          message: "로그인 session 값이 허용 크기를 초과했습니다.",
+          message: "The login session value is too large.",
         };
       }
-      return { handled: true, final: true, ok: true, statusCode: 200, value, message: "Agentlas 로그인 완료" };
+      return { handled: true, final: true, ok: true, statusCode: 200, value, message: "Agentlas login complete" };
     },
     isConsumed() { return consumed; },
   };
@@ -197,7 +197,7 @@ function create(deps) {
       return { ok: false };
     }
     if (goal.startsWith("-")) {
-      ui.error("goal은 '-'로 시작할 수 없습니다.");
+      ui.error("goal cannot start with '-'.");
       return { ok: false };
     }
     const cwd = ctx.cwd || (typeof D.projectCwd === "function" ? D.projectCwd() : D.runCwd());
@@ -356,12 +356,12 @@ function create(deps) {
         ? spawn(found.exec, isCareerGraph ? args.slice(1) : args, { cwd, stdio: "inherit" })
         : spawnCoreModule(moduleName, moduleArgs, { cwd, stdio: "inherit" }, found.root);
     if (!child) {
-      process.stderr.write("Hephaestus 실행 실패: Python 3.9+를 찾을 수 없습니다.\n");
+      process.stderr.write("Hephaestus failed: Python 3.9+ was not found.\n");
       return Promise.resolve(1);
     }
     return new Promise((resolve) => {
       child.on("error", (e) => {
-        process.stderr.write(`Hephaestus 실행 실패: ${e.message}\n`);
+        process.stderr.write(`Hephaestus failed: ${e.message}\n`);
         resolve(1);
       });
       child.on("close", (code) => resolve(code == null ? 0 : code));
@@ -655,7 +655,7 @@ function create(deps) {
               const parsed = parseSwarmOutput(text);
               task.status = "done";
               task.result = parsed.result;
-              ui.toolResult(parsed.result.split("\n").slice(0, 3).join("\n") || "(빈 결과)", true);
+              ui.toolResult(parsed.result.split("\n").slice(0, 3).join("\n") || "(empty result)", true);
               for (const s of parsed.spawn) {
                 const key = s.title.toLowerCase();
                 if (tasks.length >= SWARM_MAX_TASKS || seen.has(key)) continue;
@@ -715,7 +715,7 @@ function create(deps) {
       );
     } catch (e) {
       ui.stopSpinner();
-      ui.error("종합 실패: " + String((e && e.message) || e).slice(0, 200));
+      ui.error("Synthesis failed: " + String((e && e.message) || e).slice(0, 200));
       finalText = pieces;
     }
     ui.stopSpinner();
@@ -901,7 +901,7 @@ function create(deps) {
       const rows = db.prepare(
         "SELECT id, name, schedule, target_type, target_id, enabled, next_run_at, last_run_at, run_count, trigger_type FROM automations ORDER BY created_at DESC",
       ).all();
-      if (!rows.length) return D.out("자동화가 없습니다.  agentlas automation add --help");
+      if (!rows.length) return D.out("No automations. Run agentlas automation add --help.");
       for (const r of rows) {
         const target = r.target_type + ":" + String(r.target_id).slice(0, 24);
         D.out(
@@ -911,8 +911,8 @@ function create(deps) {
         );
       }
       D.out("");
-      D.out("지금 실행: agentlas automation run <id>  ·  상주 실행기: agentlas automation daemon");
-      D.out("(데스크탑 앱이 켜져 있으면 앱 스케줄러도 실행합니다 — 리스로 중복 실행은 방지됩니다.)");
+      D.out("Run now: agentlas automation run <id>  ·  daemon: agentlas automation daemon");
+      D.out("The Desktop scheduler also runs when the app is open; leases prevent duplicate runs.");
       return;
     }
 
@@ -930,7 +930,7 @@ function create(deps) {
         else if (a === "--disabled") flags.disabled = true;
       }
       if (!flags.cron || !flags.prompt || (!flags.agent && !flags.firm)) {
-        D.out('usage: agentlas automation add --name "이름" --agent <slug>|--firm <slug> --cron "0 9 * * *" --prompt "지시" [--tz Asia/Seoul] [--disabled]');
+        D.out('usage: agentlas automation add --name "name" --agent <slug>|--firm <slug> --cron "0 9 * * *" --prompt "instructions" [--tz Asia/Seoul] [--disabled]');
         process.exitCode = 1;
         return;
       }
@@ -939,19 +939,19 @@ function create(deps) {
       let targetLabel;
       if (flags.agent) {
         const a = D.resolveAgent(db, flags.agent);
-        if (!a) return D.fail(`에이전트를 찾을 수 없습니다: ${flags.agent}`);
+        if (!a) return D.fail(`Agent not found: ${flags.agent}`);
         targetType = "agent";
         targetId = a.id;
         targetLabel = a.name;
       } else {
         const f = D.resolveFirm(db, flags.firm);
-        if (!f) return D.fail(`회사를 찾을 수 없습니다: ${flags.firm}`);
+        if (!f) return D.fail(`Company not found: ${flags.firm}`);
         targetType = "firm";
         targetId = f.id;
         targetLabel = f.name;
       }
       const next = nextCronRun(flags.cron, new Date(), flags.tz || null);
-      if (!next) return D.fail(`cron 표현식을 해석할 수 없습니다: "${flags.cron}" (5필드: 분 시 일 월 요일)`);
+      if (!next) return D.fail(`Could not parse cron expression: "${flags.cron}" (5 fields: minute hour day month weekday)`);
       const id = crypto.randomUUID();
       db.prepare(
         `INSERT INTO automations (id, name, schedule, target_type, target_id, prompt_template, enabled, created_by,
@@ -959,7 +959,7 @@ function create(deps) {
          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)`,
       ).run(
         id,
-        flags.name || `${targetLabel} 자동화`,
+        flags.name || `${targetLabel} automation`,
         flags.cron,
         targetType,
         targetId,
@@ -973,8 +973,8 @@ function create(deps) {
         "auto",
         "hub-allowed",
       );
-      D.out(`등록됨: ${id.slice(0, 8)}  ${flags.name || targetLabel}  next=${next.toISOString().slice(0, 16)}`);
-      D.out(`지금 실행: agentlas automation run ${id.slice(0, 8)}  ·  예약 실행: agentlas automation daemon (또는 데스크탑 앱)`);
+      D.out(`Created: ${id.slice(0, 8)}  ${flags.name || targetLabel}  next=${next.toISOString().slice(0, 16)}`);
+      D.out(`Run now: agentlas automation run ${id.slice(0, 8)}  ·  scheduled: agentlas automation daemon (or Desktop)`);
       return;
     }
 
@@ -982,14 +982,14 @@ function create(deps) {
       const idPrefix = args[1];
       if (!idPrefix) return D.fail(`usage: agentlas automation ${sub} <id>`);
       const row = db.prepare("SELECT id, name, schedule, schedule_json, timezone FROM automations WHERE id LIKE ?").get(idPrefix + "%");
-      if (!row) return D.fail(`자동화를 찾을 수 없습니다: ${idPrefix}`);
+      if (!row) return D.fail(`Automation not found: ${idPrefix}`);
       if (sub === "on") {
         const next = nextAutomationRun(row) || null;
         db.prepare("UPDATE automations SET enabled=1, next_run_at=? WHERE id=?").run(next ? next.toISOString() : null, row.id);
       } else {
         db.prepare("UPDATE automations SET enabled=0 WHERE id=?").run(row.id);
       }
-      D.out(`${sub === "on" ? "켜짐" : "꺼짐"}: ${row.id.slice(0, 8)}  ${row.name}`);
+      D.out(`${sub === "on" ? "Enabled" : "Disabled"}: ${row.id.slice(0, 8)}  ${row.name}`);
       return;
     }
 
@@ -997,9 +997,9 @@ function create(deps) {
       const idPrefix = args[1];
       if (!idPrefix) return D.fail("usage: agentlas automation remove <id>");
       const row = db.prepare("SELECT id, name FROM automations WHERE id LIKE ?").get(idPrefix + "%");
-      if (!row) return D.fail(`자동화를 찾을 수 없습니다: ${idPrefix}`);
+      if (!row) return D.fail(`Automation not found: ${idPrefix}`);
       db.prepare("DELETE FROM automations WHERE id=?").run(row.id);
-      D.out(`삭제됨: ${row.id.slice(0, 8)}  ${row.name}`);
+      D.out(`Deleted: ${row.id.slice(0, 8)}  ${row.name}`);
       return;
     }
 
@@ -1009,10 +1009,10 @@ function create(deps) {
            LEFT JOIN automations a ON a.id = h.automation_id
            ORDER BY h.ran_at DESC LIMIT 15`,
       ).all();
-      if (!rows.length) return D.out("실행 이력이 없습니다.");
+      if (!rows.length) return D.out("No run history.");
       for (const r of rows) {
         D.out(
-          `${(r.ran_at || "").slice(0, 16).padEnd(17)} ${(r.status || "?").padEnd(9)} ${(r.name || "(삭제됨)").slice(0, 30).padEnd(31)} ${r.error ? String(r.error).slice(0, 40) : ""}`,
+          `${(r.ran_at || "").slice(0, 16).padEnd(17)} ${(r.status || "?").padEnd(9)} ${(r.name || "(deleted)").slice(0, 30).padEnd(31)} ${r.error ? String(r.error).slice(0, 40) : ""}`,
         );
       }
       return;
@@ -1022,7 +1022,7 @@ function create(deps) {
       const idPrefix = args[1];
       if (!idPrefix) return D.fail("usage: agentlas automation run <id>");
       const row = db.prepare("SELECT * FROM automations WHERE id LIKE ?").get(idPrefix + "%");
-      if (!row) return D.fail(`자동화를 찾을 수 없습니다: ${idPrefix}`);
+      if (!row) return D.fail(`Automation not found: ${idPrefix}`);
       const ui = newUi();
       // run-now는 스케줄을 건드리지 않는다 (앱의 advanceSchedule=false와 동일).
       const r = await runAutomationOnce(db, row, { ui, advanceSchedule: false, runtimeOverride });
@@ -1073,7 +1073,7 @@ function create(deps) {
     const ui = ctx.ui || newUi();
     // run-now도 리스를 잡는다 — 앱 스케줄러가 같은 행을 동시에 돌리는 것을 방지.
     if (!claimAutomation(db, row.id)) {
-      ui.warn(`다른 실행기가 이 자동화를 잡고 있습니다 (lease TTL 15분): ${row.name}`);
+      ui.warn(`Another runner holds this automation (lease TTL 15 minutes): ${row.name}`);
       return { ok: false, skipped: true };
     }
     ui.line("");
@@ -1085,11 +1085,11 @@ function create(deps) {
       let agentId = null;
       if (row.target_type === "firm") {
         const firm = db.prepare("SELECT * FROM firms WHERE id = ?").get(row.target_id);
-        if (!firm) throw new Error(`회사를 찾을 수 없습니다: ${row.target_id}`);
+        if (!firm) throw new Error(`Company not found: ${row.target_id}`);
         system = D.firmSystemPrompt(db, firm);
       } else {
         const agent = db.prepare("SELECT * FROM installed_agents WHERE id = ?").get(row.target_id);
-        if (!agent) throw new Error(`에이전트를 찾을 수 없습니다: ${row.target_id}`);
+        if (!agent) throw new Error(`Agent not found: ${row.target_id}`);
         system = agent.system_prompt || `You are ${agent.name}.`;
         agentId = agent.id;
       }
@@ -1157,7 +1157,7 @@ function create(deps) {
     process.on("SIGTERM", () => { stopping = true; });
 
     ui.line("");
-    ui.ok(`automation daemon — ${intervalSec}s 폴링 · owner ${AUTOMATION_LEASE_OWNER}`);
+    ui.ok(`automation daemon — polling every ${intervalSec}s · owner ${AUTOMATION_LEASE_OWNER}`);
     ui.info(ui.lang === "ko" ? "Ctrl-C로 종료. (데스크탑 앱 스케줄러와 리스를 공유해 중복 실행되지 않습니다.)" : "Ctrl-C to stop.");
 
     while (!stopping) {
@@ -1168,7 +1168,7 @@ function create(deps) {
           "SELECT * FROM automations WHERE enabled = 1 AND trigger_type = 'schedule' AND next_run_at IS NOT NULL AND next_run_at <= ? ORDER BY next_run_at ASC LIMIT 5",
         ).all(nowIso);
       } catch (e) {
-        ui.error("due 조회 실패: " + String((e && e.message) || e));
+        ui.error("Failed to query due automations: " + String((e && e.message) || e));
       }
       for (const row of due) {
         if (stopping) break;
@@ -1192,12 +1192,12 @@ function create(deps) {
     try {
       rows = db.prepare("SELECT id, name, name_en, transport, enabled FROM mcp_servers ORDER BY installed_at ASC").all();
     } catch { /* 테이블 없음 */ }
-    if (!rows.length) return D.out("설치된 MCP 서버가 없습니다. (설치/설정은 데스크탑 앱 또는 에이전트 패키지가 관리)");
+    if (!rows.length) return D.out("No MCP servers are installed. Configure them in Desktop or an agent package.");
     for (const r of rows) {
       D.out(`${r.enabled ? "●" : "○"} ${String(r.name || r.name_en || r.id).padEnd(28).slice(0, 28)} ${String(r.transport || "stdio").padEnd(8)} ${String(r.id).slice(0, 12)}`);
     }
     D.out("");
-    D.out("full 턴에서만 활성(●) stdio 서버가 런타임에 배선됩니다. REPL에서는 /mcp.");
+    D.out("Only full-access turns wire active (●) stdio servers into the runtime. In the REPL, use /mcp.");
   }
 
   function cmdChats(db, args) {
@@ -1211,12 +1211,12 @@ function create(deps) {
           ORDER BY c.updated_at DESC LIMIT ?`,
       ).all(limit);
     } catch { /* 스키마 차이 */ }
-    if (!rows.length) return D.out("채팅이 없습니다.");
+    if (!rows.length) return D.out("No chats.");
     for (const r of rows) {
-      D.out(`${String(r.updated_at || "").slice(0, 16).padEnd(17)} ${String(r.agent_name || r.agent_name_en || "-").slice(0, 18).padEnd(19)} ${String(r.title || "(제목 없음)").slice(0, 60)}`);
+      D.out(`${String(r.updated_at || "").slice(0, 16).padEnd(17)} ${String(r.agent_name_en || r.agent_name || "-").slice(0, 18).padEnd(19)} ${String(r.title || "(untitled)").slice(0, 60)}`);
     }
     D.out("");
-    D.out("데스크탑 앱과 같은 대화 목록입니다 — 터미널 세션 이어하기는 REPL의 /resume.");
+    D.out("These chats are shared with Desktop. Resume terminal sessions with /resume in the REPL.");
   }
 
   // ── usage — 로컬 집계 ──
@@ -1233,14 +1233,14 @@ function create(deps) {
     const msg7 = q("SELECT COUNT(*) AS n FROM chat_messages WHERE created_at > ?", week);
     const auto = q("SELECT COUNT(*) AS n FROM automations WHERE enabled=1");
     const runs7 = q("SELECT COUNT(*) AS n, SUM(CASE WHEN status='error' OR error IS NOT NULL THEN 1 ELSE 0 END) AS err FROM run_history WHERE ran_at > ?", week);
-    D.out(`활성 런타임      ${ar.kind || "(없음)"}`);
-    D.out(`설치 에이전트    ${agents.n ?? "?"}`);
-    D.out(`활성 채팅        ${chats.n ?? "?"}`);
-    D.out(`메시지           24h ${msg24.n ?? 0}  ·  7d ${msg7.n ?? 0}`);
-    D.out(`자동화(켜짐)     ${auto.n ?? 0}`);
-    D.out(`자동화 실행(7d)  ${runs7.n ?? 0}${runs7.err ? `  (실패 ${runs7.err})` : ""}`);
+    D.out(`Active runtime    ${ar.kind || "(none)"}`);
+    D.out(`Installed agents  ${agents.n ?? "?"}`);
+    D.out(`Active chats      ${chats.n ?? "?"}`);
+    D.out(`Messages          24h ${msg24.n ?? 0}  ·  7d ${msg7.n ?? 0}`);
+    D.out(`Automations       ${auto.n ?? 0}`);
+    D.out(`Runs (7d)         ${runs7.n ?? 0}${runs7.err ? `  (${runs7.err} failed)` : ""}`);
     D.out("");
-    D.out("세션 단위 토큰/비용은 대화 안 /cost, 프로바이더 쿼터 대시보드는 데스크탑 앱에서.");
+    D.out("Session tokens/cost: /cost in chat. Provider quota dashboards are in Desktop.");
   }
 
   // ── telegram — 바인딩 현황 (읽기 전용) ──
@@ -1252,17 +1252,17 @@ function create(deps) {
       rows = [];
     }
     if (!rows.length) {
-      D.out("텔레그램 바인딩이 없습니다 — 페어링은 데스크탑 앱 Connect에서 합니다.");
+      D.out("No Telegram bindings. Pair devices from Desktop Connect.");
       return;
     }
     for (const r of rows) {
-      const bot = r.bot_username ? "@" + r.bot_username : "(봇 미지정)";
-      const chat = r.telegram_chat_title || r.telegram_chat_id || "(채팅 미연결)";
+      const bot = r.bot_username ? "@" + r.bot_username : "(bot not set)";
+      const chat = r.telegram_chat_title || r.telegram_chat_id || "(chat not connected)";
       const status = r.status || (r.telegram_chat_id ? "paired" : "pending");
       D.out(`${String(r.id).slice(0, 8)}  ${r.target_kind}:${String(r.target_id).slice(0, 20).padEnd(21)} ${String(bot).padEnd(24)} ${String(chat).slice(0, 28).padEnd(29)} ${status}`);
     }
     D.out("");
-    D.out("페어링/봇 발급은 데스크탑 앱 Connect에서, 여기서는 현황만 봅니다.");
+    D.out("Pairing and bot issuance happen in Desktop Connect; this command only shows status.");
   }
 
   // ── login / logout / whoami — Agentlas Cloud 세션 (데스크탑과 동일한 loopback 브라우저 플로우) ──
@@ -1283,15 +1283,15 @@ function create(deps) {
 
   async function fetchSessionMeta(cookie) {
     const resp = await fetch(`${webBaseUrl()}/api/auth/session`, { headers: { cookie }, signal: AbortSignal.timeout(8000) });
-    if (!resp.ok) throw new Error(`세션 확인 응답 ${resp.status}`);
+    if (!resp.ok) throw new Error(`Session check returned ${resp.status}`);
     return resp.json();
   }
 
   function loginCallbackHtml(ok) {
-    const title = ok ? "Agentlas 로그인 완료" : "Agentlas 로그인 실패";
+    const title = ok ? "Agentlas login complete" : "Agentlas login failed";
     const body = ok
-      ? "터미널로 돌아가세요. 이 창은 닫아도 됩니다."
-      : "터미널로 돌아가 agentlas login을 다시 실행하세요.";
+      ? "Return to the terminal. You can close this window."
+      : "Return to the terminal and run agentlas login again.";
     return `<!doctype html><html><head><meta charset="utf-8"><title>Agentlas</title></head><body style="font-family:-apple-system,system-ui,sans-serif;padding:40px"><h3>${title}</h3><p>${body}</p></body></html>`;
   }
 
@@ -1302,7 +1302,7 @@ function create(deps) {
     const state = createLoginState(options.randomBytes || crypto.randomBytes);
     const guard = createLoginCallbackGuard(state);
     const onLoginUrl = options.onLoginUrl || ((url) => {
-      D.out("브라우저에서 Agentlas에 로그인하세요 (자동으로 열립니다):");
+      D.out("Sign in to Agentlas in the browser (opening automatically):");
       D.out("  " + url);
       openInBrowser(url);
     });
@@ -1341,7 +1341,7 @@ function create(deps) {
         const address = server.address();
         const port = address && typeof address === "object" ? address.port : 0;
         if (!port) {
-          finish(new Error("로그인 loopback 포트를 열지 못했습니다."));
+          finish(new Error("Could not open the login loopback port."));
           return;
         }
         const callback = new URL(`http://127.0.0.1:${port}${LOGIN_CALLBACK_PATH}`);
@@ -1350,13 +1350,13 @@ function create(deps) {
         try {
           loginUrl = new URL("/account", `${options.baseUrl || webBaseUrl()}/`);
         } catch {
-          finish(new Error("Agentlas 로그인 URL이 올바르지 않습니다."));
+          finish(new Error("The Agentlas login URL is invalid."));
           return;
         }
         loginUrl.searchParams.set("desktop", "1");
         loginUrl.searchParams.set("callback", callback.toString());
         timer = setTimeout(
-          () => finish(new Error(`로그인 대기 시간(${Math.ceil(timeoutMs / 1000)}초)이 지났습니다. 다시 시도: agentlas login`)),
+          () => finish(new Error(`Login timed out after ${Math.ceil(timeoutMs / 1000)} seconds. Try: agentlas login`)),
           timeoutMs,
         );
         if (timer.unref) timer.unref();
@@ -1375,7 +1375,7 @@ function create(deps) {
   async function cmdWhoami() {
     const cookie = await D.cloudSessionCookieCli();
     if (!cookie) {
-      D.out("로그아웃 상태입니다.  agentlas login 으로 로그인하세요.");
+      D.out("You are signed out. Sign in with agentlas login.");
       process.exitCode = 1;
       return;
     }
@@ -1384,13 +1384,13 @@ function create(deps) {
       if (j && j.authenticated) {
         const email = (j.user && j.user.email) || "?";
         const ws = j.workspace || {};
-        D.out(`로그인됨: ${email}  ·  워크스페이스: ${ws.name || "?"} (${ws.plan || "free"})`);
+        D.out(`Signed in: ${email}  ·  workspace: ${ws.name || "?"} (${ws.plan || "free"})`);
       } else {
-        D.out("세션이 만료되었거나 유효하지 않습니다.  agentlas login 으로 다시 로그인하세요.");
+        D.out("The session is expired or invalid. Sign in again with agentlas login.");
         process.exitCode = 1;
       }
     } catch (e) {
-      D.fail("세션 확인 실패: " + String((e && e.message) || e));
+      D.fail("Session check failed: " + String((e && e.message) || e));
     }
   }
 
@@ -1404,7 +1404,7 @@ function create(deps) {
         try {
           const j = await fetchSessionMeta(existing);
           if (j && j.authenticated) {
-            D.out(`이미 로그인돼 있습니다 (${(j.user && j.user.email) || "?"}).  재로그인: agentlas login --force`);
+            D.out(`Already signed in (${(j.user && j.user.email) || "?"}). Re-authenticate with agentlas login --force`);
             return;
           }
         } catch { /* 확인 실패 — 새로 로그인 진행 */ }
@@ -1422,18 +1422,18 @@ function create(deps) {
     fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });
     fs.writeFileSync(p, JSON.stringify({ version: 1, value, updatedAt: new Date().toISOString() }, null, 2) + "\n", { mode: 0o600 });
     try { fs.chmodSync(p, 0o600); } catch { /* win32 */ }
-    D.out(`세션 저장됨: ${p}`);
+    D.out(`Session saved: ${p}`);
     await cmdWhoami();
   }
 
   function cmdLogout() {
     const p = D.cliSessionPath();
     if (fs.existsSync(p)) {
-      try { fs.rmSync(p); D.out("로그아웃 완료 (CLI 세션 삭제)."); } catch (e) { return D.fail("세션 파일 삭제 실패: " + e.message); }
+      try { fs.rmSync(p); D.out("Signed out (CLI session deleted)."); } catch (e) { return D.fail("Could not delete the session file: " + e.message); }
     } else {
-      D.out("저장된 CLI 세션이 없습니다.");
+      D.out("No saved CLI session.");
     }
-    if (process.env.AGENTLAS_SESSION) D.out("주의: AGENTLAS_SESSION 환경변수가 여전히 설정돼 있어 로그인 상태로 보일 수 있습니다.");
+    if (process.env.AGENTLAS_SESSION) D.out("Warning: AGENTLAS_SESSION is still set, so the CLI may appear signed in.");
   }
 
   // ── cloud search — 마켓플레이스 검색 ──
@@ -1445,8 +1445,8 @@ function create(deps) {
       else rest.push(args[i]);
     }
     const query = rest.join(" ").trim();
-    if (!query) return D.fail('usage: agentlas cloud search "<찾는 일>" [--limit 10]');
-    if (typeof fetch !== "function") return D.fail("이 런타임에 fetch가 없습니다.");
+    if (!query) return D.fail('usage: agentlas cloud search "<task>" [--limit 10]');
+    if (typeof fetch !== "function") return D.fail("fetch is not available in this runtime.");
     const base = process.env.AGENTLAS_MCP_BASE_URL || "https://agentlas.cloud/api/mcp/v1";
     const headers = { "content-type": "application/json" };
     try {
@@ -1465,9 +1465,9 @@ function create(deps) {
         }),
       });
     } catch (e) {
-      return D.fail(`마켓플레이스 연결 실패: ${(e && e.message) || e}`);
+      return D.fail(`Marketplace connection failed: ${(e && e.message) || e}`);
     }
-    if (!resp.ok) return D.fail(`마켓플레이스 응답 ${resp.status}`);
+    if (!resp.ok) return D.fail(`Marketplace returned ${resp.status}`);
     const json = await resp.json();
     if (json.error) return D.fail(json.error.message || "marketplace error");
     const result = json.result || {};
@@ -1475,7 +1475,7 @@ function create(deps) {
     // 엔진 내부 에이전트(researcher-<n>, research-intelligence-desk, hephaestus-*)는 제품이 아니므로 숨긴다.
     const items = Array.isArray(rawItems) ? rawItems.filter((it) => !isInternalAgentSlug(it && (it.slug || it.id))) : rawItems;
     if (!Array.isArray(items) || !items.length) {
-      D.out(`검색 결과 없음: "${query}"`);
+      D.out(`No results for "${query}"`);
       return;
     }
     for (const it of items.slice(0, limit)) {
@@ -1486,7 +1486,7 @@ function create(deps) {
       D.out(`${String(slug).padEnd(34).slice(0, 34)} ${String(name).slice(0, 26).padEnd(27)} ${String(kind).padEnd(14)} ${String(tagline).slice(0, 60)}`);
     }
     D.out("");
-    D.out("설치: agentlas install <slug>");
+    D.out("Install: agentlas install <slug>");
   }
 
   return {
