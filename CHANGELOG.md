@@ -36,6 +36,12 @@
   exclusions, and exhaustive "everything else" exclusion lists. Explicit user
   prohibitions remain hard constraints while unused or adjacent communities do
   not become accidental disqualifiers.
+- Validate every Hub CandidateSet, slot, candidate, semantic snapshot,
+  evidence row, and operational card against exact keys before candidate text
+  reaches the selection prompt. Candidate metadata remains explicitly
+  untrusted data; unknown prompt-bearing fields fail closed. Structured repair
+  receipts persist fixed error-code messages instead of fragments copied from
+  rejected model output.
 - Parse the Terminal Hub transport's bounded buffered `{ status, headers, text }`
   response shape at the Workforce adapter boundary. This keeps real Hub MCP
   JSON from being misclassified as invalid merely because it is not a native

@@ -151,6 +151,7 @@ function assertLeveledConcepts(value, label) {
   const seen = new Set();
   for (let index = 0; index < items.length; index += 1) {
     const row = assertObject(items[index], `${label}[${index}]`);
+    assertExactKeys(row, ["concept", "level"], `${label}[${index}]`, "candidate_set_invalid");
     const concept = assertId(row.concept, `${label}[${index}].concept`);
     if (seen.has(concept)) fail("invalid_contract", `${label} repeats ${concept}`);
     seen.add(concept);
@@ -268,12 +269,21 @@ function sanitizeValidationCode(value) {
   return code || "structured_output_invalid";
 }
 
-function sanitizeValidationMessage(value) {
-  return String(value || "Structured output did not satisfy the required schema.")
-    .replace(/[\u0000-\u001f\u007f]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 600) || "Structured output did not satisfy the required schema.";
+function validationMessageForCode(rawCode) {
+  const code = sanitizeValidationCode(rawCode);
+  const messages = {
+    model_call_failed: "The model invocation failed before a structured result was available.",
+    model_output_too_large: "The model output exceeded the structured-output byte limit.",
+    model_json_missing: "The model output did not contain a JSON object.",
+    model_json_invalid: "The model output contained invalid JSON.",
+    work_order_invalid: "The WorkOrder failed the exact direct-object schema.",
+    work_order_not_redacted: "The WorkOrder did not preserve the required redaction boundary.",
+    work_order_ontology_stale: "The WorkOrder did not use the pinned ontology version.",
+    selection_invalid: "The Selection failed the exact direct-object schema or candidate-set binding.",
+    execution_plan_invalid: "The delegation plan failed the exact accepted-roster schema.",
+    invalid_contract: "The structured output failed a bounded field contract.",
+  };
+  return messages[code] || "Structured output did not satisfy the exact required schema.";
 }
 
 function boundedRepairPriorOutput(value) {
@@ -290,7 +300,7 @@ function boundedRepairPriorOutput(value) {
 function buildSchemaRepairPrompt(error, schemaRequirements, priorOutput) {
   const validation = {
     code: sanitizeValidationCode(error && error.code),
-    message: sanitizeValidationMessage(error && error.message),
+    message: validationMessageForCode(error && error.code),
   };
   const prior = boundedRepairPriorOutput(priorOutput);
   if (!prior.included) return { prompt: null, prior, validation };
@@ -383,6 +393,10 @@ function validateWorkOrder(value) {
 function validateCandidateSet(value, workOrder, now = new Date(), options = {}) {
   const set = assertObject(value, "candidateSet");
   assertNoForbiddenFitSignals(set);
+  assertExactKeys(set, [
+    "schemaVersion", "selectionSessionId", "workOrderId", "ontologyVersion",
+    "candidateSetDigest", "decisionOwner", "historyInfluence", "slots", "issuedAt", "expiresAt",
+  ], "candidateSet", "candidate_set_invalid");
   if (set.schemaVersion !== "agentlas.workforce-candidate-set.v1") fail("candidate_set_invalid", "unsupported candidate set schema");
   assertId(set.selectionSessionId, "candidateSet.selectionSessionId");
   if (set.workOrderId !== workOrder.workOrderId) fail("candidate_set_invalid", "candidate set workOrderId mismatch");
@@ -400,12 +414,18 @@ function validateCandidateSet(value, workOrder, now = new Date(), options = {}) 
   const seenSlots = new Set();
   for (const slotResult of slots) {
     assertObject(slotResult, "candidateSet slot");
+    assertExactKeys(slotResult, ["slotId", "candidates", "coverageGaps"], "candidateSet slot", "candidate_set_invalid");
     const slotId = assertId(slotResult.slotId, "candidateSet slotId");
     if (!orderSlots.has(slotId) || seenSlots.has(slotId)) fail("candidate_set_invalid", `invalid candidate slot ${slotId}`);
     seenSlots.add(slotId);
     const releases = new Set();
     for (const candidate of assertArray(slotResult.candidates, `candidateSet.${slotId}.candidates`, 100)) {
       assertObject(candidate, "candidate");
+      assertExactKeys(candidate, [
+        "agentDefinitionId", "agentReleaseId", "releaseVersion", "packageHash", "contentDigest",
+        "entityKind", "name", "communities", "fitEvidence", "qualificationEvidence", "optionalGaps",
+        "semanticSnapshot", "operational",
+      ], "candidate", "candidate_set_invalid");
       assertId(candidate.agentDefinitionId, "candidate.agentDefinitionId");
       const releaseId = assertId(candidate.agentReleaseId, "candidate.agentReleaseId");
       if (releases.has(releaseId)) fail("candidate_set_invalid", `duplicate release ${releaseId} in ${slotId}`);
@@ -420,9 +440,14 @@ function validateCandidateSet(value, workOrder, now = new Date(), options = {}) 
       assertIds(candidate.qualificationEvidence, "candidate.qualificationEvidence");
       assertIds(candidate.optionalGaps, "candidate.optionalGaps");
       const operational = assertObject(candidate.operational, "candidate.operational");
+      assertExactKeys(operational, ["callable", "installable"], "candidate.operational", "candidate_set_invalid", ["unavailableReasons"]);
       if (typeof operational.callable !== "boolean" || typeof operational.installable !== "boolean") fail("candidate_set_invalid", "candidate operational flags are invalid");
       assertIds(operational.unavailableReasons || [], "candidate.operational.unavailableReasons");
       const semantic = assertObject(candidate.semanticSnapshot, "candidate.semanticSnapshot");
+      assertExactKeys(semantic, [
+        "summaries", "roles", "skills", "toolCapabilities", "consumes", "produces",
+        "authorities", "runtimes", "languages",
+      ], "candidate.semanticSnapshot", "candidate_set_invalid");
       assertStrings(semantic.summaries, "candidate.semanticSnapshot.summaries");
       assertIds(semantic.roles, "candidate.semanticSnapshot.roles");
       assertLeveledConcepts(semantic.skills, "candidate.semanticSnapshot.skills");
@@ -1206,8 +1231,8 @@ function create(deps = {}) {
             outputDigest: null,
             outputBytes: 0,
             schemaRequirementsDigest: sha256(schemaRequirements),
-            validationErrorCode: sanitizeValidationCode(error && error.code ? error.code : "model_call_failed"),
-            validationErrorMessage: sanitizeValidationMessage(error && error.message),
+            validationErrorCode: "model_call_failed",
+            validationErrorMessage: validationMessageForCode("model_call_failed"),
             repairEligible: false,
             retryScheduled: false,
             repairPromptDigest: null,
