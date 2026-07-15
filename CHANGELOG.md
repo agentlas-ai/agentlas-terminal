@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.8.5 — 2026-07-16
+
+- Preserve the exact bounded, host-authored contract diagnostic in each local
+  model's one allowed structured-output repair prompt. The host still never
+  mutates model output or replays private stage inputs, but a model can now see
+  which exact Selection, WorkOrder, or planner field failed instead of receiving
+  only a generic schema error.
+- Keep Codex CLI Workforce execution fail-closed before the first model or Hub
+  call because Codex 0.144.4 continued to expose collaboration authority after
+  every available isolation flag and an isolated `CODEX_HOME` were applied.
+- Pin both release workflows to Agentlas OS v1.1.45 at immutable commit
+  `49752a783e944c898ea023705104661b3beb87b2`, whose finite 23-code Hub
+  coverage-gap contract accepts the live aggregate response while rejecting
+  unknown or identity-bearing reasons.
+
 ## 0.8.4 — 2026-07-16
 
 - Make Workforce Ontology the default for ordinary direct, goal-like work on
@@ -42,10 +57,12 @@
   capabilities through the active host LLM, and validate the private inventory
   and capability-binding plan against the public pair-scoped receipt. Raw local
   tool inventory never crosses the Hub boundary.
-- Run Codex and Claude workforce subprocesses with no inherited tool authority;
-  API and Ollama workers are zero-tool, and Gemini workforce execution fails
-  closed until equivalent isolation is proven. Required-tool work cannot start
-  without an exact policy-filtered native grant.
+- Probe Codex Workforce isolation and fail closed before the first model or Hub
+  call when Codex still exposes collaboration authority. Claude workforce
+  subprocesses run without inherited tool authority, API and Ollama workers are
+  zero-tool, and Gemini workforce execution fails closed until equivalent
+  isolation is proven. Required-tool work cannot start without an exact
+  policy-filtered native grant.
 - Require direct WorkOrder and Selection objects from the active host LLM and
   reject ceremonial tool-call envelopes, unknown keys, contradictory community
   exclusions, and exhaustive "everything else" exclusion lists. Explicit user

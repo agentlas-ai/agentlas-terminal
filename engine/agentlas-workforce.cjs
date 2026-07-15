@@ -705,6 +705,17 @@ function validationMessageForCode(rawCode) {
   return messages[code] || "Structured output did not satisfy the exact required schema.";
 }
 
+function boundedHostValidationDiagnostic(error) {
+  const message = String(error?.message || "")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  // WorkforceContractError messages are host-authored contract diagnostics,
+  // never raw model output. Keep them bounded so a local model can repair the
+  // exact failed field without re-exposing the original stage inputs.
+  return message.slice(0, 1_000);
+}
+
 function boundedRepairPriorOutput(value) {
   const text = stripQwenThinking(value);
   const byteLength = Buffer.byteLength(text, "utf8");
@@ -720,6 +731,7 @@ function buildSchemaRepairPrompt(error, schemaRequirements, priorOutput) {
   const validation = {
     code: sanitizeValidationCode(error && error.code),
     message: validationMessageForCode(error && error.code),
+    diagnostic: boundedHostValidationDiagnostic(error),
     issues: Array.isArray(error?.details?.issues)
       ? error.details.issues.slice(0, 64).map((issue) => ({ path: String(issue.path || ""), code: String(issue.code || "") }))
       : [],

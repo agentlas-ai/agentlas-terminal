@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Exact immutable release tag to publish (for example v0.8.4)"
+        description: "Exact immutable release tag to publish (for example v0.8.5)"
         required: true
         type: string
 
@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      AGENTLAS_CORE_COMMIT: f29381f15c0ee4f244c2bac253bbb992765bc859
+      AGENTLAS_CORE_COMMIT: 49752a783e944c898ea023705104661b3beb87b2
       HEPHAESTUS_RUNTIME_ROOT: ${{ github.workspace }}/Agentlas-OS
       HEPHAESTUS_PYTHON: python
     steps:

@@ -802,6 +802,7 @@ async function malformedStructuredStagesRepairOnceAndSucceed() {
     assert.match(repairCall.prompt, /PRIOR_MODEL_OUTPUT_DATA=/);
     assert.doesNotMatch(repairCall.prompt, /ORIGINAL_STAGE_INPUT|error\.details/i);
   }
+  assert.match(h.modelCalls[3].prompt, /direct Selection must contain exactly these required keys/);
   assert.doesNotMatch(h.modelCalls[3].prompt, /WORK_ORDER_DATA=|CANDIDATE_SET_DATA=/);
   assert.doesNotMatch(h.modelCalls[5].prompt, /ACCEPTED_SELECTION_DATA=|PREPARED_RELEASE_PINS=/);
   assert.equal(result.receipt.planner.structuredAttemptCount, 2);
