@@ -212,6 +212,51 @@ function fixture() {
   return { workOrder, candidates, selection, validationReceipt, prepared, plan };
 }
 
+function leaderSearchEnvelope(workOrder) {
+  return JSON.stringify({
+    schemaVersion: "agentlas.workforce-leader-call.v1",
+    toolCall: { name: "workforce.search_candidates", arguments: { workOrder } },
+  });
+}
+
+function unfilledCandidateSet(workOrder, suffix = "initial") {
+  return {
+    schemaVersion: "agentlas.workforce-candidate-set.v1",
+    selectionSessionId: `selection-session:${suffix}`,
+    workOrderId: workOrder.workOrderId,
+    ontologyVersion: workOrder.ontologyVersion,
+    candidateSetDigest: HASH_B,
+    decisionOwner: "host_llm",
+    historyInfluence: "none",
+    issuedAt: "2026-07-15T00:00:00.000Z",
+    expiresAt: "2026-07-16T00:00:00.000Z",
+    slots: workOrder.roleSlots.map((slotRow) => ({
+      slotId: slotRow.slotId,
+      candidates: [],
+      coverageGaps: [
+        "gap:minimum-candidate-count",
+        "gap:no-hard-eligible-candidate",
+        "gap:excluded:missing-required-role",
+        "gap:excluded:missing-required-skill",
+        "gap:excluded:missing-required-tool",
+      ],
+    })),
+  };
+}
+
+function relaxedWorkOrder(workOrder) {
+  const revised = structuredClone(workOrder);
+  revised.forbiddenCommunities = ["community:travel", "community:marketing"];
+  for (const slotRow of revised.roleSlots) {
+    slotRow.optionalSkills = [...new Set([...(slotRow.optionalSkills || []), ...slotRow.requiredSkills])];
+    slotRow.requiredRoles = [];
+    slotRow.requiredSkills = [];
+    slotRow.requiredToolCapabilities = [];
+    slotRow.excludedCommunities = [...revised.forbiddenCommunities];
+  }
+  return revised;
+}
+
 function harness(overrides = {}) {
   const f = fixture();
   const modelOutputs = overrides.modelOutputs || [
@@ -237,6 +282,7 @@ function harness(overrides = {}) {
   const receipts = [];
   const benchmarkArtifacts = [];
   let modelIndex = 0;
+  let searchIndex = 0;
   const runtime = create({
     resolveRuntime: () => ({ mode: "api", backend: "ollama", model: "qwen3:30b-a3b" }),
     buildChildEnv: async () => ({}),
@@ -247,7 +293,16 @@ function harness(overrides = {}) {
     },
     callHubTool: async (name, args) => {
       hubCalls.push({ name, args });
-      if (name === "workforce.search_candidates") return f.candidates;
+      if (typeof overrides.callHubTool === "function") {
+        return overrides.callHubTool(name, args, { fixture: f, callIndex: hubCalls.length - 1 });
+      }
+      if (name === "workforce.search_candidates") {
+        if (Array.isArray(overrides.searchResults)) {
+          if (searchIndex >= overrides.searchResults.length) throw new Error("unexpected extra candidate search");
+          return structuredClone(overrides.searchResults[searchIndex++]);
+        }
+        return f.candidates;
+      }
       if (name === "workforce.validate_selection") return f.validationReceipt;
       if (name === "workforce.prepare_execution") {
         const prepared = structuredClone(f.prepared);
@@ -375,6 +430,242 @@ async function malformedStructuredStagesRepairOnceAndSucceed() {
   );
 }
 
+async function terraEdgeEnumRepairUsesExactContract() {
+  const f = fixture();
+  const malformed = structuredClone(f.workOrder);
+  malformed.edges[0].relation = "hands_off";
+  const h = harness({
+    modelOutputs: [
+      leaderSearchEnvelope(malformed),
+      leaderSearchEnvelope(f.workOrder),
+      JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.validate_selection", arguments: { selection: f.selection } } }),
+      JSON.stringify(f.plan),
+      "Backend handoff.",
+      "Verifier handoff.",
+      "Integrated deliverable.",
+      JSON.stringify({
+        schemaVersion: "agentlas.workforce-verification.v1",
+        status: "passed",
+        checks: [{ checkId: "check:edge-contract", status: "passed", evidence: "allowed relation repaired" }],
+        issues: [],
+      }),
+    ],
+  });
+  const result = await h.runtime.workforceRun({}, "cross-role handoff benchmark", { silent: true, benchmark: true });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  assert.deepEqual(
+    result.receipt.structuredModelAttempts.filter((row) => row.phase === "leader-work-order").map((row) => row.status),
+    ["rejected", "accepted"],
+  );
+  assert.match(h.modelCalls[1].prompt, /relation must be exactly one of reportsTo, handsOffTo, reviews, coordinatesWith/);
+  assert.equal(result.receipt.benchmarkAudit.passed, true);
+}
+
+async function candidateGapRefinementRemainsTopLlmAuthored() {
+  const f = fixture();
+  const initial = structuredClone(f.workOrder);
+  initial.forbiddenCommunities = [];
+  for (const slotRow of initial.roleSlots) {
+    slotRow.excludedCommunities = [];
+    slotRow.requiredToolCapabilities = ["tool:database"];
+  }
+  const revised = relaxedWorkOrder(initial);
+  const h = harness({
+    modelOutputs: [
+      leaderSearchEnvelope(initial),
+      leaderSearchEnvelope(revised),
+      JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.validate_selection", arguments: { selection: f.selection } } }),
+      JSON.stringify(f.plan),
+      "Backend handoff.",
+      "Verifier handoff.",
+      "Integrated deliverable.",
+      JSON.stringify({
+        schemaVersion: "agentlas.workforce-verification.v1",
+        status: "passed",
+        checks: [{ checkId: "check:refinement", status: "passed", evidence: "same leader authored revised job analysis" }],
+        issues: [],
+      }),
+    ],
+    searchResults: [unfilledCandidateSet(initial), f.candidates],
+  });
+  const result = await h.runtime.workforceRun({}, "staff a difficult cross-domain project", { silent: true, benchmark: true });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  assert.deepEqual(result.workOrder, revised, "the host must execute the replacement WorkOrder exactly as authored by the same LLM");
+  assert.deepEqual(h.hubCalls.map((row) => row.name), [
+    "workforce.search_candidates",
+    "workforce.search_candidates",
+    "workforce.validate_selection",
+    "workforce.prepare_execution",
+  ]);
+  assert.deepEqual(h.hubCalls[0].args.workOrder, initial);
+  assert.deepEqual(h.hubCalls[1].args.workOrder, revised);
+  assert.equal(result.receipt.workOrderRefinements.length, 1);
+  assert.equal(result.receipt.workOrderRefinements[0].status, "accepted");
+  assert.equal(result.receipt.workOrderRefinements[0].hostMutationApplied, false);
+  assert.equal(result.receipt.workOrderRefinements[0].fallbackUsed, false);
+  assert.deepEqual(result.receipt.workOrderRefinements[0].gapSlotIds, ["slot:backend", "slot:verification"]);
+  const refinementAttempt = result.receipt.structuredModelAttempts.find((row) => row.phase === "leader-work-order-refinement" && row.status === "accepted");
+  assert.ok(refinementAttempt);
+  assert.equal(result.receipt.workOrderRefinements[0].invocationId, refinementAttempt.invocationId);
+  assert.match(h.modelCalls[1].system, /one bounded job-analysis refinement/);
+  assert.match(h.modelCalls[1].prompt, /PREVIOUS_WORK_ORDER_DATA=/);
+  assert.match(h.modelCalls[1].prompt, /CANDIDATE_GAP_SUMMARY_DATA=/);
+  assert.match(h.modelCalls[1].prompt, /gap:no-hard-eligible-candidate/);
+  assert.doesNotMatch(h.modelCalls[1].prompt, /Backend Architect|Adversarial Verifier|release:backend-v3|release:verifier-v7/);
+  const searchObservations = result.receipt.hubTools.filter((row) => row.tool === "workforce.search_candidates");
+  assert.equal(searchObservations[0].authoritativeChain, false);
+  assert.equal(searchObservations[0].supersededByWorkOrderRefinement, true);
+  assert.equal(searchObservations[1].authoritativeChain, true);
+  assert.deepEqual(h.benchmarkArtifacts[0].selectionReceipt.mcpCalls.map((row) => row.tool), [
+    "workforce.search_candidates",
+    "workforce.validate_selection",
+    "workforce.prepare_execution",
+  ]);
+  assert.deepEqual(h.benchmarkArtifacts[0].selectionReceipt.leaderInvocations.map((row) => row.phase), ["work-order", "selection"]);
+  assert.equal(h.benchmarkArtifacts[0].selectionReceipt.leaderInvocations[0].invocationId, refinementAttempt.invocationId);
+  assert.equal(result.receipt.benchmarkAudit.passed, true);
+}
+
+async function candidateGapRefinementIsBoundedAndFailsClosed() {
+  const f = fixture();
+  const initial = structuredClone(f.workOrder);
+  const revised = relaxedWorkOrder(initial);
+  const h = harness({
+    modelOutputs: [leaderSearchEnvelope(initial), leaderSearchEnvelope(revised)],
+    searchResults: [unfilledCandidateSet(initial, "first-gap"), unfilledCandidateSet(revised, "final-gap")],
+  });
+  const result = await h.runtime.workforceRun({}, "staff a project with scarce eligible workers", { silent: true, benchmark: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "workforce_unfilled");
+  assert.equal(h.modelCalls.length, 2, "only one semantic WorkOrder refinement may run");
+  assert.deepEqual(h.hubCalls.map((row) => row.name), ["workforce.search_candidates", "workforce.search_candidates"]);
+  assert.equal(result.receipt.workOrderRefinements.length, 1);
+  assert.equal(result.receipt.workOrderRefinements[0].status, "accepted");
+  assert.deepEqual(h.benchmarkArtifacts[0].workOrder, revised);
+  assert.equal(h.benchmarkArtifacts[0].candidateSet.selectionSessionId, "selection-session:final-gap");
+  assert.deepEqual(h.benchmarkArtifacts[0].selectionReceipt.mcpCalls.map((row) => row.tool), ["workforce.search_candidates"]);
+}
+
+async function ambiguousSearchResponseRetriesExactRequestOnce() {
+  let searchCalls = 0;
+  const h = harness({
+    callHubTool: async (name, args, { fixture: f }) => {
+      if (name === "workforce.search_candidates") {
+        searchCalls += 1;
+        if (searchCalls === 1) {
+          const error = new Error("invalid JSON");
+          error.code = "hub_invalid_response";
+          error.details = { retryClass: "ambiguous_search_transport" };
+          throw error;
+        }
+        return f.candidates;
+      }
+      if (name === "workforce.validate_selection") return f.validationReceipt;
+      if (name === "workforce.prepare_execution") return f.prepared;
+      throw new Error(`unexpected Hub tool ${name}`);
+    },
+  });
+  const result = await h.runtime.workforceRun({}, "retry-safe candidate discovery", { silent: true, benchmark: true });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  assert.deepEqual(h.hubCalls.map((row) => row.name), [
+    "workforce.search_candidates",
+    "workforce.search_candidates",
+    "workforce.validate_selection",
+    "workforce.prepare_execution",
+  ]);
+  assert.deepEqual(h.hubCalls[0].args, h.hubCalls[1].args);
+  assert.deepEqual(result.receipt.hubTools.slice(0, 2).map((row) => row.status), ["failed", "succeeded"]);
+  assert.equal(result.receipt.hubTools[0].retryScheduled, true);
+  assert.equal(result.receipt.hubTools[0].attempt, 1);
+  assert.equal(result.receipt.hubTools[1].attempt, 2);
+  assert.equal(result.receipt.hubTools[0].requestDigest, result.receipt.hubTools[1].requestDigest);
+  assert.equal(result.receipt.hubTools[0].replaySafety, "deterministic-selection-session-replace-upsert");
+  assert.deepEqual(h.benchmarkArtifacts[0].selectionReceipt.mcpCalls.map((row) => row.tool), [
+    "workforce.search_candidates",
+    "workforce.validate_selection",
+    "workforce.prepare_execution",
+  ]);
+}
+
+async function validMcpEnvelopeWithInvalidToolPayloadDoesNotRetry() {
+  const h = harness({
+    callHubTool: async (name) => {
+      if (name === "workforce.search_candidates") {
+        return { content: [{ type: "text", text: "not-json-tool-payload" }] };
+      }
+      throw new Error(`unexpected Hub tool ${name}`);
+    },
+  });
+  const result = await h.runtime.workforceRun({}, "malformed tool payload is not transport ambiguity", { silent: true, benchmark: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "hub_tool_invalid");
+  assert.deepEqual(h.hubCalls.map((row) => row.name), ["workforce.search_candidates"]);
+  assert.equal(result.receipt.hubTools[0].retryScheduled, false);
+}
+
+async function ambiguousSearchRetryExhaustionStopsAfterTwoExactCalls() {
+  const h = harness({
+    callHubTool: async (name) => {
+      if (name === "workforce.search_candidates") {
+        const error = new Error("still no valid response");
+        error.code = "hub_transport_error";
+        error.details = { retryClass: "ambiguous_search_transport" };
+        throw error;
+      }
+      throw new Error(`unexpected Hub tool ${name}`);
+    },
+  });
+  const result = await h.runtime.workforceRun({}, "bounded search replay", { silent: true, benchmark: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "hub_transport_error");
+  assert.deepEqual(h.hubCalls.map((row) => row.name), ["workforce.search_candidates", "workforce.search_candidates"]);
+  assert.deepEqual(result.receipt.hubTools.map((row) => row.retryScheduled), [true, false]);
+  assert.deepEqual(result.receipt.hubTools.map((row) => row.attempt), [1, 2]);
+  assert.equal(result.receipt.hubTools[0].requestDigest, result.receipt.hubTools[1].requestDigest);
+}
+
+async function validationAndPreparationMutationsNeverRetry() {
+  for (const failingTool of ["workforce.validate_selection", "workforce.prepare_execution"]) {
+    const h = harness({
+      callHubTool: async (name, args, { fixture: f }) => {
+        if (name === "workforce.search_candidates") return f.candidates;
+        if (name === failingTool) {
+          const error = new Error("ambiguous mutation response");
+          error.code = "hub_invalid_response";
+          error.details = { retryClass: "ambiguous_search_transport" };
+          throw error;
+        }
+        if (name === "workforce.validate_selection") return f.validationReceipt;
+        if (name === "workforce.prepare_execution") return f.prepared;
+        throw new Error(`unexpected Hub tool ${name}`);
+      },
+    });
+    const result = await h.runtime.workforceRun({}, `do not retry ${failingTool}`, { silent: true, benchmark: true });
+    assert.equal(result.ok, false);
+    assert.equal(result.error.code, "hub_invalid_response");
+    assert.equal(h.hubCalls.filter((row) => row.name === failingTool).length, 1);
+    const failed = result.receipt.hubTools.find((row) => row.tool === failingTool && row.status === "failed");
+    assert.equal(failed.maxAttempts, 1);
+    assert.equal(failed.retryScheduled, false);
+    assert.equal(failed.replaySafety, "not-retried");
+  }
+}
+
+function cardinalityShortfallTriggersRefinementButPolicyMinimumDoesNot() {
+  const f = fixture();
+  const twoRequired = structuredClone(f.workOrder);
+  twoRequired.roleSlots[0].cardinality = 2;
+  const short = structuredClone(f.candidates);
+  short.slots[0].coverageGaps = ["gap:minimum-candidate-count"];
+  const summary = _test.candidateGapSummary(short, twoRequired);
+  assert.deepEqual(summary.gaps.map((row) => row.slotId), ["slot:backend"]);
+  assert.equal(summary.gaps[0].eligibleCandidateCount, 1);
+  assert.deepEqual(summary.gaps[0].coverageGapCodes, ["gap:minimum-candidate-count"]);
+
+  const policyOnly = _test.candidateGapSummary(short, f.workOrder);
+  assert.deepEqual(policyOnly.gaps, [], "policy minimum shortage must not trigger refinement when cardinality is filled");
+}
+
 async function structuredRepairExhaustionFailsBeforeHubAndPersistsArtifact() {
   const f = fixture();
   const malformedWorkOrder = structuredClone(f.workOrder);
@@ -494,6 +785,24 @@ function portableContractFailsClosed() {
     () => _test.validateWorkOrder({ ...f.workOrder, ontologyVersion: "awo:stale" }),
     (error) => error.code === "work_order_ontology_stale",
   );
+  const missingExplicitOptionalArray = structuredClone(f.workOrder);
+  delete missingExplicitOptionalArray.roleSlots[0].excludedCommunities;
+  assert.throws(
+    () => _test.validateWorkOrder(missingExplicitOptionalArray),
+    (error) => error.code === "invalid_contract" && /excludedCommunities/.test(error.message),
+  );
+  const missingSelectionPolicy = structuredClone(f.workOrder);
+  delete missingSelectionPolicy.selectionPolicy;
+  assert.throws(
+    () => _test.validateWorkOrder(missingSelectionPolicy),
+    (error) => error.code === "invalid_contract" && /selectionPolicy/.test(error.message),
+  );
+  const missingEdgeArtifacts = structuredClone(f.workOrder);
+  delete missingEdgeArtifacts.edges[0].artifactKinds;
+  assert.throws(
+    () => _test.validateWorkOrder(missingEdgeArtifacts),
+    (error) => error.code === "invalid_contract" && /artifactKinds/.test(error.message),
+  );
   assert.throws(
     () => _test.validateCandidateSet({ ...f.candidates, issuedAt: undefined }, f.workOrder, observedAt),
     (error) => error.code === "invalid_contract" && /issuedAt/.test(error.message),
@@ -527,7 +836,10 @@ function sourceBoundaryContract() {
   const repl = require("node:fs").readFileSync(require.resolve("../engine/agentlas-repl.cjs"), "utf8");
   assert.match(repl, /prefs\.autoNetwork && H\.workforceRun/);
   assert.doesNotMatch(repl, /prefs\.autoNetwork && H\.hepRun/);
-  assert.match(source, /Hard requirements mean catalog-proof-required eligibility/);
+  assert.match(source, /absence makes the assignment impossible/);
+  assert.match(source, /distinct primary responsibility/);
+  assert.match(source, /relation must be exactly one of reportsTo, handsOffTo, reviews, coordinatesWith/);
+  assert.match(source, /A requiredToolCapabilities entry means the selected worker itself must invoke that exact host tool/);
 }
 
 function workforcePreferenceDefaults() {
@@ -540,6 +852,14 @@ function workforcePreferenceDefaults() {
 async function main() {
   await successContract();
   await malformedStructuredStagesRepairOnceAndSucceed();
+  await terraEdgeEnumRepairUsesExactContract();
+  await candidateGapRefinementRemainsTopLlmAuthored();
+  await candidateGapRefinementIsBoundedAndFailsClosed();
+  await ambiguousSearchResponseRetriesExactRequestOnce();
+  await validMcpEnvelopeWithInvalidToolPayloadDoesNotRetry();
+  await ambiguousSearchRetryExhaustionStopsAfterTwoExactCalls();
+  await validationAndPreparationMutationsNeverRetry();
+  cardinalityShortfallTriggersRefinementButPolicyMinimumDoesNot();
   await structuredRepairExhaustionFailsBeforeHubAndPersistsArtifact();
   await digestMismatchFailsClosed();
   await invalidPlannerNeverFallsBack();
