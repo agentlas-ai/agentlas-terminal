@@ -955,7 +955,15 @@ function create(deps = {}) {
       fail("hub_transport_error", `${name} transport failed before a valid response was available`, { retryClass: "ambiguous_search_transport" });
     }
     let body;
-    try { body = await response.json(); } catch {
+    try {
+      if (response && typeof response.json === "function") {
+        body = await response.json();
+      } else if (response && typeof response.text === "string") {
+        body = JSON.parse(response.text || "null");
+      } else {
+        throw new TypeError("Hub response exposes neither json() nor buffered text");
+      }
+    } catch {
       fail("hub_invalid_response", `${name} returned invalid JSON`, { retryClass: "ambiguous_search_transport" });
     }
     if (!response.ok) {

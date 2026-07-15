@@ -22,6 +22,10 @@
   exclusions, and exhaustive "everything else" exclusion lists. Explicit user
   prohibitions remain hard constraints while unused or adjacent communities do
   not become accidental disqualifiers.
+- Parse the Terminal Hub transport's bounded buffered `{ status, headers, text }`
+  response shape at the Workforce adapter boundary. This keeps real Hub MCP
+  JSON from being misclassified as invalid merely because it is not a native
+  Fetch `Response` object, and is covered by an end-to-end adapter regression.
 - Ordinary `/network`, `/taskforce`, and `/workforce` requests now use the
   Agent Workforce Ontology protocol. The active host LLM creates the pinned
   work order and selects exact AgentRelease IDs from the Hub candidate menu;

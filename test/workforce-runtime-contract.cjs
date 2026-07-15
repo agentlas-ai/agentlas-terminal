@@ -368,6 +368,67 @@ async function successContract() {
   assert.equal(h.benchmarkArtifacts[0].executionReceipt.status, "passed");
 }
 
+async function terminalBufferedFetchAdapterContract() {
+  const f = fixture();
+  const modelOutputs = [
+    JSON.stringify(f.workOrder),
+    JSON.stringify(f.selection),
+    JSON.stringify(f.plan),
+    "Backend handoff: idempotency transaction boundary.",
+    "Verifier handoff: replay and concurrent-commit cases.",
+    "Integrated implementation-ready deliverable.",
+    JSON.stringify({
+      schemaVersion: "agentlas.workforce-verification.v1",
+      status: "passed",
+      checks: [{ checkId: "check:adapter", status: "passed", evidence: "buffered Hub response parsed" }],
+      issues: [],
+    }),
+  ];
+  let modelIndex = 0;
+  const fetchCalls = [];
+  const runtime = create({
+    resolveRuntime: () => ({ mode: "api", backend: "ollama", model: "qwen3:30b-a3b" }),
+    buildChildEnv: async () => ({}),
+    runModel: async () => modelOutputs[modelIndex++],
+    cloudSessionCookie: async () => "agentlas_session=redacted-test-value",
+    fetchHub: async (_url, init) => {
+      const request = JSON.parse(init.body);
+      const tool = request.params.name;
+      fetchCalls.push({ tool, headers: init.headers, args: request.params.arguments });
+      const result = tool === "workforce.search_candidates"
+        ? f.candidates
+        : tool === "workforce.validate_selection"
+          ? f.validationReceipt
+          : tool === "workforce.prepare_execution"
+            ? f.prepared
+            : null;
+      assert.ok(result, `unexpected Hub tool ${tool}`);
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "application/json" }),
+        text: JSON.stringify({ jsonrpc: "2.0", id: request.id, result }),
+      };
+    },
+    appendReceipt: () => {},
+    persistBenchmarkArtifact: () => "/tmp/workforce-buffered-fetch-adapter.json",
+    now: () => new Date("2026-07-15T00:00:00.000Z"),
+  });
+  const result = await runtime.workforceRun({}, "hard payment buffered fetch adapter benchmark", {
+    silent: true,
+    benchmark: true,
+    concurrency: 2,
+  });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  assert.deepEqual(fetchCalls.map((row) => row.tool), [
+    "workforce.search_candidates",
+    "workforce.validate_selection",
+    "workforce.prepare_execution",
+  ]);
+  assert.equal(fetchCalls[0].headers.cookie, "agentlas_session=redacted-test-value");
+  assert.deepEqual(result.receipt.hubTools.map((row) => row.status), ["succeeded", "succeeded", "succeeded"]);
+}
+
 async function malformedStructuredStagesRepairOnceAndSucceed() {
   const f = fixture();
   const malformedWorkOrder = structuredClone(f.workOrder);
@@ -972,6 +1033,7 @@ function workforcePreferenceDefaults() {
 
 async function main() {
   await successContract();
+  await terminalBufferedFetchAdapterContract();
   await malformedStructuredStagesRepairOnceAndSucceed();
   await nestedNameEnvelopeRepairsToDirectObjectsWithoutHostNormalization();
   await nestedNameEnvelopeExhaustionNeverNormalizesOrCallsHub();
