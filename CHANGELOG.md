@@ -9,14 +9,28 @@
 - Persist every benchmark run as a scorer-ready, private JSON artifact with the
   work order, content-only candidate set, host selection, three MCP receipts,
   and real planner/worker/synthesis/verifier execution evidence.
-- Give the host LLM one bounded schema-only repair attempt for malformed work
-  orders, selections, or delegation plans, plus at most one semantic WorkOrder
-  refinement from redacted coverage-gap codes when required cardinality cannot
-  be filled. Every attempt is digest-audited; Terminal never fills a missing
-  hard field, exposes candidate identities to refinement, falls back to a
-  lexical router, or persists raw prior model output. Only the idempotent Hub
-  search may replay once after an outer transport/JSON ambiguity; validation
-  and preparation remain single-shot.
+- Give the host LLM one bounded schema-only repair attempt per structured phase
+  for malformed work orders, selections, or delegation plans, plus at most two
+  total semantic WorkOrder refinements from redacted required-cardinality gaps
+  or one valid `requestExpansionForSlots` content-expansion decision. Each
+  refinement has its own audited phase, re-searches the Hub, and supersedes the
+  prior search without exposing candidate identities, content, rankings, or
+  history to the refinement prompt. A repeated expansion or exhausted budget
+  fails closed; Terminal never fills a missing hard field, coerces expansion
+  through schema repair, falls back to a lexical router, or persists raw prior
+  model output. Only the idempotent Hub search may replay once after an outer
+  transport/JSON ambiguity; validation and preparation remain single-shot.
+- Treat `consumes` and `produces` as exact candidate-profile declaration gates,
+  not ordinary workflow handoffs, and explain each hard-skill/tool/artifact or
+  entity-kind coverage gap to the same host LLM. General HR decomposition now
+  keeps any explicitly named specialized domain with distinct accountability
+  in its own slot instead of collapsing it into generic implementation work.
+- Recompute every prepared roster row's domain-separated runtime bundle digest
+  from the exact selected release identity and complete directive bundle before
+  execution. Only execution-plan v2 with the explicit v1 digest-schema marker
+  is accepted. Directive or identity tampering now fails closed, while the
+  sanitized nested runtime package hash remains separate from the AgentRelease
+  upload package hash.
 - Require direct WorkOrder and Selection objects from the active host LLM and
   reject ceremonial tool-call envelopes, unknown keys, contradictory community
   exclusions, and exhaustive "everything else" exclusion lists. Explicit user

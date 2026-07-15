@@ -166,7 +166,7 @@ function fixture() {
     receipt: { workOrderId: workOrder.workOrderId, selectionSessionId: candidates.selectionSessionId },
   };
   const prepared = {
-    schemaVersion: "agentlas.workforce-execution-plan.v1",
+    schemaVersion: "agentlas.workforce-execution-plan.v2",
     status: "prepared",
     issues: [],
     preparationReceiptId: "workforce-preparation:hard-payment",
@@ -183,6 +183,7 @@ function fixture() {
         packageHash: HASH_B,
         contentDigest: HASH_C,
         entityKind: "agent",
+        bundleDigestSchema: "agentlas.workforce-runtime-bundle-digest.v1",
         bundleDigest: HASH_D,
         directiveBundle: { systemPrompt: "You are the exact backend release. Design and implement transaction-safe APIs." },
       },
@@ -194,11 +195,15 @@ function fixture() {
         packageHash: HASH_C,
         contentDigest: HASH_D,
         entityKind: "agent",
+        bundleDigestSchema: "agentlas.workforce-runtime-bundle-digest.v1",
         bundleDigest: HASH_A,
         directiveBundle: { agentMd: "You are the exact verifier release. Try to falsify all correctness claims." },
       },
     ],
   };
+  for (const row of prepared.executionRoster) {
+    row.bundleDigest = _test.workforceRuntimeBundleDigest(row);
+  }
   const plan = {
     schemaVersion: "agentlas.workforce-delegation-plan.v1",
     planId: "workforce-plan:hard-payment",
@@ -250,7 +255,7 @@ function unfilledCandidateSet(workOrder, suffix = "initial") {
 
 function relaxedWorkOrder(workOrder) {
   const revised = structuredClone(workOrder);
-  revised.forbiddenCommunities = ["community:travel", "community:marketing"];
+  revised.forbiddenCommunities = [...workOrder.forbiddenCommunities];
   for (const slotRow of revised.roleSlots) {
     slotRow.optionalSkills = [...new Set([...(slotRow.optionalSkills || []), ...slotRow.requiredSkills])];
     slotRow.requiredRoles = [];
@@ -629,20 +634,28 @@ async function candidateGapRefinementRemainsTopLlmAuthored() {
   assert.deepEqual(h.hubCalls[1].args.workOrder, revised);
   assert.equal(result.receipt.workOrderRefinements.length, 1);
   assert.equal(result.receipt.workOrderRefinements[0].status, "accepted");
+  assert.equal(result.receipt.workOrderRefinements[0].refinement, 1);
+  assert.equal(result.receipt.workOrderRefinements[0].maxRefinements, 2);
+  assert.equal(result.receipt.workOrderRefinements[0].triggerKind, "cardinality");
   assert.equal(result.receipt.workOrderRefinements[0].hostMutationApplied, false);
   assert.equal(result.receipt.workOrderRefinements[0].fallbackUsed, false);
   assert.deepEqual(result.receipt.workOrderRefinements[0].gapSlotIds, ["slot:backend", "slot:verification"]);
   const refinementAttempt = result.receipt.structuredModelAttempts.find((row) => row.phase === "leader-work-order-refinement" && row.status === "accepted");
   assert.ok(refinementAttempt);
   assert.equal(result.receipt.workOrderRefinements[0].invocationId, refinementAttempt.invocationId);
-  assert.match(h.modelCalls[1].system, /one bounded job-analysis refinement/);
-  assert.match(h.modelCalls[1].prompt, /PREVIOUS_WORK_ORDER_DATA=/);
-  assert.match(h.modelCalls[1].prompt, /CANDIDATE_GAP_SUMMARY_DATA=/);
+  assert.match(h.modelCalls[1].system, /bounded semantic job-analysis refinement/);
+  assert.match(h.modelCalls[1].prompt, /REFINEMENT_CONTEXT_DATA=/);
+  assert.match(h.modelCalls[1].prompt, /VALIDATED_PREVIOUS_WORK_ORDER_DATA=/);
+  assert.match(h.modelCalls[1].prompt, /REDACTED_CANDIDATE_GAP_SUMMARY_DATA=/);
   assert.match(h.modelCalls[1].prompt, /gap:no-hard-eligible-candidate/);
+  assert.doesNotMatch(h.modelCalls[1].prompt, /PRIOR_MODEL_OUTPUT_DATA=/);
   assert.doesNotMatch(h.modelCalls[1].prompt, /Backend Architect|Adversarial Verifier|release:backend-v3|release:verifier-v7/);
   const searchObservations = result.receipt.hubTools.filter((row) => row.tool === "workforce.search_candidates");
   assert.equal(searchObservations[0].authoritativeChain, false);
   assert.equal(searchObservations[0].supersededByWorkOrderRefinement, true);
+  assert.equal(searchObservations[0].refinement, 1);
+  assert.equal(searchObservations[0].maxRefinements, 2);
+  assert.equal(searchObservations[0].triggerKind, "cardinality");
   assert.equal(searchObservations[1].authoritativeChain, true);
   assert.deepEqual(h.benchmarkArtifacts[0].selectionReceipt.mcpCalls.map((row) => row.tool), [
     "workforce.search_candidates",
@@ -654,24 +667,110 @@ async function candidateGapRefinementRemainsTopLlmAuthored() {
   assert.equal(result.receipt.benchmarkAudit.passed, true);
 }
 
+async function twoCardinalityRefinementsCanSucceed() {
+  const f = fixture();
+  const initial = structuredClone(f.workOrder);
+  for (const slotRow of initial.roleSlots) slotRow.requiredToolCapabilities = ["tool:database"];
+  const revised = relaxedWorkOrder(initial);
+  const revisedTwice = structuredClone(revised);
+  for (const slotRow of revisedTwice.roleSlots) slotRow.allowedEntityKinds = ["agent", "team"];
+  const h = harness({
+    modelOutputs: [
+      workOrderOutput(initial),
+      workOrderOutput(revised),
+      workOrderOutput(revisedTwice),
+      JSON.stringify(f.selection),
+      JSON.stringify(f.plan),
+      "Backend handoff.",
+      "Verifier handoff.",
+      "Integrated deliverable.",
+      JSON.stringify({
+        schemaVersion: "agentlas.workforce-verification.v1",
+        status: "passed",
+        checks: [{ checkId: "check:two-refinements", status: "passed", evidence: "the final exact roster executed" }],
+        issues: [],
+      }),
+    ],
+    searchResults: [
+      unfilledCandidateSet(initial, "cardinality-1"),
+      unfilledCandidateSet(revised, "cardinality-2"),
+      f.candidates,
+    ],
+  });
+  const result = await h.runtime.workforceRun({}, "two bounded cardinality refinements", { silent: true, benchmark: true });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  assert.deepEqual(result.workOrder, revisedTwice);
+  assert.deepEqual(h.hubCalls.map((row) => row.name), [
+    "workforce.search_candidates",
+    "workforce.search_candidates",
+    "workforce.search_candidates",
+    "workforce.validate_selection",
+    "workforce.prepare_execution",
+  ]);
+  assert.deepEqual(result.receipt.workOrderRefinements.map((row) => ({
+    refinement: row.refinement,
+    maxRefinements: row.maxRefinements,
+    triggerKind: row.triggerKind,
+    status: row.status,
+  })), [
+    { refinement: 1, maxRefinements: 2, triggerKind: "cardinality", status: "accepted" },
+    { refinement: 2, maxRefinements: 2, triggerKind: "cardinality", status: "accepted" },
+  ]);
+  assert.deepEqual(
+    result.receipt.structuredModelAttempts
+      .filter((row) => row.phase.startsWith("leader-work-order-refinement"))
+      .map((row) => row.phase),
+    ["leader-work-order-refinement", "leader-work-order-refinement-2"],
+  );
+  assert.deepEqual(
+    result.receipt.hubTools.filter((row) => row.tool === "workforce.search_candidates").map((row) => row.authoritativeChain),
+    [false, false, true],
+  );
+  assert.deepEqual(h.benchmarkArtifacts[0].selectionReceipt.mcpCalls.map((row) => row.tool), [
+    "workforce.search_candidates",
+    "workforce.validate_selection",
+    "workforce.prepare_execution",
+  ]);
+  assert.equal(result.receipt.benchmarkAudit.passed, true);
+}
+
 async function candidateGapRefinementIsBoundedAndFailsClosed() {
   const f = fixture();
   const initial = structuredClone(f.workOrder);
   const revised = relaxedWorkOrder(initial);
+  const revisedTwice = structuredClone(revised);
   const h = harness({
-    modelOutputs: [workOrderOutput(initial), workOrderOutput(revised)],
-    searchResults: [unfilledCandidateSet(initial, "first-gap"), unfilledCandidateSet(revised, "final-gap")],
+    modelOutputs: [workOrderOutput(initial), workOrderOutput(revised), workOrderOutput(revisedTwice)],
+    searchResults: [
+      unfilledCandidateSet(initial, "first-gap"),
+      unfilledCandidateSet(revised, "second-gap"),
+      unfilledCandidateSet(revisedTwice, "final-gap"),
+    ],
   });
   const result = await h.runtime.workforceRun({}, "staff a project with scarce eligible workers", { silent: true, benchmark: true });
   assert.equal(result.ok, false);
   assert.equal(result.error.code, "workforce_unfilled");
-  assert.equal(h.modelCalls.length, 2, "only one semantic WorkOrder refinement may run");
-  assert.deepEqual(h.hubCalls.map((row) => row.name), ["workforce.search_candidates", "workforce.search_candidates"]);
-  assert.equal(result.receipt.workOrderRefinements.length, 1);
-  assert.equal(result.receipt.workOrderRefinements[0].status, "accepted");
-  assert.deepEqual(h.benchmarkArtifacts[0].workOrder, revised);
+  assert.equal(h.modelCalls.length, 3, "only two semantic WorkOrder refinements may run");
+  assert.deepEqual(h.hubCalls.map((row) => row.name), [
+    "workforce.search_candidates",
+    "workforce.search_candidates",
+    "workforce.search_candidates",
+  ]);
+  assert.equal(result.receipt.workOrderRefinements.length, 2);
+  assert.deepEqual(result.receipt.workOrderRefinements.map((row) => row.status), ["accepted", "accepted"]);
+  assert.deepEqual(result.receipt.workOrderRefinements.map((row) => row.refinement), [1, 2]);
+  assert.deepEqual(result.receipt.workOrderRefinements.map((row) => row.maxRefinements), [2, 2]);
+  assert.deepEqual(result.receipt.workOrderRefinements.map((row) => row.triggerKind), ["cardinality", "cardinality"]);
+  assert.deepEqual(
+    result.receipt.structuredModelAttempts.filter((row) => row.phase.startsWith("leader-work-order-refinement")).map((row) => row.phase),
+    ["leader-work-order-refinement", "leader-work-order-refinement-2"],
+  );
+  assert.deepEqual(h.benchmarkArtifacts[0].workOrder, revisedTwice);
   assert.equal(h.benchmarkArtifacts[0].candidateSet.selectionSessionId, "selection-session:final-gap");
   assert.deepEqual(h.benchmarkArtifacts[0].selectionReceipt.mcpCalls.map((row) => row.tool), ["workforce.search_candidates"]);
+  const searches = result.receipt.hubTools.filter((row) => row.tool === "workforce.search_candidates");
+  assert.deepEqual(searches.map((row) => row.authoritativeChain), [false, false, true]);
+  assert.deepEqual(searches.slice(0, 2).map((row) => row.refinement), [1, 2]);
 }
 
 async function ambiguousSearchResponseRetriesExactRequestOnce() {
@@ -794,6 +893,29 @@ function cardinalityShortfallTriggersRefinementButPolicyMinimumDoesNot() {
   assert.deepEqual(policyOnly.gaps, [], "policy minimum shortage must not trigger refinement when cardinality is filled");
 }
 
+function selectionExpansionSummaryIsRedactedAndSlotBounded() {
+  const f = fixture();
+  const candidates = structuredClone(f.candidates);
+  candidates.slots[0].coverageGaps = ["gap:minimum-candidate-count"];
+  candidates.slots[0].candidates[0].name = "PRIVATE_EXPANSION_CANDIDATE";
+  candidates.slots[0].candidates[0].semanticSnapshot.summaries = ["PRIVATE_EXPANSION_CONTENT"];
+  const summary = _test.selectionExpansionGapSummary(candidates, f.workOrder, ["slot:backend"]);
+  assert.deepEqual(summary, {
+    schemaVersion: "agentlas.workforce-candidate-gap-summary.v1",
+    workOrderId: f.workOrder.workOrderId,
+    gaps: [{
+      slotId: "slot:backend",
+      eligibleCandidateCount: 1,
+      coverageGapCodes: ["gap:minimum-candidate-count", "gap:selection-requested-content-expansion"],
+    }],
+  });
+  assert.doesNotMatch(JSON.stringify(summary), /PRIVATE_EXPANSION|agentReleaseId|semanticSnapshot|fitEvidence/);
+  assert.throws(
+    () => _test.selectionExpansionGapSummary(candidates, f.workOrder, ["slot:unknown"]),
+    (error) => error.code === "selection_invalid" && /unknown expansion slot/.test(error.message),
+  );
+}
+
 async function structuredRepairExhaustionFailsBeforeHubAndPersistsArtifact() {
   const f = fixture();
   const malformedWorkOrder = structuredClone(f.workOrder);
@@ -825,6 +947,116 @@ async function digestMismatchFailsClosed() {
   assert.equal(result.error.code, "execution_bundle_digest_mismatch");
   assert.equal(h.modelCalls.length, 2, "no planner or worker may run after a pin mismatch");
   assert.equal(h.receipts[0].status, "failed");
+}
+
+function runtimeBundleDigestUsesExactCanonicalProjection() {
+  const f = fixture();
+  const row = structuredClone(f.prepared.executionRoster[0]);
+  const expected = _test.workforceRuntimeBundleDigest(row);
+  assert.equal(expected, "sha256:e9d0416db83ac2447c95eb1d3374c1356cde3bc00fc70d21b4887cf6f98b4ab4", "Terminal canonical bytes must match the Core reference digest");
+  const crossLanguageVector = {
+    slotId: "slot:payments",
+    agentDefinitionId: "definition:payments",
+    agentReleaseId: "release:payments@1.2.3",
+    releaseVersion: "1.2.3",
+    packageHash: `sha256:${"a".repeat(64)}`,
+    contentDigest: `sha256:${"b".repeat(64)}`,
+    entityKind: "agent",
+    directiveBundle: {
+      instructions: "Execute exactly.",
+      agentMd: "결제 무결성을 검증한다.",
+      runtimeBundle: { entityKind: "agent", executionGraph: null, tools: ["mongodb", "payments"] },
+    },
+  };
+  assert.equal(
+    _test.workforceRuntimeBundleDigest(crossLanguageVector),
+    "sha256:33463c138f6af8e0d130f4ecd8a7a503fc2c734ddcf70be0daf8701db393e933",
+    "Terminal UTF-8 canonical JSON must match the reviewed cross-language golden vector",
+  );
+  const withUnknowns = {
+    extraUntrustedField: "excluded-from-contract",
+    ...structuredClone(row),
+    bundleDigest: HASH_A,
+  };
+  assert.equal(_test.workforceRuntimeBundleDigest(withUnknowns), expected, "unknown row fields and bundleDigest must be excluded");
+
+  const nested = structuredClone(row);
+  nested.directiveBundle.runtimeBundle = {
+    packageHash: HASH_A,
+    tools: ["tool:database", "tool:shell"],
+    nested: { z: 2, a: 1 },
+  };
+  const reordered = structuredClone(nested);
+  reordered.directiveBundle.runtimeBundle = {
+    nested: { a: 1, z: 2 },
+    tools: ["tool:database", "tool:shell"],
+    packageHash: HASH_A,
+  };
+  assert.equal(
+    _test.workforceRuntimeBundleDigest(nested),
+    _test.workforceRuntimeBundleDigest(reordered),
+    "recursive object key order must not affect the canonical digest",
+  );
+  reordered.directiveBundle.runtimeBundle.tools.reverse();
+  assert.notEqual(
+    _test.workforceRuntimeBundleDigest(nested),
+    _test.workforceRuntimeBundleDigest(reordered),
+    "array order must remain digest-significant",
+  );
+}
+
+async function tamperedDirectiveBundleDigestFailsBeforePlanner() {
+  const h = harness({
+    prepareMutation: (prepared) => {
+      prepared.executionRoster[0].directiveBundle.systemPrompt = "Tampered after Hub preparation.";
+    },
+  });
+  const result = await h.runtime.workforceRun({}, "reject a tampered runtime directive bundle", { silent: true, benchmark: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "execution_bundle_digest_mismatch");
+  assert.match(result.error.message, /runtime bundle digest/);
+  assert.equal(h.modelCalls.length, 2, "planner and workers must not run after directive tampering");
+  assert.deepEqual(result.receipt.workers, []);
+  assert.equal(result.receipt.planner, null);
+  assert.deepEqual(h.hubCalls.map((row) => row.name), [
+    "workforce.search_candidates",
+    "workforce.validate_selection",
+    "workforce.prepare_execution",
+  ]);
+}
+
+async function bundleDigestSchemaMarkerIsMandatory() {
+  for (const mutation of [
+    (row) => { delete row.bundleDigestSchema; },
+    (row) => { row.bundleDigestSchema = "agentlas.workforce-runtime-bundle-digest.v0"; },
+  ]) {
+    const h = harness({
+      prepareMutation: (prepared) => mutation(prepared.executionRoster[0]),
+    });
+    const result = await h.runtime.workforceRun({}, "reject an unmarked runtime digest", { silent: true, benchmark: true });
+    assert.equal(result.ok, false);
+    assert.equal(result.error.code, "execution_bundle_digest_mismatch");
+    assert.match(result.error.message, /digest schema is unsupported/);
+    assert.equal(h.modelCalls.length, 2);
+    assert.deepEqual(result.receipt.workers, []);
+  }
+}
+
+async function nestedRuntimePackageHashIsNotComparedToReleaseUploadHash() {
+  const h = harness({
+    prepareMutation: (prepared) => {
+      for (const row of prepared.executionRoster) {
+        row.directiveBundle.runtimeBundle = { packageHash: HASH_A, runtime: "sanitized-host-bundle" };
+        row.bundleDigest = _test.workforceRuntimeBundleDigest(row);
+      }
+    },
+  });
+  const result = await h.runtime.workforceRun({}, "keep runtime and upload package hashes in separate domains", { silent: true, benchmark: true });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  assert.notEqual(
+    result.prepared.executionRoster[0].packageHash,
+    result.prepared.executionRoster[0].directiveBundle.runtimeBundle.packageHash,
+  );
 }
 
 async function invalidPlannerNeverFallsBack() {
@@ -870,24 +1102,156 @@ async function outsideCandidateNeverReachesHubValidation() {
   assert.deepEqual(h.hubCalls.map((row) => row.name), ["workforce.search_candidates"]);
 }
 
-async function candidateExpansionRemainsLeaderDecision() {
+async function selectionExpansionCanUseSecondRefinementAndSucceed() {
   const f = fixture();
-  f.selection.requestExpansionForSlots = ["slot:backend"];
+  const initial = structuredClone(f.workOrder);
+  for (const slotRow of initial.roleSlots) slotRow.requiredToolCapabilities = ["tool:database"];
+  const revised = relaxedWorkOrder(initial);
+  const revisedTwice = structuredClone(revised);
+  revisedTwice.roleSlots[0].task = `${revisedTwice.roleSlots[0].task}; preserve the independently accountable payment failure boundary`;
+  const middleCandidates = structuredClone(f.candidates);
+  middleCandidates.selectionSessionId = "selection-session:content-expansion";
+  middleCandidates.candidateSetDigest = HASH_B;
+  middleCandidates.slots[0].candidates[0].name = "PRIVATE_CANDIDATE_NAME_MUST_NOT_REACH_REFINEMENT";
+  middleCandidates.slots[0].candidates[0].semanticSnapshot.summaries = ["PRIVATE_CANDIDATE_CONTENT_MUST_NOT_REACH_REFINEMENT"];
+  const provisionalSelection = structuredClone(f.selection);
+  provisionalSelection.selectionSessionId = middleCandidates.selectionSessionId;
+  provisionalSelection.candidateSetDigest = middleCandidates.candidateSetDigest;
+  provisionalSelection.requestExpansionForSlots = ["slot:backend"];
+  const h = harness({
+    modelOutputs: [
+      JSON.stringify(initial),
+      JSON.stringify(revised),
+      JSON.stringify(provisionalSelection),
+      JSON.stringify(revisedTwice),
+      JSON.stringify(f.selection),
+      JSON.stringify(f.plan),
+      "Backend handoff.",
+      "Verifier handoff.",
+      "Integrated deliverable.",
+      JSON.stringify({
+        schemaVersion: "agentlas.workforce-verification.v1",
+        status: "passed",
+        checks: [{ checkId: "check:selection-expansion", status: "passed", evidence: "final exact selection executed" }],
+        issues: [],
+      }),
+    ],
+    searchResults: [unfilledCandidateSet(initial, "initial-cardinality"), middleCandidates, f.candidates],
+  });
+  const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  assert.deepEqual(h.hubCalls.map((row) => row.name), [
+    "workforce.search_candidates",
+    "workforce.search_candidates",
+    "workforce.search_candidates",
+    "workforce.validate_selection",
+    "workforce.prepare_execution",
+  ]);
+  assert.deepEqual(result.receipt.workOrderRefinements.map((row) => ({
+    refinement: row.refinement,
+    maxRefinements: row.maxRefinements,
+    triggerKind: row.triggerKind,
+  })), [
+    { refinement: 1, maxRefinements: 2, triggerKind: "cardinality" },
+    { refinement: 2, maxRefinements: 2, triggerKind: "selection-content-expansion" },
+  ]);
+  const expansionAttempt = result.receipt.structuredModelAttempts.find((row) => row.phase === "leader-selection-expansion");
+  assert.ok(expansionAttempt);
+  assert.equal(expansionAttempt.status, "accepted");
+  assert.equal(expansionAttempt.repairAttempt, false);
+  assert.equal(expansionAttempt.superseded, true);
+  assert.equal(expansionAttempt.supersededReason, "selection-content-expansion");
+  assert.equal(result.receipt.structuredModelAttempts.filter((row) => row.phase === "leader-selection").length, 1);
+  const expansionPrompt = h.modelCalls[3].prompt;
+  assert.match(expansionPrompt, /"triggerKind":"selection-content-expansion"/);
+  assert.match(expansionPrompt, /gap:selection-requested-content-expansion/);
+  assert.match(expansionPrompt, /"slotId":"slot:backend"/);
+  assert.match(expansionPrompt, /"eligibleCandidateCount":1/);
+  assert.doesNotMatch(expansionPrompt, /release:backend-v3|release:verifier-v7/);
+  assert.doesNotMatch(expansionPrompt, /PRIVATE_CANDIDATE_NAME|PRIVATE_CANDIDATE_CONTENT/);
+  assert.doesNotMatch(expansionPrompt, /semanticSnapshot|fitEvidence|qualificationEvidence|historyInfluence|performanceHistory|popularity|ranking/i);
+  assert.doesNotMatch(expansionPrompt, /PRIOR_MODEL_OUTPUT_DATA=/);
+  const searches = result.receipt.hubTools.filter((row) => row.tool === "workforce.search_candidates");
+  assert.deepEqual(searches.map((row) => row.authoritativeChain), [false, false, true]);
+  assert.deepEqual(searches.slice(0, 2).map((row) => row.triggerKind), ["cardinality", "selection-content-expansion"]);
+  assert.deepEqual(searches.slice(0, 2).map((row) => row.refinement), [1, 2]);
+  assert.deepEqual(h.benchmarkArtifacts[0].selectionReceipt.mcpCalls.map((row) => row.tool), [
+    "workforce.search_candidates",
+    "workforce.validate_selection",
+    "workforce.prepare_execution",
+  ]);
+  assert.deepEqual(h.benchmarkArtifacts[0].selectionReceipt.leaderInvocations.map((row) => row.phase), ["work-order", "selection"]);
+  assert.equal(result.receipt.benchmarkAudit.passed, true);
+}
+
+async function repeatedSelectionExpansionFailsWithoutSchemaRepairCoercion() {
+  const f = fixture();
+  const firstExpansion = structuredClone(f.selection);
+  firstExpansion.requestExpansionForSlots = ["slot:backend"];
+  const refined = structuredClone(f.workOrder);
+  refined.roleSlots[0].task = `${refined.roleSlots[0].task}; retain payment-domain accountability`;
+  const repeatedExpansion = structuredClone(f.selection);
+  repeatedExpansion.requestExpansionForSlots = ["slot:backend"];
   const h = harness({
     modelOutputs: [
       JSON.stringify(f.workOrder),
-      JSON.stringify(f.selection),
+      JSON.stringify(firstExpansion),
+      JSON.stringify(refined),
+      JSON.stringify(repeatedExpansion),
+    ],
+    searchResults: [f.candidates, f.candidates],
+  });
+  const result = await h.runtime.workforceRun({}, "repeat semantic candidate expansion", { silent: true, benchmark: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "candidate_expansion_repeated");
+  assert.deepEqual(h.hubCalls.map((row) => row.name), ["workforce.search_candidates", "workforce.search_candidates"]);
+  assert.equal(result.receipt.workOrderRefinements.length, 1);
+  assert.equal(result.receipt.workOrderRefinements[0].triggerKind, "selection-content-expansion");
+  const selectionAttempts = result.receipt.structuredModelAttempts.filter((row) => row.phase.includes("leader-selection"));
+  assert.deepEqual(selectionAttempts.map((row) => row.status), ["accepted", "accepted"]);
+  assert.deepEqual(selectionAttempts.map((row) => row.repairAttempt), [false, false]);
+  assert.deepEqual(selectionAttempts.map((row) => row.retryScheduled), [false, false]);
+  assert.equal(h.modelCalls.length, 4, "valid expansion decisions must not be coerced through schema repair");
+  assert.equal(h.hubCalls.some((row) => row.name === "workforce.validate_selection"), false);
+}
+
+async function exhaustedRefinementBudgetRejectsSelectionExpansion() {
+  const f = fixture();
+  const initial = structuredClone(f.workOrder);
+  const revised = relaxedWorkOrder(initial);
+  const revisedTwice = structuredClone(revised);
+  for (const slotRow of revisedTwice.roleSlots) slotRow.allowedEntityKinds = ["agent", "team"];
+  const expansion = structuredClone(f.selection);
+  expansion.requestExpansionForSlots = ["slot:backend"];
+  const h = harness({
+    modelOutputs: [
+      JSON.stringify(initial),
+      JSON.stringify(revised),
+      JSON.stringify(revisedTwice),
+      JSON.stringify(expansion),
+    ],
+    searchResults: [
+      unfilledCandidateSet(initial, "budget-1"),
+      unfilledCandidateSet(revised, "budget-2"),
+      f.candidates,
     ],
   });
-  const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true });
+  const result = await h.runtime.workforceRun({}, "exhaust refinement budget before expansion", { silent: true, benchmark: true });
   assert.equal(result.ok, false);
-  assert.equal(result.error.code, "candidate_expansion_required");
-  assert.equal(h.modelCalls.length, 2, "a valid leader expansion decision must not be coerced through schema repair");
-  assert.deepEqual(h.hubCalls.map((row) => row.name), ["workforce.search_candidates"]);
-  const attempt = result.receipt.structuredModelAttempts.find((row) => row.phase === "leader-selection");
-  assert.equal(attempt.status, "rejected");
-  assert.equal(attempt.repairEligible, false);
-  assert.equal(attempt.retryScheduled, false);
+  assert.equal(result.error.code, "candidate_expansion_exhausted");
+  assert.equal(result.error.details.refinementsUsed, 2);
+  assert.equal(result.error.details.maxRefinements, 2);
+  assert.deepEqual(result.receipt.workOrderRefinements.map((row) => row.triggerKind), ["cardinality", "cardinality"]);
+  assert.equal(result.receipt.workOrderRefinements.length, 2);
+  assert.equal(h.modelCalls.length, 4, "an exhausted valid expansion request must not trigger repair or a third refinement");
+  const expansionAttempt = result.receipt.structuredModelAttempts.find((row) => row.phase === "leader-selection-expansion");
+  assert.equal(expansionAttempt.status, "accepted");
+  assert.equal(expansionAttempt.repairAttempt, false);
+  assert.deepEqual(h.hubCalls.map((row) => row.name), [
+    "workforce.search_candidates",
+    "workforce.search_candidates",
+    "workforce.search_candidates",
+  ]);
 }
 
 function benchmarkAuditFailsForMissingReceipts() {
@@ -966,6 +1330,22 @@ function portableContractFailsClosed() {
     () => _test.validateSelection(missingDecisionRuntime, f.candidates, f.workOrder, identity),
     (error) => error.code === "selection_invalid" && /decisionAuthor/.test(error.message),
   );
+  const completeExpansionSelection = structuredClone(f.selection);
+  completeExpansionSelection.requestExpansionForSlots = ["slot:backend"];
+  assert.deepEqual(
+    _test.validateSelection(completeExpansionSelection, f.candidates, f.workOrder, identity, { allowExpansion: true }),
+    completeExpansionSelection,
+  );
+  assert.throws(
+    () => _test.validateSelection(completeExpansionSelection, f.candidates, f.workOrder, identity),
+    (error) => error.code === "candidate_expansion_required",
+  );
+  const incompleteExpansionSelection = structuredClone(completeExpansionSelection);
+  incompleteExpansionSelection.assignments = incompleteExpansionSelection.assignments.filter((row) => row.slotId !== "slot:verification");
+  assert.throws(
+    () => _test.validateSelection(incompleteExpansionSelection, f.candidates, f.workOrder, identity, { allowExpansion: true }),
+    (error) => error.code === "selection_invalid" && /required slot slot:verification/.test(error.message),
+  );
   assert.throws(
     () => _test.validateCandidateSet({ ...f.candidates, issuedAt: undefined }, f.workOrder, observedAt),
     (error) => error.code === "invalid_contract" && /issuedAt/.test(error.message),
@@ -986,6 +1366,12 @@ function portableContractFailsClosed() {
     () => _test.validateSelectionReceipt(badValidation, f.selection, f.candidates, f.workOrder),
     (error) => error.code === "selection_validation_invalid" && /frozen candidate release/.test(error.message),
   );
+  const legacyPrepared = structuredClone(f.prepared);
+  legacyPrepared.schemaVersion = "agentlas.workforce-execution-plan.v1";
+  assert.throws(
+    () => _test.validatePreparedExecution(legacyPrepared, f.selection, f.candidates, f.validationReceipt),
+    (error) => error.code === "execution_bundle_invalid" && /unsupported prepared execution schema/.test(error.message),
+  );
 }
 
 function sourceBoundaryContract() {
@@ -1003,6 +1389,7 @@ function sourceBoundaryContract() {
   assert.match(source, /distinct primary responsibility/);
   assert.match(source, /relation must be exactly one of reportsTo, handsOffTo, reviews, coordinatesWith/);
   assert.match(source, /A requiredToolCapabilities entry means the selected worker itself must invoke that exact host tool/);
+  assert.match(source, /consumes and produces are hard candidate-profile declaration gates/);
   const prompts = _test.buildPrompts("staff a project", {
     modelId: "model:test/direct",
     runtimeId: "runtime:test",
@@ -1016,10 +1403,22 @@ function sourceBoundaryContract() {
   assert.match(prompts.searchSystem, /Never forbid or exclude a broad ancestor, descendant, adjacent, or legitimately co-occurring community/);
   assert.match(prompts.searchSystem, /requiredRoles must default to \[\]/);
   assert.match(prompts.searchSystem, /there is no optionalRoles field/);
+  assert.match(prompts.searchSystem, /specialized domain explicitly present in the task with distinct failure or accountability semantics/);
+  assert.match(prompts.searchSystem, /Never collapse such a named domain into generic backend, software, database, or implementation work/);
+  assert.match(prompts.searchSystem, /consumes and produces require the selected Hub candidate profile itself to declare those exact artifacts/);
   assert.doesNotMatch(prompts.searchSystem, /put communities unrelated to the whole project in forbiddenCommunities/);
   assert.match(prompts.refinementSystem, /Preserve community prohibitions explicitly stated in the redacted taskBrief/);
   assert.match(prompts.refinementSystem, /correct exclusions inferred by the prior job analysis/);
   assert.match(prompts.refinementSystem, /coverage gap codes show forbidden-community exclusion/);
+  assert.match(prompts.refinementSystem, /gap:excluded:missing-required-skill/);
+  assert.match(prompts.refinementSystem, /gap:excluded:missing-required-tool/);
+  assert.match(prompts.refinementSystem, /gap:excluded:missing-consumed-artifact/);
+  assert.match(prompts.refinementSystem, /gap:excluded:missing-produced-artifact/);
+  assert.match(prompts.refinementSystem, /gap:excluded:entity-kind-mismatch/);
+  assert.match(prompts.refinementSystem, /At most two total semantic refinements/);
+  assert.match(prompts.refinementSystem, /each explicitly named specialized domain responsibility has an independent accountable slot/);
+  assert.match(prompts.selectionSystem, /requestExpansionForSlots is exceptional/);
+  assert.match(prompts.selectionSystem, /Do not request expansion merely because selectionPolicy\.minimumCandidatesPerSlot is unmet while cardinality is filled/);
   assert.doesNotMatch(prompts.searchSystem, /Return exactly one envelope/);
   assert.doesNotMatch(prompts.selectionSystem, /Return exactly one envelope/);
 }
@@ -1039,17 +1438,25 @@ async function main() {
   await nestedNameEnvelopeExhaustionNeverNormalizesOrCallsHub();
   await terraEdgeEnumRepairUsesExactContract();
   await candidateGapRefinementRemainsTopLlmAuthored();
+  await twoCardinalityRefinementsCanSucceed();
   await candidateGapRefinementIsBoundedAndFailsClosed();
   await ambiguousSearchResponseRetriesExactRequestOnce();
   await validMcpEnvelopeWithInvalidToolPayloadDoesNotRetry();
   await ambiguousSearchRetryExhaustionStopsAfterTwoExactCalls();
   await validationAndPreparationMutationsNeverRetry();
   cardinalityShortfallTriggersRefinementButPolicyMinimumDoesNot();
+  selectionExpansionSummaryIsRedactedAndSlotBounded();
   await structuredRepairExhaustionFailsBeforeHubAndPersistsArtifact();
   await digestMismatchFailsClosed();
+  runtimeBundleDigestUsesExactCanonicalProjection();
+  await tamperedDirectiveBundleDigestFailsBeforePlanner();
+  await bundleDigestSchemaMarkerIsMandatory();
+  await nestedRuntimePackageHashIsNotComparedToReleaseUploadHash();
   await invalidPlannerNeverFallsBack();
   await outsideCandidateNeverReachesHubValidation();
-  await candidateExpansionRemainsLeaderDecision();
+  await selectionExpansionCanUseSecondRefinementAndSucceed();
+  await repeatedSelectionExpansionFailsWithoutSchemaRepairCoercion();
+  await exhaustedRefinementBudgetRejectsSelectionExpansion();
   benchmarkAuditFailsForMissingReceipts();
   portableContractFailsClosed();
   sourceBoundaryContract();
