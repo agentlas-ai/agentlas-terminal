@@ -40,7 +40,7 @@ function fixture() {
     workOrderId: "work-order:hard-payment",
     taskBrief: "Build and adversarially verify an idempotent payment API.",
     redacted: true,
-    ontologyVersion: "awo:2026-07-15.1",
+    ontologyVersion: "awo:2026-07-15.2",
     roleSlots: [
       slot("slot:backend", "payment backend", ["community:backend-engineering"], ["role:backend-engineer"], ["skill:api-design"]),
       slot("slot:verification", "independent verifier", ["community:quality-engineering"], ["role:quality-engineer"], ["skill:test-design"]),
@@ -53,7 +53,7 @@ function fixture() {
     schemaVersion: "agentlas.workforce-candidate-set.v1",
     selectionSessionId: "selection-session:hard-payment",
     workOrderId: workOrder.workOrderId,
-    ontologyVersion: "awo:2026-07-15.1",
+    ontologyVersion: "awo:2026-07-15.2",
     candidateSetDigest: HASH_A,
     decisionOwner: "host_llm",
     historyInfluence: "none",
@@ -291,7 +291,7 @@ async function successContract() {
   assert.equal(h.receipts[0].orchestrator.status, "completed");
   assert.equal(h.receipts[0].planner.parseSuccess, true);
   assert.equal(h.receipts[0].workers.every((row) => row.status === "completed" && row.modelId && row.invocationId && row.handoffArtifactRefs.length), true);
-  assert.match(h.modelCalls[0].system, /awo:2026-07-15\.1/);
+  assert.match(h.modelCalls[0].system, /awo:2026-07-15\.2/);
   assert.match(h.modelCalls[0].system, /role:payments-engineer/);
   assert.match(h.modelCalls[0].system, /role:quality-engineer/);
   assert.match(h.modelCalls[0].system, /community:payments-engineering/);

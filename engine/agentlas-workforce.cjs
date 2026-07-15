@@ -30,7 +30,7 @@ const FORBIDDEN_FIT_FIELDS = new Set([
 const MAX_SLOTS = 32;
 const MAX_ASSIGNMENTS = 64;
 const MAX_MODEL_OUTPUT = 2 * 1024 * 1024;
-const WORKFORCE_ONTOLOGY_VERSION = "awo:2026-07-15.1";
+const WORKFORCE_ONTOLOGY_VERSION = "awo:2026-07-15.2";
 const WORKFORCE_ONTOLOGY_MENU = [
   "Controlled communities: community:software-engineering, community:backend-engineering, community:frontend-engineering, community:database-engineering, community:payments-engineering, community:quality-engineering, community:security-engineering, community:data-engineering, community:ai-engineering, community:devops, community:product-design, community:research, community:marketing, community:finance, community:corporate-development, community:insurance, community:insurance-actuarial, community:insurance-claims, community:insurance-underwriting, community:human-resources, community:information-technology, community:legal, community:travel, community:operations, community:agent-systems.",
   "Controlled roles: role:software-architect, role:backend-engineer, role:frontend-engineer, role:database-engineer, role:payments-engineer, role:quality-engineer, role:security-engineer, role:ontology-architect, role:agent-runtime-engineer, role:researcher, role:ma-diligence-lead, role:insurance-actuary, role:claims-diligence-specialist, role:underwriting-diligence-specialist, role:travel-planner.",
