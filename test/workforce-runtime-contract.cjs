@@ -212,10 +212,14 @@ function fixture() {
   return { workOrder, candidates, selection, validationReceipt, prepared, plan };
 }
 
-function leaderSearchEnvelope(workOrder) {
+function workOrderOutput(workOrder) {
+  return JSON.stringify(workOrder);
+}
+
+function nestedNameEnvelope(toolName, argumentKey, value) {
   return JSON.stringify({
     schemaVersion: "agentlas.workforce-leader-call.v1",
-    toolCall: { name: "workforce.search_candidates", arguments: { workOrder } },
+    toolCall: { arguments: { [argumentKey]: value, name: toolName } },
   });
 }
 
@@ -260,8 +264,8 @@ function relaxedWorkOrder(workOrder) {
 function harness(overrides = {}) {
   const f = fixture();
   const modelOutputs = overrides.modelOutputs || [
-    JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.search_candidates", arguments: { workOrder: f.workOrder } } }),
-    `<think>compare qualified candidates only</think>\n\`\`\`json\n${JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.validate_selection", arguments: { selection: f.selection } } })}\n\`\`\``,
+    JSON.stringify(f.workOrder),
+    `<think>compare qualified candidates only</think>\n\`\`\`json\n${JSON.stringify(f.selection)}\n\`\`\``,
     JSON.stringify(f.plan),
     "Backend handoff: idempotency key state machine and serializable transaction boundary.",
     "Verifier handoff: replay, partial-failure, forged-key, and concurrent-commit adversarial cases.",
@@ -374,10 +378,10 @@ async function malformedStructuredStagesRepairOnceAndSucceed() {
   delete malformedPlan.packets[0].expectedOutput;
   const h = harness({
     modelOutputs: [
-      JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.search_candidates", arguments: { workOrder: malformedWorkOrder } } }),
-      JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.search_candidates", arguments: { workOrder: f.workOrder } } }),
-      JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.validate_selection", arguments: { selection: malformedSelection } } }),
-      JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.validate_selection", arguments: { selection: f.selection } } }),
+      JSON.stringify(malformedWorkOrder),
+      JSON.stringify(f.workOrder),
+      JSON.stringify(malformedSelection),
+      JSON.stringify(f.selection),
       JSON.stringify(malformedPlan),
       JSON.stringify(f.plan),
       "Backend handoff: idempotency key state machine and serializable transaction boundary.",
@@ -430,15 +434,78 @@ async function malformedStructuredStagesRepairOnceAndSucceed() {
   );
 }
 
+async function nestedNameEnvelopeRepairsToDirectObjectsWithoutHostNormalization() {
+  const f = fixture();
+  const nestedWorkOrder = nestedNameEnvelope("workforce.search_candidates", "workOrder", f.workOrder);
+  const nestedSelection = nestedNameEnvelope("workforce.validate_selection", "selection", f.selection);
+  const h = harness({
+    modelOutputs: [
+      nestedWorkOrder,
+      JSON.stringify(f.workOrder),
+      nestedSelection,
+      JSON.stringify(f.selection),
+      JSON.stringify(f.plan),
+      "Backend handoff.",
+      "Verifier handoff.",
+      "Integrated deliverable.",
+      JSON.stringify({
+        schemaVersion: "agentlas.workforce-verification.v1",
+        status: "passed",
+        checks: [{ checkId: "check:direct-contract", status: "passed", evidence: "direct objects reached the fixed host sequence" }],
+        issues: [],
+      }),
+    ],
+  });
+  const result = await h.runtime.workforceRun({}, "real-shaped nested-name diagnostic", { silent: true, benchmark: true });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  assert.deepEqual(h.hubCalls.map((row) => row.name), [
+    "workforce.search_candidates",
+    "workforce.validate_selection",
+    "workforce.prepare_execution",
+  ]);
+  const workOrderAttempts = result.receipt.structuredModelAttempts.filter((row) => row.phase === "leader-work-order");
+  const selectionAttempts = result.receipt.structuredModelAttempts.filter((row) => row.phase === "leader-selection");
+  assert.deepEqual(workOrderAttempts.map((row) => row.status), ["rejected", "accepted"]);
+  assert.deepEqual(selectionAttempts.map((row) => row.status), ["rejected", "accepted"]);
+  assert.equal(workOrderAttempts[0].validationErrorCode, "work_order_invalid");
+  assert.equal(selectionAttempts[0].validationErrorCode, "selection_invalid");
+  assert.match(workOrderAttempts[0].validationErrorMessage, /direct agentlas\.workforce-work-order\.v1 object/);
+  assert.match(selectionAttempts[0].validationErrorMessage, /direct agentlas\.workforce-selection\.v1 object/);
+  assert.match(h.modelCalls[1].prompt, /Return the direct agentlas\.workforce-work-order\.v1 JSON object/);
+  assert.match(h.modelCalls[3].prompt, /Return the direct agentlas\.workforce-selection\.v1 JSON object/);
+  assert.match(h.modelCalls[1].prompt, /PRIOR_MODEL_OUTPUT_DATA=/);
+  assert.doesNotMatch(JSON.stringify(result.receipt), /"toolCall"/);
+  assert.doesNotMatch(JSON.stringify(h.benchmarkArtifacts[0]), /"toolCall"/);
+  assert.deepEqual(result.workOrder, f.workOrder);
+  assert.deepEqual(result.selection, f.selection);
+}
+
+async function nestedNameEnvelopeExhaustionNeverNormalizesOrCallsHub() {
+  const f = fixture();
+  const nested = nestedNameEnvelope("workforce.search_candidates", "workOrder", f.workOrder);
+  const h = harness({ modelOutputs: [nested, nested] });
+  const result = await h.runtime.workforceRun({}, "never normalize legacy envelopes", { silent: true, benchmark: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "work_order_invalid");
+  assert.equal(result.error.details.structuredRetryExhausted, true);
+  assert.equal(result.error.details.phase, "leader-work-order");
+  assert.deepEqual(h.hubCalls, []);
+  assert.deepEqual(result.receipt.structuredModelAttempts.map((row) => row.status), ["rejected", "rejected"]);
+  assert.equal(result.receipt.structuredModelAttempts[0].outputDigest, result.receipt.structuredModelAttempts[1].outputDigest);
+  assert.match(result.receipt.structuredModelAttempts[0].validationErrorMessage, /toolCall envelopes are forbidden/);
+  assert.equal(h.benchmarkArtifacts[0].workOrder, null);
+  assert.doesNotMatch(JSON.stringify(result.receipt), /"toolCall"/);
+}
+
 async function terraEdgeEnumRepairUsesExactContract() {
   const f = fixture();
   const malformed = structuredClone(f.workOrder);
   malformed.edges[0].relation = "hands_off";
   const h = harness({
     modelOutputs: [
-      leaderSearchEnvelope(malformed),
-      leaderSearchEnvelope(f.workOrder),
-      JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.validate_selection", arguments: { selection: f.selection } } }),
+      workOrderOutput(malformed),
+      workOrderOutput(f.workOrder),
+      JSON.stringify(f.selection),
       JSON.stringify(f.plan),
       "Backend handoff.",
       "Verifier handoff.",
@@ -472,9 +539,9 @@ async function candidateGapRefinementRemainsTopLlmAuthored() {
   const revised = relaxedWorkOrder(initial);
   const h = harness({
     modelOutputs: [
-      leaderSearchEnvelope(initial),
-      leaderSearchEnvelope(revised),
-      JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.validate_selection", arguments: { selection: f.selection } } }),
+      workOrderOutput(initial),
+      workOrderOutput(revised),
+      JSON.stringify(f.selection),
       JSON.stringify(f.plan),
       "Backend handoff.",
       "Verifier handoff.",
@@ -531,7 +598,7 @@ async function candidateGapRefinementIsBoundedAndFailsClosed() {
   const initial = structuredClone(f.workOrder);
   const revised = relaxedWorkOrder(initial);
   const h = harness({
-    modelOutputs: [leaderSearchEnvelope(initial), leaderSearchEnvelope(revised)],
+    modelOutputs: [workOrderOutput(initial), workOrderOutput(revised)],
     searchResults: [unfilledCandidateSet(initial, "first-gap"), unfilledCandidateSet(revised, "final-gap")],
   });
   const result = await h.runtime.workforceRun({}, "staff a project with scarce eligible workers", { silent: true, benchmark: true });
@@ -670,14 +737,11 @@ async function structuredRepairExhaustionFailsBeforeHubAndPersistsArtifact() {
   const f = fixture();
   const malformedWorkOrder = structuredClone(f.workOrder);
   delete malformedWorkOrder.roleSlots[0].requiredRoles;
-  const invalidEnvelope = JSON.stringify({
-    schemaVersion: "agentlas.workforce-leader-call.v1",
-    toolCall: { name: "workforce.search_candidates", arguments: { workOrder: malformedWorkOrder } },
-  });
-  const h = harness({ modelOutputs: [invalidEnvelope, invalidEnvelope] });
+  const invalidOutput = JSON.stringify(malformedWorkOrder);
+  const h = harness({ modelOutputs: [invalidOutput, invalidOutput] });
   const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true });
   assert.equal(result.ok, false);
-  assert.equal(result.error.code, "invalid_contract");
+  assert.equal(result.error.code, "work_order_invalid");
   assert.equal(result.error.details.structuredRetryExhausted, true);
   assert.equal(result.error.details.phase, "leader-work-order");
   assert.equal(result.error.details.attempts, 2);
@@ -707,8 +771,8 @@ async function invalidPlannerNeverFallsBack() {
   const rawPriorMarker = "RAW_PRIOR_MUST_NOT_BE_PERSISTED_7419";
   const h = harness({
     modelOutputs: [
-      JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.search_candidates", arguments: { workOrder: f.workOrder } } }),
-      JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.validate_selection", arguments: { selection: f.selection } } }),
+      JSON.stringify(f.workOrder),
+      JSON.stringify(f.selection),
       `I refuse to emit the requested plan JSON ${rawPriorMarker}`,
       `I still refuse to emit the requested plan JSON ${rawPriorMarker}`,
     ],
@@ -734,9 +798,9 @@ async function outsideCandidateNeverReachesHubValidation() {
   f.selection.assignments[0].agentReleaseId = "release:travel-agent";
   const h = harness({
     modelOutputs: [
-      JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.search_candidates", arguments: { workOrder: f.workOrder } } }),
-      JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.validate_selection", arguments: { selection: f.selection } } }),
-      JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.validate_selection", arguments: { selection: f.selection } } }),
+      JSON.stringify(f.workOrder),
+      JSON.stringify(f.selection),
+      JSON.stringify(f.selection),
     ],
   });
   const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true });
@@ -750,8 +814,8 @@ async function candidateExpansionRemainsLeaderDecision() {
   f.selection.requestExpansionForSlots = ["slot:backend"];
   const h = harness({
     modelOutputs: [
-      JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.search_candidates", arguments: { workOrder: f.workOrder } } }),
-      JSON.stringify({ schemaVersion: "agentlas.workforce-leader-call.v1", toolCall: { name: "workforce.validate_selection", arguments: { selection: f.selection } } }),
+      JSON.stringify(f.workOrder),
+      JSON.stringify(f.selection),
     ],
   });
   const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true });
@@ -789,19 +853,41 @@ function portableContractFailsClosed() {
   delete missingExplicitOptionalArray.roleSlots[0].excludedCommunities;
   assert.throws(
     () => _test.validateWorkOrder(missingExplicitOptionalArray),
-    (error) => error.code === "invalid_contract" && /excludedCommunities/.test(error.message),
+    (error) => error.code === "work_order_invalid" && /excludedCommunities/.test(error.message),
   );
   const missingSelectionPolicy = structuredClone(f.workOrder);
   delete missingSelectionPolicy.selectionPolicy;
   assert.throws(
     () => _test.validateWorkOrder(missingSelectionPolicy),
-    (error) => error.code === "invalid_contract" && /selectionPolicy/.test(error.message),
+    (error) => error.code === "work_order_invalid" && /selectionPolicy/.test(error.message),
   );
   const missingEdgeArtifacts = structuredClone(f.workOrder);
   delete missingEdgeArtifacts.edges[0].artifactKinds;
   assert.throws(
     () => _test.validateWorkOrder(missingEdgeArtifacts),
-    (error) => error.code === "invalid_contract" && /artifactKinds/.test(error.message),
+    (error) => error.code === "work_order_invalid" && /artifactKinds/.test(error.message),
+  );
+  const extraWorkOrderKey = { ...structuredClone(f.workOrder), route: "workforce.search_candidates" };
+  assert.throws(
+    () => _test.validateWorkOrder(extraWorkOrderKey),
+    (error) => error.code === "work_order_invalid" && /direct WorkOrder/.test(error.message),
+  );
+  const legacyEnvelope = JSON.parse(nestedNameEnvelope("workforce.search_candidates", "workOrder", f.workOrder));
+  assert.throws(
+    () => _test.validateWorkOrder(legacyEnvelope),
+    (error) => error.code === "work_order_invalid" && /toolCall envelopes are forbidden/.test(error.message),
+  );
+  const identity = { modelId: f.selection.decisionAuthor.modelId, runtimeId: f.selection.decisionAuthor.runtimeId };
+  const extraSelectionKey = { ...structuredClone(f.selection), route: "workforce.validate_selection" };
+  assert.throws(
+    () => _test.validateSelection(extraSelectionKey, f.candidates, f.workOrder, identity),
+    (error) => error.code === "selection_invalid" && /direct Selection/.test(error.message),
+  );
+  const missingDecisionRuntime = structuredClone(f.selection);
+  delete missingDecisionRuntime.decisionAuthor.runtimeId;
+  assert.throws(
+    () => _test.validateSelection(missingDecisionRuntime, f.candidates, f.workOrder, identity),
+    (error) => error.code === "selection_invalid" && /decisionAuthor/.test(error.message),
   );
   assert.throws(
     () => _test.validateCandidateSet({ ...f.candidates, issuedAt: undefined }, f.workOrder, observedAt),
@@ -840,6 +926,16 @@ function sourceBoundaryContract() {
   assert.match(source, /distinct primary responsibility/);
   assert.match(source, /relation must be exactly one of reportsTo, handsOffTo, reviews, coordinatesWith/);
   assert.match(source, /A requiredToolCapabilities entry means the selected worker itself must invoke that exact host tool/);
+  const prompts = _test.buildPrompts("staff a project", {
+    modelId: "model:test/direct",
+    runtimeId: "runtime:test",
+  });
+  assert.match(prompts.searchSystem, /Return the direct WorkOrder JSON object only/);
+  assert.match(prompts.selectionSystem, /Return the direct Selection JSON object only/);
+  assert.match(prompts.searchSchemaRequirements, /host invokes workforce\.search_candidates/);
+  assert.match(prompts.selectionSchemaRequirements, /host invokes workforce\.validate_selection/);
+  assert.doesNotMatch(prompts.searchSystem, /Return exactly one envelope/);
+  assert.doesNotMatch(prompts.selectionSystem, /Return exactly one envelope/);
 }
 
 function workforcePreferenceDefaults() {
@@ -852,6 +948,8 @@ function workforcePreferenceDefaults() {
 async function main() {
   await successContract();
   await malformedStructuredStagesRepairOnceAndSucceed();
+  await nestedNameEnvelopeRepairsToDirectObjectsWithoutHostNormalization();
+  await nestedNameEnvelopeExhaustionNeverNormalizesOrCallsHub();
   await terraEdgeEnumRepairUsesExactContract();
   await candidateGapRefinementRemainsTopLlmAuthored();
   await candidateGapRefinementIsBoundedAndFailsClosed();
