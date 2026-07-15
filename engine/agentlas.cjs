@@ -9118,6 +9118,7 @@ function buildHelpers(db) {
     // 패리티: REPL의 /storm·/swarm·/build·/route·/research 가 그대로 호출한다.
     stormRun: (db_, goal, ctx) => parity().stormRun(db_, goal, ctx),
     swarmRun: (db_, goal, ctx) => parity().swarmRun(db_, goal, ctx),
+    workforceRun: (db_, goal, ctx) => workforce().workforceRun(db_, goal, ctx),
     terminalBuild: (db_, args, ctx = {}) => terminalAssets.cmdBuild({
       db: db_,
       args: Array.isArray(args) ? args : terminalAssets.tokenizeBuildCommandLine(String(args || "")),
@@ -9435,6 +9436,28 @@ function parity() {
     });
   }
   return parity._i;
+}
+
+// Agent Workforce Ontology is a separate, fail-closed route. Unlike the
+// compatibility router it gives final staffing authority to the active host
+// LLM and uses Hub MCP only for retrieval, validation, and pinned preparation.
+function workforce() {
+  if (!workforce._i) {
+    workforce._i = require("./agentlas-workforce.cjs").create({
+      captureRuntime,
+      runApi,
+      resolveRuntime,
+      buildChildEnv: buildChildEnvCli,
+      projectCwd,
+      userDataDir,
+      receiptFile: () => path.join(userDataDir(), "workforce-execution-receipts.jsonl"),
+      cloudSessionCookie: cloudSessionCookieCli,
+      fetchHub: (url, init) => fetchHubCli(url, init),
+      prefsLang,
+      out,
+    });
+  }
+  return workforce._i;
 }
 
 // ── 명령 구현 ──────────────────────────────────────────────
@@ -11068,7 +11091,9 @@ function cmdHelp() {
       hdr("EXECUTE"),
       "  storm <goal>             Agentlas Goal+UltraCode harness: plan → allocate → execute → verify  [--research]",
       "  swarm <goal>             emergent agent swarm — parallel workers + synthesizer [--parallel N]",
-      "  network <request>        decompose a request into an A2A task force       (hep-network)",
+      "  network <request>        host-LLM workforce ontology → exact TF → execute [--benchmark]",
+      "  workforce <request>      same Agent Workforce Ontology route (explicit name)",
+      "  legacy-network <request> compatibility-only Hephaestus network route",
       "  call \"a,b\" \"<ctx>\"       invoke named Hub/Cloud agents                    (hep-call)",
       "  browser [<sub>]          real browser execution hardpoint                 (hep-browser)",
       "  route \"<request>\"        routing preview — which agent/pipeline would take this",
@@ -11260,8 +11285,14 @@ async function main() {
       return parity().cmdHep(db, ["hep-browser", ...rest.slice(1)]);
     case "call": // hep-call — 지정 에이전트 호출/준비
       return parity().cmdHep(db, ["hep-call", ...rest.slice(1)]);
-    case "network": // hep-network — A2A 태스크포스 분해/스케줄
-    case "taskforce":
+    case "workforce":
+    case "network":
+    case "taskforce": {
+      const cwd = projectCwd();
+      const projectPath = ensureTerminalProjectForExecutionCli(db, cwd, PERMISSION, "terminal-workforce");
+      return workforce().cmdWorkforce(db, rest.slice(1), runtimeOverride, { cwd, projectPath, permission: PERMISSION });
+    }
+    case "legacy-network": // explicit compatibility escape hatch only
       return parity().cmdHep(db, ["hep-network", ...rest.slice(1)]);
     case "route": // 라우팅 미리보기 (실행 없음)
       return parity().cmdHep(

@@ -920,9 +920,38 @@ function startRepl(opts) {
         else await H.hepRun(["hep-search", arg], { cwd: state.cwd });
         return true;
       }
+      case "workforce":
       case "network":
       case "taskforce": {
-        if (!arg) return ui.warn("usage: /network <요청>  (A2A 태스크포스)"), true;
+        if (!arg) return ui.warn("usage: /network <요청> [--benchmark]  (Agent Workforce Ontology)"), true;
+        let goal = arg;
+        const benchmark = /(?:^|\s)--benchmark(?:\s|$)/.test(goal);
+        goal = goal.replace(/(?:^|\s)--benchmark(?=\s|$)/g, " ").trim();
+        let concurrency;
+        const parallel = goal.match(/(?:^|\s)--parallel\s+(\d+)\b/);
+        if (parallel) {
+          concurrency = Number(parallel[1]);
+          goal = goal.replace(parallel[0], "").trim();
+        }
+        if (H.ensureProjectForExecution) {
+          state.projectPath = H.ensureProjectForExecution(db, state.cwd, state.permission, "terminal-workforce");
+        }
+        ui.line("");
+        await H.workforceRun(db, goal, {
+          ui,
+          cwd: state.cwd,
+          permission: state.permission,
+          runtime: state.runtime,
+          projectPath: state.projectPath,
+          modelPin: state.modelPinned ? state.runtime.model : null,
+          effortPin: state.effortPinned ? (state.effort || "none") : undefined,
+          concurrency,
+          benchmark,
+        });
+        return true;
+      }
+      case "legacy-network": {
+        if (!arg) return ui.warn("usage: /legacy-network <요청>"), true;
         ui.line("");
         await H.hepRun(["hep-network", arg, "--project", state.cwd, "--runtime", "terminal"], { cwd: state.cwd });
         return true;
@@ -1349,10 +1378,21 @@ function startRepl(opts) {
           await H.stormRun(db, t, { ui, cwd: state.cwd, research: false });
           return;
         }
-        if (prefs.autoNetwork && H.hepRun) {
-          ui.info(ui.t("config.autoEngage", "hep-network", "network"));
+        if (prefs.autoNetwork && H.workforceRun) {
+          ui.info(ui.t("config.autoEngage", "workforce ontology", "network"));
+          if (H.ensureProjectForExecution) {
+            state.projectPath = H.ensureProjectForExecution(db, state.cwd, state.permission, "terminal-workforce-auto");
+          }
           ui.line("");
-          await H.hepRun(["hep-network", t, "--project", state.cwd, "--runtime", "terminal"], { cwd: state.cwd });
+          await H.workforceRun(db, t, {
+            ui,
+            cwd: state.cwd,
+            permission: state.permission,
+            runtime: state.runtime,
+            projectPath: state.projectPath,
+            modelPin: state.modelPinned ? state.runtime.model : null,
+            effortPin: state.effortPinned ? (state.effort || "none") : undefined,
+          });
           return;
         }
       }

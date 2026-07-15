@@ -286,7 +286,9 @@ Agent Cloud 소유자 복원은 반드시 `agentlas cloud restore <slug>`를 사
 ```sh
 agentlas storm "목표"              # Agentlas 자체 Goal+UltraCode: 계획→런타임/모델/effort 배정→실행→검증 [--research]
 agentlas swarm "목표"              # emergent 에이전트 스웜 [--parallel N]
-agentlas network "요청"            # A2A 태스크포스로 분해            (hep-network)
+agentlas network "요청"            # 상위 LLM이 Workforce Ontology에서 exact-release TF 선발·실행
+agentlas network "요청" --benchmark # child/synthesis/verifier 영수증 누락 시 실패
+agentlas legacy-network "요청"     # 이전 hep-network 호환 경로(명시 실행만)
 agentlas call "a,b" "컨텍스트"      # 지정 에이전트 호출               (hep-call)
 agentlas browser                   # 실제 브라우저 하드포인트          (hep-browser)
 agentlas route "요청"              # 라우팅 미리보기 (실행 없음)
@@ -300,6 +302,18 @@ agentlas route "요청"              # 라우팅 미리보기 (실행 없음)
 선택이 여전히 가능한지·capability·context·비용 상한·명시적 사용자 고정만 검증한다.
 배정 JSON이 깨지거나 런타임/모델이 사라지면 현재 모델로 폴백하고 그 이유를 화면과
 비공개 영수증에 남긴다.
+
+`network`는 새 Agent Workforce Ontology 경로다. 활성 상위 LLM이 먼저 redacted
+work order와 역할 슬롯을 만든 뒤 Hub MCP의 `workforce.search_candidates`를 직접
+호출하고, 반환된 직무·skill·MCP/tool·eval 증거 안에서 정확한 release를 고른다.
+호스트 코드는 팀을 고르지 않고 계약만 검사한다. 선택은
+`workforce.validate_selection`으로 검증하고, `workforce.prepare_execution`이 같은
+release/version/package hash/content digest에 고정한 directive bundle을 반환한 뒤에만
+manager plan → 별도 worker → synthesis → verifier 순서로 실행한다. 후보 밖 release,
+digest 불일치, 실행 불가, 대체 release, 잘못된 planner JSON은 기존 검색이나 로컬
+에이전트로 폴백하지 않고 실패한다. `--benchmark`는 planner fallback 0건, 모든 child,
+synthesis, verifier 영수증과 verifier pass를 모두 요구한다. 이전 Hephaestus 분해기는
+`legacy-network`로만 명시 호출할 수 있다.
 
 **지식 & 리서치**
 ```sh

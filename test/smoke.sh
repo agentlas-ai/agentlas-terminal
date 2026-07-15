@@ -59,6 +59,7 @@ check "permission-mapping" node "$SCRIPT_DIR/permission-mapping.cjs"
 check "sqlite-driver-probe" node "$SCRIPT_DIR/sqlite-driver-probe.cjs"
 check "capture-runtime-guard" node "$SCRIPT_DIR/capture-runtime-guard.cjs"
 check "workload-routing-contract" node "$SCRIPT_DIR/workload-routing-contract.cjs"
+check "workforce-runtime-contract" node "$SCRIPT_DIR/workforce-runtime-contract.cjs"
 check "update-safety" node "$SCRIPT_DIR/update-safety.cjs"
 check "semver-precedence" node "$SCRIPT_DIR/semver-precedence.cjs"
 
