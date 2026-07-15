@@ -162,7 +162,7 @@ function makeStyleGuard(ui) {
 function startRepl(opts) {
   const { db } = opts;
   const H = opts.helpers;
-  const prefs = opts.prefs || {};
+  const prefs = applyPreferenceDefaults(opts.prefs || {});
   prefs.agentRuntime = prefs.agentRuntime || {}; // { agentSlug|firmSlug: runtimeSpec|"auto" }
   let baseRuntime = opts.runtime; // session default; per-agent runtime auto-routes from this
   const ui = new Ui({ lang: terminalLang(prefs, opts) });
@@ -1371,7 +1371,8 @@ function startRepl(opts) {
           }
         }
       }
-      // 자동 엔진 개입은 명시적 opt-in 전용 (/config, 기본 off): direct 판정 + 실작업형 프롬프트일 때만.
+      // Workforce is the default for direct, goal-like work. An explicit
+      // `/config network off` remains a durable opt-out; Storm stays opt-in.
       if (state.subject && state.subject.kind === "direct" && goalLikePrompt(t)) {
         if (prefs.autoStorm && H.stormRun) {
           ui.info(ui.t("config.autoEngage", "stormbreaker", "storm"));
@@ -1569,6 +1570,11 @@ function startRepl(opts) {
   bootstrap();
 }
 
+function applyPreferenceDefaults(prefs) {
+  if (!Object.prototype.hasOwnProperty.call(prefs, "autoNetwork")) prefs.autoNetwork = true;
+  return prefs;
+}
+
 function printHelp(ui) {
   const c = ui.c;
   ui.line("");
@@ -1641,4 +1647,4 @@ function printKeybindings(ui) {
   for (const [k, v] of tips) ui.line("  " + c.emerald(k.padEnd(24)) + c.dim(v));
 }
 
-module.exports = { startRepl, runtimeLabel, makeMemoryGuard, makeStyleGuard };
+module.exports = { startRepl, runtimeLabel, makeMemoryGuard, makeStyleGuard, applyPreferenceDefaults };

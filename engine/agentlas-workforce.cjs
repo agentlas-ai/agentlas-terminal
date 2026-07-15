@@ -37,6 +37,7 @@ const WORKFORCE_ONTOLOGY_MENU = [
   "Canonical skills: skill:software-architecture, skill:api-design, skill:server-implementation, skill:frontend-implementation, skill:data-modeling, skill:database-querying, skill:billing-integration, skill:transaction-integrity, skill:test-design, skill:verification, skill:security-review, skill:ontology-modeling, skill:knowledge-graph-design, skill:multi-agent-orchestration, skill:runtime-integration, skill:evidence-synthesis, skill:deal-diligence, skill:valuation, skill:actuarial-reserving, skill:solvency-analysis, skill:claims-liability-assessment, skill:underwriting-portfolio-analysis, skill:travel-planning.",
   "Canonical tool capabilities: tool:file-system, tool:file-read, tool:file-write, tool:shell, tool:web-search, tool:browser, tool:mongodb, tool:database, tool:github, tool:payments.",
   "Use artifact:<kind> for consumes, produces and edge artifactKinds. If no controlled role precisely applies, leave requiredRoles empty and express the job through a controlled community, canonical skills and task text; never invent a near-synonym role ID.",
+  "Treat required roles, skills, tools, artifacts and authorities as non-negotiable hard constraints only when Hub package declarations must prove them. Legacy Hub profiles can legitimately have empty role/tool fields. Use a broad required community for the job-family boundary, put desired expertise in optional communities/skills plus the role task, and let the host LLM judge title, summary and semantic evidence. Keep unrelated communities such as travel excluded.",
 ].join("\n");
 
 class WorkforceContractError extends Error {
@@ -644,6 +645,7 @@ function buildPrompts(task, identity) {
     searchSystem: [
       "You are the top-level Agentlas workforce leader, not a keyword router.",
       "Analyze the actual work like an HR project staffing decision. Decompose only genuinely distinct responsibilities.",
+      "Hard requirements mean catalog-proof-required eligibility, not merely important work. Prefer a broad required community plus optional skills when legacy declarations may be sparse.",
       "Return exactly one JSON tool-call envelope. Do not choose agents yet. Do not use ratings, popularity, invocation history, or revenue.",
       "Never copy secrets, local file contents, account identifiers, or private memory into taskBrief; summarize them as local protected inputs and set redacted=true.",
       `ontologyVersion must be exactly ${WORKFORCE_ONTOLOGY_VERSION}.`,

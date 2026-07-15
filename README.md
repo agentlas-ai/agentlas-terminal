@@ -316,6 +316,11 @@ digest 불일치, 실행 불가, 대체 release, 잘못된 planner JSON은 기�
 synthesis, verifier 영수증과 verifier pass를 모두 요구한다. 이전 Hephaestus 분해기는
 `legacy-network`로만 명시 호출할 수 있다.
 
+새 설치와 아직 network 설정을 건드리지 않은 설치에서는 일반적인 실작업형 요청도
+이 Workforce 경로로 자동 진입한다. 사용자가 `/config network off`로 명시적으로 끈
+값은 업그레이드 후에도 보존된다. 질문·잡담과 이미 특정 에이전트를 고른 대화에는
+자동 TF를 붙이지 않는다.
+
 **지식 & 리서치**
 ```sh
 agentlas research <sub>            # Research Engine (status|gather|search|read|plan)

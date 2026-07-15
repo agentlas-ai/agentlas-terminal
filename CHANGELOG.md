@@ -2,6 +2,10 @@
 
 ## 0.8.4 — 2026-07-16
 
+- Make Workforce Ontology the default for ordinary direct, goal-like work on
+  new or untouched installs while preserving an explicit `network off` opt-out.
+  Sparse legacy role/tool declarations are optional semantic evidence instead
+  of accidental zero-candidate hard requirements.
 - Ordinary `/network`, `/taskforce`, and `/workforce` requests now use the
   Agent Workforce Ontology protocol. The active host LLM creates the pinned
   work order and selects exact AgentRelease IDs from the Hub candidate menu;

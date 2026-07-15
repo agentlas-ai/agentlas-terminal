@@ -390,6 +390,14 @@ function sourceBoundaryContract() {
   const repl = require("node:fs").readFileSync(require.resolve("../engine/agentlas-repl.cjs"), "utf8");
   assert.match(repl, /prefs\.autoNetwork && H\.workforceRun/);
   assert.doesNotMatch(repl, /prefs\.autoNetwork && H\.hepRun/);
+  assert.match(source, /Hard requirements mean catalog-proof-required eligibility/);
+}
+
+function workforcePreferenceDefaults() {
+  const { applyPreferenceDefaults } = require("../engine/agentlas-repl.cjs");
+  assert.equal(applyPreferenceDefaults({}).autoNetwork, true, "new and untouched installs must use Workforce by default");
+  assert.equal(applyPreferenceDefaults({ autoNetwork: false }).autoNetwork, false, "explicit opt-out must survive upgrades");
+  assert.equal(applyPreferenceDefaults({ autoNetwork: true }).autoNetwork, true);
 }
 
 async function main() {
@@ -400,6 +408,7 @@ async function main() {
   benchmarkAuditFailsForMissingReceipts();
   portableContractFailsClosed();
   sourceBoundaryContract();
+  workforcePreferenceDefaults();
   process.stdout.write("workforce runtime contract: PASS\n");
 }
 
