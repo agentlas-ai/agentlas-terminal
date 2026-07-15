@@ -730,6 +730,18 @@ function create(deps = {}) {
     fs.appendFileSync(file, `${JSON.stringify(receipt)}\n`, { encoding: "utf8", mode: 0o600 });
   }
 
+  function persistBenchmarkArtifact(artifact) {
+    if (typeof D.persistBenchmarkArtifact === "function") return D.persistBenchmarkArtifact(artifact);
+    const directory = path.join(path.dirname(receiptFile()), "workforce-benchmarks");
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const executionId = String(artifact?.executionReceipt?.executionId || "workforce-run")
+      .replace(/[^A-Za-z0-9._-]+/g, "-")
+      .slice(0, 180);
+    const file = path.join(directory, `${executionId}.json`);
+    fs.writeFileSync(file, `${JSON.stringify(artifact, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    return file;
+  }
+
   async function workforceRun(db, rawTask, ctx = {}) {
     const task = assertString(rawTask, "task", 20_000);
     const ui = ctx.ui || newUi();
@@ -771,6 +783,52 @@ function create(deps = {}) {
       verifier: null,
       benchmarkAudit: null,
       failure: null,
+    };
+    const benchmarkState = {
+      workOrder: null,
+      candidateSet: null,
+      selection: null,
+      selectionValidation: null,
+    };
+    const currentBenchmarkArtifact = () => {
+      const validation = benchmarkState.selectionValidation || {};
+      return {
+        schemaVersion: "agentlas.workforce-benchmark-runtime-artifacts.v1",
+        workOrder: benchmarkState.workOrder,
+        candidateSet: benchmarkState.candidateSet,
+        selection: benchmarkState.selection,
+        selectionValidation: benchmarkState.selectionValidation,
+        selectionReceipt: {
+          schemaVersion: "agentlas.terminal-workforce-selection-receipt.v1",
+          receiptId: validation.selectionReceiptId || null,
+          workOrderId: receipt.workOrderId,
+          selectionReceiptId: validation.selectionReceiptId || null,
+          preparationReceiptId: receipt.preparationReceiptId,
+          candidateSetDigest: benchmarkState.candidateSet?.candidateSetDigest || null,
+          ontologyVersion: benchmarkState.candidateSet?.ontologyVersion || null,
+          decisionOwner: "host_llm",
+          decisionModel: identity.modelId,
+          decisionRuntime: identity.runtimeId,
+          historyInfluence: "none",
+          idealTeam: validation.idealTeam || [],
+          executableTeam: validation.executableTeam || [],
+          unfilledPosts: validation.unfilledPosts || [],
+          substitutions: validation.substitutions || [],
+          mcpCalls: receipt.hubTools
+            .filter((row) => row.status === "succeeded")
+            .map((row) => ({ tool: row.tool, status: "ok" })),
+          leaderInvocations: receipt.stages
+            .filter((row) => row.stage === "leader-work-order" || row.stage === "leader-selection")
+            .map((row) => ({
+              phase: row.stage === "leader-work-order" ? "work-order" : "selection",
+              invocationId: row.receiptId,
+              modelId: identity.modelId,
+              runtimeId: identity.runtimeId,
+              status: "completed",
+            })),
+        },
+        executionReceipt: receipt,
+      };
     };
 
     const runStage = async (stage, input, fn, extra = {}) => {
@@ -829,10 +887,12 @@ function create(deps = {}) {
       const leaderSearchRaw = await runStage("leader-work-order", { taskDigest: receipt.taskDigest }, () => runModel(runtime, prompts.searchSystem, prompts.searchUser, modelContext));
       const workOrderInvocationId = receipt.stages[receipt.stages.length - 1].receiptId;
       const { workOrder } = validateLeaderSearchCall(parseModelObject(leaderSearchRaw, "leader work order"));
+      benchmarkState.workOrder = workOrder;
       receipt.workOrderId = workOrder.workOrderId;
 
       const candidateRaw = await hubStage("workforce.search_candidates", { workOrder });
       const candidateSet = validateCandidateSet(candidateRaw, workOrder, typeof D.now === "function" ? D.now() : new Date());
+      benchmarkState.candidateSet = candidateSet;
 
       const selectionPrompt = [
         `WORK_ORDER_DATA=${stableJson(workOrder)}`,
@@ -841,6 +901,7 @@ function create(deps = {}) {
       const leaderSelectionRaw = await runStage("leader-selection", { workOrder, candidateSet }, () => runModel(runtime, prompts.selectionSystem, selectionPrompt, modelContext));
       const selectionInvocationId = receipt.stages[receipt.stages.length - 1].receiptId;
       const { selection } = validateLeaderSelectionCall(parseModelObject(leaderSelectionRaw, "leader selection"), candidateSet, workOrder, identity);
+      benchmarkState.selection = selection;
       receipt.orchestrator = {
         invocationId: selectionInvocationId,
         modelId: identity.modelId,
@@ -851,6 +912,7 @@ function create(deps = {}) {
 
       const validationRaw = await hubStage("workforce.validate_selection", { workOrder, candidateSet, selection });
       const validationReceipt = validateSelectionReceipt(validationRaw, selection, candidateSet, workOrder);
+      benchmarkState.selectionValidation = validationReceipt;
       receipt.selectionReceiptId = validationReceipt.selectionReceiptId;
 
       const preparedRaw = await hubStage("workforce.prepare_execution", { workOrder, candidateSet, selection, validationReceipt });
@@ -1034,12 +1096,16 @@ function create(deps = {}) {
       receipt.status = "passed";
       receipt.completedAt = nowIso(D.now);
       persistReceipt(receipt);
+      const benchmarkArtifactPath = ctx.benchmark === true
+        ? persistBenchmarkArtifact(currentBenchmarkArtifact())
+        : null;
       if (!ctx.silent) {
         ui.line("");
         ui.markdown(finalText);
         ui.info(`workforce receipt: ${runId} · children ${receipt.workers.length}/${plan.packets.length} · verifier passed`);
+        if (benchmarkArtifactPath) ui.info(`workforce benchmark artifacts: ${benchmarkArtifactPath}`);
       }
-      return { ok: true, finalText, workOrder, candidateSet, selection, validationReceipt, prepared, plan, receipt };
+      return { ok: true, finalText, workOrder, candidateSet, selection, validationReceipt, prepared, plan, receipt, benchmarkArtifactPath };
     } catch (error) {
       receipt.status = "failed";
       receipt.completedAt = nowIso(D.now);
@@ -1052,8 +1118,14 @@ function create(deps = {}) {
       try { persistReceipt(receipt); } catch (persistError) {
         receipt.failure.receiptPersistenceError = String((persistError && persistError.message) || persistError).slice(0, 500);
       }
+      let benchmarkArtifactPath = null;
+      if (ctx.benchmark === true) {
+        try { benchmarkArtifactPath = persistBenchmarkArtifact(currentBenchmarkArtifact()); } catch (persistError) {
+          receipt.failure.benchmarkPersistenceError = String((persistError && persistError.message) || persistError).slice(0, 500);
+        }
+      }
       if (!ctx.silent) ui.error(`${receipt.failure.code}: ${receipt.failure.message}`);
-      return { ok: false, error: receipt.failure, receipt };
+      return { ok: false, error: receipt.failure, receipt, benchmarkArtifactPath };
     }
   }
 

@@ -235,6 +235,7 @@ function harness(overrides = {}) {
   const modelCalls = [];
   const hubCalls = [];
   const receipts = [];
+  const benchmarkArtifacts = [];
   let modelIndex = 0;
   const runtime = create({
     resolveRuntime: () => ({ mode: "api", backend: "ollama", model: "qwen3:30b-a3b" }),
@@ -256,9 +257,13 @@ function harness(overrides = {}) {
       throw new Error(`unexpected Hub tool ${name}`);
     },
     appendReceipt: (receipt) => receipts.push(structuredClone(receipt)),
+    persistBenchmarkArtifact: (artifact) => {
+      benchmarkArtifacts.push(structuredClone(artifact));
+      return "/tmp/workforce-benchmark-fixture.json";
+    },
     now: () => new Date("2026-07-15T00:00:00.000Z"),
   });
-  return { ...f, runtime, modelCalls, hubCalls, receipts };
+  return { ...f, runtime, modelCalls, hubCalls, receipts, benchmarkArtifacts };
 }
 
 async function successContract() {
@@ -293,6 +298,15 @@ async function successContract() {
   assert.equal(h.modelCalls.some((call) => /travel/i.test(call.system) && /PINNED_RELEASE/.test(call.system)), false);
   assert.match(h.modelCalls.find((call) => /PINNED_RELEASE=release:backend-v3/.test(call.system)).system, /exact backend release/i);
   assert.match(h.modelCalls.find((call) => /PINNED_RELEASE=release:verifier-v7/.test(call.system)).system, /exact verifier release/i);
+  assert.equal(result.benchmarkArtifactPath, "/tmp/workforce-benchmark-fixture.json");
+  assert.equal(h.benchmarkArtifacts.length, 1);
+  assert.deepEqual(h.benchmarkArtifacts[0].selectionReceipt.mcpCalls.map((row) => row.tool), [
+    "workforce.search_candidates",
+    "workforce.validate_selection",
+    "workforce.prepare_execution",
+  ]);
+  assert.deepEqual(h.benchmarkArtifacts[0].selectionReceipt.leaderInvocations.map((row) => row.phase), ["work-order", "selection"]);
+  assert.equal(h.benchmarkArtifacts[0].executionReceipt.status, "passed");
 }
 
 async function digestMismatchFailsClosed() {

@@ -6,6 +6,9 @@
   new or untouched installs while preserving an explicit `network off` opt-out.
   Sparse legacy role/tool declarations are optional semantic evidence instead
   of accidental zero-candidate hard requirements.
+- Persist every benchmark run as a scorer-ready, private JSON artifact with the
+  work order, content-only candidate set, host selection, three MCP receipts,
+  and real planner/worker/synthesis/verifier execution evidence.
 - Ordinary `/network`, `/taskforce`, and `/workforce` requests now use the
   Agent Workforce Ontology protocol. The active host LLM creates the pinned
   work order and selects exact AgentRelease IDs from the Hub candidate menu;
