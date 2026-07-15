@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.9.0 — 2026-07-16
+
+- Add `agentlas plugin add <slug>` and `agentlas plugin list`. The Hub has
+  advertised `npx agentlas@latest plugin add <slug>` on every catalog plugin
+  and serves the manifest for it, but the subcommand did not exist, so every
+  listing pointed at a command that could not run. (`agentlas install` is
+  agent-only and fails with "Hub agent not found" on a plugin slug.)
+- Register a plugin's MCP servers from its published manifest, separating stdio
+  launch commands from remote URLs so a mixed entry cannot violate the codex
+  config.toml schema and take the runtime down. Reinstalling is idempotent, and
+  a plugin that ships no MCP server is refused instead of reported installed.
+- Translate remaining Korean runtime messages to English across the launcher,
+  doctor, parity, bootstrap schema, and tests.
+
 ## 0.8.5 — 2026-07-16
 
 - Preserve the exact bounded, host-authored contract diagnostic in each local
