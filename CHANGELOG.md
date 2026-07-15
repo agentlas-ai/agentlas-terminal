@@ -20,7 +20,7 @@
 - Keep the retired lexical router available only through explicit
   `/legacy-network`. Cross-platform and npm release gates now exercise the
   workforce runtime contract on Agentlas OS v1.1.39 at immutable commit
-  `485b88946fb104710f51023c8504a1c5f91a71ba`, including canonical ontology
+  `cf71b8be1732f249b4d79d66246f7d3c0cd0790f`, including canonical ontology
   `awo:2026-07-15.2` and its reviewed singular payment/security aliases.
 - This source commit does not prove a GitHub release or npm publication; both
   remain separate immutable-tag gates.
