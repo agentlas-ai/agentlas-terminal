@@ -12,7 +12,10 @@ const {
   prepareCodexRuntimeEnv,
 } = require("../engine/agentlas-native-host.cjs");
 const permissions = require("../engine/agentlas-permissions.cjs");
-const { buildArgs: legacyBuildArgs } = require("../engine/agentlas.cjs");
+const {
+  buildArgs: legacyBuildArgs,
+  codexCaptureAgentText,
+} = require("../engine/agentlas.cjs");
 
 const mcpServers = [{
   id: "playwright",
@@ -25,8 +28,7 @@ const mcpServers = [{
 }];
 
 function hasPair(args, flag, value) {
-  const index = args.indexOf(flag);
-  return index >= 0 && args[index + 1] === value;
+  return args.some((item, index) => item === flag && args[index + 1] === value);
 }
 
 function includesExternalMcp(args) {
@@ -180,6 +182,41 @@ function testBackgroundAndSwarmCapturePath() {
   assert.ok(hasPair(invalid, "--sandbox", "read-only"), "capture path must also fail closed");
 }
 
+function testWorkforceNoAuthorityCapturePath() {
+  const claude = legacyBuildArgs("claude-code", "system", "prompt", "full", {
+    authorityMode: "no-authority",
+  });
+  assert.ok(hasPair(claude, "--permission-mode", "plan"));
+  assert.ok(hasPair(claude, "--tools", ""), "Claude workforce isolation must expose an exact empty built-in tool set");
+  assert.ok(claude.includes("--strict-mcp-config"));
+  assert.equal(claude.includes("--dangerously-skip-permissions"), false);
+
+  const codex = legacyBuildArgs("codex", "system", "prompt", "full", {
+    model: "gpt-5.6-terra",
+    authorityMode: "no-authority",
+  });
+  for (const flag of ["--ephemeral", "--ignore-user-config", "--ignore-rules", "--json"]) {
+    assert.ok(codex.includes(flag), `Codex workforce isolation is missing ${flag}`);
+  }
+  for (const capability of [
+    "shell_tool", "unified_exec", "apps", "browser_use", "computer_use",
+    "image_generation", "workspace_dependencies", "goals", "memories",
+    "plugins", "hooks", "multi_agent", "tool_suggest",
+  ]) {
+    assert.ok(hasPair(codex, "--disable", capability), `Codex workforce isolation is missing --disable ${capability}`);
+  }
+  assert.ok(hasPair(codex, "--sandbox", "read-only"));
+  assert.equal(codex.includes("--dangerously-bypass-approvals-and-sandbox"), false);
+
+  const captured = codexCaptureAgentText([
+    JSON.stringify({ type: "thread.started", thread_id: "thread:fixture" }),
+    JSON.stringify({ type: "item.updated", item: { id: "item:1", type: "agent_message", text: "partial" } }),
+    JSON.stringify({ type: "item.completed", item: { id: "item:1", type: "agent_message", text: '{"schemaVersion":"fixture.v1"}' } }),
+    JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } }),
+  ].join("\n"));
+  assert.equal(captured, '{"schemaVersion":"fixture.v1"}', "no-authority Codex JSONL must yield only the final agent message to the workforce parser");
+}
+
 testClaude();
 testCodex();
 testGemini();
@@ -187,4 +224,5 @@ testCodexIsolatedHome();
 testFailClosedAndCopy();
 testShiftTabFullConfirmation();
 testBackgroundAndSwarmCapturePath();
+testWorkforceNoAuthorityCapturePath();
 console.log("permission-mapping: PASS");

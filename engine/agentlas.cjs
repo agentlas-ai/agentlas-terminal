@@ -8980,22 +8980,50 @@ function buildArgs(kind, systemPrompt, prompt, permission, runtimeOptions = {}) 
   const level = require("./agentlas-permissions.cjs").normalize(permission);
   const model = runtimeOptions.model ? String(runtimeOptions.model) : null;
   const effort = runtimeOptions.effort ? String(runtimeOptions.effort) : null;
+  const noAuthority = runtimeOptions.authorityMode === "no-authority";
   if (kind === "claude-code") {
-    const perm = native.claudePermissionArgs(level);
+    const perm = native.claudePermissionArgs(noAuthority ? "read" : level);
     // Background/capture has no one-pass reviewed server list. Full permission
     // changes tool authority, not MCP consent, so this path remains exact-empty.
     const mcp = native.claudeMcpIsolationArgs();
     const thinking = effort === "max" || effort === "xhigh" ? "Ultrathink. " : effort === "high" ? "Think hard. " : effort === "medium" ? "Think. " : "";
     const claudeEffort = effort === "minimal" ? "low" : effort === "xhigh" ? "max" : effort;
     const effortArgs = claudeEffort && claudeEffort !== "none" ? ["--effort", claudeEffort] : [];
-    return ["-p", thinking + prompt, "--append-system-prompt", systemPrompt, ...(model ? ["--model", model] : []), ...effortArgs, ...perm, ...mcp];
+    return [
+      "-p", thinking + prompt,
+      "--append-system-prompt", systemPrompt,
+      ...(model ? ["--model", model] : []),
+      ...effortArgs,
+      ...perm,
+      ...(noAuthority ? ["--tools", ""] : []),
+      ...mcp,
+    ];
   }
   if (kind === "codex") {
-    const perm = native.codexPermissionArgs(level);
+    const perm = native.codexPermissionArgs(noAuthority ? "read" : level);
     const mcp = [];
     const modelArgs = model ? ["-m", model] : [];
     const effortArgs = effort ? ["-c", `model_reasoning_effort="${effort}"`] : [];
-    return ["exec", "--skip-git-repo-check", ...modelArgs, ...effortArgs, ...perm, ...mcp, `[SYSTEM]\n${systemPrompt}\n\n${prompt}`];
+    const noAuthorityArgs = noAuthority ? [
+      "--ephemeral",
+      "--ignore-user-config",
+      "--ignore-rules",
+      "--disable", "shell_tool",
+      "--disable", "unified_exec",
+      "--disable", "apps",
+      "--disable", "browser_use",
+      "--disable", "computer_use",
+      "--disable", "image_generation",
+      "--disable", "workspace_dependencies",
+      "--disable", "goals",
+      "--disable", "memories",
+      "--disable", "plugins",
+      "--disable", "hooks",
+      "--disable", "multi_agent",
+      "--disable", "tool_suggest",
+      "--json",
+    ] : [];
+    return ["exec", "--skip-git-repo-check", ...noAuthorityArgs, ...modelArgs, ...effortArgs, ...perm, ...mcp, `[SYSTEM]\n${systemPrompt}\n\n${prompt}`];
   }
   if (kind === "gemini") {
     const perm = native.geminiPermissionArgs(level);
@@ -9006,6 +9034,22 @@ function buildArgs(kind, systemPrompt, prompt, permission, runtimeOptions = {}) 
     return ["--prompt", `[SYSTEM]\n${systemPrompt}\n\n${prompt}`, ...(model ? ["-m", model] : []), ...perm, ...mcp];
   }
   return [prompt];
+}
+
+function codexCaptureAgentText(jsonl) {
+  const completed = [];
+  const latest = new Map();
+  for (const line of String(jsonl || "").split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    let event;
+    try { event = JSON.parse(line); } catch { continue; }
+    const item = event?.item;
+    if (!item || item.type !== "agent_message" || typeof item.text !== "string") continue;
+    if (event.type === "item.completed") completed.push(item.text);
+    else if (event.type === "item.started" || event.type === "item.updated") latest.set(String(item.id || latest.size), item.text);
+  }
+  if (completed.length) return completed.join("");
+  return [...latest.values()].join("");
 }
 
 // `claude` 치면 바로 대화형 세션 뜨듯이 — 에이전트 폴더(CLAUDE.md/AGENTS.md/GEMINI.md 보유)에서
@@ -9273,7 +9317,11 @@ function captureRuntime(kind, systemPrompt, prompt, opts) {
         mcpServers: [],
         mcpAllowlistMode: kind === "gemini" ? "exact" : undefined,
       });
-      child = spawnImpl(bin, buildArgs(kind, systemPrompt, prompt, opts.permission, { model: opts.model, effort: opts.effort }), {
+      child = spawnImpl(bin, buildArgs(kind, systemPrompt, prompt, opts.permission, {
+        model: opts.model,
+        effort: opts.effort,
+        authorityMode: opts.authorityMode,
+      }), {
         cwd,
         stdio: ["ignore", "pipe", "pipe"],
         env,
@@ -9384,7 +9432,11 @@ function captureRuntime(kind, systemPrompt, prompt, opts) {
         finishReject(new Error(`${kind} exited ${code}: ${stderr.slice(-500)}`));
         return;
       }
-      finishResolve(stdout.trim() || stderr.trim());
+      const raw = stdout.trim() || stderr.trim();
+      const captured = kind === "codex" && opts.authorityMode === "no-authority"
+        ? codexCaptureAgentText(raw)
+        : "";
+      finishResolve(captured || raw);
     };
     onAbort = () => {
       const reason = opts.signal && opts.signal.reason;
@@ -9441,6 +9493,75 @@ function parity() {
 // Agent Workforce Ontology is a separate, fail-closed route. Unlike the
 // compatibility router it gives final staffing authority to the active host
 // LLM and uses Hub MCP only for retrieval, validation, and pinned preparation.
+async function listWorkforceToolsCli({ db, roster, runtimeId, cwd, env, timeoutMs, signal }) {
+  const mcp = require("./agentlas-experience-mcp.cjs");
+  const servers = mcp.readConsentedSystemMcpServers(db, {
+    userDataDir: userDataDir(),
+    createRuntimeHome: false,
+  }).slice(0, 8);
+  if (!servers.length) return [];
+  const deadline = Date.now() + Math.max(50, Math.min(12_000, Number(timeoutMs) || 12_000));
+  const outcomes = new Array(servers.length);
+  let cursor = 0;
+  const worker = async () => {
+    while (true) {
+      const index = cursor++;
+      if (index >= servers.length) return;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0 || signal?.aborted) return;
+      outcomes[index] = await mcp.probeSystemMcpServerConnection(servers[index], {
+        cwd,
+        env,
+        userDataDir: userDataDir(),
+        timeoutMs: Math.min(4_000, remaining),
+        signal,
+      });
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(3, servers.length) }, () => worker()));
+
+  const safeId = /^[A-Za-z0-9][A-Za-z0-9_.$:/@+~-]{0,127}$/;
+  const rows = [];
+  for (let index = 0; index < servers.length; index += 1) {
+    const server = servers[index];
+    const listed = outcomes[index];
+    if (!listed?.connected || !Array.isArray(listed.tools)) continue;
+    for (const tool of listed.tools.slice(0, 256)) {
+      if (!tool || typeof tool !== "object" || Array.isArray(tool)) continue;
+      const declared = tool._meta?.agentlas || {};
+      const toolId = typeof declared.toolId === "string" ? declared.toolId : String(tool.name || "");
+      const capabilityIds = Array.isArray(declared.capabilityIds)
+        ? [...new Set(declared.capabilityIds.filter((id) => /^[A-Za-z0-9][A-Za-z0-9._:/@-]{1,255}$/.test(String(id))))]
+        : [];
+      if (!safeId.test(toolId) || !capabilityIds.length) continue;
+      const schemaJson = JSON.stringify(tool.inputSchema || {}, Object.keys(tool.inputSchema || {}).sort());
+      for (const pinned of roster || []) {
+        if (pinned?.permissionPolicy?.mcp?.mode !== "allowlist" || !pinned.permissionPolicy.mcp.allowedTools.includes(toolId)) continue;
+        rows.push({
+          slotId: pinned.slotId,
+          agentReleaseId: pinned.agentReleaseId,
+          permissionPolicyDigest: pinned.permissionPolicyDigest,
+          provider: "mcp",
+          toolId,
+          serverId: server.id,
+          description: "Ready consented host MCP tool",
+          inputSchemaDigest: `sha256:${crypto.createHash("sha256").update(schemaJson).digest("hex")}`,
+          // Terminal's one-shot native/API runners do not yet expose a proven
+          // exact per-tool attachment boundary. Preserve the real tools/list
+          // observation, but advertise no executable runtime instead of
+          // manufacturing authority. collectToolInventory filters this row and
+          // fails closed before the planner for a required capability.
+          runtimeIds: [],
+          selectiveEnforcement: "unavailable",
+          capabilityIds,
+          status: "observed-not-executable",
+        });
+      }
+    }
+  }
+  return rows;
+}
+
 function workforce() {
   if (!workforce._i) {
     workforce._i = require("./agentlas-workforce.cjs").create({
@@ -9453,6 +9574,8 @@ function workforce() {
       receiptFile: () => path.join(userDataDir(), "workforce-execution-receipts.jsonl"),
       cloudSessionCookie: cloudSessionCookieCli,
       fetchHub: (url, init) => fetchHubCli(url, init),
+      listWorkforceTools: listWorkforceToolsCli,
+      supportsWorkforceToolAuthority: async () => false,
       prefsLang,
       out,
     });
@@ -11375,6 +11498,7 @@ module.exports = {
   replaceMacAppBundle,
   captureRuntime,
   buildArgs,
+  codexCaptureAgentText,
   captureOutputLimit,
   materializeCloudListingCli,
   recoverCloudInstallJournalCli,

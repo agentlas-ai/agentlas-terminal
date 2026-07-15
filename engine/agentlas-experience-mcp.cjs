@@ -994,7 +994,7 @@ function probeSystemMcpServerConnection(server, options = {}) {
       }
       try { child?.kill(signal); } catch { /* noop */ }
     };
-    const finish = (connected, reason) => {
+    const finish = (connected, reason, tools = []) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -1005,7 +1005,12 @@ function probeSystemMcpServerConnection(server, options = {}) {
         forceKillTimer = setTimeout(() => terminateChild("SIGKILL"), 250);
         forceKillTimer.unref?.();
       }
-      resolve({ connected, reason });
+      const result = { connected, reason };
+      Object.defineProperty(result, "tools", {
+        value: Array.isArray(tools) ? tools : [],
+        enumerable: false,
+      });
+      resolve(result);
     };
     const onMessage = (message) => {
       if (!message || message.jsonrpc !== "2.0") return;
@@ -1019,7 +1024,11 @@ function probeSystemMcpServerConnection(server, options = {}) {
           finish(false, "connection_failed");
         }
       } else if (message.id === 2 && initialized) {
-        finish(!message.error && Boolean(message.result), message.error ? "tools_list_failed" : "connected");
+        finish(
+          !message.error && Boolean(message.result),
+          message.error ? "tools_list_failed" : "connected",
+          message.result?.tools,
+        );
       }
     };
     const drain = () => {

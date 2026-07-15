@@ -27,10 +27,25 @@
   in its own slot instead of collapsing it into generic implementation work.
 - Recompute every prepared roster row's domain-separated runtime bundle digest
   from the exact selected release identity and complete directive bundle before
-  execution. Only execution-plan v2 with the explicit v1 digest-schema marker
-  is accepted. Directive or identity tampering now fails closed, while the
-  sanitized nested runtime package hash remains separate from the AgentRelease
-  upload package hash.
+  execution. Only execution-plan v5 with the explicit v4 digest-schema marker
+  is accepted. The shared Python/JavaScript domain rejects numbers, lone
+  surrogates, unsafe keys including `__proto__`, and non-JSON values; every row
+  must expose a nonblank top-level `systemPrompt`, `instructions`, or `agentMd`.
+  Directive or identity tampering now fails closed, while the sanitized nested
+  runtime package hash remains separate from the AgentRelease upload package
+  hash.
+- Execute team releases as their declared manager and every graph worker in
+  exact order, followed by manager synthesis. A missing worker, flattened team,
+  unparseable manager plan, or fallback plan now rejects the v2 execution
+  receipt instead of masquerading as a successful team run.
+- Build the local `tools/list` inventory only after Hub discovery, bind required
+  capabilities through the active host LLM, and validate the private inventory
+  and capability-binding plan against the public pair-scoped receipt. Raw local
+  tool inventory never crosses the Hub boundary.
+- Run Codex and Claude workforce subprocesses with no inherited tool authority;
+  API and Ollama workers are zero-tool, and Gemini workforce execution fails
+  closed until equivalent isolation is proven. Required-tool work cannot start
+  without an exact policy-filtered native grant.
 - Require direct WorkOrder and Selection objects from the active host LLM and
   reject ceremonial tool-call envelopes, unknown keys, contradictory community
   exclusions, and exhaustive "everything else" exclusion lists. Explicit user
@@ -56,8 +71,8 @@
   planner fallback, and single-model masquerading fail closed.
 - Keep the retired lexical router available only through explicit
   `/legacy-network`. Cross-platform and npm release gates now exercise the
-  workforce runtime contract on Agentlas OS v1.1.41 at immutable commit
-  `4f5e53f24886ebd52d257d176aadffb090be4ff6`, including canonical ontology
+  workforce runtime contract on Agentlas OS v1.1.44 at immutable commit
+  `f29381f15c0ee4f244c2bac253bbb992765bc859`, including canonical ontology
   `awo:2026-07-15.2` and its reviewed singular payment/security aliases.
 - This source commit does not prove a GitHub release or npm publication; both
   remain separate immutable-tag gates.

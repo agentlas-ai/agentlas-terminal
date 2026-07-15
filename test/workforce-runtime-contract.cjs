@@ -165,8 +165,30 @@ function fixture() {
     edges: selection.edges,
     receipt: { workOrderId: workOrder.workOrderId, selectionSessionId: candidates.selectionSessionId },
   };
+  const executionContext = {
+    schemaVersion: "agentlas.workforce-execution-context.v1",
+    workOrderId: workOrder.workOrderId,
+    taskBrief: workOrder.taskBrief,
+    forbiddenCommunities: workOrder.forbiddenCommunities,
+    slots: workOrder.roleSlots.map((slot) => ({
+      ...slot,
+      cardinality: String(slot.cardinality),
+      minimumEvidenceLevel: slot.minimumEvidenceLevel ?? null,
+    })),
+    workOrderEdges: workOrder.edges,
+    assignments: selection.assignments,
+    selectionEdges: selection.edges,
+  };
+  const denyAllPolicy = {
+    schemaVersion: "agentlas.workforce-permission-policy.v1",
+    network: "deny",
+    shell: "deny",
+    fileRead: { mode: "deny", allowPatterns: [], denyPatterns: [] },
+    mcp: { mode: "deny", allowedTools: [] },
+    unknownTools: "deny",
+  };
   const prepared = {
-    schemaVersion: "agentlas.workforce-execution-plan.v2",
+    schemaVersion: "agentlas.workforce-execution-plan.v5",
     status: "prepared",
     issues: [],
     preparationReceiptId: "workforce-preparation:hard-payment",
@@ -174,6 +196,8 @@ function fixture() {
     selectionReceiptId: validationReceipt.selectionReceiptId,
     decisionOwner: "host_llm",
     substitutions: [],
+    executionContext,
+    executionContextDigest: _test.executionContextDigest(executionContext),
     executionRoster: [
       {
         slotId: "slot:backend",
@@ -183,7 +207,11 @@ function fixture() {
         packageHash: HASH_B,
         contentDigest: HASH_C,
         entityKind: "agent",
-        bundleDigestSchema: "agentlas.workforce-runtime-bundle-digest.v1",
+        permissionPolicy: denyAllPolicy,
+        permissionPolicyDigest: _test.permissionPolicyDigest(denyAllPolicy),
+        executionGraph: null,
+        executionGraphDigest: null,
+        bundleDigestSchema: "agentlas.workforce-runtime-bundle-digest.v4",
         bundleDigest: HASH_D,
         directiveBundle: { systemPrompt: "You are the exact backend release. Design and implement transaction-safe APIs." },
       },
@@ -195,7 +223,11 @@ function fixture() {
         packageHash: HASH_C,
         contentDigest: HASH_D,
         entityKind: "agent",
-        bundleDigestSchema: "agentlas.workforce-runtime-bundle-digest.v1",
+        permissionPolicy: denyAllPolicy,
+        permissionPolicyDigest: _test.permissionPolicyDigest(denyAllPolicy),
+        executionGraph: null,
+        executionGraphDigest: null,
+        bundleDigestSchema: "agentlas.workforce-runtime-bundle-digest.v4",
         bundleDigest: HASH_A,
         directiveBundle: { agentMd: "You are the exact verifier release. Try to falsify all correctness claims." },
       },
@@ -204,7 +236,7 @@ function fixture() {
   for (const row of prepared.executionRoster) {
     row.bundleDigest = _test.workforceRuntimeBundleDigest(row);
   }
-  const plan = {
+  const delegationPlan = {
     schemaVersion: "agentlas.workforce-delegation-plan.v1",
     planId: "workforce-plan:hard-payment",
     packets: [
@@ -214,11 +246,118 @@ function fixture() {
     synthesis: { slotId: "slot:backend", agentReleaseId: "release:backend-v3", brief: "Integrate design and adversarial findings" },
     verifier: { slotId: "slot:verification", agentReleaseId: "release:verifier-v7", brief: "Check the integrated answer", criteria: ["idempotency", "rollback", "authorization"] },
   };
-  return { workOrder, candidates, selection, validationReceipt, prepared, plan };
+  const toolInventorySnapshot = {
+    schemaVersion: "agentlas.workforce-tool-inventory.v1",
+    executionContextDigest: prepared.executionContextDigest,
+    observedAt: "2026-07-15T00:00:00Z",
+    entries: [],
+  };
+  const plan = {
+    schemaVersion: "agentlas.workforce-orchestration-plan.v2",
+    delegationPlan,
+    capabilityBindingPlan: {
+      schemaVersion: "agentlas.workforce-capability-binding-plan.v1",
+      decisionOwner: "host_llm",
+      plannerInvocationId: "__PLANNER_INVOCATION_ID__",
+      executionContextDigest: "__EXECUTION_CONTEXT_DIGEST__",
+      toolInventoryDigest: "__TOOL_INVENTORY_DIGEST__",
+      inventory: [],
+    },
+  };
+  return { workOrder, candidates, selection, validationReceipt, prepared, delegationPlan, toolInventorySnapshot, plan };
+}
+
+function refreshPreparedFixture(f) {
+  bindPreparedContext(f.prepared, f.workOrder, f.selection);
+  for (const row of f.prepared.executionRoster) {
+    row.permissionPolicyDigest = _test.permissionPolicyDigest(row.permissionPolicy);
+    row.executionGraphDigest = row.executionGraph ? _test.executionGraphDigest(row.executionGraph) : null;
+    row.bundleDigest = _test.workforceRuntimeBundleDigest(row);
+  }
+  f.toolInventorySnapshot.executionContextDigest = f.prepared.executionContextDigest;
+  return f;
+}
+
+function teamFixture() {
+  const f = fixture();
+  f.workOrder.roleSlots[0].allowedEntityKinds = ["team"];
+  f.candidates.slots[0].candidates[0].entityKind = "team";
+  f.validationReceipt.idealTeam[0].entityKind = "team";
+  f.validationReceipt.executableTeam[0].entityKind = "team";
+  const row = f.prepared.executionRoster[0];
+  row.entityKind = "team";
+  row.executionGraph = {
+    schemaVersion: "1.0",
+    manager: { path: "team/manager.md", content: "Plan every declared worker and synthesize every handoff." },
+    workers: [
+      { id: "worker:builder", path: "team/builder.md", content: "Build the transaction-safe payment design." },
+      { id: "worker:adversarial", path: "team/adversarial.md", content: "Adversarially falsify the payment design." },
+    ],
+  };
+  return refreshPreparedFixture(f);
+}
+
+function toolBindingFixture() {
+  const f = fixture();
+  const capabilityId = "tool:database";
+  const toolId = "mcp__database__query";
+  f.workOrder.roleSlots[0].requiredToolCapabilities = [capabilityId];
+  f.candidates.slots[0].candidates[0].semanticSnapshot.toolCapabilities = [{ concept: capabilityId, level: "demonstrated" }];
+  const row = f.prepared.executionRoster[0];
+  row.permissionPolicy = {
+    ...row.permissionPolicy,
+    mcp: { mode: "allowlist", allowedTools: [toolId] },
+  };
+  refreshPreparedFixture(f);
+  const inventoryEntry = {
+    slotId: "slot:backend",
+    agentReleaseId: "release:backend-v3",
+    permissionPolicyDigest: row.permissionPolicyDigest,
+    provider: "mcp",
+    toolId,
+    serverId: "server:database",
+    description: "Execute a bounded database query",
+    inputSchemaDigest: HASH_A,
+    runtimeIds: ["runtime:ollama"],
+    selectiveEnforcement: "exact-tool-allowlist",
+    capabilityIds: [capabilityId],
+    status: "ready",
+  };
+  f.toolInventorySnapshot.entries = [inventoryEntry];
+  f.plan.capabilityBindingPlan.inventory = [{
+    slotId: "slot:backend",
+    agentReleaseId: "release:backend-v3",
+    permissionPolicyDigest: row.permissionPolicyDigest,
+    provider: "mcp",
+    toolId,
+    capabilityIds: [capabilityId],
+    status: "bound",
+  }];
+  return { ...f, inventoryEntry };
 }
 
 function workOrderOutput(workOrder) {
   return JSON.stringify(workOrder);
+}
+
+function bindPreparedContext(prepared, workOrder, selection) {
+  const executionContext = {
+    schemaVersion: "agentlas.workforce-execution-context.v1",
+    workOrderId: workOrder.workOrderId,
+    taskBrief: workOrder.taskBrief,
+    forbiddenCommunities: workOrder.forbiddenCommunities,
+    slots: workOrder.roleSlots.map((slot) => ({
+      ...slot,
+      cardinality: String(slot.cardinality),
+      minimumEvidenceLevel: slot.minimumEvidenceLevel ?? null,
+    })),
+    workOrderEdges: workOrder.edges,
+    assignments: selection.assignments,
+    selectionEdges: selection.edges,
+  };
+  prepared.executionContext = executionContext;
+  prepared.executionContextDigest = _test.executionContextDigest(executionContext);
+  return prepared;
 }
 
 function nestedNameEnvelope(toolName, argumentKey, value) {
@@ -267,7 +406,7 @@ function relaxedWorkOrder(workOrder) {
 }
 
 function harness(overrides = {}) {
-  const f = fixture();
+  const f = overrides.fixture || fixture();
   const modelOutputs = overrides.modelOutputs || [
     JSON.stringify(f.workOrder),
     `<think>compare qualified candidates only</think>\n\`\`\`json\n${JSON.stringify(f.selection)}\n\`\`\``,
@@ -289,16 +428,27 @@ function harness(overrides = {}) {
   const modelCalls = [];
   const hubCalls = [];
   const receipts = [];
+  const auditReceipts = [];
   const benchmarkArtifacts = [];
   let modelIndex = 0;
   let searchIndex = 0;
+  let plannerLineage = null;
   const runtime = create({
     resolveRuntime: () => ({ mode: "api", backend: "ollama", model: "qwen3:30b-a3b" }),
     buildChildEnv: async () => ({}),
     runModel: async (call) => {
       modelCalls.push(call);
       if (modelIndex >= modelOutputs.length) throw new Error("unexpected model call");
-      return modelOutputs[modelIndex++];
+      const match = String(call.prompt || "").match(/PLANNER_LINEAGE_DATA=(\{[^\n]+\})/);
+      if (match) plannerLineage = JSON.parse(match[1]);
+      let output = modelOutputs[modelIndex++];
+      if (plannerLineage && typeof output === "string") {
+        output = output
+          .replaceAll("__PLANNER_INVOCATION_ID__", plannerLineage.plannerInvocationId)
+          .replaceAll("__EXECUTION_CONTEXT_DIGEST__", plannerLineage.executionContextDigest)
+          .replaceAll("__TOOL_INVENTORY_DIGEST__", plannerLineage.toolInventoryDigest);
+      }
+      return output;
     },
     callHubTool: async (name, args) => {
       hubCalls.push({ name, args });
@@ -314,20 +464,23 @@ function harness(overrides = {}) {
       }
       if (name === "workforce.validate_selection") return f.validationReceipt;
       if (name === "workforce.prepare_execution") {
-        const prepared = structuredClone(f.prepared);
+        const prepared = bindPreparedContext(structuredClone(f.prepared), args.workOrder, args.selection);
         if (overrides.prepareMutation) overrides.prepareMutation(prepared);
         return prepared;
       }
       throw new Error(`unexpected Hub tool ${name}`);
     },
     appendReceipt: (receipt) => receipts.push(structuredClone(receipt)),
+    appendAuditReceipt: (receipt) => auditReceipts.push(structuredClone(receipt)),
     persistBenchmarkArtifact: (artifact) => {
       benchmarkArtifacts.push(structuredClone(artifact));
       return "/tmp/workforce-benchmark-fixture.json";
     },
     now: () => new Date("2026-07-15T00:00:00.000Z"),
+    listWorkforceTools: overrides.listWorkforceTools,
+    supportsWorkforceToolAuthority: overrides.supportsWorkforceToolAuthority,
   });
-  return { ...f, runtime, modelCalls, hubCalls, receipts, benchmarkArtifacts };
+  return { ...f, runtime, modelCalls, hubCalls, receipts, auditReceipts, benchmarkArtifacts };
 }
 
 async function successContract() {
@@ -354,7 +507,12 @@ async function successContract() {
   assert.equal(h.receipts[0].preparationReceiptId, h.prepared.preparationReceiptId);
   assert.equal(h.receipts[0].orchestrator.status, "completed");
   assert.equal(h.receipts[0].planner.parseSuccess, true);
-  assert.equal(h.receipts[0].workers.every((row) => row.status === "completed" && row.modelId && row.invocationId && row.handoffArtifactRefs.length), true);
+  assert.equal(h.receipts[0].workers.every((row) =>
+    row.status === "completed"
+    && row.executionMode === "direct"
+    && row.directInvocation?.modelId
+    && row.directInvocation?.invocationId
+    && row.handoffArtifactRefs.length), true);
   assert.match(h.modelCalls[0].system, /awo:2026-07-15\.2/);
   assert.match(h.modelCalls[0].system, /role:payments-engineer/);
   assert.match(h.modelCalls[0].system, /role:quality-engineer/);
@@ -371,6 +529,92 @@ async function successContract() {
   ]);
   assert.deepEqual(h.benchmarkArtifacts[0].selectionReceipt.leaderInvocations.map((row) => row.phase), ["work-order", "selection"]);
   assert.equal(h.benchmarkArtifacts[0].executionReceipt.status, "passed");
+  assert.equal(h.benchmarkArtifacts[0].preparedExecution.schemaVersion, "agentlas.workforce-execution-plan.v5");
+  assert.equal(h.benchmarkArtifacts[0].toolInventorySnapshot.schemaVersion, "agentlas.workforce-tool-inventory.v1");
+}
+
+async function nestedTeamGraphExecutesEveryDeclaredWorkerWithoutFlattening() {
+  const f = teamFixture();
+  const nestedPlan = {
+    schemaVersion: "agentlas.workforce-team-delegation-plan.v1",
+    plannedWorkerIds: ["worker:builder", "worker:adversarial"],
+    packets: [
+      { id: "worker:builder", objective: "Build the exact payment transaction design", inputs: ["parent packet"], expectedOutput: "design handoff" },
+      { id: "worker:adversarial", objective: "Falsify the transaction design", inputs: ["parent packet"], expectedOutput: "adversarial handoff" },
+    ],
+    synthesisBrief: "Integrate both declared worker handoffs without omission",
+  };
+  const h = harness({
+    fixture: f,
+    modelOutputs: [
+      JSON.stringify(f.workOrder),
+      JSON.stringify(f.selection),
+      JSON.stringify(f.plan),
+      JSON.stringify(nestedPlan),
+      "Declared builder handoff.",
+      "Declared adversarial handoff.",
+      "Pinned team manager synthesis with both declared handoffs.",
+      "Independent direct verifier handoff.",
+      "Top-level synthesis over team and direct-agent handoffs.",
+      JSON.stringify({
+        schemaVersion: "agentlas.workforce-verification.v1",
+        status: "passed",
+        checks: [{ checkId: "check:nested-graph", status: "passed", evidence: "both graph workers and manager synthesis are present" }],
+        issues: [],
+      }),
+    ],
+  });
+  const result = await h.runtime.workforceRun({}, "nested team graph benchmark", { silent: true, benchmark: true, concurrency: 1 });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  const teamWorker = result.executionReceipt.workers.find((row) => row.agentReleaseId === "release:backend-v3");
+  assert.equal(teamWorker.entityKind, "team");
+  assert.equal(teamWorker.executionMode, "nested");
+  assert.equal(teamWorker.directInvocation, null);
+  assert.ok(teamWorker.nestedExecutionId);
+  assert.equal(result.executionReceipt.nestedExecutions.length, 1);
+  const nested = result.executionReceipt.nestedExecutions[0];
+  assert.deepEqual(nested.managerPlan.plannedWorkerIds, ["worker:builder", "worker:adversarial"]);
+  assert.equal(nested.managerPlan.parseSuccess, true);
+  assert.equal(nested.managerPlan.fallbackUsed, false);
+  assert.deepEqual(nested.workers.map((row) => row.id), ["worker:builder", "worker:adversarial"]);
+  assert.equal(nested.managerSynthesis.status, "completed");
+  assert.equal(h.modelCalls.filter((call) => /DECLARED_WORKER_ID=/.test(call.system)).length, 2);
+  assert.equal(h.modelCalls.some((call) => /PINNED_RELEASE=release:backend-v3/.test(call.system)), false, "a team release must never be flattened into one direct worker call");
+}
+
+async function requiredToolBindingUsesOnlyPrivateExactInventoryAndNativeGrant() {
+  const f = toolBindingFixture();
+  const h = harness({
+    fixture: f,
+    listWorkforceTools: async () => [structuredClone(f.inventoryEntry)],
+    supportsWorkforceToolAuthority: async ({ grantedToolIds }) => grantedToolIds.length === 1 && grantedToolIds[0] === "mcp__database__query",
+  });
+  const result = await h.runtime.workforceRun({}, "required tool binding benchmark", { silent: true, benchmark: true, concurrency: 1 });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  const backend = result.executionReceipt.workers.find((row) => row.slotId === "slot:backend");
+  assert.deepEqual(backend.capabilityBindings, [{
+    capabilityId: "tool:database",
+    provider: "mcp",
+    toolId: "mcp__database__query",
+    source: "host_inventory",
+    status: "bound",
+  }]);
+  assert.equal(backend.directInvocation.permissionEnforcement.enforcementMode, "native-sandbox");
+  assert.deepEqual(backend.directInvocation.permissionEnforcement.enforcementEvidence.grantedToolIds, ["mcp__database__query"]);
+  assert.match(h.modelCalls[2].prompt, /POLICY_FILTERED_LOCAL_TOOL_MENU_DATA=/);
+  assert.match(h.modelCalls[2].prompt, /mcp__database__query/);
+  assert.equal(h.hubCalls.some((call) => JSON.stringify(call.args).includes("mcp__database__query")), false, "private tool inventory must never be sent to Hub MCP");
+}
+
+async function requiredToolWithoutReadyInventoryFailsBeforePlannerOrWorker() {
+  const f = toolBindingFixture();
+  const h = harness({ fixture: f, listWorkforceTools: async () => [] });
+  const result = await h.runtime.workforceRun({}, "missing required tool inventory", { silent: true, benchmark: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "workforce_required_tool_unavailable");
+  assert.equal(h.modelCalls.length, 2, "no planner or worker may run without an exact ready local tools/list binding");
+  assert.equal(result.receipt.planner, null);
+  assert.deepEqual(result.receipt.workers, []);
 }
 
 async function terminalBufferedFetchAdapterContract() {
@@ -390,11 +634,23 @@ async function terminalBufferedFetchAdapterContract() {
     }),
   ];
   let modelIndex = 0;
+  let plannerLineage = null;
   const fetchCalls = [];
   const runtime = create({
     resolveRuntime: () => ({ mode: "api", backend: "ollama", model: "qwen3:30b-a3b" }),
     buildChildEnv: async () => ({}),
-    runModel: async () => modelOutputs[modelIndex++],
+    runModel: async (call) => {
+      const match = String(call.prompt || "").match(/PLANNER_LINEAGE_DATA=(\{[^\n]+\})/);
+      if (match) plannerLineage = JSON.parse(match[1]);
+      let output = modelOutputs[modelIndex++];
+      if (plannerLineage && typeof output === "string") {
+        output = output
+          .replaceAll("__PLANNER_INVOCATION_ID__", plannerLineage.plannerInvocationId)
+          .replaceAll("__EXECUTION_CONTEXT_DIGEST__", plannerLineage.executionContextDigest)
+          .replaceAll("__TOOL_INVENTORY_DIGEST__", plannerLineage.toolInventoryDigest);
+      }
+      return output;
+    },
     cloudSessionCookie: async () => "agentlas_session=redacted-test-value",
     fetchHub: async (_url, init) => {
       const request = JSON.parse(init.body);
@@ -441,7 +697,7 @@ async function malformedStructuredStagesRepairOnceAndSucceed() {
   const malformedSelection = structuredClone(f.selection);
   delete malformedSelection.edges;
   const malformedPlan = structuredClone(f.plan);
-  delete malformedPlan.packets[0].expectedOutput;
+  delete malformedPlan.delegationPlan.packets[0].expectedOutput;
   const h = harness({
     modelOutputs: [
       JSON.stringify(malformedWorkOrder),
@@ -493,7 +749,7 @@ async function malformedStructuredStagesRepairOnceAndSucceed() {
   assert.equal(result.receipt.benchmarkAudit.structuredRepairCount, 3);
   assert.equal(result.receipt.benchmarkAudit.passed, true);
   assert.equal(h.benchmarkArtifacts.length, 1);
-  assert.equal(h.benchmarkArtifacts[0].executionReceipt.structuredModelAttempts.length, 6);
+  assert.equal(h.benchmarkArtifacts[0].orchestrationAudit.structuredModelAttempts.length, 6);
   assert.deepEqual(
     h.benchmarkArtifacts[0].selectionReceipt.leaderInvocations.filter((row) => row.status === "completed").map((row) => row.phase),
     ["work-order", "selection"],
@@ -936,8 +1192,9 @@ async function structuredRepairExhaustionFailsBeforeHubAndPersistsArtifact() {
   assert.equal(h.benchmarkArtifacts.length, 1);
   assert.equal(result.benchmarkArtifactPath, "/tmp/workforce-benchmark-fixture.json");
   assert.equal(h.benchmarkArtifacts[0].workOrder, null);
-  assert.equal(h.benchmarkArtifacts[0].executionReceipt.status, "failed");
-  assert.equal(h.benchmarkArtifacts[0].executionReceipt.structuredModelAttempts.length, 2);
+  assert.equal(h.benchmarkArtifacts[0].executionReceipt, null);
+  assert.equal(h.benchmarkArtifacts[0].orchestrationAudit.status, "failed");
+  assert.equal(h.benchmarkArtifacts[0].orchestrationAudit.structuredModelAttempts.length, 2);
 }
 
 async function digestMismatchFailsClosed() {
@@ -946,33 +1203,35 @@ async function digestMismatchFailsClosed() {
   assert.equal(result.ok, false);
   assert.equal(result.error.code, "execution_bundle_digest_mismatch");
   assert.equal(h.modelCalls.length, 2, "no planner or worker may run after a pin mismatch");
-  assert.equal(h.receipts[0].status, "failed");
+  assert.equal(h.auditReceipts[0].status, "failed");
 }
 
 function runtimeBundleDigestUsesExactCanonicalProjection() {
   const f = fixture();
   const row = structuredClone(f.prepared.executionRoster[0]);
   const expected = _test.workforceRuntimeBundleDigest(row);
-  assert.equal(expected, "sha256:e9d0416db83ac2447c95eb1d3374c1356cde3bc00fc70d21b4887cf6f98b4ab4", "Terminal canonical bytes must match the Core reference digest");
-  const crossLanguageVector = {
-    slotId: "slot:payments",
-    agentDefinitionId: "definition:payments",
-    agentReleaseId: "release:payments@1.2.3",
-    releaseVersion: "1.2.3",
-    packageHash: `sha256:${"a".repeat(64)}`,
-    contentDigest: `sha256:${"b".repeat(64)}`,
-    entityKind: "agent",
-    directiveBundle: {
-      instructions: "Execute exactly.",
-      agentMd: "결제 무결성을 검증한다.",
-      runtimeBundle: { entityKind: "agent", executionGraph: null, tools: ["mongodb", "payments"] },
-    },
-  };
-  assert.equal(
-    _test.workforceRuntimeBundleDigest(crossLanguageVector),
-    "sha256:33463c138f6af8e0d130f4ecd8a7a503fc2c734ddcf70be0daf8701db393e933",
-    "Terminal UTF-8 canonical JSON must match the reviewed cross-language golden vector",
-  );
+  assert.match(expected, /^sha256:[0-9a-f]{64}$/);
+  const vectors = JSON.parse(require("node:fs").readFileSync(
+    require.resolve("./fixtures/runtime-bundle-digest-v4-vectors.json"),
+    "utf8",
+  ));
+  assert.equal(vectors.digestSchemaVersion, "agentlas.workforce-runtime-bundle-digest.v4");
+  assert.equal(vectors.executionPlanSchemaVersion, "agentlas.workforce-execution-plan.v5");
+  for (const vector of vectors.accepted) {
+    const vectorRow = { ...vectors.baseRosterRow, ...vector.rosterRow };
+    if (vector.canonicalJson !== undefined) {
+      assert.equal(_test.workforceRuntimeBundleCanonicalJson(vectorRow), vector.canonicalJson, vector.vectorId);
+    }
+    assert.equal(_test.workforceRuntimeBundleDigest(vectorRow), vector.bundleDigest, vector.vectorId);
+  }
+  for (const vector of vectors.rejected) {
+    const vectorRow = { ...vectors.baseRosterRow, ...vector.rosterRow };
+    assert.throws(
+      () => _test.workforceRuntimeBundleDigest(vectorRow),
+      (error) => error && ["execution_bundle_digest_domain_invalid", "execution_bundle_invalid"].includes(error.code),
+      vector.vectorId,
+    );
+  }
   const withUnknowns = {
     extraUntrustedField: "excluded-from-contract",
     ...structuredClone(row),
@@ -984,11 +1243,11 @@ function runtimeBundleDigestUsesExactCanonicalProjection() {
   nested.directiveBundle.runtimeBundle = {
     packageHash: HASH_A,
     tools: ["tool:database", "tool:shell"],
-    nested: { z: 2, a: 1 },
+    nested: { z: "2", a: "1" },
   };
   const reordered = structuredClone(nested);
   reordered.directiveBundle.runtimeBundle = {
-    nested: { a: 1, z: 2 },
+    nested: { a: "1", z: "2" },
     tools: ["tool:database", "tool:shell"],
     packageHash: HASH_A,
   };
@@ -1023,6 +1282,21 @@ async function tamperedDirectiveBundleDigestFailsBeforePlanner() {
     "workforce.validate_selection",
     "workforce.prepare_execution",
   ]);
+}
+
+async function unrelatedStringIsNotAnExecutableDirective() {
+  const h = harness({
+    prepareMutation: (prepared) => {
+      prepared.executionRoster[0].directiveBundle = { slug: "nonblank-but-not-executable" };
+      prepared.executionRoster[0].bundleDigest = _test.workforceRuntimeBundleDigest(prepared.executionRoster[0]);
+    },
+  });
+  const result = await h.runtime.workforceRun({}, "reject a roster without executable directives", { silent: true, benchmark: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "execution_bundle_invalid");
+  assert.match(result.error.message, /no executable instructions/);
+  assert.equal(h.modelCalls.length, 2, "planner and workers must not run without an executable directive");
+  assert.deepEqual(result.receipt.workers, []);
 }
 
 async function bundleDigestSchemaMarkerIsMandatory() {
@@ -1380,7 +1654,7 @@ function portableContractFailsClosed() {
   const legacyPrepared = structuredClone(f.prepared);
   legacyPrepared.schemaVersion = "agentlas.workforce-execution-plan.v1";
   assert.throws(
-    () => _test.validatePreparedExecution(legacyPrepared, f.selection, f.candidates, f.validationReceipt),
+    () => _test.validatePreparedExecution(legacyPrepared, f.workOrder, f.selection, f.candidates, f.validationReceipt),
     (error) => error.code === "execution_bundle_invalid" && /unsupported prepared execution schema/.test(error.message),
   );
 }
@@ -1441,8 +1715,25 @@ function workforcePreferenceDefaults() {
   assert.equal(applyPreferenceDefaults({ autoNetwork: true }).autoNetwork, true);
 }
 
+async function privateWorkOrderRepairsLocallyAndNeverCallsHubOnExhaustion() {
+  const f = fixture();
+  const privateOrder = structuredClone(f.workOrder);
+  privateOrder.taskBrief = "Inspect /Users/example/private/.env for customer id=acct_12345678";
+  const h = harness({ modelOutputs: [JSON.stringify(privateOrder), JSON.stringify(privateOrder)] });
+  const result = await h.runtime.workforceRun({}, "private boundary test", { silent: true, benchmark: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "work_order_hub_boundary_rejected");
+  assert.equal(h.modelCalls.length, 2, "the same leader receives exactly one bounded local repair attempt");
+  assert.deepEqual(h.hubCalls, [], "rejected private text must produce zero Hub calls");
+  assert.match(h.modelCalls[1].prompt, /hub_private_local_path/);
+  assert.match(h.modelCalls[1].prompt, /hub_private_labeled_identifier/);
+}
+
 async function main() {
   await successContract();
+  await nestedTeamGraphExecutesEveryDeclaredWorkerWithoutFlattening();
+  await requiredToolBindingUsesOnlyPrivateExactInventoryAndNativeGrant();
+  await requiredToolWithoutReadyInventoryFailsBeforePlannerOrWorker();
   await terminalBufferedFetchAdapterContract();
   await malformedStructuredStagesRepairOnceAndSucceed();
   await nestedNameEnvelopeRepairsToDirectObjectsWithoutHostNormalization();
@@ -1458,9 +1749,11 @@ async function main() {
   cardinalityShortfallTriggersRefinementButPolicyMinimumDoesNot();
   selectionExpansionSummaryIsRedactedAndSlotBounded();
   await structuredRepairExhaustionFailsBeforeHubAndPersistsArtifact();
+  await privateWorkOrderRepairsLocallyAndNeverCallsHubOnExhaustion();
   await digestMismatchFailsClosed();
   runtimeBundleDigestUsesExactCanonicalProjection();
   await tamperedDirectiveBundleDigestFailsBeforePlanner();
+  await unrelatedStringIsNotAnExecutableDirective();
   await bundleDigestSchemaMarkerIsMandatory();
   await nestedRuntimePackageHashIsNotComparedToReleaseUploadHash();
   await invalidPlannerNeverFallsBack();
@@ -1475,7 +1768,7 @@ async function main() {
   process.stdout.write("workforce runtime contract: PASS\n");
 }
 
-module.exports = { fixture, harness };
+module.exports = { fixture, harness, teamFixture, toolBindingFixture };
 
 if (require.main === module) {
   main().catch((error) => {
