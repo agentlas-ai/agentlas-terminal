@@ -50,8 +50,8 @@
   planner fallback, and single-model masquerading fail closed.
 - Keep the retired lexical router available only through explicit
   `/legacy-network`. Cross-platform and npm release gates now exercise the
-  workforce runtime contract on Agentlas OS v1.1.40 at immutable commit
-  `14fc67e5d6741cf83910b5161c68c09718cc5ab1`, including canonical ontology
+  workforce runtime contract on Agentlas OS v1.1.41 at immutable commit
+  `4f5e53f24886ebd52d257d176aadffb090be4ff6`, including canonical ontology
   `awo:2026-07-15.2` and its reviewed singular payment/security aliases.
 - This source commit does not prove a GitHub release or npm publication; both
   remain separate immutable-tag gates.
