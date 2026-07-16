@@ -7,8 +7,12 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Exact immutable release tag to publish (for example v0.8.5)"
+        description: "Exact immutable release tag or current main commit SHA"
         required: true
+        type: string
+      version:
+        description: "Package version when ref is the exact current main commit SHA"
+        required: false
         type: string
 
 permissions:
@@ -32,18 +36,38 @@ jobs:
         id: release
         env:
           REQUESTED_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
+          REQUESTED_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [[ ! "$REQUESTED_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Expected an exact vX.Y.Z release tag, got: $REQUESTED_REF" >&2
+          if [[ "$REQUESTED_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            release_kind=tag
+            release_version="${REQUESTED_REF#v}"
+          elif [[ "$EVENT_NAME" = workflow_dispatch && "$REQUESTED_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            if [ "$REQUESTED_REF" != "$WORKFLOW_SHA" ]; then
+              echo "Commit publication requires the exact workflow main SHA: $WORKFLOW_SHA" >&2
+              exit 1
+            fi
+            if [[ ! "$REQUESTED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Commit publication requires an exact X.Y.Z version" >&2
+              exit 1
+            fi
+            release_kind=commit
+            release_version="$REQUESTED_VERSION"
+          else
+            echo "Expected an exact vX.Y.Z tag or the exact current main commit SHA, got: $REQUESTED_REF" >&2
             exit 1
           fi
-          echo "tag=$REQUESTED_REF" >> "$GITHUB_OUTPUT"
-          echo "version=${REQUESTED_REF#v}" >> "$GITHUB_OUTPUT"
+          {
+            echo "ref=$REQUESTED_REF"
+            echo "kind=$release_kind"
+            echo "version=$release_version"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v6
         with:
-          ref: ${{ steps.release.outputs.tag }}
+          ref: ${{ steps.release.outputs.ref }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -71,11 +95,18 @@ jobs:
 
       - name: Verify tag and package identity
         env:
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_REF: ${{ steps.release.outputs.ref }}
+          RELEASE_KIND: ${{ steps.release.outputs.kind }}
           RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          WORKFLOW_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          test "$(git describe --tags --exact-match HEAD)" = "$RELEASE_TAG"
+          if [ "$RELEASE_KIND" = tag ]; then
+            test "$(git describe --tags --exact-match HEAD)" = "$RELEASE_REF"
+          else
+            test "$(git rev-parse HEAD)" = "$RELEASE_REF"
+            test "$RELEASE_REF" = "$WORKFLOW_SHA"
+          fi
           test "$(node -p "require('./package.json').name")" = "agentlas"
           test "$(node -p "require('./package.json').version")" = "$RELEASE_VERSION"
           test "$(node -p "require('./package.json').repository.url")" = "git+https://github.com/agentlas-ai/agentlas-terminal.git"
