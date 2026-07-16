@@ -8,6 +8,7 @@
  * First launch runs an onboarding wizard (language → runtime → permission), stored in prefs.
  */
 const readline = require("node:readline");
+const crypto = require("node:crypto");
 const { Ui } = require("./agentlas-ui.cjs");
 const banner = require("./agentlas-banner.cjs");
 const { runNativeTurn } = require("./agentlas-native-host.cjs");
@@ -22,6 +23,12 @@ function runtimeLabel(rt) {
   if (!rt) return "(none)";
   if (rt.mode === "cli") return rt.kind;
   return `${rt.backend}${rt.model ? " · " + rt.model : ""}`;
+}
+
+function runtimePromptForSession(prompt, ctx, rt, session, helpers) {
+  const resumesServerSide = rt && (rt.kind === "claude-code" || rt.kind === "codex");
+  if (!session?.id || !resumesServerSide || typeof helpers?.memoryEmitterPrompt !== "function") return prompt;
+  return `${prompt}\n\n${helpers.memoryEmitterPrompt(prompt, ctx)}`;
 }
 
 function normalizeLang(value) {
@@ -300,10 +307,16 @@ function startRepl(opts) {
     busy = true;
     currentAbort = new AbortController();
     const signal = currentAbort.signal;
-    const experienceRunId = `terminal-run:${require("node:crypto").randomUUID()}`;
+    let experienceRunId = `terminal-run:${crypto.randomUUID()}`;
     const runStartedAt = Date.now();
     let experienceFinalized = false;
     let experienceContext = null;
+    let memorySettled = false;
+    let memoryContext = null;
+    let memoryRuntime = null;
+    let memoryModel = null;
+    let memoryOutput = "";
+    let memoryOutcome = "failed";
     try {
       ui.beginTurn({
         ...composerMeta(),
@@ -325,8 +338,32 @@ function startRepl(opts) {
       const recordHistoryEntry = !runOptions.side;
       const targetLang = H.detectResponseLanguage ? H.detectResponseLanguage(prompt, ui.lang) : ui.lang;
       const curatedMemories = [];
-      const ctx = { ...ctxNow(), lang: targetLang, uiLang: ui.lang, curatedMemories };
       const rt = state.runtime;
+      const priorContextDigest = crypto.createHash("sha256")
+        .update(JSON.stringify(state.history.map((item) => ({ role: item.role, text: item.text }))))
+        .digest("hex");
+      const memoryTurn = typeof H.beginMemoryTurn === "function"
+        ? H.beginMemoryTurn(db, prompt, {
+            ...ctxNow(),
+            surface: runOptions.side ? "terminal-side-turn" : "terminal-interactive-turn",
+            conversationRef: rt.mode === "cli" ? state.native[rt.kind]?.id : null,
+            priorContextDigest,
+            // Provider session resume is conversation context, not turn
+            // identity. Every submitted host turn receives a fresh id.
+            stableTurnId: `terminal-turn:${crypto.randomUUID()}`,
+          })
+        : null;
+      if (memoryTurn?.turnId) experienceRunId = `terminal-run:${memoryTurn.turnId}`;
+      const ctx = {
+        ...ctxNow(),
+        lang: targetLang,
+        uiLang: ui.lang,
+        curatedMemories,
+        memoryTurn,
+        turnId: memoryTurn?.turnId || null,
+      };
+      memoryContext = ctx;
+      memoryRuntime = rt;
       let workloadResolution = null;
       if (state.subject && state.subject.kind === "firm" && typeof H.allocateWorkload === "function") {
         ui.status(targetLang === "ko" ? "상위 AI가 팀 작업의 모델 비용을 배정 중…" : "Higher-level AI is allocating the team model…");
@@ -347,6 +384,7 @@ function startRepl(opts) {
         }
       }
       const selectedModel = (workloadResolution && workloadResolution.model) || rt.model || null;
+      memoryModel = selectedModel;
       const selectedEffort = workloadResolution ? workloadResolution.effort : state.effort || null;
       const costLabel = selectedModel ? `${runtimeLabel(rt)} · ${selectedModel}` : runtimeLabel(rt);
       experienceContext = { ctx, rt, selectedModel, curatedMemories, targetLang };
@@ -368,6 +406,10 @@ function startRepl(opts) {
         // 플래그가 없어 매 턴이 새 프로세스 — session.id로 시스템 프롬프트를 비우면 2턴째부터
         // 페르소나가 통째로 사라진다. 그래서 gemini는 매 턴 시스템 프롬프트를 다시 보낸다.
         const resumesServerSide = rt.kind === "claude-code" || rt.kind === "codex";
+        // Claude/Codex resume keeps the first turn's system prompt. Append the
+        // current host contract to this turn's user payload so a resumed model
+        // cannot reuse a stale Memory Ticket id from an earlier turn.
+        const runtimePrompt = runtimePromptForSession(prompt, ctx, rt, session, H);
         const memoryGuard = makeMemoryGuard(assistantUi, H.eventsHeading());
         const connectedMcpServers = state.permission === "full" && H.mcpServers
           ? H.mcpServers(db).filter((server) =>
@@ -376,7 +418,7 @@ function startRepl(opts) {
         const res = await runNativeTurn({
           kind: rt.kind,
           bin,
-          prompt,
+          prompt: runtimePrompt,
           systemPrompt: session.id && resumesServerSide ? "" : sys,
           cwd: state.cwd,
           permission: state.permission,
@@ -388,7 +430,29 @@ function startRepl(opts) {
           ui: memoryGuard,
           signal,
         });
-        const at = (H.curateCliReply(db, res.text || "", ctx) || "").trim();
+        memoryOutput = String(res.text || "");
+        memoryOutcome = res.error ? "failed" : "succeeded";
+        let at = "";
+        let memoryResult = null;
+        if (typeof H.completeMemoryTurn === "function") {
+          try {
+            memoryResult = await H.completeMemoryTurn(db, memoryOutput, ctx, rt, {
+              model: selectedModel,
+              outcome: memoryOutcome,
+              requestText: prompt,
+              invokeCurator: !res.error,
+            });
+            memorySettled = true;
+          } catch {
+            // finally retries once without semantic Curator authority.
+          }
+          for (const memory of memoryResult?.curatedMemories || []) {
+            if (memory && !curatedMemories.some((item) => item.id === memory.id)) curatedMemories.push(memory);
+          }
+          at = (H.sanitizeAssistantText(memoryResult?.cleaned ?? memoryOutput) || "").trim();
+        } else {
+          at = (H.sanitizeAssistantText(res.text || "") || "").trim();
+        }
         if (recordHistoryEntry && at && !res.error) state.history.push({ role: "user", text: prompt }, { role: "assistant", text: at });
         recordCost(costLabel, res.usage);
         if (!runOptions.side && session.id && !res.error) persistSession(rt.kind, session.id, prompt);
@@ -440,7 +504,28 @@ function startRepl(opts) {
           ui: guard,
           signal,
         });
-        const cleaned = (H.curateCliReply(db, res.text || "", ctx) || "").trim();
+        memoryOutput = String(res.text || "");
+        memoryOutcome = "succeeded";
+        let cleaned = "";
+        if (typeof H.completeMemoryTurn === "function") {
+          let memoryResult = null;
+          try {
+            memoryResult = await H.completeMemoryTurn(db, memoryOutput, ctx, rt, {
+              model: selectedModel,
+              outcome: memoryOutcome,
+              requestText: prompt,
+            });
+            memorySettled = true;
+          } catch {
+            // finally retries once without semantic Curator authority.
+          }
+          for (const memory of memoryResult?.curatedMemories || []) {
+            if (memory && !curatedMemories.some((item) => item.id === memory.id)) curatedMemories.push(memory);
+          }
+          cleaned = (H.sanitizeAssistantText(memoryResult?.cleaned ?? memoryOutput) || "").trim();
+        } else {
+          cleaned = (H.sanitizeAssistantText(res.text || "") || "").trim();
+        }
         if (recordHistoryEntry && cleaned) state.history.push({ role: "user", text: prompt }, { role: "assistant", text: cleaned });
         recordCost(costLabel, ui._lastUsage);
         if (typeof H.finalizeExperienceRun === "function") {
@@ -464,6 +549,7 @@ function startRepl(opts) {
       }
     } catch (e) {
       ui.stopSpinner();
+      memoryOutcome = signal.aborted ? "cancelled" : "failed";
       if (!experienceFinalized && experienceContext && typeof H.finalizeExperienceRun === "function") {
         H.finalizeExperienceRun(db, {
           agentId: experienceContext.ctx.agentId,
@@ -489,6 +575,21 @@ function startRepl(opts) {
         ui.error((e && e.message) || String(e));
       }
     } finally {
+      if (!memorySettled && memoryContext?.turnId && typeof H.completeMemoryTurn === "function") {
+        try {
+          await H.completeMemoryTurn(db, memoryOutput, memoryContext, memoryRuntime, {
+            model: memoryModel,
+            outcome: memoryOutcome,
+            requestText: prompt,
+            invokeCurator: false,
+          });
+          memorySettled = true;
+        } catch {
+          ui.warn(memoryContext.lang === "ko"
+            ? "메모리 영수증을 저장하지 못했습니다. 응답 실행은 유지됩니다."
+            : "The memory receipt could not be persisted; the response run is preserved.");
+        }
+      }
       busy = false;
       ui.endTurn();
       currentAbort = null;
@@ -1647,4 +1748,11 @@ function printKeybindings(ui) {
   for (const [k, v] of tips) ui.line("  " + c.emerald(k.padEnd(24)) + c.dim(v));
 }
 
-module.exports = { startRepl, runtimeLabel, makeMemoryGuard, makeStyleGuard, applyPreferenceDefaults };
+module.exports = {
+  startRepl,
+  runtimeLabel,
+  runtimePromptForSession,
+  makeMemoryGuard,
+  makeStyleGuard,
+  applyPreferenceDefaults,
+};

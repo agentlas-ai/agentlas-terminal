@@ -34,6 +34,7 @@ const terminalExperienceExchange = require("./agentlas-experience-exchange.cjs")
 const desktopOntologyLoadout = require("./agentlas-desktop-loadout.cjs");
 const workloadRouting = require("./agentlas-workload-routing.cjs");
 const terminalExperienceIntake = require("./agentlas-experience-intake.cjs");
+const terminalMemoryGovernance = require("./agentlas-memory-governance.cjs");
 const { captureCoreJsonSync, resolveCoreRuntimeRoot } = require("./agentlas-core-harness.cjs");
 
 // ── 앱과 동일한 userData 경로 (electron app.getPath('userData')와 일치) ──
@@ -392,8 +393,8 @@ function routeNormalize(value) {
   return String(value || "").toLowerCase().replace(/[_/]+/g, "-");
 }
 // 경로 디렉터리 성분은 라우팅 의도가 아니다 — 마지막 세그먼트(파일/폴더명)만 남긴다.
-// 사고(2026-07-12): "/Users/mason/Documents/…/Appbridge_Template.이 …" 프롬프트의 경로 토큰
-// ("users","mason","documents","users-mason-documents-")이 임포트 에이전트 system_prompt 속
+// 사고(2026-07-12): "/Users/example/Projects/…/Appbridge_Template.이 …" 프롬프트의 경로 토큰
+// ("users","example","projects","users-example-projects-")이 임포트 에이전트 system_prompt 속
 // 절대경로와 맞아떨어져 +2씩 쌓이고 라우팅 근거에까지 노출됐다. 프롬프트/헤이스택 양쪽에
 // 대칭 적용해 경로↔경로 우연 일치를 차단한다. 파일/폴더명은 실제 의도라서 보존한다.
 // 규칙: 공백/인용부호/괄호 뒤(또는 문자열 시작)에서 시작하고, "세그먼트+구분자"가 2회 이상
@@ -8088,7 +8089,7 @@ function ensureTerminalProjectForExecutionCli(db, projectPath, permission = PERM
   if (permission === "read") return activeProjectPath(db, { projectPath: root });
   return activeProjectPath(db, { projectPath: root, activate: true, reason });
 }
-function cliMemoryContext(db, projectPath) {
+function cliMemoryContext(db, projectPath, agentId = null) {
   const sections = [];
   const arch = loadArch();
   ensureMemoryContextColumn(db);
@@ -8104,14 +8105,49 @@ function cliMemoryContext(db, projectPath) {
   }
   if (tableExists(db, "memory_entries")) {
     try {
-      const rows = projectPath
-        ? db.prepare("SELECT kind, content, context_json FROM memory_entries WHERE superseded_at IS NULL AND scope!='session' AND (project_path=? OR (project_path IS NULL AND scope IN ('user_identity','team_memory','agent_team'))) ORDER BY created_at DESC LIMIT 12").all(projectPath)
-        : db.prepare("SELECT kind, content, context_json FROM memory_entries WHERE project_path IS NULL AND scope!='session' AND superseded_at IS NULL ORDER BY created_at DESC LIMIT 12").all();
-      if (rows.length) sections.push((projectPath ? "### Recent curated memory\n" : "### Curated memory (global)\n") + rows.map((r) => `- [${r.kind}] ${r.content}${contextLine(r.context_json)}`).join("\n"));
+      // New writes are read through a scoped global<->project timeline. The
+      // project key is a digest, and team/agent lanes additionally require the
+      // current owner id, so project B cannot recall project A's local memory.
+      const governed = terminalMemoryGovernance.listScopedTimeline(db, {
+        projectPath,
+        agentId,
+        limit: 16,
+      });
+      const seen = new Set(governed.map((row) => row.id));
+      // Legacy rows predate the timeline. Keep only intentional user-global
+      // rows, this exact project, and this exact agent/team owner. In
+      // particular, do not revive the old global team-memory leakage query.
+      const legacy = projectPath
+        ? db.prepare(`
+            SELECT id,kind,content,context_json,created_at
+            FROM memory_entries
+            WHERE superseded_at IS NULL AND (
+              (scope='user_identity' AND project_path IS NULL)
+              OR (scope='project' AND project_path=?)
+              OR (scope IN ('team_memory','agent_team','agent_repo') AND agent_id=? AND (project_path IS NULL OR project_path=?))
+            )
+            ORDER BY created_at DESC LIMIT 16
+          `).all(projectPath, agentId, projectPath)
+        : db.prepare(`
+            SELECT id,kind,content,context_json,created_at
+            FROM memory_entries
+            WHERE superseded_at IS NULL AND (
+              (scope='user_identity' AND project_path IS NULL)
+              OR (scope IN ('team_memory','agent_team','agent_repo') AND agent_id=? AND project_path IS NULL)
+            )
+            ORDER BY created_at DESC LIMIT 16
+          `).all(agentId);
+      const rows = [...governed, ...legacy.filter((row) => !seen.has(row.id))].slice(0, 16);
+      if (rows.length) {
+        sections.push(
+          (projectPath ? "### Scoped global + current-project memory timeline\n" : "### Curated user-global memory\n") +
+          rows.map((r) => `- [${r.kind}] ${r.content}${contextLine(r.context_json)}`).join("\n"),
+        );
+      }
     } catch { /* ignore */ }
   }
   if (!sections.length) return "";
-  return "## Agentlas memory (read before answering; five-scope + request_context recall)\n\n" + sections.join("\n\n");
+  return "## Agentlas memory (read before answering; governed scope recall)\n\n" + sections.join("\n\n");
 }
 function parseMemoryEventsCli(text) {
   const heading = loadArch().eventsHeading;
@@ -8184,9 +8220,12 @@ function prefsLang() {
 
 const TERMINAL_MEMORY_CORE_MAX_TOKENS = 150;
 const TERMINAL_MEMORY_CORE = [
-  "## Memory",
-  "Only for a durable decision, fact, preference, risk, or reusable procedure, end with `## Memory Events` plus a fenced JSON array; otherwise emit nothing.",
-  "Each item: memory_kind, content, suggested_scope. Never include secrets, credentials, prompts, transcripts, or raw logs; the curator validates scope.",
+  "## Memory governance",
+  "End every completed reply with hidden `## Memory Events` plus fenced JSON:",
+  '{"turn_id":"<stable-id>","observation":{"outcome":"completed","summary":"safe short outcome"},"candidates":[]}',
+  "Candidates 0..N: memory_kind,content,suggested_scope,confidence.",
+  "Scopes: user_global|team|agent|project|session|discard.",
+  "No raw prompts/transcripts, secrets, logs, or absolute paths. Curator suggests; deterministic gates decide writes.",
 ].join("\n");
 const MEMORY_DETAIL_RE = /\b(?:remember|memory|save this|record this|memory event)\b|기억|메모리|저장해|기록해|남겨/i;
 const CREDENTIAL_INDEX_RE = /\b(?:deploy|release|billing|auth|oauth|credential|api key|secret key|cloud)\b|배포|릴리스|출시|결제|인증|자격 증명|API\s*키|시크릿|클라우드/i;
@@ -8198,16 +8237,19 @@ if (approximatePromptTokens(TERMINAL_MEMORY_CORE) > TERMINAL_MEMORY_CORE_MAX_TOK
   throw new Error("Terminal always-on memory core exceeds 150 tokens");
 }
 
-function memoryEmitterPromptFor(request, arch = loadArch()) {
-  if (!MEMORY_DETAIL_RE.test(String(request || ""))) return TERMINAL_MEMORY_CORE;
-  const full = String(arch?.emitterBlock || "");
-  if (!full) return TERMINAL_MEMORY_CORE;
-  // Credential lookup is a separate triggered concern. Remove the legacy
-  // always-on paragraph from the full memory schema too.
-  return full.replace(
-    /\n- Real credential values may live only[\s\S]*?before saying a credential is missing\.\n/,
-    "\n",
-  ).trim();
+function memoryEmitterPromptFor(request, arch = loadArch(), turnId = null, permission = "write") {
+  const stableId = String(turnId || "").replace(/[^A-Za-z0-9:._-]/g, "").slice(0, 160);
+  let prompt = TERMINAL_MEMORY_CORE;
+  if (stableId) prompt += `\nUse turn_id=${stableId}. permission=${permission === "read" ? "receipt-only" : "curated-write"}.`;
+  if (!MEMORY_DETAIL_RE.test(String(request || ""))) return prompt;
+  const kinds = Array.isArray(arch?.kinds) && arch.kinds.length ? arch.kinds.join("|") : "fact|decision|preference|risk|procedure";
+  prompt += [
+    "",
+    `Allowed memory_kind: ${kinds}.`,
+    "Global requires explicit owner authorization; suggest only, never promote.",
+    "Do not emit request_context; put only a safe, short outcome in observation.",
+  ].join("\n");
+  return prompt;
 }
 
 function credentialIndexReminderFor(request) {
@@ -8227,14 +8269,131 @@ function augmentSystem(db, baseSystem, ctx, withEmitter, request = "") {
   sys = langDirective(lang) + (sys ? "\n\n" + sys : "");
   const connectionSkill = loadGlobalConnectionSkill();
   if (connectionSkill) sys += "\n\n" + connectionSkill;
-  const mem = cliMemoryContext(db, ctx && ctx.projectPath);
+  const mem = cliMemoryContext(db, ctx && ctx.projectPath, ctx && ctx.agentId);
   if (mem) sys += "\n\n" + mem;
-  if (withEmitter && (!ctx || ctx.permission !== "read")) {
-    sys += "\n\n" + memoryEmitterPromptFor(request, arch);
+  if (withEmitter) {
+    sys += "\n\n" + memoryEmitterPromptFor(request, arch, ctx && ctx.turnId, ctx && ctx.permission);
     const credentialReminder = credentialIndexReminderFor(request);
     if (credentialReminder) sys += "\n\n" + credentialReminder;
   }
   return sys;
+}
+
+function curatorRuntimeDirCli() {
+  const root = path.join(userDataDir(), "memory-governance", "curator-runtime");
+  fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(path.dirname(root), 0o700); } catch { /* Windows/ACL-only host */ }
+  try { fs.chmodSync(root, 0o700); } catch { /* Windows/ACL-only host */ }
+  return root;
+}
+
+function curatorRuntimeEnvCli(source = process.env) {
+  // The semantic Curator has no tools and receives only pre-gated candidates.
+  // Keep its process environment equally narrow: subscription CLIs can locate
+  // their normal file-backed auth, but project/provider secret env is absent.
+  const allowed = new Set([
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP",
+    "LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM", "NO_COLOR",
+    "CODEX_HOME", "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "USERPROFILE",
+    "APPDATA", "LOCALAPPDATA", "SYSTEMROOT", "SystemRoot", "COMSPEC", "ComSpec", "PATHEXT",
+  ]);
+  const env = {};
+  for (const [key, value] of Object.entries(source || {})) {
+    if (allowed.has(key) || key.startsWith("LC_")) env[key] = value;
+  }
+  env.AGENTLAS_MEMORY_CURATOR = "1";
+  return env;
+}
+
+function ensureGeminiNoToolsPolicyCli() {
+  const dir = curatorRuntimeDirCli();
+  const file = path.join(dir, "gemini-no-tools-policy.toml");
+  const content = [
+    "# Managed by Agentlas Terminal for the semantic Memory Curator.",
+    "[[rule]]",
+    'toolName = "*"',
+    'decision = "deny"',
+    "priority = 999",
+    "",
+  ].join("\n");
+  let current = null;
+  try { current = fs.readFileSync(file, "utf8"); } catch { /* first write */ }
+  if (current !== content) {
+    const temp = path.join(dir, `.gemini-no-tools-policy.${process.pid}.${crypto.randomUUID()}.tmp`);
+    fs.writeFileSync(temp, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    fs.renameSync(temp, file);
+  }
+  try { fs.chmodSync(file, 0o600); } catch { /* Windows/ACL-only host */ }
+  return file;
+}
+
+async function invokeMemoryCuratorCli(db, runtime, model, payload, systemPrompt) {
+  const serialized = JSON.stringify(payload);
+  if (
+    terminalMemoryGovernance.hasSecret(serialized) ||
+    terminalMemoryGovernance.hasAbsolutePath(serialized) ||
+    terminalMemoryGovernance.hasTranscriptBody(serialized)
+  ) {
+    throw new Error("Memory Curator payload failed the pre-invocation privacy gate");
+  }
+  if (runtime.mode === "cli") {
+    return captureRuntime(runtime.kind, systemPrompt, serialized, {
+      cwd: curatorRuntimeDirCli(),
+      env: curatorRuntimeEnvCli(),
+      permission: "read",
+      model: model || runtime.model || null,
+      effort: "low",
+      authorityMode: "no-authority",
+      noToolsPolicyPath: runtime.kind === "gemini" ? ensureGeminiNoToolsPolicyCli() : null,
+      outputLimitBytes: 64 * 1024,
+      timeoutConfig: { idleMs: 60_000, totalMs: 120_000, killGraceMs: 2_000 },
+    });
+  }
+  return runApi(runtime.backend, model || runtime.model, systemPrompt, serialized);
+}
+
+function beginMemoryTurnCli(db, prompt, ctx = {}) {
+  return terminalMemoryGovernance.beginTurn(db, {
+    prompt,
+    projectPath: ctx.projectPath,
+    agentId: ctx.agentId,
+    permission: ctx.permission,
+    surface: ctx.surface || "terminal-normal-turn",
+    conversationRef: ctx.conversationRef,
+    priorContextDigest: ctx.priorContextDigest,
+    stableTurnId: ctx.stableTurnId || process.env.AGENTLAS_TURN_ID,
+  });
+}
+
+async function completeMemoryTurnCli(db, text, ctx, runtime, options = {}) {
+  const turnId = ctx?.memoryTurn?.turnId || ctx?.turnId;
+  const arch = loadArch();
+  const runtimeInfo = runtime || {};
+  const completion = {
+    turnId,
+    mainOutput: text,
+    requestText: options.requestText,
+    permission: ctx && ctx.permission,
+    projectPath: ctx && ctx.projectPath,
+    agentId: ctx && ctx.agentId,
+    eventsHeading: arch.eventsHeading,
+    outcome: options.outcome || "completed",
+    coreFiles: {
+      memoryDir: arch.memoryDir || ".agentlas",
+      ticketFile: arch.memoryTicketsFile || "memory-tickets.jsonl",
+      decisionFile: arch.curatorDecisionsFile || "curator-decisions.jsonl",
+    },
+  };
+  if (options.invokeCurator !== false) {
+    completion.invokeCurator = (payload, systemPrompt) => invokeMemoryCuratorCli(
+      db,
+      runtimeInfo,
+      options.model || runtimeInfo.model || null,
+      payload,
+      systemPrompt,
+    );
+  }
+  return terminalMemoryGovernance.completeTurn(db, completion);
 }
 
 function loadGlobalConnectionSkill() {
@@ -8540,10 +8699,20 @@ function finalizeExperienceExecutionCli(db, input) {
 async function executeOnce(db, system, prompt, override, ctx) {
   ctx = ctx || { projectPath: null, agentId: null };
   const runStartedAt = Date.now();
-  const experienceRunId = `terminal-run:${crypto.randomUUID()}`;
+  const memoryTurn = beginMemoryTurnCli(db, prompt, {
+    ...ctx,
+    surface: ctx.surface || "terminal-one-shot",
+    stableTurnId: ctx.turnId,
+  });
+  ctx.memoryTurn = memoryTurn;
+  ctx.turnId = memoryTurn.turnId;
+  const experienceRunId = `terminal-run:${memoryTurn.turnId}`;
   const curatedMemories = [];
   ctx.curatedMemories = curatedMemories;
   if (!ctx.cwdAtRequest) ctx.cwdAtRequest = projectCwd();
+  let memoryRuntime = null;
+  let memorySettled = false;
+  try {
   let runtimeSystem = system;
   let localExperienceContext = null;
   if (ctx.runtimeExperience?.disabled === true && ctx.runtimeExperience.observableReason) {
@@ -8589,6 +8758,7 @@ async function executeOnce(db, system, prompt, override, ctx) {
     );
   }
   const rt = resolveRuntime(db, override);
+  memoryRuntime = rt;
   if (rt.mode === "cli") {
     // 네이티브 CLI에도 같은 Memory emitter를 주입하되 guard가 화면의 JSON 블록을 숨긴다.
     // 큐레이터가 만든 구조화 Memory만 성공 RunReceipt 이후 Experience intake로 전달된다.
@@ -8616,23 +8786,39 @@ async function executeOnce(db, system, prompt, override, ctx) {
     }
     ui.beginTurn();
     const memoryGuard = makeMemoryGuard(ui, loadArch().eventsHeading);
-    const res = await runNativeTurn({
-      kind: rt.kind,
-      bin: which(RUNTIME_BIN[rt.kind]) || RUNTIME_BIN[rt.kind],
-      prompt,
-      systemPrompt: sys,
-      cwd,
-      permission,
-      session: {},
-      model: ctx.model || null,
-      effort: ctx.effort || null,
-      mcpServers,
-      mcpAllowlistMode: ctx.mcpAllowlistMode,
-      env,
-      ui: memoryGuard,
+    let res;
+    try {
+      res = await runNativeTurn({
+        kind: rt.kind,
+        bin: which(RUNTIME_BIN[rt.kind]) || RUNTIME_BIN[rt.kind],
+        prompt,
+        systemPrompt: sys,
+        cwd,
+        permission,
+        session: {},
+        model: ctx.model || null,
+        effort: ctx.effort || null,
+        mcpServers,
+        mcpAllowlistMode: ctx.mcpAllowlistMode,
+        env,
+        ui: memoryGuard,
+      });
+    } finally {
+      ui.endTurn();
+    }
+    const nativeText = String(res.text || "");
+    const memoryResult = await completeMemoryTurnCli(db, nativeText, ctx, rt, {
+      model: ctx.model || rt.model,
+      outcome: res.error ? "failed" : "succeeded",
+      requestText: prompt,
+      // Every failed runtime needs a deterministic receipt, but must not
+      // recursively call the runtime that just failed.
+      invokeCurator: !res.error,
     });
-    ui.endTurn();
-    curateCliReply(db, res.text || "", ctx);
+    memorySettled = true;
+    for (const memory of memoryResult.curatedMemories || []) {
+      if (memory && !curatedMemories.some((item) => item.id === memory.id)) curatedMemories.push(memory);
+    }
     finalizeExperienceExecutionCli(db, {
       agentId: ctx.agentId,
       projectPath: ctx.projectPath,
@@ -8679,7 +8865,16 @@ async function executeOnce(db, system, prompt, override, ctx) {
     });
     throw error;
   }
-  const cleaned = curateCliReply(db, text || "", ctx);
+  const memoryResult = await completeMemoryTurnCli(db, text || "", ctx, rt, {
+    model: selectedModel,
+    outcome: "succeeded",
+    requestText: prompt,
+  });
+  memorySettled = true;
+  for (const memory of memoryResult.curatedMemories || []) {
+    if (memory && !curatedMemories.some((item) => item.id === memory.id)) curatedMemories.push(memory);
+  }
+  const cleaned = require("./agentlas-style.cjs").sanitizeAssistantText(memoryResult.cleaned || "");
   finalizeExperienceExecutionCli(db, {
     agentId: ctx.agentId,
     projectPath: ctx.projectPath,
@@ -8697,6 +8892,23 @@ async function executeOnce(db, system, prompt, override, ctx) {
   });
   process.stdout.write((cleaned || "").trim() + "\n");
   return 0;
+  } catch (error) {
+    if (!memorySettled) {
+      try {
+        await completeMemoryTurnCli(db, "", ctx, memoryRuntime, {
+          model: ctx.model || memoryRuntime?.model || null,
+          outcome: "failed",
+          requestText: prompt,
+          invokeCurator: false,
+        });
+        memorySettled = true;
+      } catch {
+        // A missing/locked DB is the only remaining case where a receipt may
+        // be impossible. Preserve the original runtime error for the caller.
+      }
+    }
+    throw error;
+  }
 }
 
 async function runTerminalBuilder(db, request, metadata = {}, runtimeOverride = null, cwd = projectCwd()) {
@@ -9120,12 +9332,18 @@ function buildArgs(kind, systemPrompt, prompt, permission, runtimeOptions = {}) 
     return ["exec", "--skip-git-repo-check", ...noAuthorityArgs, ...modelArgs, ...effortArgs, ...perm, ...mcp, `[SYSTEM]\n${systemPrompt}\n\n${prompt}`];
   }
   if (kind === "gemini") {
-    const perm = native.geminiPermissionArgs(level);
+    const perm = native.geminiPermissionArgs(noAuthority ? "read" : level);
+    if (noAuthority && !runtimeOptions.noToolsPolicyPath) {
+      throw new Error("Gemini no-authority capture requires an explicit deny-all policy");
+    }
+    const noAuthorityArgs = noAuthority
+      ? ["--admin-policy", String(runtimeOptions.noToolsPolicyPath)]
+      : [];
     // Legacy/background capture has no structured reviewed server list. Even
     // at full permission it must stay exact-empty instead of inheriting the
     // user's global Gemini MCP definitions with the provider credential env.
     const mcp = native.geminiMcpIsolationArgs();
-    return ["--prompt", `[SYSTEM]\n${systemPrompt}\n\n${prompt}`, ...(model ? ["-m", model] : []), ...perm, ...mcp];
+    return ["--prompt", `[SYSTEM]\n${systemPrompt}\n\n${prompt}`, ...(model ? ["-m", model] : []), ...perm, ...noAuthorityArgs, ...mcp];
   }
   return [prompt];
 }
@@ -9169,7 +9387,14 @@ function buildHelpers(db) {
     which,
     RUNTIME_BIN,
     augmentSystem: (db_, base, ctx, emit, request) => augmentSystem(db_, base, ctx, emit, request),
-    curateCliReply: (db_, text, ctx) => curateCliReply(db_, text, ctx),
+    memoryEmitterPrompt: (request, ctx) => memoryEmitterPromptFor(
+      request,
+      loadArch(),
+      ctx && ctx.turnId,
+      ctx && ctx.permission,
+    ),
+    beginMemoryTurn: (db_, prompt, ctx) => beginMemoryTurnCli(db_, prompt, ctx),
+    completeMemoryTurn: (db_, text, ctx, runtime, options) => completeMemoryTurnCli(db_, text, ctx, runtime, options),
     detectResponseLanguage: (prompt, fallback) => require("./agentlas-style.cjs").detectResponseLanguage(prompt, fallback),
     sanitizeAssistantText: (text) => require("./agentlas-style.cjs").sanitizeAssistantText(text),
     apiKey: (backend) => apiKey(backend),
@@ -9189,7 +9414,7 @@ function buildHelpers(db) {
     autoRouteNote: (choice, lang) => autoRouteNote(choice, lang),
     autoRoutePreamble: (choice, lang) => autoRoutePreamble(choice, lang),
     directSystemPrompt: (lang) => directSystemPrompt(lang),
-    cliMemoryContext: (db_, pp) => cliMemoryContext(db_, pp),
+    cliMemoryContext: (db_, pp, agentId) => cliMemoryContext(db_, pp, agentId),
     importLocal: (db_, p) => importLocalFolderCli(db_, p),
     // REPL-safe public Hub install: fail()(process.exit) 대신 Error를 throw 해 REPL이 직접 렌더하게 한다.
     cloudInstall: async (db_, slug) => {
@@ -9415,6 +9640,7 @@ function captureRuntime(kind, systemPrompt, prompt, opts) {
         model: opts.model,
         effort: opts.effort,
         authorityMode: opts.authorityMode,
+        noToolsPolicyPath: opts.noToolsPolicyPath,
       }), {
         cwd,
         stdio: ["ignore", "pipe", "pipe"],
@@ -11629,6 +11855,10 @@ module.exports = {
   finalizeExperienceExecutionCli,
   buildChildEnvCli,
   augmentSystem,
+  beginMemoryTurnCli,
+  completeMemoryTurnCli,
+  curatorRuntimeEnvCli,
+  ensureGeminiNoToolsPolicyCli,
   curateCliReply,
   TERMINAL_MEMORY_CORE,
   TERMINAL_MEMORY_CORE_MAX_TOKENS,

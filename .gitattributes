@@ -1,0 +1,30 @@
+* text=auto
+
+# npm/source archives expose runtime files only; local verification inputs are
+# intentionally excluded from public snapshots.
+tests/** export-ignore
+test/** export-ignore
+**/tests/** export-ignore
+**/test/** export-ignore
+benchmarks/** export-ignore
+**/benchmarks/** export-ignore
+fixtures/** export-ignore
+**/fixtures/** export-ignore
+docs/** export-ignore
+findings/** export-ignore
+/research/** export-ignore
+plans/** export-ignore
+reports/** export-ignore
+notes/** export-ignore
+receipts/** export-ignore
+evidence/** export-ignore
+artifacts/** export-ignore
+output/** export-ignore
+.env* export-ignore
+credentials/** export-ignore
+signing/** export-ignore
+**/*_test.* export-ignore
+**/test-*.* export-ignore
+scripts/test-* export-ignore
+**/*-smoke.* export-ignore
+**/*-benchmark.* export-ignore

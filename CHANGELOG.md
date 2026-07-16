@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.1 — 2026-07-16
+
+- Record exactly one compact Memory Ticket receipt for every completed,
+  failed, or cancelled user turn, including turns with zero durable memory
+  candidates and resumed Claude/Codex sessions.
+- Run semantic curation as a separate no-tools advisory pass, then apply
+  deterministic privacy, permission, owner, and scope gates before any durable
+  write. Read-only turns keep the central receipt but never write project files
+  or durable memory.
+- Add owner-isolated user-global, team, agent, and project timeline lanes with
+  idempotent completion and redacted Core-compatible JSONL mirrors. Raw prompts,
+  transcripts, secrets, and absolute paths are rejected from logs and payloads.
+- Restrict npm artifacts to the runtime allowlist; tests, fixtures, benchmarks,
+  internal docs, credentials, and signing material remain unpublished.
+
 ## 0.9.0 — 2026-07-16
 
 - Add `agentlas plugin add <slug>` and `agentlas plugin list`. The Hub has
