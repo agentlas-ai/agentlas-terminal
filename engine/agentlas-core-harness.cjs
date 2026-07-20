@@ -9,6 +9,11 @@ const { spawn, spawnSync } = require("node:child_process");
 const HARNESS_SCHEMA_VERSION = "agentlas.stormbreaker.goal-ultracode-harness.v1";
 const HARNESS_ID = "agentlas-core/stormbreaker-goal-ultracode";
 const HARNESS_MODE = "stormbreaker-goal-ultracode";
+const CORE_RUNTIME_MARKERS = [
+  ["agentlas_cloud", "__main__.py"],
+  ["schemas", "workforce-work-order.schema.json"],
+  ["schemas", "workforce-selection.schema.json"],
+];
 
 const PY_BOOTSTRAP =
   "import os, runpy, sys; " +
@@ -23,11 +28,11 @@ function unique(values) {
 }
 
 function runtimeRoots(explicitRoot) {
+  if (explicitRoot) return unique([explicitRoot]);
   const binRoot = process.env.HEPHAESTUS_BIN
     ? path.dirname(path.dirname(path.resolve(process.env.HEPHAESTUS_BIN)))
     : null;
   const roots = [
-    explicitRoot,
     process.env.HEPHAESTUS_RUNTIME_ROOT,
     binRoot,
     path.join(os.homedir(), ".agentlas", "runtime", "current"),
@@ -40,7 +45,9 @@ function runtimeRoots(explicitRoot) {
 function resolveCoreRuntimeRoot(explicitRoot) {
   for (const root of runtimeRoots(explicitRoot)) {
     try {
-      if (fs.existsSync(path.join(root, "agentlas_cloud", "__main__.py"))) return root;
+      if (CORE_RUNTIME_MARKERS.every((segments) => fs.existsSync(path.join(root, ...segments)))) {
+        return root;
+      }
     } catch {
       // Continue to the next installed/bundled root.
     }

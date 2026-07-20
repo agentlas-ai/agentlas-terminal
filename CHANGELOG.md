@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.2 — 2026-07-20
+
+- Require the installed or Desktop-bundled Agentlas Core runtime to include the
+  canonical Workforce WorkOrder and Selection schemas before Terminal selects
+  it. Incomplete older bundles are skipped so another valid runtime candidate
+  can be used instead of failing immediately before execution.
+- Pin cross-platform and npm publication gates to the same Agentlas OS v1.1.50
+  commit shipped by Agentlas Desktop 0.8.58.
+
 ## 0.9.1 — 2026-07-16
 
 - Record exactly one compact Memory Ticket receipt for every completed,
