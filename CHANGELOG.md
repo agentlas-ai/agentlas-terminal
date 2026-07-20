@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.3 — 2026-07-20
+
+- Preserve the terminal UI spinner lifecycle through the memory-output guard,
+  so completed one-shot Claude/Codex turns exit cleanly instead of throwing
+  after the model result has already been printed.
+- Keep Agentlas Terminal focused on independent agent and team execution; this
+  release does not add an Agentlas One surface.
+
 ## 0.9.2 — 2026-07-20
 
 - Require the installed or Desktop-bundled Agentlas Core runtime to include the

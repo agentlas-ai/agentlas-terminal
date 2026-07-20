@@ -90,6 +90,7 @@ function makeMemoryGuard(ui, heading) {
       flush();
       ui.streamEnd();
     },
+    stopSpinner: (...a) => ui.stopSpinner(...a),
     tool: (...a) => ui.tool(...a),
     toolResult: (...a) => ui.toolResult(...a),
     info: (...a) => ui.info(...a),
