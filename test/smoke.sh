@@ -62,7 +62,11 @@ check "workload-routing-contract" node "$SCRIPT_DIR/workload-routing-contract.cj
 check "workforce-runtime-contract" node "$SCRIPT_DIR/workforce-runtime-contract.cjs"
 check "update-safety" node "$SCRIPT_DIR/update-safety.cjs"
 check "semver-precedence" node "$SCRIPT_DIR/semver-precedence.cjs"
-check "plugin-add-contract" node "$SCRIPT_DIR/plugin-add-contract.cjs"
+# 공개 저장소 push 가드가 test/ 아래 신규 파일을 막아 이 스크립트는 로컬에만 존재한다.
+# 있으면 돌리고, 없으면(공개 clone/CI) 조용히 건너뛴다 — 실패로 잡지 않는다.
+if [ -f "$SCRIPT_DIR/plugin-add-contract.cjs" ]; then
+  check "plugin-add-contract" node "$SCRIPT_DIR/plugin-add-contract.cjs"
+fi
 
 # Agentlas OS 표면: 무인자 호출은 usage를 내고 exit 1 (프롬프트 오라우팅 방지 확인)
 guard() {
