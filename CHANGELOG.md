@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.4 — 2026-07-23
+
+- `plugin add` no longer registers a code-hosting page (GitHub/GitLab/Bitbucket
+  repo or homepage URL) as if it were a live MCP server, even when a manifest
+  row explicitly claims `transport:"http"`. A connectorless catalog entry now
+  refuses honestly with its docs link instead of writing an unreachable
+  server into the local MCP config.
+- stdio rows (`command`+`args`+`envKeys`) from a plugin manifest now install
+  correctly into the local MCP server registry.
+- `plugin-add-contract` runs as part of the regular smoke suite.
+
 ## 0.9.3 — 2026-07-20
 
 - Preserve the terminal UI spinner lifecycle through the memory-output guard,
