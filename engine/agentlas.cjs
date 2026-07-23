@@ -2210,43 +2210,107 @@ async function fetchPluginManifestCli(slug) {
   return manifest;
 }
 
-/** 매니페스트의 mcp[] 항목을 mcp_servers 행으로 정규화. stdio(command)와 remote(url)를 구분한다. */
-function pluginMcpRowCli(slug, entry, index) {
-  const source = typeof entry?.source === "string" ? entry.source.trim() : "";
-  const name = (typeof entry?.name === "string" && entry.name.trim()) || `${slug}-${index + 1}`;
-  const remote = /^https?:\/\//i.test(source);
-  // 원격은 URL, stdio는 실행 커맨드다. 둘을 섞으면 codex config.toml 스키마 위반으로
-  // 런타임이 통째로 죽는다(Runtime Doctor가 반복해서 잡던 사고 계열).
-  if (!remote && !source) return null;
-  const argv = remote ? [] : source.split(/\s+/).filter(Boolean);
-  return {
-    id: require("node:crypto").randomUUID(),
-    catalogId: `hub:${slug}:${name}`,
-    name,
-    transport: remote ? "http" : "stdio",
-    command: remote ? null : (argv[0] ?? null),
-    argsJson: JSON.stringify(remote ? [] : argv.slice(1)),
-    url: remote ? source : null,
-    envKeysJson: JSON.stringify(
-      Array.isArray(entry?.envKeys) ? entry.envKeys.filter((key) => typeof key === "string") : [],
-    ),
-  };
+// 레포/홈페이지 HTML 페이지는 문서지 MCP 연결이 아니다. 이 URL들을 transport:"http"로
+// 등록하면 "절대 연결될 수 없는 MCP 서버"가 생긴다(2026-07-23 근본수리 계열).
+const PLUGIN_CODE_HOSTING_HTML_RE = /^https?:\/\/(www\.)?(github\.com|gitlab\.com|bitbucket\.org)\//i;
+
+/** 휴리스틱: 명시적 transport 선언이 없는 레거시 source URL이 진짜 MCP 엔드포인트로 보이는가. */
+function pluginLooksLikeMcpEndpointCli(rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(String(rawUrl || ""));
+  } catch {
+    return false;
+  }
+  if (!/^https?:$/.test(parsed.protocol)) return false;
+  if (PLUGIN_CODE_HOSTING_HTML_RE.test(parsed.href)) return false;
+  const pathname = parsed.pathname.replace(/\/+$/, "");
+  if (/\/(mcp|sse)$/i.test(pathname)) return true; // …/mcp, …/sse 관례
+  if (/^mcp\./i.test(parsed.hostname)) return true; // mcp.linear.app 류 전용 호스트
+  return false;
 }
 
-async function cmdPluginAdd(db, slug) {
-  if (!slug) fail('usage: agentlas plugin add <slug>   (run agentlas plugin list first)');
-  const manifest = await fetchPluginManifestCli(slug);
-  if (!manifest) fail(`Hub plugin not found: ${slug}`);
-  const entries = Array.isArray(manifest.mcp) ? manifest.mcp : [];
-  const rows = entries.map((entry, index) => pluginMcpRowCli(slug, entry, index)).filter(Boolean);
-  if (!rows.length) {
-    // 설치할 MCP 서버가 없으면 조용히 성공했다고 하지 않는다 — 사용자는 이 플러그인이
-    // 붙었다고 믿고 도구를 기대하게 된다.
-    fail(
-      `${slug} ships no MCP server to install (skills-only or source-link plugin). ` +
-        `Nothing was registered. See: ${manifest.source?.repo || manifest.source?.homepage || "the plugin page"}`,
-    );
+/**
+ * 매니페스트의 mcp[] 항목을 mcp_servers 행으로 정규화. stdio(command)와 remote(url)를 구분한다.
+ * 반환: { row } | { refused: { name, source, reason } } | null(빈 항목).
+ *
+ * 규칙(근본수리): 레포 URL은 어떤 경우에도 transport:"http" 행으로 쓰이지 않는다.
+ *  - transport:"stdio" + command 명시 → stdio 행 (mcp_servers는 command/args_json을 이미 지원).
+ *  - transport:"http" + url 명시 → http 행. 단 코드호스팅 HTML 페이지(github.com/…)면 거부.
+ *  - 레거시 {name, source}: http(s)면 MCP 엔드포인트로 보일 때만(…/mcp, …/sse, mcp.* 호스트) 수용,
+ *    아니면 거부. 비-URL 문자열은 기존대로 stdio 실행 커맨드로 해석.
+ */
+function pluginMcpRowCli(slug, entry, index) {
+  const name = (typeof entry?.name === "string" && entry.name.trim()) || `${slug}-${index + 1}`;
+  const source = typeof entry?.source === "string" ? entry.source.trim() : "";
+  const transport = typeof entry?.transport === "string" ? entry.transport.trim().toLowerCase() : "";
+  const envKeys = Array.isArray(entry?.envKeys)
+    ? entry.envKeys.filter((key) => typeof key === "string")
+    : entry?.env && typeof entry.env === "object"
+      ? Object.keys(entry.env)
+      : [];
+  const makeRow = (fields) => ({
+    row: {
+      id: require("node:crypto").randomUUID(),
+      catalogId: `hub:${slug}:${name}`,
+      name,
+      envKeysJson: JSON.stringify(envKeys),
+      ...fields,
+    },
+  });
+  const refuse = (reason) => ({ refused: { name, source: source || (typeof entry?.url === "string" ? entry.url : ""), reason } });
+
+  if (transport === "stdio") {
+    const command = typeof entry?.command === "string" ? entry.command.trim() : "";
+    if (!command) return refuse("stdio row without a launch command");
+    const args = Array.isArray(entry?.args) ? entry.args.filter((a) => typeof a === "string") : [];
+    return makeRow({ transport: "stdio", command, argsJson: JSON.stringify(args), url: null });
   }
+  if (transport === "http" || transport === "sse") {
+    const url = typeof entry?.url === "string" && entry.url.trim() ? entry.url.trim() : source;
+    if (!/^https?:\/\//i.test(url)) return refuse("http row without a usable endpoint URL");
+    if (PLUGIN_CODE_HOSTING_HTML_RE.test(url)) {
+      return refuse("URL is a code-hosting HTML page (docs), not an MCP endpoint");
+    }
+    // 명시적 transport 선언은 서버가 검증한 연결정보로 신뢰한다 (레포 페이지만 방어).
+    return makeRow({ transport: "http", command: null, argsJson: "[]", url });
+  }
+  if (transport) return refuse(`unsupported transport "${transport}"`);
+
+  // ── 레거시 {name, source} 행 ──
+  if (!source) return null;
+  if (/^https?:\/\//i.test(source)) {
+    if (!pluginLooksLikeMcpEndpointCli(source)) {
+      return refuse(
+        PLUGIN_CODE_HOSTING_HTML_RE.test(source)
+          ? "URL is a code-hosting HTML page (docs), not an MCP endpoint"
+          : "URL does not look like an MCP endpoint (no /mcp, /sse, or mcp.* host, and no declared transport)",
+      );
+    }
+    return makeRow({ transport: "http", command: null, argsJson: "[]", url: source });
+  }
+  // 원격은 URL, stdio는 실행 커맨드다. 둘을 섞으면 codex config.toml 스키마 위반으로
+  // 런타임이 통째로 죽는다(Runtime Doctor가 반복해서 잡던 사고 계열).
+  const argv = source.split(/\s+/).filter(Boolean);
+  return makeRow({ transport: "stdio", command: argv[0] ?? null, argsJson: JSON.stringify(argv.slice(1)), url: null });
+}
+
+/** 매니페스트 전체를 설치 계획으로 정규화: 등록할 행과, 정직하게 거부한 항목을 분리한다. */
+function planPluginMcpInstallCli(slug, manifest) {
+  const entries = Array.isArray(manifest?.mcp) ? manifest.mcp : [];
+  const rows = [];
+  const refused = [];
+  entries.forEach((entry, index) => {
+    const normalized = pluginMcpRowCli(slug, entry, index);
+    if (!normalized) return;
+    if (normalized.row) rows.push(normalized.row);
+    else if (normalized.refused) refused.push(normalized.refused);
+  });
+  return { rows, refused };
+}
+
+/** 정규화된 행들을 로컬 mcp_servers 스키마에 멱등 삽입. { installed, reused } 반환. */
+function installPluginMcpRowsCli(db, rows) {
   let installed = 0;
   let reused = 0;
   for (const row of rows) {
@@ -2261,7 +2325,34 @@ async function cmdPluginAdd(db, slug) {
     );
     installed += 1;
   }
+  return { installed, reused };
+}
+
+async function cmdPluginAdd(db, slug) {
+  if (!slug) fail('usage: agentlas plugin add <slug>   (run agentlas plugin list first)');
+  const manifest = await fetchPluginManifestCli(slug);
+  if (!manifest) fail(`Hub plugin not found: ${slug}`);
+  const { rows, refused } = planPluginMcpInstallCli(slug, manifest);
+  const docsLink = manifest.docs || manifest.source?.repo || manifest.source?.homepage || null;
+  if (!rows.length) {
+    // 설치할 MCP 서버가 없으면 조용히 성공했다고 하지 않는다 — 사용자는 이 플러그인이
+    // 붙었다고 믿고 도구를 기대하게 된다. 레포 URL을 http MCP 서버로 등록하는 일도
+    // 절대 하지 않는다(연결 불가능한 가짜 서버).
+    const reasonLines = refused.map((item) => `  ✗ ${item.name}: ${item.reason}${item.source ? ` (${item.source})` : ""}`);
+    fail(
+      [
+        `${slug} ships no machine-connectable MCP endpoint yet. Nothing was registered.`,
+        ...reasonLines,
+        docsLink ? `  docs: ${docsLink} (upstream project page — not an MCP endpoint)` : null,
+        "  When the catalog gains verified connection info for this plugin, re-run: agentlas plugin add " + slug,
+      ].filter(Boolean).join("\n"),
+    );
+  }
+  const { installed, reused } = installPluginMcpRowsCli(db, rows);
   out(`✓ Plugin installed ${manifest.slug} — ${manifest.name}`);
+  for (const item of refused) {
+    out(`  ⚠ skipped ${item.name}: ${item.reason}${item.source ? ` (${item.source})` : ""}`);
+  }
   out(`  MCP servers: ${installed} added${reused ? `, ${reused} already present` : ""}`);
   const authKind = manifest.auth?.kind;
   if (authKind && authKind !== "none") {
@@ -11875,4 +11966,9 @@ module.exports = {
   autoRouteNote,
   autoRoutePreamble,
   directSystemPrompt,
+  // Hub 플러그인 설치 회귀 테스트 표면 — 레포 URL을 MCP 서버로 등록하지 않는 규칙 검증용.
+  pluginMcpRowCli,
+  planPluginMcpInstallCli,
+  installPluginMcpRowsCli,
+  pluginLooksLikeMcpEndpointCli,
 };
