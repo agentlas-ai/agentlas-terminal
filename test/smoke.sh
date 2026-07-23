@@ -62,6 +62,7 @@ check "workload-routing-contract" node "$SCRIPT_DIR/workload-routing-contract.cj
 check "workforce-runtime-contract" node "$SCRIPT_DIR/workforce-runtime-contract.cjs"
 check "update-safety" node "$SCRIPT_DIR/update-safety.cjs"
 check "semver-precedence" node "$SCRIPT_DIR/semver-precedence.cjs"
+check "plugin-add-contract" node "$SCRIPT_DIR/plugin-add-contract.cjs"
 
 # Agentlas OS 표면: 무인자 호출은 usage를 내고 exit 1 (프롬프트 오라우팅 방지 확인)
 guard() {
