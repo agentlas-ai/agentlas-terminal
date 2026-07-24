@@ -70,6 +70,9 @@ fi
 if [ -f "$SCRIPT_DIR/memory-import-contract.cjs" ]; then
   check "memory-import-contract" node "$SCRIPT_DIR/memory-import-contract.cjs"
 fi
+if [ -f "$SCRIPT_DIR/evolution-command-contract.cjs" ]; then
+  check "evolution-command-contract" node "$SCRIPT_DIR/evolution-command-contract.cjs"
+fi
 
 # Agentlas OS 표면: 무인자 호출은 usage를 내고 exit 1 (프롬프트 오라우팅 방지 확인)
 guard() {

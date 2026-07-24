@@ -10022,6 +10022,19 @@ function cmdList(db) {
         : "\n(Built-in orchestration agents run in the background. Find agents with `agentlas cloud search \"what you need\"`, or just open `agentlas` and type a task.)",
     );
   }
+  // Phase 2+: 검토 대기 중인 에이전트 성장 제안이 있으면 홈에 한 줄로 노출.
+  try {
+    const pendingGrowth = require("./agentlas-evolution.cjs").countPendingGrowthProposals(db);
+    if (pendingGrowth > 0) {
+      out(
+        lang === "ko"
+          ? `\n🧬 에이전트 성장 제안 ${pendingGrowth}건 · \`agentlas evolve\`로 검토`
+          : `\n🧬 ${pendingGrowth} agent growth proposal(s) · review with \`agentlas evolve\``,
+      );
+    }
+  } catch {
+    /* 홈 배너 실패는 무해 */
+  }
   out("\nRun: agentlas <agent>  ·  agentlas firm <firm>  ·  agentlas run <agent> \"...\"");
 }
 
@@ -11740,6 +11753,9 @@ async function main() {
     case "memory":
       // Phase 1b: 기존 마크다운 메모리 → 공유 agentlas.sqlite 이관(dry-run 기본, --apply).
       return require("./agentlas-memory-import.cjs").cmdMemory({ db, args: rest.slice(1), out, fail });
+    case "evolve":
+      // Phase 2/2+: 데스크탑 트리거가 만든 성장 제안 검토·적용·되돌리기(공유 DB).
+      return require("./agentlas-evolution.cjs").cmdEvolve({ db, args: rest.slice(1), out, fail, agentFolder });
     case "multimodal":
       return cmdMultimodal(db, rest.slice(1));
     case "oberon":
