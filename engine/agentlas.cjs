@@ -11737,6 +11737,9 @@ async function main() {
       return cmdFirm(db, rest[1], rest.slice(2).join(" "), runtimeOverride);
     case "env":
       return cmdEnv(db);
+    case "memory":
+      // Phase 1b: 기존 마크다운 메모리 → 공유 agentlas.sqlite 이관(dry-run 기본, --apply).
+      return require("./agentlas-memory-import.cjs").cmdMemory({ db, args: rest.slice(1), out, fail });
     case "multimodal":
       return cmdMultimodal(db, rest.slice(1));
     case "oberon":

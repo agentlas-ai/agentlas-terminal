@@ -67,6 +67,9 @@ check "semver-precedence" node "$SCRIPT_DIR/semver-precedence.cjs"
 if [ -f "$SCRIPT_DIR/plugin-add-contract.cjs" ]; then
   check "plugin-add-contract" node "$SCRIPT_DIR/plugin-add-contract.cjs"
 fi
+if [ -f "$SCRIPT_DIR/memory-import-contract.cjs" ]; then
+  check "memory-import-contract" node "$SCRIPT_DIR/memory-import-contract.cjs"
+fi
 
 # Agentlas OS 표면: 무인자 호출은 usage를 내고 exit 1 (프롬프트 오라우팅 방지 확인)
 guard() {
