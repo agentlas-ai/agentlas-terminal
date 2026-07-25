@@ -30,17 +30,7 @@ const FINAL_SCOPES = new Set(["user_global", "team", "agent", "project", "sessio
 const SEMANTIC_DISPOSITIONS = new Set(["retain", "session", "discard", "review"]);
 const CONFIDENCE_LEVELS = new Set(["high", "medium", "low"]);
 
-const SECRET_PATTERNS = [
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/i,
-  /\b(?:sk|rk|pk)-(?:ant|proj|live|test)?-?[A-Za-z0-9_-]{16,}\b/i,
-  /\bgh[pousr]_[A-Za-z0-9]{20,}\b/i,
-  /\bxox[baprs]-[A-Za-z0-9-]{16,}\b/i,
-  /\bAIza[A-Za-z0-9_-]{30,}\b/,
-  /\bAKIA[A-Z0-9]{16}\b/,
-  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/,
-  /\b(?:password|passwd|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret)\s*[:=]\s*[^\s,;]{6,}/i,
-  /\bauthorization\s*:\s*bearer\s+[^\s,;]{8,}/i,
-];
+const { SECRET_PATTERNS } = require("./agentlas-secret-patterns.cjs");
 const ABSOLUTE_PATH_PATTERNS = [
   /(?:^|[\s("'`])~\/[A-Za-z0-9._-]/,
   /(?:^|[\s("'`])\/(?:Users|home|private|var|tmp|opt|etc|Volumes|Applications|System|Library)\//,

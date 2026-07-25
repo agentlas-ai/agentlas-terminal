@@ -30,12 +30,7 @@ const ALWAYS_KEEP_HINT = /(team[-_ ]?memory|glossary|dossier|handoff|safety|scop
 
 // Minimal secret guard (a subset of the shared secret-patterns chokepoint) so a
 // stray key in legacy notes never becomes a durable memory row.
-const SECRET_RE =
-  /(sk-[A-Za-z0-9]{20,}|sk_live_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|gh[opsu]_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{20,}|glpat-[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|AKIA[0-9A-Z]{16})/;
-
-function looksSecret(content) {
-  return SECRET_RE.test(String(content || ""));
-}
+const { looksSecret } = require("./agentlas-secret-patterns.cjs");
 
 function substantiveBody(body) {
   const lines = body.split("\n").map((l) => l.trim()).filter(Boolean);

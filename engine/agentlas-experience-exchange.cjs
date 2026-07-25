@@ -97,15 +97,7 @@ const SEMVER_RE = /^v?[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$/;
 const ENV_RE = /^[A-Z][A-Z0-9_]*$/;
 const SAFE_IDEMPOTENCY_RE = /^[A-Za-z0-9._:-]{8,200}$/;
 
-const SECRET_PATTERNS = [
-  /\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b/i,
-  /\bxox[baprs]-[A-Za-z0-9-]{20,}\b/i,
-  /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/,
-  /\bAKIA[0-9A-Z]{16}\b/,
-  /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/i,
-  /\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|passwd|private[_-]?key|cookie)\b\s*[:=]\s*['"]?[^\s'"]{8,}/i,
-  /\bauthorization\b\s*[:=]\s*['"]?(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}/i,
-];
+const { SECRET_PATTERNS } = require("./agentlas-secret-patterns.cjs");
 const PII_PATTERNS = [
   /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i,
   /(?<!\w)(?:\+?\d[\d ().-]{8,}\d)(?!\w)/,
