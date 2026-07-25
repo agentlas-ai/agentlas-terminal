@@ -1530,13 +1530,10 @@ function keywordOccurs(normalizedPrompt, rawKeyword) {
   if (!keyword) return false;
   if (/[가-힣]/.test(keyword)) {
     // Korean has no word boundary, so a raw includes() matched inside longer compounds:
-    // 번역 hit 번역기, 영업 hit 영업일 (business day). But Korean is agglutinative — a real
-    // mention usually carries a particle (고객 문의를, 번역이, 영업은), so rejecting any trailing
-    // Hangul would throw away the legitimate case. Block a preceding syllable, and allow
-    // only a short particle/verb-ending tail after the keyword.
+    // 번역 hit 번역기, 금융 hit compound finance words, 영업 hit 영업일 (business day).
+    // Require the keyword not be glued to another Hangul syllable on either side.
     const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const TAIL = "은|는|이|가|을|를|의|에서|에게|에|와|과|으로|로|도|만|부터|까지|보다|처럼|라도|이나|나|이랑|랑|하고|하는|해줘|해서|합니다|한다|했|해|한";
-    return new RegExp(`(?<![가-힣])${escaped}(?:${TAIL})?(?![가-힣])`).test(normalizedPrompt);
+    return new RegExp(`(?<![가-힣])${escaped}(?![가-힣])`).test(normalizedPrompt);
   }
   return ` ${normalizedPrompt} `.includes(` ${keyword} `);
 }
