@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.9.8 — 2026-07-25
+
+- No more silent keyword fallback. When the connected model can't judge a route
+  (no runtime, or the model timed out / returned junk), Agentlas no longer picks
+  a specialist by keyword — it answers with the plain assistant and says why. The
+  note distinguishes "no model connected" (connect one) from "the model didn't
+  answer in time" (retry / check it), so a transient timeout isn't mistaken for a
+  missing model. Image-capability routing is likewise model-only: a keyword guess
+  never hijacks which runtime an agent runs on.
+- The embedded Agentlas OS runtime's own judge (content-guard, pipeline,
+  research, privacy) now uses this host's connected model too, via a universal
+  callback — so provider/CLI users, not only local Ollama, get real judgment
+  there, with no model hardcoded. Pins Agentlas OS v1.1.62.
+
 ## 0.9.7 — 2026-07-25
 
 - Fix: the resident judge now reaches API/Ollama/BYOK runtimes, not only CLI
