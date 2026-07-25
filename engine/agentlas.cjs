@@ -577,8 +577,18 @@ function directRouteChoice(lang) {
 // 않는다. 어떤 전문 에이전트가 맞는지 "판단하지 못한다"고 정직하게 밝히고 기본 어시스턴트로
 // 답한다. routeSource는 "deterministic"(=판정 없음)으로 유지하되 noModel 플래그로 구분해
 // 사용자에게 "모델 연결" 안내를 띄운다. 이 경로가 조용히 키워드로 결정하던 것이 사고의 근본.
-function noModelRouteChoice(lang) {
+// reason 구분: "no_runtime"=연결된 런타임이 아예 없음(드묾), "model_unavailable"=런타임은
+// 연결됐지만 그 한 번의 판정이 타임아웃/불량 응답으로 실패(현실적 케이스). 모델이 거의 항상
+// 연결돼 있으므로 후자를 "연결 안 됨"으로 오인시키지 않도록 문구를 다르게 준다.
+function noModelRouteChoice(lang, reason = "no_runtime") {
   const resolvedLang = lang || prefsLang();
+  const message = reason === "model_unavailable"
+    ? (resolvedLang === "ko"
+        ? "연결된 모델이 제때 응답하지 않아 어떤 전문 에이전트가 맞는지 판단하지 못했습니다. 잠시 후 다시 시도하거나 모델 상태를 확인해 주세요. 지금은 기본 어시스턴트로 답합니다"
+        : "the connected model didn't answer in time, so I couldn't judge which specialist agent fits; retry in a moment or check the model, and I'll answer with the default assistant for now")
+    : (resolvedLang === "ko"
+        ? "연결된 모델이 없어 어떤 전문 에이전트가 맞는지 판단하지 못했습니다. 모델을 연결하면 자동 라우팅이 됩니다. 지금은 기본 어시스턴트로 답합니다"
+        : "no model is connected, so I couldn't judge which specialist agent fits; connect a model to enable auto-routing, and I'll answer with the default assistant for now");
   return {
     direct: true,
     agent: null,
@@ -586,10 +596,9 @@ function noModelRouteChoice(lang) {
     terms: [],
     strong: false,
     noModel: true,
+    noModelReason: reason,
     routeSource: "deterministic",
-    reason: resolvedLang === "ko"
-      ? "연결된 모델이 없어 어떤 전문 에이전트가 맞는지 판단하지 못했습니다. 모델을 연결하면 자동 라우팅이 됩니다. 지금은 기본 어시스턴트로 답합니다"
-      : "no model is connected, so I couldn't judge which specialist agent fits; connect a model to enable auto-routing, and I'll answer with the default assistant for now",
+    reason: message,
   };
 }
 // 직답 모드 시스템 프롬프트 — 페르소나·라우팅 오염 없이 현재 런타임 그대로 답한다.
@@ -668,7 +677,7 @@ async function resolveAutoRoute(db, prompt, lang) {
     judgment = null;
   }
   // 연결 모델 없음 → 어휘로 전문 에이전트를 고르지 않는다. 정직하게 "판단 못 함" + 모델 연결 안내.
-  if (!judgment || !judgment.hasJudgmentRunner()) return noModelRouteChoice(resolvedLang);
+  if (!judgment || !judgment.hasJudgmentRunner()) return noModelRouteChoice(resolvedLang, "no_runtime");
   const promptText = routeNormalize(routeStripPaths(prompt));
   // 잡담("hi")은 닫힌형 결정적 가드로 직답 — 모델은 연결돼 있으니 "모델 연결" 안내는 필요 없다.
   if (!promptText.trim() || isTrivialRoutePrompt(promptText)) return { ...directRouteChoice(resolvedLang), routeSource: "deterministic" };
@@ -731,7 +740,7 @@ async function resolveAutoRoute(db, prompt, lang) {
   });
   // 모델이 판정을 못 냈다(러너 실패/타임아웃/정크 응답) → 어휘 픽으로 떨어지지 않는다.
   // 연결 모델이 사실상 판단하지 못한 것이므로 "판단 못 함" 직답으로 정직하게 종결한다.
-  if (verdict.source !== "llm" || !verdict.labels.length) return noModelRouteChoice(resolvedLang);
+  if (verdict.source !== "llm" || !verdict.labels.length) return noModelRouteChoice(resolvedLang, "model_unavailable");
   const picked = verdict.labels[0];
   const reason =
     verdict.reason ||
@@ -752,7 +761,12 @@ async function resolveAutoRoute(db, prompt, lang) {
 function routeJudgeSourceNote(choice, lang) {
   if (!choice || !choice.routeSource) return "";
   if (choice.routeSource === "llm") return lang === "ko" ? " (판정: 연결 모델)" : " (judged by the connected model)";
-  if (choice.noModel) return lang === "ko" ? " (판정 없음 — 연결 모델 없음)" : " (no judgment — no model connected)";
+  if (choice.noModel) {
+    if (choice.noModelReason === "model_unavailable") {
+      return lang === "ko" ? " (판정 없음 — 모델 응답 없음)" : " (no judgment — model did not answer)";
+    }
+    return lang === "ko" ? " (판정 없음 — 연결 모델 없음)" : " (no judgment — no model connected)";
+  }
   return "";
 }
 function autoRouteNote(choice, lang) {

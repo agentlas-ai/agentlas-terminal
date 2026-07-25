@@ -455,8 +455,8 @@ const pathDb = makeDb(PATH_AGENTS);
       assert.equal(calls, 0, "TRIVIAL_ROUTE_PROMPTS는 모델 판정 없이 결정적으로 처리");
     }
 
-    // 26) 정크 판정(비JSON) = 모델이 판정 못 냄 → 어휘 전문 에이전트로 떨어지지 않는다.
-    //     "판단 못 함" 직답 + "모델 연결" 안내 (하우스 룰: 어휘 폴백 결정 금지).
+    // 26) 정크 판정(비JSON) = 런타임은 연결됐지만 그 판정이 실패 → 어휘 전문 에이전트로
+    //     떨어지지 않는다. "판단 못 함" 직답 + "모델이 응답 안 함" 안내(런타임 미연결과 구분).
     {
       judgment.clearJudgmentCache();
       judgment.setJudgmentRunner(async () => "totally not json");
@@ -464,14 +464,15 @@ const pathDb = makeDb(PATH_AGENTS);
       assert.equal(judged.direct, true, "정크 판정은 어휘 전문 에이전트가 아니라 직답");
       assert.equal(judged.agent, null, "어휘 스코어 1위(thumbnail-studio)로 새면 안 됨");
       assert.equal(judged.noModel, true, "판정 불가 = noModel 신호");
+      assert.equal(judged.noModelReason, "model_unavailable", "런타임은 있으나 응답 실패 = model_unavailable");
       assert.equal(judged.routeSource, "deterministic", "기계 플래그는 deterministic(=판정 없음)");
-      assert.match(autoRouteNote(judged, "ko"), /연결된 모델이 없어/);
+      assert.match(autoRouteNote(judged, "ko"), /제때 응답하지 않아/);
       // 같은 정크 판정을 en 세션에서 → 안내도 en (route lang == note lang, 실사용과 동일)
       judgment.clearJudgmentCache();
       const judgedEn = await resolveAutoRoute(db, "draw me two more youtube thumbnails", "en");
       assert.equal(judgedEn.direct, true);
       assert.equal(judgedEn.agent, null);
-      assert.match(autoRouteNote(judgedEn, "en"), /no model is connected/);
+      assert.match(autoRouteNote(judgedEn, "en"), /didn't answer in time/);
     }
 
     // 27) 러너 없음 → 어휘로 전문 에이전트를 고르지 않는다. DIRECT(기본 어시스턴트) + "모델 연결" 안내.
