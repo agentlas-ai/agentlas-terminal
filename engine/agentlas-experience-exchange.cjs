@@ -103,8 +103,14 @@ const PII_PATTERNS = [
   /(?<!\w)(?:\+?\d[\d ().-]{8,}\d)(?!\w)/,
   /\b(?:account|customer|client|tenant|workspace|user)[ _-]?(?:id|key|number|no)\s*[:=#]?\s*[A-Za-z0-9_-]{4,}\b|(?:계정|고객|사용자)[ _-]?(?:id|아이디|번호)\s*[:=#]?\s*[A-Za-z0-9_-]{4,}/i,
 ];
+// Absolute LOCAL paths and file URLs only. The previous alternation matched any
+// slash-containing token, so ordinary prose lost its experience: "TCP/IP", "read/write",
+// "and/or", and web routes like "GET /api/users" were all reported as a local path. A
+// leading-slash path now has to look like a real filesystem root (or start from a home /
+// relative marker, a Windows drive, or a UNC share); a lone `/word` — which is what a web
+// route looks like — no longer counts, and neither does `word/word` inside a sentence.
 const LOCAL_PATH_PATTERNS = [
-  /(?:file:\/\/|(?:^|[\s"'`()\[\]{}=:,;])(?:\.\.[/\\]|~[/\\]|\/(?!\/|\s)(?:[^/\s"'`<>]+\/)*[^/\s"'`<>]+|[A-Za-z]:[/\\]\S+|\\\\[^\\/\s]+[\\/][^\\/\s]+))/i,
+  /(?:file:\/\/|(?:^|[\s"'`()\[\]{}=:,;])(?:\.\.[/\\]|~[/\\]|\/(?:Users|home|root|private|var|tmp|opt|etc|srv|mnt|media|Volumes|Applications|System|Library|usr)\/[^\s"'`<>]+|[A-Za-z]:[/\\]\S+|\\\\[^\\/\s]+[\\/][^\\/\s]+))/i,
 ];
 const RAW_INTERACTION_PATTERNS = [
   /(?:^|\n)\s*(?:system|assistant|user|tool|customer|agent)\s*:\s+/i,
@@ -1522,7 +1528,13 @@ function isCanonicalTaskId(value) {
 function keywordOccurs(normalizedPrompt, rawKeyword) {
   const keyword = normalizeClassificationText(rawKeyword);
   if (!keyword) return false;
-  if (/[가-힣]/.test(keyword)) return normalizedPrompt.includes(keyword);
+  if (/[가-힣]/.test(keyword)) {
+    // Korean has no word boundary, so a raw includes() matched inside longer compounds:
+    // 번역 hit 번역기, 금융 hit compound finance words, 영업 hit 영업일 (business day).
+    // Require the keyword not be glued to another Hangul syllable on either side.
+    const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(?<![가-힣])${escaped}(?![가-힣])`).test(normalizedPrompt);
+  }
   return ` ${normalizedPrompt} `.includes(` ${keyword} `);
 }
 
