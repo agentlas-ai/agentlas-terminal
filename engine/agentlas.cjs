@@ -573,6 +573,25 @@ function directRouteChoice(lang) {
       : "this is a general request that needs no specialist agent",
   };
 }
+// 연결 모델 없음 직답 — 하우스 룰: 모델이 없으면 어휘(단어목록)로 전문 에이전트를 고르지
+// 않는다. 어떤 전문 에이전트가 맞는지 "판단하지 못한다"고 정직하게 밝히고 기본 어시스턴트로
+// 답한다. routeSource는 "deterministic"(=판정 없음)으로 유지하되 noModel 플래그로 구분해
+// 사용자에게 "모델 연결" 안내를 띄운다. 이 경로가 조용히 키워드로 결정하던 것이 사고의 근본.
+function noModelRouteChoice(lang) {
+  const resolvedLang = lang || prefsLang();
+  return {
+    direct: true,
+    agent: null,
+    score: 0,
+    terms: [],
+    strong: false,
+    noModel: true,
+    routeSource: "deterministic",
+    reason: resolvedLang === "ko"
+      ? "연결된 모델이 없어 어떤 전문 에이전트가 맞는지 판단하지 못했습니다. 모델을 연결하면 자동 라우팅이 됩니다. 지금은 기본 어시스턴트로 답합니다"
+      : "no model is connected, so I couldn't judge which specialist agent fits; connect a model to enable auto-routing, and I'll answer with the default assistant for now",
+  };
+}
 // 직답 모드 시스템 프롬프트 — 페르소나·라우팅 오염 없이 현재 런타임 그대로 답한다.
 function directSystemPrompt(lang) {
   const resolvedLang = lang || prefsLang();
@@ -630,8 +649,10 @@ function autoRouteAgent(db, prompt, lang) {
 // direct) 중에서 의미로 하나를 고른다 — 어휘 점수 0점인 에이전트(아랍어 등 어떤 언어의
 // 요청이든)도 모델은 뽑을 수 있다. 닫힌형 가드는 결정적으로 유지: 잡담 short-circuit
 // (isTrivialRoutePrompt)과 경로 스트리핑(ROUTE_PATH_RE)은 모델 호출 전에 그대로 적용.
-// 러너 없음/타임아웃/정크 → 기존 어휘 라우팅(autoRouteAgent)을 routeSource:"deterministic"
-// 으로 라벨해 반환한다 — 조용한 폴백 금지(라우트 노트에 판정 주체가 찍힌다).
+// 러너 없음/타임아웃/정크 → 어휘로 전문 에이전트를 고르지 않는다. 연결 모델이 없으면
+// "판단 못 함"을 정직하게 밝히고 기본 어시스턴트로 직답한다(noModelRouteChoice) —
+// 어휘 스코어러(autoRouteAgent/rankRouteAgents)는 후보 모집 전용이지 반환 결정이 아니다.
+// routeSource:"deterministic"은 "판정 없음"을 뜻하는 기계 플래그로만 남는다(키워드 픽 아님).
 const ROUTE_JUDGE_CANDIDATE_CAP = 30;
 const ROUTE_JUDGE_DIRECT_LABEL = "direct";
 const ROUTE_JUDGE_META_LABEL = "meta-builder";
@@ -639,7 +660,6 @@ const ROUTE_JUDGE_APP_LABEL = "app-builder";
 const APP_BUILDER_ROUTE_SLUG = "agentlas-app-builder";
 async function resolveAutoRoute(db, prompt, lang) {
   const resolvedLang = lang || prefsLang();
-  const prefilter = autoRouteAgent(db, prompt, resolvedLang);
   ensureJudgmentRunnerInstalled(db);
   let judgment;
   try {
@@ -647,13 +667,15 @@ async function resolveAutoRoute(db, prompt, lang) {
   } catch {
     judgment = null;
   }
-  if (!judgment || !judgment.hasJudgmentRunner()) return { ...prefilter, routeSource: "deterministic" };
+  // 연결 모델 없음 → 어휘로 전문 에이전트를 고르지 않는다. 정직하게 "판단 못 함" + 모델 연결 안내.
+  if (!judgment || !judgment.hasJudgmentRunner()) return noModelRouteChoice(resolvedLang);
   const promptText = routeNormalize(routeStripPaths(prompt));
-  // 잡담("hi")까지 모델에 물으면 매 턴이 느려진다 — 정확 매칭 가드는 닫힌형이라 결정적 유지.
-  if (!promptText.trim() || isTrivialRoutePrompt(promptText)) return { ...prefilter, routeSource: "deterministic" };
+  // 잡담("hi")은 닫힌형 결정적 가드로 직답 — 모델은 연결돼 있으니 "모델 연결" 안내는 필요 없다.
+  if (!promptText.trim() || isTrivialRoutePrompt(promptText)) return { ...directRouteChoice(resolvedLang), routeSource: "deterministic" };
   const ranked = rankRouteAgents(db, prompt, resolvedLang);
   const meta = resolveMetaBuilder(db);
-  if (!ranked.length && !meta) return { ...prefilter, routeSource: "deterministic" };
+  // 라우팅할 후보 자체가 없음(설치 에이전트 0) → 직답. 모델은 연결돼 있으니 일반 직답 사유.
+  if (!ranked.length && !meta) return { ...directRouteChoice(resolvedLang), routeSource: "deterministic" };
   // App Builder는 합성 라벨로만 제시한다(동의 핸드셰이크가 걸린 특수 라우트임을 모델에 명시).
   const appBuilder = ranked.find((r) => r.agent.slug === APP_BUILDER_ROUTE_SLUG) || null;
   const candidates = ranked.filter((r) => r.agent.slug !== APP_BUILDER_ROUTE_SLUG).slice(0, ROUTE_JUDGE_CANDIDATE_CAP);
@@ -707,7 +729,9 @@ async function resolveAutoRoute(db, prompt, lang) {
     // model still aborts cleanly at this deadline rather than hanging forever.
     timeoutMs: 40000,
   });
-  if (verdict.source !== "llm" || !verdict.labels.length) return { ...prefilter, routeSource: "deterministic" };
+  // 모델이 판정을 못 냈다(러너 실패/타임아웃/정크 응답) → 어휘 픽으로 떨어지지 않는다.
+  // 연결 모델이 사실상 판단하지 못한 것이므로 "판단 못 함" 직답으로 정직하게 종결한다.
+  if (verdict.source !== "llm" || !verdict.labels.length) return noModelRouteChoice(resolvedLang);
   const picked = verdict.labels[0];
   const reason =
     verdict.reason ||
@@ -717,15 +741,19 @@ async function resolveAutoRoute(db, prompt, lang) {
     return { agent: meta, score: 1000, strong: true, terms: [], reason, routeSource: "llm" };
   }
   const chosen = picked === ROUTE_JUDGE_APP_LABEL ? appBuilder : bySlug.get(picked);
-  if (!chosen) return { ...prefilter, routeSource: "deterministic" };
+  // 모델이 라벨을 골랐지만 설치 에이전트로 해석되지 않음(경계 케이스) → 어휘 픽 대신 직답.
+  if (!chosen) return { ...directRouteChoice(resolvedLang), routeSource: "deterministic" };
   // 모델 확답은 strong 계약을 충족한다 — 어휘 근거(terms/score)는 참고로 보존.
   return { ...chosen, strong: true, reason, routeSource: "llm" };
 }
 // 라우트 영수증 라벨 — 누가 최종 판정했는지 반드시 찍는다(조용한 폴백 금지 하우스 룰).
+// noModel 경로는 사유(reason)에 이미 "모델 연결" 안내가 담겨 있으니 짧은 기계 라벨만 덧붙인다.
+// 그 외 deterministic(잡담·후보 없음: 모델은 연결됨)은 사유가 이미 설명하므로 라벨을 붙이지 않는다.
 function routeJudgeSourceNote(choice, lang) {
   if (!choice || !choice.routeSource) return "";
   if (choice.routeSource === "llm") return lang === "ko" ? " (판정: 연결 모델)" : " (judged by the connected model)";
-  return lang === "ko" ? " (판정: 결정적 폴백 — 연결 모델 없음)" : " (deterministic fallback — no connected-model verdict)";
+  if (choice.noModel) return lang === "ko" ? " (판정 없음 — 연결 모델 없음)" : " (no judgment — no model connected)";
+  return "";
 }
 function autoRouteNote(choice, lang) {
   const resolvedLang = lang || prefsLang();
@@ -8623,8 +8651,9 @@ const RUNTIME_BIN = {
  * Wire the resident judgment service to whatever runtime the user actually has connected.
  * This is what lets classification be decided by MEANING instead of by a wordlist: the
  * judge asks the connected model, and the old keyword maps are passed only as hints. It is
- * invisible to the user (no output, read-only, no tools) and every judged call falls back
- * to the deterministic prefilter when no runtime answers.
+ * invisible to the user (no output, read-only, no tools). When no runtime answers, judged
+ * callers do NOT keyword-decide: routing/intent go to the plain assistant with a "connect a
+ * model" note, capability inference returns undecided, and gates fail closed.
  */
 function installJudgmentRunner(db, rt) {
   let judgment;

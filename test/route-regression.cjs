@@ -13,7 +13,7 @@
 const assert = require("node:assert/strict");
 const { autoRouteAgent, resolveAutoRoute, autoRouteNote, autoRoutePreamble, directSystemPrompt, installJudgmentRunner } = require("../engine/agentlas.cjs");
 const caps = require("../engine/agentlas-capabilities.cjs");
-const { needsImage, autoRuntimeFor } = caps;
+const { needsImage, needsImageLexical, autoRuntimeFor } = caps;
 const judgment = require("../engine/agentlas-judgment.cjs");
 
 // 실제 설치 상태를 흉내 낸 스텁 DB — 모든 에이전트 프롬프트에 "AI"가 들어 있다(현실과 동일).
@@ -178,29 +178,33 @@ const pathDb = makeDb(PATH_AGENTS);
   assert.ok(choice.score < 40, `이름 중복 보너스 금지 — score ${choice.score} < 40 이어야 함`);
 }
 
-// 12) needsImage — 조율 CEO 프롬프트의 지나가는 "디자인" 한 단어로 이미지 판정 금지
+// 12) needsImageLexical — 조율 CEO 프롬프트의 지나가는 "디자인" 한 단어로 이미지 힌트 금지
+//     (needsImageLexical는 이제 힌트 스코어러 전용 — 최종 판정은 모델이 하고, 동기 needsImage는
+//      모델 웜캐시만 읽는다. 어휘 정밀도 회귀는 needsImageLexical로 계속 고정한다.)
 {
-  assert.equal(needsImage(PATH_AGENTS[0]), false, "appbridge는 이미지 에이전트가 아님");
-  assert.equal(needsImage(PATH_AGENTS[1]), false, "stock team은 이미지 에이전트가 아님");
+  assert.equal(needsImageLexical(PATH_AGENTS[0]), false, "appbridge는 이미지 에이전트가 아님");
+  assert.equal(needsImageLexical(PATH_AGENTS[1]), false, "stock team은 이미지 에이전트가 아님");
   // 정체성 존(이름/태그라인)의 이미지 힌트는 그대로 신뢰
   assert.equal(
-    needsImage({ slug: "thumbnail-studio", name: "썸네일 스튜디오", tagline: "유튜브 썸네일 디자인", system_prompt: "" }),
+    needsImageLexical({ slug: "thumbnail-studio", name: "썸네일 스튜디오", tagline: "유튜브 썸네일 디자인", system_prompt: "" }),
     true,
     "정체성 존 이미지 힌트는 유지",
   );
-  // 본문 단독: 힌트를 포함한 "긍정문"이 3문장 이상이어야 이미지 판정
+  // 본문 단독: 힌트를 포함한 "긍정문"이 3문장 이상이어야 이미지 힌트
   assert.equal(
-    needsImage({ slug: "s1", name: "스튜디오", tagline: "제작", system_prompt: "요청마다 이미지를 생성한다. 유튜브 썸네일을 만든다. 배너 시안을 뽑아 저장한다." }),
+    needsImageLexical({ slug: "s1", name: "스튜디오", tagline: "제작", system_prompt: "요청마다 이미지를 생성한다. 유튜브 썸네일을 만든다. 배너 시안을 뽑아 저장한다." }),
     true,
-    "긍정문 3문장 이상이면 이미지 판정 유지",
+    "긍정문 3문장 이상이면 이미지 힌트 유지",
   );
-  // 겹치는 정규식 여러 개를 때리는 "한 문장"으로는 판정 금지 (상관 힌트 무력화)
+  // 겹치는 정규식 여러 개를 때리는 "한 문장"으로는 힌트 금지 (상관 힌트 무력화)
   assert.equal(
-    needsImage({ slug: "s2", name: "스튜디오", tagline: "제작", system_prompt: "이미지 생성 후 썸네일과 배너, 포스터를 만든다." }),
+    needsImageLexical({ slug: "s2", name: "스튜디오", tagline: "제작", system_prompt: "이미지 생성 후 썸네일과 배너, 포스터를 만든다." }),
     false,
     "한 문장 안의 상관 힌트 여러 개는 1클러스터",
   );
-  // 이미지 판정이 꺼졌으니 세션 런타임(claude-code)이 gemini로 전환되지 않는다
+  // 모델 판정(웜캐시)이 없으면 동기 needsImage는 이미지로 인정하지 않는다 → 런타임 하이재킹 금지.
+  // (연결 모델 없음/미웜 상태에서 어휘 힌트만으로 세션 런타임이 gemini로 끌려가던 사고의 근본 수리)
+  assert.equal(needsImage(PATH_AGENTS[0]), false, "웜캐시 없으면 동기 needsImage는 not-image");
   assert.equal(
     autoRuntimeFor(PATH_AGENTS[0], { installedKinds: ["claude-code", "codex", "gemini"], activeSpec: "claude-code" }),
     "claude-code",
@@ -299,31 +303,32 @@ const pathDb = makeDb(PATH_AGENTS);
   assert.equal(kept.agent.slug, "design-desk");
 }
 
-// 19) needsImage 정밀도 — 부정문·그림자·기계 파생 slug는 이미지 판정 금지, 도구 마커는 단독 인정
+// 19) needsImageLexical 정밀도 — 부정문·그림자·기계 파생 slug는 이미지 힌트 금지, 도구 마커는 단독 인정
+//     (힌트 스코어러의 정밀도가 곧 모델에 넘기는 힌트 품질 — needsImageLexical로 직접 고정)
 {
   assert.equal(
-    needsImage({ slug: "coord", name: "코디네이터", tagline: "조율", system_prompt: "상품 이미지 생성 금지. 코드 리뷰와 배포만 담당한다." }),
+    needsImageLexical({ slug: "coord", name: "코디네이터", tagline: "조율", system_prompt: "상품 이미지 생성 금지. 코드 리뷰와 배포만 담당한다." }),
     false,
     "부정문(금지)의 힌트는 능력이 아님",
   );
   // 긍정문에 흔한 보조 부정("묻지 않고 바로 …")까지 부정으로 오판하면 안 된다
   assert.equal(
-    needsImage({ slug: "fastgen", name: "생성기", tagline: "콘텐츠", system_prompt: "묻지 않고 바로 이미지를 생성한다. 요청 즉시 썸네일을 뽑는다. 지체 없이 배너를 만든다." }),
+    needsImageLexical({ slug: "fastgen", name: "생성기", tagline: "콘텐츠", system_prompt: "묻지 않고 바로 이미지를 생성한다. 요청 즉시 썸네일을 뽑는다. 지체 없이 배너를 만든다." }),
     true,
     "보조 부정이 낀 긍정문은 능력으로 인정",
   );
   assert.equal(
-    needsImage({ slug: "fx", name: "이펙트 코더", tagline: "CSS 전문", system_prompt: "그림자 효과를 코드로 구현한다. 그림자 블러를 조정한다. 그림자 색을 계산한다." }),
+    needsImageLexical({ slug: "fx", name: "이펙트 코더", tagline: "CSS 전문", system_prompt: "그림자 효과를 코드로 구현한다. 그림자 블러를 조정한다. 그림자 색을 계산한다." }),
     false,
     "'그림자'(shadow)는 이미지 힌트가 아님",
   );
   assert.equal(
-    needsImage({ slug: "local-design-system", name: "토큰 린터", tagline: "코드 린트", system_prompt: "Lint CSS variables and tokens." }),
+    needsImageLexical({ slug: "local-design-system", name: "토큰 린터", tagline: "코드 린트", system_prompt: "Lint CSS variables and tokens." }),
     false,
     "폴더명 파생 slug('design-system')는 단독 신뢰 대상이 아님",
   );
   assert.equal(
-    needsImage({ slug: "gen", name: "제너레이터", tagline: "콘텐츠 제작", system_prompt: "결과물은 nano-banana로 렌더링해 저장한다." }),
+    needsImageLexical({ slug: "gen", name: "제너레이터", tagline: "콘텐츠 제작", system_prompt: "결과물은 nano-banana로 렌더링해 저장한다." }),
     true,
     "이미지 도구 마커는 단독으로도 인정",
   );
@@ -331,14 +336,14 @@ const pathDb = makeDb(PATH_AGENTS);
   // entity_kind='team'이면 정체성 존만 본다. 같은 본문이라도 단일 에이전트면 body로 판정.
   const orgBody = "디자인 부서가 배너를 만든다. 디자인 부서가 썸네일을 만든다. 디자인 부서가 포스터를 만든다.";
   assert.equal(
-    needsImage({ slug: "eng-team", name: "엔지니어링 팀", tagline: "제품 개발", entity_kind: "team", system_prompt: orgBody }),
+    needsImageLexical({ slug: "eng-team", name: "엔지니어링 팀", tagline: "제품 개발", entity_kind: "team", system_prompt: orgBody }),
     false,
-    "팀은 body 키워드로 이미지 판정 금지 (vibecoder 사례)",
+    "팀은 body 키워드로 이미지 힌트 금지 (vibecoder 사례)",
   );
   assert.equal(
-    needsImage({ slug: "solo", name: "제작기", tagline: "콘텐츠", entity_kind: "agent", system_prompt: orgBody }),
+    needsImageLexical({ slug: "solo", name: "제작기", tagline: "콘텐츠", entity_kind: "agent", system_prompt: orgBody }),
     true,
-    "단일 에이전트는 body 클러스터 판정 유지",
+    "단일 에이전트는 body 클러스터 힌트 유지",
   );
 }
 
@@ -450,25 +455,43 @@ const pathDb = makeDb(PATH_AGENTS);
       assert.equal(calls, 0, "TRIVIAL_ROUTE_PROMPTS는 모델 판정 없이 결정적으로 처리");
     }
 
-    // 26) 정크 판정(비JSON) → 어휘 폴백, 라벨 필수
+    // 26) 정크 판정(비JSON) = 모델이 판정 못 냄 → 어휘 전문 에이전트로 떨어지지 않는다.
+    //     "판단 못 함" 직답 + "모델 연결" 안내 (하우스 룰: 어휘 폴백 결정 금지).
     {
       judgment.clearJudgmentCache();
       judgment.setJudgmentRunner(async () => "totally not json");
       const judged = await resolveAutoRoute(db, "유튜브 썸네일 두 장만 더 뽑아줘", "ko");
-      assert.equal(judged.agent && judged.agent.slug, "thumbnail-studio", "정크 판정은 어휘 폴백과 동일 라우트");
-      assert.equal(judged.routeSource, "deterministic");
-      assert.match(autoRouteNote(judged, "ko"), /결정적 폴백/);
+      assert.equal(judged.direct, true, "정크 판정은 어휘 전문 에이전트가 아니라 직답");
+      assert.equal(judged.agent, null, "어휘 스코어 1위(thumbnail-studio)로 새면 안 됨");
+      assert.equal(judged.noModel, true, "판정 불가 = noModel 신호");
+      assert.equal(judged.routeSource, "deterministic", "기계 플래그는 deterministic(=판정 없음)");
+      assert.match(autoRouteNote(judged, "ko"), /연결된 모델이 없어/);
+      // 같은 정크 판정을 en 세션에서 → 안내도 en (route lang == note lang, 실사용과 동일)
+      judgment.clearJudgmentCache();
+      const judgedEn = await resolveAutoRoute(db, "draw me two more youtube thumbnails", "en");
+      assert.equal(judgedEn.direct, true);
+      assert.equal(judgedEn.agent, null);
+      assert.match(autoRouteNote(judgedEn, "en"), /no model is connected/);
     }
 
-    // 27) 러너 없음 → 오늘의 어휘 라우팅과 동일 + "deterministic" 라벨 (조용한 폴백 금지)
+    // 27) 러너 없음 → 어휘로 전문 에이전트를 고르지 않는다. DIRECT(기본 어시스턴트) + "모델 연결" 안내.
+    //     핵심: 어휘 1위 specialist(thumbnail-studio)를 절대 반환하지 않는다.
     {
       cleanup();
+      // 어휘로는 thumbnail-studio strong 위임이지만, 러너 없으면 그 픽을 반환하면 안 된다.
+      const lexical = autoRouteAgent(db, "유튜브 썸네일 하나 뽑아줘", "ko");
+      assert.equal(lexical.agent && lexical.agent.slug, "thumbnail-studio", "전제: 어휘로는 specialist 위임");
       const offline = await resolveAutoRoute(db, "유튜브 썸네일 하나 뽑아줘", "ko");
-      assert.equal(offline.agent && offline.agent.slug, "thumbnail-studio");
+      assert.equal(offline.direct, true, "러너 없으면 어휘 specialist가 아니라 직답");
+      assert.equal(offline.agent, null, "어휘 specialist(thumbnail-studio)로 새면 안 됨");
+      assert.equal(offline.noModel, true);
       assert.equal(offline.routeSource, "deterministic");
-      const offlineDirect = await resolveAutoRoute(db, "맥이 잠금상태에서 자꾸 ai 돌릴때 안켜지게 하는법 없나", "ko");
-      assert.equal(offlineDirect.direct, true, "러너 없으면 기존 어휘 동작 그대로");
-      assert.match(autoRouteNote(offlineDirect, "en"), /deterministic fallback/);
+      assert.match(autoRouteNote(offline, "ko"), /모델을 연결하면 자동 라우팅/);
+      // 일반 질문도 동일하게 DIRECT + "모델 연결" 안내 (en 세션)
+      const offlineDirect = await resolveAutoRoute(db, "how do I keep my mac awake while ai jobs run", "en");
+      assert.equal(offlineDirect.direct, true, "러너 없으면 DIRECT");
+      assert.equal(offlineDirect.noModel, true);
+      assert.match(autoRouteNote(offlineDirect, "en"), /connect a model/);
     }
 
     // 28) 이미지 능력 — 모델 판정이 어휘 판정을 이긴다 (힌트 0개의 아랍어 이미지 에이전트)
@@ -537,14 +560,28 @@ const pathDb = makeDb(PATH_AGENTS);
       assert.equal(calls, 0, "팀 베토는 하드 가드 — 모델에 묻지 않는다");
     }
 
-    // 31) 러너 없음 → 이미지 판정도 오늘의 어휘 동작과 동일 + "fallback" 라벨
+    // 31) 러너 없음 → 이미지 여부를 단어목록으로 결정하지 않는다. source:"unavailable"(판정 불가) +
+    //     안전 기본값(런타임 하이재킹 금지). 어휘로는 명백히 이미지인 에이전트로 반증한다.
     {
       cleanup();
-      const verdict = await caps.resolveNeedsImage(arabicPainter);
-      assert.equal(verdict.image, false, "러너 없으면 어휘 판정 그대로");
-      assert.equal(verdict.source, "fallback", "폴백은 반드시 라벨");
-      assert.equal(needsImage(arabicPainter), false);
-      assert.equal(caps.imageJudgmentSource(arabicPainter), "deterministic");
+      const lexicalImageAgent = {
+        slug: "poster-shop", name: "포스터 샵", name_en: "Poster Shop",
+        tagline: "배너 포스터 썸네일 디자인", tagline_en: "banner poster thumbnail design",
+        system_prompt: "이미지를 생성한다. 썸네일을 만든다. 배너를 뽑는다.",
+      };
+      assert.equal(needsImageLexical(lexicalImageAgent), true, "전제: 어휘로는 명백히 이미지 에이전트");
+      const verdict = await caps.resolveNeedsImage(lexicalImageAgent);
+      assert.equal(verdict.image, false, "러너 없으면 이미지 여부를 단어목록으로 결정하지 않는다(안전 기본값)");
+      assert.equal(verdict.source, "unavailable", "판정 불가는 반드시 라벨(조용한 어휘 결정 금지)");
+      assert.equal(verdict.decided, false, "판정 불가 = decided:false");
+      assert.equal(needsImage(lexicalImageAgent), false, "동기 needsImage도 어휘로 이미지 판정하지 않는다");
+      assert.equal(caps.imageJudgmentSource(lexicalImageAgent), "deterministic");
+      // 핵심: 어휘로는 이미지지만 러너가 없으니 세션 런타임(claude-code)이 gemini로 하이재킹되면 안 된다
+      assert.equal(
+        autoRuntimeFor(lexicalImageAgent, { installedKinds: ["claude-code", "codex", "gemini"], activeSpec: "claude-code" }),
+        "claude-code",
+        "러너 없으면 어휘 이미지 추정으로 런타임 하이재킹 금지",
+      );
     }
 
     // 32) API/Ollama/BYOK 런타임도 판정 러너를 받는다 — CLI 전용 배선이면 ollama 사용자는

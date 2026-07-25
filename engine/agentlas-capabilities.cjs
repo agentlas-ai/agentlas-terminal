@@ -63,9 +63,10 @@ const IMAGE_TOOL_MARKERS = [/nano-?banana/i, /\bimagen\b/i, /gpt-image/i, /grok\
 // 겹치는 정규식 여러 개를 동시에 때려도 1클러스터다.
 const MIN_BODY_IMAGE_SENTENCES = 3;
 const BODY_SCAN_CAP = 16000; // 로컬 임포트 상한과 동일 — 클라우드 무제한 프롬프트의 전문 스캔 방지
-// 어휘 판정 — 연결 모델이 없을 때의 결정적 폴백이자, 모델 판정 전의 참고 프리필터.
-// 하우스 룰: 단어목록은 최종 결정을 내리지 않는다. 최종 판정은 resolveNeedsImage가
-// 상주 판정 서비스(judgeLabels)에 묻고, 이 함수는 그 폴백으로만 살아남는다.
+// 어휘 스코어 — IMAGE_HINTS 단어목록에 대한 참고용 스코어러. 하우스 룰(2026-07-25):
+// 단어목록은 최종 결정을 내리지 않는다. resolveNeedsImage가 IMAGE_HINTS를 힌트로만 모델에
+// 넘기고, 연결 모델이 없으면 이미지 여부를 판정하지 않는다(어휘 폴백 제거). 이 함수는 힌트
+// 품질을 고정하는 참조 스코어러로만 남는다(회귀 테스트가 정밀도를 검증).
 function needsImageLexical(agent) {
   if (!agent) return false;
   if (NON_IMAGE_ROLES.has(String(agent.role || "").toLowerCase())) return false;
@@ -93,7 +94,7 @@ function needsImageLexical(agent) {
 // ── 상주 판정 서비스 배선 — 모델이 의미로 최종 판정, IMAGE_HINTS는 참고 힌트 ──────
 // needsImage 호출자(REPL 배지·autoRuntimeFor·routingNote)는 동기라서 warm-cache 패턴:
 // 비동기 경로(resolveNeedsImage)가 먼저 판정해 캐시를 데우고, 동기 needsImage는 캐시만
-// 읽는다. 캐시 미스 = 어휘 폴백 그대로 — imageJudgmentSource가 어느 쪽이었는지 라벨한다.
+// 읽는다. 캐시 미스 = "이미지 아님"으로 처리(어휘 폴백 없음) — 모델 판정만 이미지로 인정한다.
 const IMAGE_VERDICT_CACHE_MAX = 200;
 const imageVerdicts = new Map();
 function imageJudgeInput(agent) {
@@ -109,17 +110,20 @@ function imageJudgeVetoed(agent) {
   return false;
 }
 // 이 에이전트의 직무가 이미지 생산인지를 연결 모델이 의미로 판정한다.
-// 러너 없음/타임아웃/정크 → 어휘 판정을 "fallback"으로 라벨해 반환 (조용한 회귀 금지).
+// 하우스 룰(2026-07-25): 연결 모델이 없으면 단어목록으로 이미지 여부를 결정하지 않는다.
+// 러너 없음/타임아웃/정크 → source:"unavailable"(판정 불가)로 반환하고, 호출자는 안전
+// 기본값(세션 런타임 유지, gemini/codex 하이재킹 금지)을 지킨다. 이미지 판정은 저위험
+// 능력 추론이라 실패-닫힘이 아니라 "판정 안 함"으로 정직하게 둔다.
 async function resolveNeedsImage(agent) {
-  const lexical = needsImageLexical(agent);
-  if (imageJudgeVetoed(agent)) return { image: lexical, source: "deterministic" };
+  // 팀/역할 하드 가드는 구조적 판단(키워드 아님) — 판정 대상에서 제외하고 결정적으로 not-image.
+  if (imageJudgeVetoed(agent)) return { image: false, source: "deterministic" };
   let judgment;
   try {
     judgment = require("./agentlas-judgment.cjs");
   } catch {
     judgment = null;
   }
-  if (!judgment || !judgment.hasJudgmentRunner()) return { image: lexical, source: "fallback" };
+  if (!judgment || !judgment.hasJudgmentRunner()) return { image: false, source: "unavailable", decided: false };
   const input = imageJudgeInput(agent);
   const cached = imageVerdicts.get(input);
   if (cached) return cached;
@@ -136,9 +140,10 @@ async function resolveNeedsImage(agent) {
       "producing them: builders, orchestrators, PMs, curators, and coordination brains that commission or " +
       "delegate image work are 'not-image'. Refusals or prohibitions ('never generate images') declare the " +
       "opposite of a capability.",
-    fallback: [lexical ? "image" : "not-image"],
+    fallback: [],
   });
-  if (verdict.source !== "llm" || !verdict.labels.length) return { image: lexical, source: "fallback" };
+  // 모델이 판정을 못 냈다 → 어휘 폴백 없이 "판정 불가". 캐시하지 않아 이후 모델 연결 시 재판정한다.
+  if (verdict.source !== "llm" || !verdict.labels.length) return { image: false, source: "unavailable", decided: false };
   const out = { image: verdict.labels[0] === "image", source: "llm", reason: verdict.reason || "" };
   imageVerdicts.set(input, out);
   if (imageVerdicts.size > IMAGE_VERDICT_CACHE_MAX) {
@@ -148,14 +153,15 @@ async function resolveNeedsImage(agent) {
   return out;
 }
 // Does this agent's job involve generating/handling images? Sync surface for badges and
-// autoRuntimeFor: model verdict from the warm cache wins; miss = deterministic lexical fallback.
+// autoRuntimeFor. House rule (2026-07-25): only a warm MODEL verdict counts as "image".
+// A cache miss (no model judgment / not warmed) is treated as "not specifically an image
+// agent" so a keyword guess can never hijack the runtime to gemini/codex. The lexical
+// scorer (needsImageLexical) survives only as the hint source for the judge, not a decision.
 function needsImage(agent) {
   if (!agent) return false;
-  if (!imageJudgeVetoed(agent)) {
-    const cached = imageVerdicts.get(imageJudgeInput(agent));
-    if (cached) return cached.image;
-  }
-  return needsImageLexical(agent);
+  if (imageJudgeVetoed(agent)) return false;
+  const cached = imageVerdicts.get(imageJudgeInput(agent));
+  return cached ? cached.image : false;
 }
 // 라벨용 — 이 에이전트의 현재 이미지 판정이 모델("llm")인지 결정적 경로("deterministic")인지.
 function imageJudgmentSource(agent) {
