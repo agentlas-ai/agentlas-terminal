@@ -643,12 +643,26 @@ function startRepl(opts) {
     state.modelPinned = false;
     state.native = {};
   }
+  // 이미지 능력 판정 warm-cache — 동기 호출자(applyRuntimeFor/배지)가 읽기 전에 비동기
+  // 경로에서 상주 판정 서비스를 먼저 데운다. 러너 없음/실패는 어휘 폴백(라벨은 routingNote가 찍음).
+  async function warmImageJudgment(agentRow) {
+    if (!agentRow || typeof caps.resolveNeedsImage !== "function") return;
+    try {
+      await caps.resolveNeedsImage(agentRow);
+    } catch {
+      /* lexical fallback */
+    }
+  }
   // Tell the user when we routed to an image-capable runtime, or when the current one can't make images.
   function routingNote(subject) {
     if (!subject || !caps.needsImage(subject.capAgent)) return;
     const spec = caps.specOf(state.runtime);
     if (caps.capsFor(spec).image) {
-      if (spec !== caps.specOf(baseRuntime)) ui.info(ui.t("routedImage", spec));
+      if (spec !== caps.specOf(baseRuntime)) {
+        // 판정 주체 라벨 — 모델 판정인지 결정적 폴백인지 반드시 밝힌다(조용한 폴백 금지).
+        const judged = typeof caps.imageJudgmentSource === "function" && caps.imageJudgmentSource(subject.capAgent) === "llm";
+        ui.info(ui.t("routedImage", spec) + " — " + ui.t(judged ? "judge.source.llm" : "judge.source.fallback"));
+      }
     } else {
       ui.warn(ui.t("guard.imageWarn", caps.capsFor(spec).label || spec));
     }
@@ -701,10 +715,11 @@ function startRepl(opts) {
     state.routePreambleOnce = null;
     applyRuntimeFor(state.subject);
   }
-  function switchSubject(kind, query) {
+  async function switchSubject(kind, query) {
     if (kind === "agent") {
       const agent = H.resolveAgent(db, query);
       if (!agent) return ui.error(ui.t("noAgent", query));
+      await warmImageJudgment(agent); // 런타임 자동 배정 전에 모델 판정을 데운다
       setSubjectAgent(agent);
     } else {
       const firm = H.resolveFirm(db, query);
@@ -933,11 +948,11 @@ function startRepl(opts) {
       }
       case "agent":
         if (!arg) return ui.warn(ui.t("agentUsage")), true;
-        switchSubject("agent", arg);
+        await switchSubject("agent", arg);
         return true;
       case "firm":
         if (!arg) return ui.warn(ui.t("firmUsage")), true;
-        switchSubject("firm", arg);
+        await switchSubject("firm", arg);
         return true;
       case "runtime":
         setRuntime(arg);
@@ -1364,7 +1379,8 @@ function startRepl(opts) {
   }
 
   // ── interactive picker (when no agent was given) ──
-  function chooseAndStart(setter, row) {
+  async function chooseAndStart(setter, row) {
+    if (setter === setSubjectAgent) await warmImageJudgment(row); // firm은 팀 베토라 판정 대상 아님
     setter(row);
     ui.ok(ui.t("switched", state.subject.label));
     routingNote(state.subject);
@@ -1402,12 +1418,14 @@ function startRepl(opts) {
       if (a) return chooseAndStart(setSubjectAgent, a);
       const f = H.resolveFirm(db, t);
       if (f) return chooseAndStart(setSubjectFirm, f);
-      if (H.autoRouteAgent) {
-        const choice = H.autoRouteAgent(db, t, ui.lang);
+      if (H.autoRouteAgent || H.resolveAutoRoute) {
+        // 연결 모델이 라우트를 최종 판정한다(resolveAutoRoute) — 없으면 어휘 폴백.
+        const choice = H.resolveAutoRoute ? await H.resolveAutoRoute(db, t, ui.lang) : H.autoRouteAgent(db, t, ui.lang);
         if (choice) {
           if (choice.direct) {
             setSubjectDirect();
           } else {
+            await warmImageJudgment(choice.agent);
             setSubjectAgent(choice.agent);
           }
           state.routePreambleOnce = H.autoRoutePreamble ? H.autoRoutePreamble(choice, ui.lang) : null;
@@ -1442,6 +1460,7 @@ function startRepl(opts) {
         if (/^\d+$/.test(t)) {
           const n = parseInt(t, 10);
           if (n >= 1 && n <= ags.length) {
+            await warmImageJudgment(ags[n - 1]);
             setSubjectAgent(ags[n - 1]);
             ui.ok(ui.t("switched", state.subject.label));
             routingNote(state.subject);
@@ -1450,13 +1469,14 @@ function startRepl(opts) {
         }
         if (single) {
           const a = H.resolveAgent(db, t);
-          if (a) { setSubjectAgent(a); ui.ok(ui.t("switched", state.subject.label)); routingNote(state.subject); return; }
+          if (a) { await warmImageJudgment(a); setSubjectAgent(a); ui.ok(ui.t("switched", state.subject.label)); routingNote(state.subject); return; }
           const f = H.resolveFirm(db, t);
           if (f) { setSubjectFirm(f); ui.ok(ui.t("switched", state.subject.label)); routingNote(state.subject); return; }
         }
       }
-      if (H.autoRouteAgent) {
-        const choice = H.autoRouteAgent(db, t, ui.lang);
+      if (H.autoRouteAgent || H.resolveAutoRoute) {
+        // 연결 모델이 라우트를 최종 판정한다(resolveAutoRoute) — 없으면 어휘 폴백.
+        const choice = H.resolveAutoRoute ? await H.resolveAutoRoute(db, t, ui.lang) : H.autoRouteAgent(db, t, ui.lang);
         if (choice) {
           if (choice.direct) {
             setSubjectDirect();
@@ -1466,6 +1486,7 @@ function startRepl(opts) {
               ui.info(H.autoRouteNote ? H.autoRouteNote(choice, ui.lang) : `direct answer (no agent)`);
             }
           } else {
+            await warmImageJudgment(choice.agent);
             setSubjectAgent(choice.agent);
             state.routePreambleOnce = H.autoRoutePreamble ? H.autoRoutePreamble(choice, ui.lang) : null;
             ui.info(H.autoRouteNote ? H.autoRouteNote(choice, ui.lang) : `auto-routed to ${choice.agent.name}`);

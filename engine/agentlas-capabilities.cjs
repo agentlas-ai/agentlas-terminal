@@ -63,7 +63,10 @@ const IMAGE_TOOL_MARKERS = [/nano-?banana/i, /\bimagen\b/i, /gpt-image/i, /grok\
 // 겹치는 정규식 여러 개를 동시에 때려도 1클러스터다.
 const MIN_BODY_IMAGE_SENTENCES = 3;
 const BODY_SCAN_CAP = 16000; // 로컬 임포트 상한과 동일 — 클라우드 무제한 프롬프트의 전문 스캔 방지
-function needsImage(agent) {
+// 어휘 판정 — 연결 모델이 없을 때의 결정적 폴백이자, 모델 판정 전의 참고 프리필터.
+// 하우스 룰: 단어목록은 최종 결정을 내리지 않는다. 최종 판정은 resolveNeedsImage가
+// 상주 판정 서비스(judgeLabels)에 묻고, 이 함수는 그 폴백으로만 살아남는다.
+function needsImageLexical(agent) {
   if (!agent) return false;
   if (NON_IMAGE_ROLES.has(String(agent.role || "").toLowerCase())) return false;
   // 정체성 존은 사용자가 선언한 이름/태그라인만 — slug는 폴더명에서 기계 파생되므로
@@ -87,6 +90,82 @@ function needsImage(agent) {
   return false;
 }
 
+// ── 상주 판정 서비스 배선 — 모델이 의미로 최종 판정, IMAGE_HINTS는 참고 힌트 ──────
+// needsImage 호출자(REPL 배지·autoRuntimeFor·routingNote)는 동기라서 warm-cache 패턴:
+// 비동기 경로(resolveNeedsImage)가 먼저 판정해 캐시를 데우고, 동기 needsImage는 캐시만
+// 읽는다. 캐시 미스 = 어휘 폴백 그대로 — imageJudgmentSource가 어느 쪽이었는지 라벨한다.
+const IMAGE_VERDICT_CACHE_MAX = 200;
+const imageVerdicts = new Map();
+function imageJudgeInput(agent) {
+  const identity = [agent.slug, agent.name, agent.name_en, agent.tagline, agent.tagline_en].filter(Boolean).join(" | ");
+  return `${identity}\n---\n${String(agent.system_prompt || "").slice(0, 6000)}`;
+}
+// 역할/팀 베토는 보수적 하드 가드로 유지 — 조율 두뇌가 부서 소개 문장("Design HQ")으로
+// 이미지 팀이 되던 사고(vibecoder/appbridge)는 모델 판정 대상에서 아예 뺀다.
+function imageJudgeVetoed(agent) {
+  if (!agent) return true;
+  if (NON_IMAGE_ROLES.has(String(agent.role || "").toLowerCase())) return true;
+  if (String(agent.entity_kind || "").toLowerCase() === "team") return true;
+  return false;
+}
+// 이 에이전트의 직무가 이미지 생산인지를 연결 모델이 의미로 판정한다.
+// 러너 없음/타임아웃/정크 → 어휘 판정을 "fallback"으로 라벨해 반환 (조용한 회귀 금지).
+async function resolveNeedsImage(agent) {
+  const lexical = needsImageLexical(agent);
+  if (imageJudgeVetoed(agent)) return { image: lexical, source: "deterministic" };
+  let judgment;
+  try {
+    judgment = require("./agentlas-judgment.cjs");
+  } catch {
+    judgment = null;
+  }
+  if (!judgment || !judgment.hasJudgmentRunner()) return { image: lexical, source: "fallback" };
+  const input = imageJudgeInput(agent);
+  const cached = imageVerdicts.get(input);
+  if (cached) return cached;
+  const verdict = await judgment.judgeLabels({
+    kind: "agent-produces-images",
+    question:
+      "Does this agent's OWN job include producing images (generating or designing visual assets such as thumbnails, banners, logos, posters, product shots)?",
+    labels: ["image", "not-image"],
+    multi: false,
+    input,
+    hints: { image: IMAGE_HINTS.map((re) => re.source) },
+    guidance:
+      "Judge the agent's role from its identity and instructions, in any language. Mentioning images is not " +
+      "producing them: builders, orchestrators, PMs, curators, and coordination brains that commission or " +
+      "delegate image work are 'not-image'. Refusals or prohibitions ('never generate images') declare the " +
+      "opposite of a capability.",
+    fallback: [lexical ? "image" : "not-image"],
+  });
+  if (verdict.source !== "llm" || !verdict.labels.length) return { image: lexical, source: "fallback" };
+  const out = { image: verdict.labels[0] === "image", source: "llm", reason: verdict.reason || "" };
+  imageVerdicts.set(input, out);
+  if (imageVerdicts.size > IMAGE_VERDICT_CACHE_MAX) {
+    const oldest = imageVerdicts.keys().next().value;
+    if (oldest !== undefined) imageVerdicts.delete(oldest);
+  }
+  return out;
+}
+// Does this agent's job involve generating/handling images? Sync surface for badges and
+// autoRuntimeFor: model verdict from the warm cache wins; miss = deterministic lexical fallback.
+function needsImage(agent) {
+  if (!agent) return false;
+  if (!imageJudgeVetoed(agent)) {
+    const cached = imageVerdicts.get(imageJudgeInput(agent));
+    if (cached) return cached.image;
+  }
+  return needsImageLexical(agent);
+}
+// 라벨용 — 이 에이전트의 현재 이미지 판정이 모델("llm")인지 결정적 경로("deterministic")인지.
+function imageJudgmentSource(agent) {
+  if (agent && !imageJudgeVetoed(agent) && imageVerdicts.has(imageJudgeInput(agent))) return "llm";
+  return "deterministic";
+}
+function clearImageJudgments() {
+  imageVerdicts.clear();
+}
+
 // Auto-pick a runtime spec for an agent given installed CLI kinds and the session default spec.
 // Image agents route to an installed image-capable runtime; otherwise keep the session default.
 function autoRuntimeFor(agent, { installedKinds, activeSpec }) {
@@ -103,4 +182,17 @@ function badge(spec) {
   return c.image ? "🖼" : "";
 }
 
-module.exports = { RUNTIME_CAPS, CLI_KINDS, capsFor, specOf, runtimeFromSpec, needsImage, autoRuntimeFor, badge };
+module.exports = {
+  RUNTIME_CAPS,
+  CLI_KINDS,
+  capsFor,
+  specOf,
+  runtimeFromSpec,
+  needsImage,
+  needsImageLexical,
+  resolveNeedsImage,
+  imageJudgmentSource,
+  clearImageJudgments,
+  autoRuntimeFor,
+  badge,
+};

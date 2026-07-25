@@ -11,8 +11,10 @@
  */
 
 const assert = require("node:assert/strict");
-const { autoRouteAgent, autoRouteNote, autoRoutePreamble, directSystemPrompt } = require("../engine/agentlas.cjs");
-const { needsImage, autoRuntimeFor } = require("../engine/agentlas-capabilities.cjs");
+const { autoRouteAgent, resolveAutoRoute, autoRouteNote, autoRoutePreamble, directSystemPrompt } = require("../engine/agentlas.cjs");
+const caps = require("../engine/agentlas-capabilities.cjs");
+const { needsImage, autoRuntimeFor } = caps;
+const judgment = require("../engine/agentlas-judgment.cjs");
 
 // 실제 설치 상태를 흉내 낸 스텁 DB — 모든 에이전트 프롬프트에 "AI"가 들어 있다(현실과 동일).
 const AGENTS = [
@@ -354,4 +356,201 @@ const pathDb = makeDb(PATH_AGENTS);
   assert.equal(nf.direct, true);
 }
 
-console.log("route-regression: PASS");
+// ── 2026-07-25 모델 최종 판정 계약 — 어휘 점수는 후보 모집/라벨 붙은 폴백 전용 ──────
+// 하우스 룰: 단어목록/정규식은 최종 라우트·능력 결정을 내리지 않는다. 연결 모델(스텁
+// 러너)이 있으면 그 판정이 어휘 픽을 이기고(어휘 0점 에이전트도 뽑는다), 러너가 없으면
+// 오늘의 결정적 라우팅과 동일하게 동작하되 폴백임을 라벨한다.
+(async () => {
+  const cleanup = () => {
+    judgment.setJudgmentRunner(null);
+    judgment.clearJudgmentCache();
+    caps.clearImageJudgments();
+  };
+  try {
+    // 21) 모델 판정이 어휘 픽을 이긴다 — 어휘 0점(아랍어) 요청도 전문 에이전트로 라우팅
+    {
+      cleanup();
+      let seenSystem = "";
+      judgment.setJudgmentRunner(async ({ system }) => {
+        seenSystem = system;
+        return JSON.stringify({ labels: ["thumbnail-studio"], reason: "the user asks for a YouTube thumbnail in Arabic" });
+      });
+      const arabic = "صمّم لي صورة مصغّرة لفيديو يوتيوب عن الطبخ";
+      const lexical = autoRouteAgent(db, arabic, "en");
+      assert.equal(lexical.direct, true, "전제: 어휘 스코어러는 아랍어 요청을 못 읽는다(0점)");
+      const judged = await resolveAutoRoute(db, arabic, "en");
+      assert.equal(judged.agent && judged.agent.slug, "thumbnail-studio", "모델 판정이 어휘 0점 에이전트를 뽑아야 함");
+      assert.equal(judged.routeSource, "llm");
+      assert.equal(judged.strong, true, "모델 확답은 strong 계약 충족");
+      assert.match(autoRouteNote(judged, "en"), /judged by the connected model/);
+      // 판정 요청 자체의 계약 — 설치 에이전트 전원 + 합성 라벨 + 힌트로 강등된 옛 단어목록
+      assert.match(seenSystem, /thumbnail-studio/, "어휘 0점 에이전트도 라벨 후보에 있어야 함");
+      assert.match(seenSystem, /meta-builder/, "메타빌더 합성 라벨 제시");
+      assert.match(seenSystem, /direct/, "direct 합성 라벨 제시");
+      assert.match(seenSystem, /may suggest "meta-builder"/, "AGENT_BUILD_TERMS는 힌트로 강등");
+    }
+
+    // 22) 모델이 어휘 픽(strong)을 뒤집어 direct로 — 단어 언급은 의도가 아니다
+    {
+      judgment.clearJudgmentCache();
+      judgment.setJudgmentRunner(async () => JSON.stringify({ labels: ["direct"], reason: "a vocabulary question, not deck work" }));
+      const lexical = autoRouteAgent(db, "pitch deck 라는 용어가 무슨 뜻이야?", "en");
+      assert.equal(lexical.agent && lexical.agent.slug, "pitch-deck-architect", "전제: 어휘로는 위임된다");
+      const judged = await resolveAutoRoute(db, "pitch deck 라는 용어가 무슨 뜻이야?", "en");
+      assert.equal(judged.direct, true, "모델의 direct 판정이 어휘 위임을 이겨야 함");
+      assert.equal(judged.routeSource, "llm");
+    }
+
+    // 23) 합성 라벨 meta-builder — 어떤 언어의 빌드 요청이든 메타빌더로
+    {
+      judgment.clearJudgmentCache();
+      judgment.setJudgmentRunner(async () => JSON.stringify({ labels: ["meta-builder"], reason: "the user wants a new agent built" }));
+      const judged = await resolveAutoRoute(db, "ساعدني في إنشاء وكيل جديد لبطاقات إنستغرام", "en");
+      assert.equal(judged.agent && judged.agent.slug, "agentlas-meta-agent");
+      assert.equal(judged.routeSource, "llm");
+    }
+
+    // 24) 합성 라벨 app-builder — 라우팅되어도 동의 핸드셰이크(효과 전 확인 질문)는 그대로
+    {
+      judgment.clearJudgmentCache();
+      const appDb = makeDb(
+        [
+          ...AGENTS,
+          {
+            id: "ab1",
+            slug: "agentlas-app-builder",
+            name: "앱 빌더",
+            name_en: "App Builder",
+            tagline: "전용 앱 생성",
+            tagline_en: "Dedicated app builder",
+            system_prompt: "You build dedicated internal Agentlas apps.",
+          },
+        ],
+        META,
+      );
+      judgment.setJudgmentRunner(async () => JSON.stringify({ labels: ["app-builder"], reason: "a recurring dashboard workflow" }));
+      const judged = await resolveAutoRoute(appDb, "매주 채널 지표를 모아 보는 대시보드를 반복 관리하고 싶어", "ko");
+      assert.equal(judged.agent && judged.agent.slug, "agentlas-app-builder");
+      assert.equal(judged.routeSource, "llm");
+      assert.match(autoRoutePreamble(judged, "ko"), /명시적으로 승인하지 않았습니다/, "App Builder 동의 핸드셰이크 보존");
+      assert.match(autoRoutePreamble(judged, "en"), /has not explicitly approved/, "App Builder 동의 핸드셰이크 보존(en)");
+    }
+
+    // 25) 잡담 short-circuit은 닫힌형 결정적 가드 — 러너가 있어도 모델에 묻지 않는다
+    {
+      judgment.clearJudgmentCache();
+      let calls = 0;
+      judgment.setJudgmentRunner(async () => {
+        calls += 1;
+        return JSON.stringify({ labels: ["direct"] });
+      });
+      const judged = await resolveAutoRoute(db, "hi", "en");
+      assert.equal(judged.direct, true);
+      assert.equal(judged.routeSource, "deterministic");
+      assert.equal(calls, 0, "TRIVIAL_ROUTE_PROMPTS는 모델 판정 없이 결정적으로 처리");
+    }
+
+    // 26) 정크 판정(비JSON) → 어휘 폴백, 라벨 필수
+    {
+      judgment.clearJudgmentCache();
+      judgment.setJudgmentRunner(async () => "totally not json");
+      const judged = await resolveAutoRoute(db, "유튜브 썸네일 두 장만 더 뽑아줘", "ko");
+      assert.equal(judged.agent && judged.agent.slug, "thumbnail-studio", "정크 판정은 어휘 폴백과 동일 라우트");
+      assert.equal(judged.routeSource, "deterministic");
+      assert.match(autoRouteNote(judged, "ko"), /결정적 폴백/);
+    }
+
+    // 27) 러너 없음 → 오늘의 어휘 라우팅과 동일 + "deterministic" 라벨 (조용한 폴백 금지)
+    {
+      cleanup();
+      const offline = await resolveAutoRoute(db, "유튜브 썸네일 하나 뽑아줘", "ko");
+      assert.equal(offline.agent && offline.agent.slug, "thumbnail-studio");
+      assert.equal(offline.routeSource, "deterministic");
+      const offlineDirect = await resolveAutoRoute(db, "맥이 잠금상태에서 자꾸 ai 돌릴때 안켜지게 하는법 없나", "ko");
+      assert.equal(offlineDirect.direct, true, "러너 없으면 기존 어휘 동작 그대로");
+      assert.match(autoRouteNote(offlineDirect, "en"), /deterministic fallback/);
+    }
+
+    // 28) 이미지 능력 — 모델 판정이 어휘 판정을 이긴다 (힌트 0개의 아랍어 이미지 에이전트)
+    const arabicPainter = {
+      id: "i1",
+      slug: "marsam",
+      name: "مرسم",
+      name_en: "Marsam",
+      tagline: "استوديو صور يوتيوب",
+      tagline_en: "",
+      system_prompt: "أنت وكيل ينشئ صورًا ولافتات وشعارات لقنوات يوتيوب.",
+    };
+    {
+      cleanup();
+      assert.equal(needsImage(arabicPainter), false, "전제: 어휘 스코어러는 아랍어 이미지 역할을 못 읽는다");
+      judgment.setJudgmentRunner(async () => JSON.stringify({ labels: ["image"], reason: "generates images per its Arabic instructions" }));
+      const verdict = await caps.resolveNeedsImage(arabicPainter);
+      assert.equal(verdict.image, true);
+      assert.equal(verdict.source, "llm");
+      assert.equal(needsImage(arabicPainter), true, "warm-cache 후 동기 needsImage도 모델 판정을 읽는다");
+      assert.equal(caps.imageJudgmentSource(arabicPainter), "llm");
+      assert.equal(
+        autoRuntimeFor(arabicPainter, { installedKinds: ["claude-code", "codex", "gemini"], activeSpec: "claude-code" }),
+        "gemini",
+        "모델 이미지 판정이 런타임 자동 배정까지 흘러야 함",
+      );
+    }
+
+    // 29) 반대 방향 — 어휘로는 이미지(정체성 존 "디자인")인데 모델이 not-image로 뒤집는다
+    {
+      judgment.clearJudgmentCache();
+      judgment.setJudgmentRunner(async () => JSON.stringify({ labels: ["not-image"], reason: "lints tokens, produces no images" }));
+      const lintTool = {
+        id: "i2",
+        slug: "style-lint",
+        name: "디자인 린터",
+        name_en: "Design Linter",
+        tagline: "디자인 토큰 린트",
+        tagline_en: "design token lint",
+        system_prompt: "Lint CSS variables and design tokens. No rendering.",
+      };
+      assert.equal(caps.needsImageLexical(lintTool), true, "전제: 어휘로는 이미지 판정");
+      const verdict = await caps.resolveNeedsImage(lintTool);
+      assert.equal(verdict.image, false);
+      assert.equal(verdict.source, "llm");
+      assert.equal(needsImage(lintTool), false, "모델 not-image 판정이 어휘 힌트를 이겨야 함");
+      assert.equal(
+        autoRuntimeFor(lintTool, { installedKinds: ["claude-code", "codex", "gemini"], activeSpec: "claude-code" }),
+        "claude-code",
+        "not-image 판정이면 세션 런타임 유지",
+      );
+    }
+
+    // 30) 팀/역할 하드 가드 — 보수적 베토는 모델 판정 대상에서 제외(호출 자체 금지)
+    {
+      judgment.clearJudgmentCache();
+      let calls = 0;
+      judgment.setJudgmentRunner(async () => {
+        calls += 1;
+        return JSON.stringify({ labels: ["image"] });
+      });
+      const orgTeam = { id: "i3", slug: "org-hq", name: "조직 HQ", tagline: "부서 조율", entity_kind: "team", system_prompt: "디자인 부서가 배너를 만든다." };
+      const verdict = await caps.resolveNeedsImage(orgTeam);
+      assert.equal(verdict.image, false);
+      assert.equal(verdict.source, "deterministic");
+      assert.equal(calls, 0, "팀 베토는 하드 가드 — 모델에 묻지 않는다");
+    }
+
+    // 31) 러너 없음 → 이미지 판정도 오늘의 어휘 동작과 동일 + "fallback" 라벨
+    {
+      cleanup();
+      const verdict = await caps.resolveNeedsImage(arabicPainter);
+      assert.equal(verdict.image, false, "러너 없으면 어휘 판정 그대로");
+      assert.equal(verdict.source, "fallback", "폴백은 반드시 라벨");
+      assert.equal(needsImage(arabicPainter), false);
+      assert.equal(caps.imageJudgmentSource(arabicPainter), "deterministic");
+    }
+  } finally {
+    cleanup();
+  }
+  console.log("route-regression: PASS");
+})().catch((err) => {
+  console.error((err && err.stack) || err);
+  process.exit(1);
+});

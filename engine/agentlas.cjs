@@ -580,6 +580,24 @@ function directSystemPrompt(lang) {
     ? "당신은 Agentlas 터미널의 기본 어시스턴트입니다. 특별한 페르소나 없이 사용자의 요청에 정확하고 간결하게 바로 답하세요. 에이전트 라우팅이나 이미지 생성 능력을 스스로 언급하지 마세요."
     : "You are the Agentlas terminal's default assistant. Answer the user's request directly and concisely, with no special persona. Do not bring up agent routing or image-generation capabilities on your own.";
 }
+// 어휘 스코어링 — 설치 에이전트 전원을 점수순으로 나열한다. 하우스 룰에 따라 이 점수는
+// (1) resolveAutoRoute의 후보 모집과 (2) 라벨 붙은 오프라인 폴백(autoRouteAgent)으로만
+// 쓰인다 — 연결 모델이 있으면 최종 라우트 결정은 상주 판정 서비스가 의미로 내린다.
+function rankRouteAgents(db, prompt, lang) {
+  const resolvedLang = lang || prefsLang();
+  const agents = listRoutableAgents(db).filter((agent) => !NON_GENERIC_ROUTE_SLUGS.has(agent.slug));
+  if (!agents.length) return [];
+  let terms = routeTokenize(prompt);
+  // 헤이스택은 한 번만 계산해 IDF와 스코어링 양쪽에서 재사용한다.
+  const hays = agents.map((agent) => ({ identityHay: routeIdentityHaystack(agent), haystack: routeHaystack(agent) }));
+  // IDF 근사 — 설치 에이전트 절반 이상의 haystack에 나오는 단어("ai","도구" 등)는 판별력이 없어 제외.
+  if (agents.length >= 3) {
+    terms = terms.filter((term) => hays.filter((h) => h.haystack.includes(term)).length * 2 <= agents.length);
+  }
+  return agents
+    .map((agent, i) => scoreRouteAgent(prompt, terms, agent, resolvedLang, hays[i]))
+    .sort((a, b) => b.score - a.score);
+}
 function autoRouteAgent(db, prompt, lang) {
   const resolvedLang = lang || prefsLang();
   // 명확한 "에이전트/팀/회사 만들기" 의도 → 메타-빌더로 직행 (약한 키워드 점수에 밀리지 않게).
@@ -598,35 +616,123 @@ function autoRouteAgent(db, prompt, lang) {
       };
     }
   }
-  const agents = listRoutableAgents(db).filter((agent) => !NON_GENERIC_ROUTE_SLUGS.has(agent.slug));
-  if (!agents.length) return directRouteChoice(resolvedLang);
-  let terms = routeTokenize(prompt);
-  // 헤이스택은 한 번만 계산해 IDF와 스코어링 양쪽에서 재사용한다.
-  const hays = agents.map((agent) => ({ identityHay: routeIdentityHaystack(agent), haystack: routeHaystack(agent) }));
-  // IDF 근사 — 설치 에이전트 절반 이상의 haystack에 나오는 단어("ai","도구" 등)는 판별력이 없어 제외.
-  if (agents.length >= 3) {
-    terms = terms.filter((term) => hays.filter((h) => h.haystack.includes(term)).length * 2 <= agents.length);
-  }
-  const ranked = agents
-    .map((agent, i) => scoreRouteAgent(prompt, terms, agent, resolvedLang, hays[i]))
-    .sort((a, b) => b.score - a.score);
+  const ranked = rankRouteAgents(db, prompt, resolvedLang);
+  if (!ranked.length) return directRouteChoice(resolvedLang);
   // 1위가 아니라 "임계값+strong을 모두 만족하는 최고 순위"를 뽑는다 — 장황한 프롬프트의
   // 약한 단어 적중이 점수 1위를 먹어도, 자격 있는 전문 에이전트가 직답으로 밀려나지 않는다.
   const pick = ranked.find((r) => r.score >= MIN_ROUTE_SCORE && r.strong);
   if (pick) return pick;
   return directRouteChoice(resolvedLang);
 }
+// ── 모델 최종 라우팅 판정 ──────────────────────────────────
+// 하우스 룰: 단어목록/정규식은 최종 라우트 결정을 내리지 않는다. 연결 모델이 있으면
+// judgeLabels가 후보(어휘 모집 + 설치 전원, 상한) + 합성 라벨(meta-builder/app-builder/
+// direct) 중에서 의미로 하나를 고른다 — 어휘 점수 0점인 에이전트(아랍어 등 어떤 언어의
+// 요청이든)도 모델은 뽑을 수 있다. 닫힌형 가드는 결정적으로 유지: 잡담 short-circuit
+// (isTrivialRoutePrompt)과 경로 스트리핑(ROUTE_PATH_RE)은 모델 호출 전에 그대로 적용.
+// 러너 없음/타임아웃/정크 → 기존 어휘 라우팅(autoRouteAgent)을 routeSource:"deterministic"
+// 으로 라벨해 반환한다 — 조용한 폴백 금지(라우트 노트에 판정 주체가 찍힌다).
+const ROUTE_JUDGE_CANDIDATE_CAP = 30;
+const ROUTE_JUDGE_DIRECT_LABEL = "direct";
+const ROUTE_JUDGE_META_LABEL = "meta-builder";
+const ROUTE_JUDGE_APP_LABEL = "app-builder";
+const APP_BUILDER_ROUTE_SLUG = "agentlas-app-builder";
+async function resolveAutoRoute(db, prompt, lang) {
+  const resolvedLang = lang || prefsLang();
+  const prefilter = autoRouteAgent(db, prompt, resolvedLang);
+  let judgment;
+  try {
+    judgment = require("./agentlas-judgment.cjs");
+  } catch {
+    judgment = null;
+  }
+  if (!judgment || !judgment.hasJudgmentRunner()) return { ...prefilter, routeSource: "deterministic" };
+  const promptText = routeNormalize(routeStripPaths(prompt));
+  // 잡담("hi")까지 모델에 물으면 매 턴이 느려진다 — 정확 매칭 가드는 닫힌형이라 결정적 유지.
+  if (!promptText.trim() || isTrivialRoutePrompt(promptText)) return { ...prefilter, routeSource: "deterministic" };
+  const ranked = rankRouteAgents(db, prompt, resolvedLang);
+  const meta = resolveMetaBuilder(db);
+  if (!ranked.length && !meta) return { ...prefilter, routeSource: "deterministic" };
+  // App Builder는 합성 라벨로만 제시한다(동의 핸드셰이크가 걸린 특수 라우트임을 모델에 명시).
+  const appBuilder = ranked.find((r) => r.agent.slug === APP_BUILDER_ROUTE_SLUG) || null;
+  const candidates = ranked.filter((r) => r.agent.slug !== APP_BUILDER_ROUTE_SLUG).slice(0, ROUTE_JUDGE_CANDIDATE_CAP);
+  const bySlug = new Map(candidates.map((r) => [r.agent.slug, r]));
+  const labels = [...bySlug.keys()];
+  const hints = {};
+  const roster = [];
+  for (const r of candidates) {
+    const a = r.agent;
+    const name = [...new Set([a.name, a.name_en].filter(Boolean))].join(" / ");
+    const tagline = [...new Set([a.tagline, a.tagline_en].filter(Boolean))].join(" / ");
+    roster.push(`- ${a.slug}: ${String(name).slice(0, 80)}${tagline ? ` — ${String(tagline).slice(0, 120)}` : ""}`);
+    // 옛 단어목록은 힌트로 강등: 큐레이션 힌트 용어 + 이 프롬프트에서 어휘 스코어러가 맞춘 용어.
+    const curated = ROUTE_HINTS.find((h) => h.slug === a.slug);
+    const hintTerms = [...new Set([...(curated ? curated.terms : []), ...(r.terms || [])])];
+    if (hintTerms.length) hints[a.slug] = hintTerms;
+  }
+  if (appBuilder) {
+    labels.push(ROUTE_JUDGE_APP_LABEL);
+    roster.push(
+      `- ${ROUTE_JUDGE_APP_LABEL}: build a dedicated internal Agentlas App (recurring workflow, durable state, editing surfaces); explicit user consent is asked separately before anything is created`,
+    );
+    hints[ROUTE_JUDGE_APP_LABEL] = APP_BUILDER_EXPLICIT_TERMS;
+  }
+  if (meta) {
+    labels.push(ROUTE_JUDGE_META_LABEL);
+    roster.push(`- ${ROUTE_JUDGE_META_LABEL}: build a NEW agent/team/company itself (the meta-builder)`);
+    hints[ROUTE_JUDGE_META_LABEL] = AGENT_BUILD_TERMS;
+  }
+  labels.push(ROUTE_JUDGE_DIRECT_LABEL);
+  roster.push(`- ${ROUTE_JUDGE_DIRECT_LABEL}: no installed agent clearly fits; answer as the plain assistant`);
+  const verdict = await judgment.judgeLabels({
+    // 라벨 집합(설치 상태)이 바뀌면 캐시 키도 바뀌어야 한다 — kind에 라벨 지문을 넣는다.
+    kind: `terminal-auto-route:${crypto.createHash("sha256").update(labels.join("\n")).digest("hex").slice(0, 12)}`,
+    question: "Which installed agent should own this user request, if any?",
+    labels,
+    input: routeStripPaths(String(prompt || "")),
+    hints,
+    guidance: [
+      "Installed agents:",
+      ...roster,
+      "Mentioning a word is not intent — judge what the user actually asks to be done, in any language.",
+      `Pick "${ROUTE_JUDGE_META_LABEL}" only when the user asks to create a new agent/team/company itself.`,
+      `Pick "${ROUTE_JUDGE_DIRECT_LABEL}" when no installed agent clearly fits the request.`,
+    ].join("\n"),
+    multi: false,
+    fallback: [],
+  });
+  if (verdict.source !== "llm" || !verdict.labels.length) return { ...prefilter, routeSource: "deterministic" };
+  const picked = verdict.labels[0];
+  const reason =
+    verdict.reason ||
+    (resolvedLang === "ko" ? "연결 모델이 요청의 의미로 판정했습니다" : "the connected model judged the request by meaning");
+  if (picked === ROUTE_JUDGE_DIRECT_LABEL) return { ...directRouteChoice(resolvedLang), reason, routeSource: "llm" };
+  if (picked === ROUTE_JUDGE_META_LABEL && meta) {
+    return { agent: meta, score: 1000, strong: true, terms: [], reason, routeSource: "llm" };
+  }
+  const chosen = picked === ROUTE_JUDGE_APP_LABEL ? appBuilder : bySlug.get(picked);
+  if (!chosen) return { ...prefilter, routeSource: "deterministic" };
+  // 모델 확답은 strong 계약을 충족한다 — 어휘 근거(terms/score)는 참고로 보존.
+  return { ...chosen, strong: true, reason, routeSource: "llm" };
+}
+// 라우트 영수증 라벨 — 누가 최종 판정했는지 반드시 찍는다(조용한 폴백 금지 하우스 룰).
+function routeJudgeSourceNote(choice, lang) {
+  if (!choice || !choice.routeSource) return "";
+  if (choice.routeSource === "llm") return lang === "ko" ? " (판정: 연결 모델)" : " (judged by the connected model)";
+  return lang === "ko" ? " (판정: 결정적 폴백 — 연결 모델 없음)" : " (deterministic fallback — no connected-model verdict)";
+}
 function autoRouteNote(choice, lang) {
   const resolvedLang = lang || prefsLang();
+  const sourceNote = routeJudgeSourceNote(choice, resolvedLang);
   if (choice.direct) {
     return resolvedLang === "ko"
-      ? `사용 에이전트: 없음 — 바로 답합니다. 이유: ${choice.reason}.`
-      : `Selected agent: none — answering directly. Reason: ${choice.reason}.`;
+      ? `사용 에이전트: 없음 — 바로 답합니다. 이유: ${choice.reason}.${sourceNote}`
+      : `Selected agent: none — answering directly. Reason: ${choice.reason}.${sourceNote}`;
   }
   const name = resolvedLang === "ko" ? choice.agent.name : choice.agent.name_en || choice.agent.name;
   return resolvedLang === "ko"
-    ? `사용 에이전트: ${name}. 이유: ${choice.reason}.`
-    : `Selected agent: ${name}. Reason: ${choice.reason}.`;
+    ? `사용 에이전트: ${name}. 이유: ${choice.reason}.${sourceNote}`
+    : `Selected agent: ${name}. Reason: ${choice.reason}.${sourceNote}`;
 }
 function autoRoutePreamble(choice, lang) {
   const resolvedLang = lang || prefsLang();
@@ -9547,6 +9653,7 @@ function buildHelpers(db) {
     listFirms,
     firmSystemPrompt,
     autoRouteAgent: (db_, prompt, lang) => autoRouteAgent(db_, prompt, lang),
+    resolveAutoRoute: (db_, prompt, lang) => resolveAutoRoute(db_, prompt, lang),
     autoRouteNote: (choice, lang) => autoRouteNote(choice, lang),
     autoRoutePreamble: (choice, lang) => autoRoutePreamble(choice, lang),
     directSystemPrompt: (lang) => directSystemPrompt(lang),
@@ -10230,7 +10337,8 @@ async function cmdRun(db, query, prompt, runtimeOverride, runtimeExperience = nu
 
 async function cmdAutoRun(db, prompt, runtimeOverride, runtimeExperience = null) {
   const lang = prefsLang();
-  const choice = autoRouteAgent(db, prompt, lang);
+  // 연결 모델이 라우트를 최종 판정한다 — 어휘 스코어는 후보 모집/라벨 붙은 폴백 전용.
+  const choice = await resolveAutoRoute(db, prompt, lang);
   if (!choice) fail("No agent is available for automatic routing. Check installation with agentlas list.");
   if (choice.direct) {
     // 전문 에이전트 확신 없음 → 페르소나/능력 라우팅 없이 현재 런타임으로 직답.
@@ -12027,6 +12135,8 @@ module.exports = {
   ANTHROPIC_COMPAT_API,
   // 자동 라우팅 회귀 테스트 표면 — 약한 매치 직답/오라우팅 방지 규칙 검증용.
   autoRouteAgent,
+  // 모델 최종 라우팅 — 어휘 점수는 후보 모집 전용, 연결 모델이 의미로 판정.
+  resolveAutoRoute,
   autoRouteNote,
   autoRoutePreamble,
   directSystemPrompt,
