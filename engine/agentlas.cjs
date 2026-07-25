@@ -640,6 +640,7 @@ const APP_BUILDER_ROUTE_SLUG = "agentlas-app-builder";
 async function resolveAutoRoute(db, prompt, lang) {
   const resolvedLang = lang || prefsLang();
   const prefilter = autoRouteAgent(db, prompt, resolvedLang);
+  ensureJudgmentRunnerInstalled(db);
   let judgment;
   try {
     judgment = require("./agentlas-judgment.cjs");
@@ -700,6 +701,11 @@ async function resolveAutoRoute(db, prompt, lang) {
     ].join("\n"),
     multi: false,
     fallback: [],
+    // Routing is a one-shot pre-run gate: correctness matters more than latency,
+    // and a local 30B model with a full roster can need well over the 20s default.
+    // The judge's abort signal is threaded into the request, so a genuinely hung
+    // model still aborts cleanly at this deadline rather than hanging forever.
+    timeoutMs: 40000,
   });
   if (verdict.source !== "llm" || !verdict.labels.length) return { ...prefilter, routeSource: "deterministic" };
   const picked = verdict.labels[0];
@@ -8627,32 +8633,83 @@ function installJudgmentRunner(db, rt) {
   } catch {
     return;
   }
-  if (!rt || rt.mode !== "cli" || !RUNTIME_BIN[rt.kind]) {
-    judgment.setJudgmentRunner(null);
+  // CLI runtime (claude-code/codex/gemini): the judge runs a silent native turn.
+  if (rt && rt.mode === "cli" && RUNTIME_BIN[rt.kind]) {
+    judgment.setJudgmentRunner(async ({ system, prompt, signal }) => {
+      const { runNativeTurn } = require("./agentlas-native-host.cjs");
+      const { Ui } = require("./agentlas-ui.cjs");
+      const silent = new Ui({ lang: prefsLang(), quiet: true });
+      for (const method of ["write", "warn", "info", "tool", "result", "status", "line"]) {
+        if (typeof silent[method] === "function") silent[method] = () => {};
+      }
+      const res = await runNativeTurn({
+        kind: rt.kind,
+        bin: RUNTIME_BIN[rt.kind],
+        prompt,
+        systemPrompt: system,
+        cwd: projectCwd(),
+        permission: "read",
+        session: {},
+        ui: silent,
+        env: process.env,
+        signal,
+      });
+      if (res && res.error) return "";
+      return (res && res.text) || "";
+    });
     return;
   }
-  judgment.setJudgmentRunner(async ({ system, prompt, signal }) => {
-    const { runNativeTurn } = require("./agentlas-native-host.cjs");
-    const { Ui } = require("./agentlas-ui.cjs");
-    const silent = new Ui({ lang: prefsLang(), quiet: true });
-    for (const method of ["write", "warn", "info", "tool", "result", "status", "line"]) {
-      if (typeof silent[method] === "function") silent[method] = () => {};
-    }
-    const res = await runNativeTurn({
-      kind: rt.kind,
-      bin: RUNTIME_BIN[rt.kind],
-      prompt,
-      systemPrompt: system,
-      cwd: projectCwd(),
-      permission: "read",
-      session: {},
-      ui: silent,
-      env: process.env,
-      signal,
+
+  // API runtime (BYOK / Ollama): the judge uses the same one-shot API path the
+  // rest of the terminal uses, so "the connected model decides" holds for the
+  // user's actual runtime — not only CLI subprocess runtimes. Without this, an
+  // Ollama/BYOK user silently gets the deterministic wordlist fallback for every
+  // route, intent, and classification decision.
+  if (rt && rt.mode === "api" && rt.backend) {
+    judgment.setJudgmentRunner(async ({ system, prompt, signal }) => {
+      // Thread the judge's timeout signal into the actual HTTP request so a slow
+      // model aborts the fetch instead of hanging past the deadline.
+      const baseFetch = globalThis.fetch;
+      const fetchImpl = typeof baseFetch === "function" && signal
+        ? (url, init) => baseFetch(url, { ...(init || {}), signal })
+        : baseFetch;
+      try {
+        return await runApi(rt.backend, rt.model, system, prompt, { fetch: fetchImpl });
+      } catch {
+        return "";
+      }
     });
-    if (res && res.error) return "";
-    return (res && res.text) || "";
-  });
+    return;
+  }
+
+  judgment.setJudgmentRunner(null);
+}
+
+// Make sure the resident judge can reach the connected model BEFORE the first
+// judged decision (routing, image capability, task class). The only other
+// install site is inside executeOnce, which runs AFTER routing — so a one-shot
+// `run`/auto-route would always fall to the deterministic label without this.
+// Uses the active runtime (CLI or API/Ollama/BYOK); a pinned override still
+// reinstalls in executeOnce for the actual task turn.
+function ensureJudgmentRunnerInstalled(db) {
+  let judgment;
+  try {
+    judgment = require("./agentlas-judgment.cjs");
+  } catch {
+    return;
+  }
+  if (judgment.hasJudgmentRunner()) return;
+  try {
+    const ar = activeRuntime(db);
+    let rt = null;
+    if (ar && RUNTIME_BIN[ar.kind]) rt = { mode: "cli", kind: ar.kind, model: ar.model || null };
+    else if (ar && ar.kind === "byok" && ar.backend) rt = { mode: "api", backend: ar.backend, model: ar.model };
+    else if (ar && ar.kind === "ollama") rt = { mode: "api", backend: "ollama", model: ar.model };
+    if (rt) installJudgmentRunner(db, rt);
+  } catch {
+    // No resolvable runtime → leave the runner unset; judged sites use their
+    // labeled deterministic fallback rather than crashing.
+  }
 }
 
 function resolveRuntime(db, override) {
@@ -11878,6 +11935,12 @@ async function main() {
   // Agentlas 아키텍처 빌트인 에이전트를 보장(앱과 동일, 멱등·버전 게이팅). 스키마가 준비됐을 때만.
   try { seedBuiltins(db); } catch { /* best-effort */ }
 
+  // Wire the resident judge to the connected runtime up front, so the FIRST
+  // routing / image-capability / task-class decision is judged by the model —
+  // in the REPL and in one-shot commands alike — instead of silently falling to
+  // the deterministic label until executeOnce eventually installs it.
+  ensureJudgmentRunnerInstalled(db);
+
   // 인자 없이 `agentlas` → 에이전트 1개면 바로 대화형, 아니면 목록 + 사용법
   if (cmd === "") {
     const agents = listAgents(db);
@@ -12140,6 +12203,9 @@ module.exports = {
   autoRouteNote,
   autoRoutePreamble,
   directSystemPrompt,
+  // Test bridge: prove the resident judge is wired to API/Ollama/BYOK runtimes,
+  // not only CLI subprocess runtimes.
+  installJudgmentRunner,
   // Hub 플러그인 설치 회귀 테스트 표면 — 레포 URL을 MCP 서버로 등록하지 않는 규칙 검증용.
   pluginMcpRowCli,
   planPluginMcpInstallCli,

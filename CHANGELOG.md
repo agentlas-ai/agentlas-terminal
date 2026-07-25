@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.9.7 — 2026-07-25
+
+- Fix: the resident judge now reaches API/Ollama/BYOK runtimes, not only CLI
+  subprocess runtimes. Previously, when your connected runtime was Ollama or a
+  BYOK API model, every route, intent, and classification silently used the
+  deterministic wordlist fallback because the judge was wired to null — so a
+  non-English request the keyword lists could not read never got a model
+  verdict. The judge now runs on whatever runtime you actually have connected,
+  and its timeout signal aborts the underlying request cleanly.
+- Fix: the judge is installed at startup, before the first routing decision.
+  It was previously wired only inside the run turn, which happens after routing,
+  so the very first auto-route in a one-shot always fell back.
+- Routing gives the model a more generous deadline (a one-shot pre-run gate), so
+  a slower local model is judged rather than frequently falling back. When it
+  still cannot answer in time, the route receipt says so explicitly.
+
 ## 0.9.6 — 2026-07-25
 
 - Agent and App Builder routing is now decided by the connected model: lexical

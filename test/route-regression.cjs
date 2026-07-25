@@ -11,7 +11,7 @@
  */
 
 const assert = require("node:assert/strict");
-const { autoRouteAgent, resolveAutoRoute, autoRouteNote, autoRoutePreamble, directSystemPrompt } = require("../engine/agentlas.cjs");
+const { autoRouteAgent, resolveAutoRoute, autoRouteNote, autoRoutePreamble, directSystemPrompt, installJudgmentRunner } = require("../engine/agentlas.cjs");
 const caps = require("../engine/agentlas-capabilities.cjs");
 const { needsImage, autoRuntimeFor } = caps;
 const judgment = require("../engine/agentlas-judgment.cjs");
@@ -545,6 +545,46 @@ const pathDb = makeDb(PATH_AGENTS);
       assert.equal(verdict.source, "fallback", "폴백은 반드시 라벨");
       assert.equal(needsImage(arabicPainter), false);
       assert.equal(caps.imageJudgmentSource(arabicPainter), "deterministic");
+    }
+
+    // 32) API/Ollama/BYOK 런타임도 판정 러너를 받는다 — CLI 전용 배선이면 ollama 사용자는
+    //     모든 라우트/의도/분류가 조용히 어휘 폴백으로 떨어졌다(실사고, 2026-07-25 실측).
+    {
+      cleanup();
+      const savedFetch = globalThis.fetch;
+      try {
+        // mode:"api" backend:"ollama" → runApi가 127.0.0.1:11434/api/chat 호출.
+        let hitOllama = false;
+        globalThis.fetch = async (url, init) => {
+          hitOllama = /11434\/api\/chat/.test(String(url));
+          // system 프롬프트가 실제로 전달되는지도 확인.
+          const body = JSON.parse(init.body);
+          assert.ok(body.messages.some((m) => m.role === "system"), "판정 system 프롬프트 전달");
+          return { ok: true, json: async () => ({ message: { content: JSON.stringify({ labels: ["task"], reason: "ollama judged" }) } }) };
+        };
+        installJudgmentRunner({}, { mode: "api", backend: "ollama", model: "qwen-test" });
+        assert.equal(judgment.hasJudgmentRunner(), true, "api-mode 런타임도 판정 러너를 설치해야 함");
+        const verdict = await judgment.judgeLabels({
+          kind: "api-wiring-smoke",
+          question: "task or conversation?",
+          labels: ["task", "conversation"],
+          input: "افتح المتصفح وانشر تغريدة",
+          multi: false,
+          fallback: ["conversation"],
+        });
+        assert.equal(hitOllama, true, "판정이 실제 ollama HTTP 경로를 타야 함");
+        assert.deepEqual(verdict.labels, ["task"]);
+        assert.equal(verdict.source, "llm", "연결 모델이 판정 — 어휘 폴백 아님");
+      } finally {
+        globalThis.fetch = savedFetch;
+      }
+
+      // backend 없는 api 런타임/런타임 없음 → 러너 미설치(조용한 어휘 폴백 대신 라벨된 폴백).
+      cleanup();
+      installJudgmentRunner({}, { mode: "api" });
+      assert.equal(judgment.hasJudgmentRunner(), false, "backend 없으면 러너 미설치");
+      installJudgmentRunner({}, null);
+      assert.equal(judgment.hasJudgmentRunner(), false, "런타임 없으면 러너 미설치");
     }
   } finally {
     cleanup();
