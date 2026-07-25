@@ -8712,6 +8712,52 @@ function ensureJudgmentRunnerInstalled(db) {
   }
 }
 
+// Hand the embedded Agentlas OS runtime a UNIVERSAL judge callback so ITS
+// resident judge (content-guard, pipeline, research, privacy) decides by meaning
+// for EVERY connected runtime — Claude/Codex/Gemini CLIs, all BYOK providers, and
+// local models alike — with no model hardcoded and no provider code duplicated in
+// Python. The OS engine stays BYOC: it never calls a model on its own; it only
+// invokes this host command, which runs the user's own connected runtime. If no
+// runtime resolves, the env is left unset and OS judged sites honestly report
+// "connect a model" instead of keyword-deciding.
+function exportOsJudgeRuntimeEnv(db) {
+  try {
+    const ar = activeRuntime(db);
+    if (!ar) return;
+    const config = {
+      kind: "host-cmd",
+      cmd: [process.execPath, path.resolve(__dirname, "..", "bin", "agentlas.cjs"), "__judge"],
+    };
+    process.env.AGENTLAS_JUDGE_RUNTIME = JSON.stringify(config);
+  } catch {
+    // Leave the env unset — OS judged sites then report "connect a model" rather
+    // than keyword-deciding.
+  }
+}
+
+// Hidden helper the embedded OS runtime calls for one-shot classification. Reads
+// {"system","prompt"} JSON on stdin, runs the connected runtime (any provider/CLI)
+// as a silent read-only turn, prints the reply text on stdout. Judgment is a
+// lightweight task, so this uses whatever model the user already has connected —
+// no hardcoded model, no separate credentials.
+async function cmdInternalJudge(db) {
+  let raw = "";
+  try {
+    raw = await readStdin();
+    const { system, prompt } = JSON.parse(raw || "{}");
+    if (!prompt || !prompt.trim()) { process.stdout.write(""); return; }
+    let judgment;
+    try { judgment = require("./agentlas-judgment.cjs"); } catch { judgment = null; }
+    ensureJudgmentRunnerInstalled(db);
+    if (!judgment || !judgment.hasJudgmentRunner()) { process.stdout.write(""); return; }
+    // Reuse the installed runner directly for an opaque system+prompt turn.
+    const text = await judgment.runRaw(String(system || ""), String(prompt), 40000);
+    process.stdout.write(text || "");
+  } catch {
+    process.stdout.write("");
+  }
+}
+
 function resolveRuntime(db, override) {
   const ar = activeRuntime(db);
   const activeCli = ar && RUNTIME_BIN[ar.kind]
@@ -11940,6 +11986,11 @@ async function main() {
   // in the REPL and in one-shot commands alike — instead of silently falling to
   // the deterministic label until executeOnce eventually installs it.
   ensureJudgmentRunnerInstalled(db);
+  // Hidden judge-callback for the embedded OS runtime — handle before exporting
+  // the env or dispatching, and never re-enter the OS from here.
+  if (cmd === "__judge") return cmdInternalJudge(db);
+  // Hand the same connected model to the embedded Agentlas OS runtime's judge.
+  exportOsJudgeRuntimeEnv(db);
 
   // 인자 없이 `agentlas` → 에이전트 1개면 바로 대화형, 아니면 목록 + 사용법
   if (cmd === "") {
