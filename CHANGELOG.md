@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.9.6 — 2026-07-25
+
+- Agent and App Builder routing is now decided by the connected model: lexical
+  scores only recruit candidates, and the model can route a request the keyword
+  lists never matched (any language). The App Builder consent handshake is
+  unchanged, and every route receipt says whether the connected model or the
+  deterministic fallback decided.
+- Whether an agent produces images (and therefore which runtime runs it) is now
+  judged by the connected model from the agent's own identity, with the old
+  keyword list demoted to reference hints. Conservative non-image vetoes stay.
+- Task classification, routing, and image judgments all fail over to the
+  previous deterministic behavior — explicitly labeled — when no connected
+  model is available.
+- Publication gates pin the Agentlas OS v1.1.61 runtime commit, which ships the
+  same judgment-engine migration across the bundled Core runtime.
+
 ## 0.9.4 — 2026-07-23
 
 - `plugin add` no longer registers a code-hosting page (GitHub/GitLab/Bitbucket
