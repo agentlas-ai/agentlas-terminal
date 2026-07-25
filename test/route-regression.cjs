@@ -120,8 +120,8 @@ assert.match(directSystemPrompt("ko"), /기본 어시스턴트/);
 assert.match(directSystemPrompt("en"), /default assistant/);
 
 // ── 2026-07-12 두 번째 오라우팅 사고 고정 ─────────────────────────────────────
-// 사고: "/Users/mason/Documents/법인관련/Appbridge_Template.이 양식으로 …" 프롬프트가
-// 경로 토큰("users","mason","documents","users-mason-documents-")으로 appbridge에 +2씩 쌓여
+// 사고: "/Users/operator/Documents/법인관련/Appbridge_Template.이 양식으로 …" 프롬프트가
+// 경로 토큰("users","operator","documents","users-operator-documents-")으로 appbridge에 +2씩 쌓여
 // 라우팅 근거에까지 노출되고, appbridge CEO 프롬프트 속 지나가는 "디자인" 한 단어 때문에
 // needsImage가 참이 되어 PPT 요청 세션이 통째로 gemini로 전환됐다.
 const PATH_AGENTS = [
@@ -133,9 +133,9 @@ const PATH_AGENTS = [
     tagline: "Imported local team",
     tagline_en: "Imported local team",
     system_prompt:
-      "You are the AppBridge CEO coordination team imported from /Users/mason/Documents/Appbridge. " +
+      "You are the AppBridge CEO coordination team imported from /Users/operator/Documents/Appbridge. " +
       "CEO는 코디네이션·라우팅의 owner다. 코드/디자인/스토어/보안 결정의 owner가 아니다. " +
-      "Templates live under /Users/mason/Documents/Appbridge/templates (Appbridge_Template).",
+      "Templates live under /Users/operator/Documents/Appbridge/templates (Appbridge_Template).",
   },
   {
     id: "p2",
@@ -144,24 +144,24 @@ const PATH_AGENTS = [
     name_en: "Stock Team",
     tagline: "Imported local team",
     tagline_en: "Imported local team",
-    system_prompt: "You trade stocks. Sources under /Users/mason/Documents/StockTeam. 리포트 디자인 지침을 따른다.",
+    system_prompt: "You trade stocks. Sources under /Users/operator/Documents/StockTeam. 리포트 디자인 지침을 따른다.",
   },
 ];
 const pathDb = makeDb(PATH_AGENTS);
 
 // 8) 사고 재현 — 이름을 실제로 부른 경로 프롬프트는 그 에이전트로 가되, 근거에 경로 쓰레기 토큰이 없어야 한다
 {
-  const choice = autoRouteAgent(pathDb, "/Users/mason/Documents/법인관련/Appbridge_Template.이 양식으로 고정 시켜서 못만드나 피피티 잘만드는거..", "en");
+  const choice = autoRouteAgent(pathDb, "/Users/operator/Documents/법인관련/Appbridge_Template.이 양식으로 고정 시켜서 못만드나 피피티 잘만드는거..", "en");
   assert.equal(choice.direct, undefined, "Appbridge_Template을 직접 언급했으므로 appbridge 라우트 유지");
   assert.equal(choice.agent.slug, "local-appbridge");
-  for (const junk of ["users", "mason", "documents", "users-mason-documents"]) {
+  for (const junk of ["users", "operator", "documents", "users-operator-documents"]) {
     assert.ok(!choice.terms.some((t) => t.toLowerCase().includes(junk)), `경로 토큰 "${junk}"이 라우팅 근거에 노출되면 안 됨 — 실제: ${JSON.stringify(choice.terms)}`);
   }
 }
 
 // 9) 무관한 파일 경로 프롬프트 — 경로↔경로 우연 일치로 위임되면 안 된다 (direct)
 {
-  const choice = autoRouteAgent(pathDb, "/Users/mason/Documents/법인관련/세금계산서.pdf 이거 요약해줘", "ko");
+  const choice = autoRouteAgent(pathDb, "/Users/operator/Documents/법인관련/세금계산서.pdf 이거 요약해줘", "ko");
   assert.equal(choice.direct, true, `무관 경로 프롬프트는 direct여야 함 — 실제: ${JSON.stringify(choice.agent && choice.agent.slug)}`);
 }
 
@@ -211,19 +211,19 @@ const pathDb = makeDb(PATH_AGENTS);
 // ── max 리뷰(2026-07-12)에서 실증된 잔여 결함 고정 ───────────────────────────
 // 13) 힌트 채널 비대칭 — 경로 디렉터리명("projects/plan")이 pm-soul strong 위임을 만들면 안 된다
 {
-  const choice = autoRouteAgent(db, "/Users/mason/projects/plan/발표자료.pptx 열어서 요약해줘", "ko");
+  const choice = autoRouteAgent(db, "/Users/operator/projects/plan/발표자료.pptx 열어서 요약해줘", "ko");
   assert.equal(choice.direct, true, `경로 힌트 위임 금지 — 실제: ${JSON.stringify(choice.agent && choice.agent.slug)}`);
 }
 
 // 14) 이름 채널 비대칭 — 부모 폴더명("…/Appbridge/…")만으로 +20 strong 위임 금지
 {
-  const choice = autoRouteAgent(pathDb, "/Users/mason/Documents/Appbridge/세금계산서.pdf 이거 요약해줘", "ko");
+  const choice = autoRouteAgent(pathDb, "/Users/operator/Documents/Appbridge/세금계산서.pdf 이거 요약해줘", "ko");
   assert.equal(choice.direct, true, `부모 폴더명 위임 금지 — 실제: ${JSON.stringify(choice.agent && choice.agent.slug)}`);
 }
 
 // 15) 메타빌더 우회 — 경로 속 "agent-tools"가 빌드 의도(score 1000)로 둔갑하면 안 된다
 {
-  const choice = autoRouteAgent(db, "/Users/mason/agent-tools/notes.md 요약본 만들어줘", "ko");
+  const choice = autoRouteAgent(db, "/Users/operator/agent-tools/notes.md 요약본 만들어줘", "ko");
   assert.notEqual(choice.agent && choice.agent.slug, "agentlas-meta-agent", "경로 토큰이 메타빌더를 부르면 안 됨");
   assert.equal(choice.direct, true);
   // 진짜 빌드 의도는 여전히 메타빌더로 (test 5와 동일 경로 재확인)
@@ -253,11 +253,11 @@ const pathDb = makeDb(PATH_AGENTS);
 {
   const choice = autoRouteAgent(
     pathDb,
-    "/Users/mason/Library/Mobile Documents/com~apple~CloudDocs/Appbridge_Template.md 이 양식으로 appbridge 정리해줘",
+    "/Users/operator/Library/Mobile Documents/com~apple~CloudDocs/Appbridge_Template.md 이 양식으로 appbridge 정리해줘",
     "en",
   );
   assert.equal(choice.agent.slug, "local-appbridge");
-  for (const junk of ["mobile", "documents", "com", "apple", "users", "mason", "library"]) {
+  for (const junk of ["mobile", "documents", "com", "apple", "users", "operator", "library"]) {
     assert.ok(!choice.terms.some((t) => t.toLowerCase() === junk), `공백 경로 토큰 "${junk}" 노출 금지 — 실제: ${JSON.stringify(choice.terms)}`);
   }
 }
@@ -351,7 +351,7 @@ const pathDb = makeDb(PATH_AGENTS);
   const b2 = autoRouteAgent(db, "회사/조직 만들어줘", "ko");
   assert.equal(b2.agent && b2.agent.slug, "agentlas-meta-agent", "'회사/조직'도 빌드 의도");
   // 경로/파일 참조는 여전히 빌드 의도가 아니다 — 수리가 test 15의 회귀를 되살리지 않았는지 재확인
-  const nf = autoRouteAgent(db, "/Users/mason/agent-tools/notes.md 요약본 만들어줘", "ko");
+  const nf = autoRouteAgent(db, "/Users/operator/agent-tools/notes.md 요약본 만들어줘", "ko");
   assert.notEqual(nf.agent && nf.agent.slug, "agentlas-meta-agent", "경로 속 'agent-tools'는 빌드 아님");
   assert.equal(nf.direct, true);
 }
