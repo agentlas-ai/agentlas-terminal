@@ -8507,6 +8507,48 @@ const RUNTIME_BIN = {
 };
 
 // 활성 런타임 → 실행 방식 결정. CLI(claude/codex/gemini) 또는 API(BYOK/Ollama).
+/**
+ * Wire the resident judgment service to whatever runtime the user actually has connected.
+ * This is what lets classification be decided by MEANING instead of by a wordlist: the
+ * judge asks the connected model, and the old keyword maps are passed only as hints. It is
+ * invisible to the user (no output, read-only, no tools) and every judged call falls back
+ * to the deterministic prefilter when no runtime answers.
+ */
+function installJudgmentRunner(db, rt) {
+  let judgment;
+  try {
+    judgment = require("./agentlas-judgment.cjs");
+  } catch {
+    return;
+  }
+  if (!rt || rt.mode !== "cli" || !RUNTIME_BIN[rt.kind]) {
+    judgment.setJudgmentRunner(null);
+    return;
+  }
+  judgment.setJudgmentRunner(async ({ system, prompt, signal }) => {
+    const { runNativeTurn } = require("./agentlas-native-host.cjs");
+    const { Ui } = require("./agentlas-ui.cjs");
+    const silent = new Ui({ lang: prefsLang(), quiet: true });
+    for (const method of ["write", "warn", "info", "tool", "result", "status", "line"]) {
+      if (typeof silent[method] === "function") silent[method] = () => {};
+    }
+    const res = await runNativeTurn({
+      kind: rt.kind,
+      bin: RUNTIME_BIN[rt.kind],
+      prompt,
+      systemPrompt: system,
+      cwd: projectCwd(),
+      permission: "read",
+      session: {},
+      ui: silent,
+      env: process.env,
+      signal,
+    });
+    if (res && res.error) return "";
+    return (res && res.text) || "";
+  });
+}
+
 function resolveRuntime(db, override) {
   const ar = activeRuntime(db);
   const activeCli = ar && RUNTIME_BIN[ar.kind]
@@ -8850,6 +8892,9 @@ async function executeOnce(db, system, prompt, override, ctx) {
   }
   const rt = resolveRuntime(db, override);
   memoryRuntime = rt;
+  // The resident judge uses the same connected runtime, so wordlist-based classification is
+  // replaced by meaning-based judgment for this turn.
+  installJudgmentRunner(db, rt);
   if (rt.mode === "cli") {
     // 네이티브 CLI에도 같은 Memory emitter를 주입하되 guard가 화면의 JSON 블록을 숨긴다.
     // 큐레이터가 만든 구조화 Memory만 성공 RunReceipt 이후 Experience intake로 전달된다.

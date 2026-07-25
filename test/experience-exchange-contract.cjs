@@ -142,8 +142,47 @@ function mutatedBundle(text, field = "instructions") {
     for (const testCase of activationContract.environmentCases) {
       check(() => assert.deepEqual(exchange.defaultEnvironmentTags(testCase.input), testCase.expected));
     }
+    // Task classification is decided by the resident judgment service from meaning;
+    // TASK_CLASS_KEYWORDS is only a reference hint list and the deterministic prefilter is
+    // only the no-model fallback. So the contract asserts two separate things:
+    //   1. the prefilter never INVENTS a class (its output is a subset of the truth), and
+    //      it stays a valid canonical id list — it is allowed to under-match, because a
+    //      keyword map cannot resolve compounds/inflection in any language;
+    //   2. with a model connected, the judged result is exactly the expected truth.
     for (const testCase of activationContract.classifierCases) {
-      check(() => assert.deepEqual(exchange.deriveCanonicalTaskClasses(testCase.prompt).taskIds, testCase.expected));
+      const prefilter = exchange.deriveCanonicalTaskClasses(testCase.prompt);
+      check(() => assert.equal(prefilter.source, "deterministic-keyword-map"));
+      check(() => assert.deepEqual(
+        prefilter.taskIds.filter((id) => !testCase.expected.includes(id)),
+        [],
+        `prefilter must not invent a class for ${JSON.stringify(testCase.prompt)}`,
+      ));
+    }
+    {
+      const judgment = require("../engine/agentlas-judgment.cjs");
+      const truth = new Map(activationContract.classifierCases.map((testCase) => [testCase.prompt, testCase.expected]));
+      judgment.clearJudgmentCache();
+      judgment.setJudgmentRunner(async ({ prompt }) => {
+        const expected = truth.get(prompt) ?? [];
+        return JSON.stringify({
+          labels: expected.map((id) => id.slice(exchange.CANONICAL_TASK_PREFIX.length)),
+          reason: "contract stub",
+        });
+      });
+      try {
+        for (const testCase of activationContract.classifierCases) {
+          const resolved = await exchange.resolveCanonicalTaskClasses(testCase.prompt);
+          check(() => assert.deepEqual(resolved.taskIds, testCase.expected));
+          check(() => assert.equal(resolved.source, "model-judgment"));
+        }
+        // No connected model must fall back to the prefilter, never to nothing.
+        judgment.setJudgmentRunner(null);
+        const offline = await exchange.resolveCanonicalTaskClasses(activationContract.classifierCases[0].prompt);
+        check(() => assert.equal(offline.source, "deterministic-keyword-map"));
+      } finally {
+        judgment.setJudgmentRunner(null);
+        judgment.clearJudgmentCache();
+      }
     }
     for (const testCase of activationContract.declaredCases) {
       const result = exchange.deriveCanonicalTaskClasses("ignored prompt", testCase);

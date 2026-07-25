@@ -1561,6 +1561,56 @@ function deriveCanonicalTaskClasses(prompt, options = {}) {
   return { taskIds: matches, source: "deterministic-keyword-map", matchedTaskClasses: matches, invalidDeclaredCount: 0 };
 }
 
+/**
+ * Meaning-aware task classification. The resident judge decides; TASK_CLASS_KEYWORDS is
+ * passed as reference hints only. This is what a keyword map cannot do: Korean compounds
+ * (번역 inside 번역기), particle inflection (고객 문의를), dialect, slang, and any other
+ * language all hinge on meaning, and no list enumerates them.
+ *
+ * An explicit declared task class still wins outright (it is data, not a guess), and with
+ * no connected model the deterministic keyword prefilter is the fallback so classification
+ * never stops working.
+ */
+async function resolveCanonicalTaskClasses(prompt, options = {}) {
+  const declaredRaw = options.declaredTaskClasses ?? options.declaredTaskClass;
+  if (declaredRaw != null && (Array.isArray(declaredRaw) ? declaredRaw.length : String(declaredRaw).trim())) {
+    return deriveCanonicalTaskClasses(prompt, options);
+  }
+  const prefilter = deriveCanonicalTaskClasses(prompt, options);
+  const judgment = require("./agentlas-judgment.cjs");
+  if (!judgment.hasJudgmentRunner()) return prefilter;
+
+  const hints = {};
+  for (const slug of CANONICAL_TASK_SLUGS) {
+    const words = TASK_CLASS_KEYWORDS[slug];
+    if (Array.isArray(words) && words.length) hints[slug] = words;
+  }
+  const verdict = await judgment.judgeLabels({
+    kind: "experience-task-class",
+    question:
+      "Which kinds of work does this request actually involve? Judge the user's real task, not words that merely appear.",
+    labels: CANONICAL_TASK_SLUGS,
+    input: String(prompt || ""),
+    guidance:
+      "Return a label only when that kind of work is genuinely part of the request. A word inside an " +
+      "unrelated compound or a different sense of the word does not count. Return an empty list for " +
+      "content with no identifiable task (hashes, ids, random strings).",
+    hints,
+    fallback: [],
+    signal: options.signal,
+  });
+  if (verdict.source !== "llm") return prefilter;
+  const taskIds = CANONICAL_TASK_IDS.filter((id) =>
+    verdict.labels.some((slug) => id === `${CANONICAL_TASK_PREFIX}${slug}`));
+  return {
+    taskIds,
+    source: "model-judgment",
+    matchedTaskClasses: taskIds,
+    invalidDeclaredCount: 0,
+    ...(verdict.reason ? { judgmentReason: verdict.reason } : {}),
+  };
+}
+
 function parseEnvironmentConstraint(value) {
   const normalized = normalizedTaxonomyAtom(value);
   const contract = EXPERIENCE_TAXONOMY_V1.environment;
@@ -2144,6 +2194,7 @@ module.exports = {
   environmentConstraintsMatch,
   selectApplicablePortableItems,
   deriveCanonicalTaskClasses,
+  resolveCanonicalTaskClasses,
   readExactLocalBaseMarker,
   exactTaskSignatureInPrompt,
   resolveRuntimeExperienceForAgent,
