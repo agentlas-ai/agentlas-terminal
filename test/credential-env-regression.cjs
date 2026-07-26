@@ -7,7 +7,12 @@ const os = require("node:os");
 const path = require("node:path");
 
 const root = path.resolve(__dirname, "..");
-const terminal = require(path.join(root, "engine", "agentlas.cjs"));
+// v2 repoint: 모놀리스 심볼을 소유 모듈로 — resolveCredentialSourcePath는 creds 명령,
+// upsertEnvLine은 engine/project/env-file. 단언은 전부 보존.
+const terminal = {
+  resolveCredentialSourcePath: require(path.join(root, "engine", "commands", "creds.cjs")).resolveCredentialSourcePath,
+  upsertEnvLine: require(path.join(root, "engine", "project", "env-file.cjs")).upsertEnvLine,
+};
 const tools = require(path.join(root, "engine", "agentlas-tools.cjs"));
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), "agentlas-credential-env-"));
 
@@ -42,9 +47,10 @@ try {
   assert.match(result.content, /turn-only/);
   assert.equal(process.env.AGENTLAS_SCOPE_TEST, before, "turn env must not leak into the host process");
 
-  const replSource = fs.readFileSync(path.join(root, "engine", "agentlas-repl.cjs"), "utf8");
+  // v2 REPL 소스 계약: 턴 env는 spawn에만 전달(env: turnEnv), 호스트 process.env 불변형.
+  const replSource = fs.readFileSync(path.join(root, "engine", "ui", "repl.cjs"), "utf8");
   assert.equal(replSource.includes("Object.assign(process.env"), false);
-  assert.match(replSource, /ctx:\s*\{ \.\.\.ctx, env: runEnv \}/);
+  assert.match(replSource, /env:\s*turnEnv/);
 
   console.log(JSON.stringify({ ok: true, checks: 8 }, null, 2));
 } finally {

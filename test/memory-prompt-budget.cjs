@@ -2,7 +2,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
-const terminal = require("../engine/agentlas.cjs");
+const terminal = require("../engine/sessions/prompt.cjs");
 
 const emptyDb = {
   prepare() {

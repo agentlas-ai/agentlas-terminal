@@ -5,20 +5,8 @@
 # 3) 신선 환경 첫 실행: DB 부트스트랩
 # 4) 살아있는 계약 테스트 + Runtime Doctor 3제품 패리티 게이트
 #
-# v2 재구축 중 비활성(대응 모듈 포팅 시 이 게이트로 복귀시킬 것):
-#   semver-precedence            → v2 update 모듈 (모놀리스 소스 검사였음 — v2용 재작성 필요)
-#   desktop-ontology-loadout-contract → v2 run --experience-desktop-loadout 배선
-#   experience-exchange-contract / experience-auto-intake-contract / experience-p6-cli-contract
-#                                → v2 experience CLI 배선 (agentlas-experience-mcp 후계 모듈)
-#   mcp-child-env-isolation / mcp-config-isolation / mcp-probe-concurrency / mcp-consent-allowlist
-#                                → v2 mcp 모듈
-#   permission-mapping           → v2 runner 배선 (native-host capture 경로)
-#   workload-routing-contract / workforce-runtime-contract / stormbreaker-core-contract
-#                                → v2 workforce/storm 배선 (agentlas-parity 후계 모듈)
-#   credential-env-regression / runtime-env-protection / memory-prompt-budget
-#                                → v2 credentials/runner/memory 배선
-#   기타 v1 전용(cloud-*, route-regression, terminal-ui-regression, …)은
-#     legacy-v1-engine-snapshot 태그에 보존.
+# v1의 전 계약 테스트가 v2 모듈로 복원 완료됐다. 신규 test/ 파일은 공개 push
+# 가드에 걸릴 수 있어 아래 optional 루프에서 존재할 때만 실행한다.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

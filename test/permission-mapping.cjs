@@ -12,11 +12,12 @@ const {
   prepareCodexRuntimeEnv,
 } = require("../engine/agentlas-native-host.cjs");
 const permissions = require("../engine/agentlas-permissions.cjs");
+// v2 repoint: 모놀리스의 캡처 경로 심볼은 engine/workforce/capture.cjs 로 포팅. 단언 보존.
 const {
   buildArgs: legacyBuildArgs,
   codexCaptureAgentText,
   capturedRuntimeAgentText,
-} = require("../engine/agentlas.cjs");
+} = require("../engine/workforce/capture.cjs");
 
 const mcpServers = [{
   id: "playwright",

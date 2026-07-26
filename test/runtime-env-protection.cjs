@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 const assert = require("node:assert/strict");
-const runtime = require("../engine/agentlas.cjs");
+const capture = require("../engine/workforce/capture.cjs");
+// v2 repoint: 모놀리스의 parseDotEnvCli/mergeChildEnvValuesCli는 engine/workforce/capture.cjs
+// 로 포팅되었다(이름의 Cli 접미사 제거). 단언은 전부 보존.
+const runtime = { parseDotEnvCli: capture.parseDotEnv, mergeChildEnvValuesCli: capture.mergeChildEnvValues };
 
 const base = {
   HOME: "/trusted/home",
