@@ -50,6 +50,8 @@ function buildCtx() {
       if (_db) return _db;
       _db = openDb();
       seedBuiltins(_db);
+      // 크래시로 남은 Hub 설치 저널 스윕 — DB행과 물질화 파일의 원자성 회복 (v1 부팅 계약).
+      try { require("./hub/install.cjs").recoverCloudInstallJournals(_db); } catch { /* best-effort */ }
       return _db;
     },
     tableExists,

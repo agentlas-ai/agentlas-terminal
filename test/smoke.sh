@@ -80,9 +80,19 @@ check "bootstrap-race" node "$SCRIPT_DIR/bootstrap-race.cjs"
 check "sqlite-driver-probe" node "$SCRIPT_DIR/sqlite-driver-probe.cjs"
 check "experience-taxonomy-parity" node "$SCRIPT_DIR/experience-taxonomy-parity.cjs"
 check "tool-workspace-boundary" node "$SCRIPT_DIR/tool-workspace-boundary.cjs"
-check "session-orchestrator-contract" node "$SCRIPT_DIR/session-orchestrator-contract.cjs"
-check "timeout-regression" node "$SCRIPT_DIR/timeout-regression.cjs"
-check "update-semver-contract" node "$SCRIPT_DIR/update-semver-contract.cjs"
+
+# 공개 저장소 push 가드가 test/ 신규 파일을 막을 수 있어, v2 신규 계약 테스트는
+# 존재할 때만 실행한다 (로컬/사설 CI에서는 전부 돈다 — v1과 동일 관례).
+for optional in \
+  session-orchestrator-contract timeout-regression update-semver-contract \
+  login-loopback-security plugin-add-contract hub-install-contract \
+  automation-contract workforce-runtime-contract capture-runtime-guard \
+  mcp-config-isolation mcp-probe-concurrency mcp-consent-allowlist mcp-child-env-isolation
+do
+  if [ -f "$SCRIPT_DIR/$optional.cjs" ]; then
+    check "$optional" node "$SCRIPT_DIR/$optional.cjs"
+  fi
+done
 
 # 신선 환경 첫 실행
 FRESH="$(mktemp -d "${TMPDIR:-/tmp}/agentlas-smoke-XXXXXX")"
