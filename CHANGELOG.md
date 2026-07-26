@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased — v2 engine ground-up rewrite (2026-07-27)
+
+- The 13,347-line v1 engine monolith is replaced by a modular v2 engine
+  (one concern per module: core/ runtimes/ agents/ sessions/ ui/ commands/
+  cloud/ hub/ mcp/ automation/ workforce/ storm/ experience/ project/
+  hephaestus/ oberon/ cloud-assets/). The full v1 command surface (55
+  commands) is live; commands that are not wired stop honestly with exit 1 —
+  there are no silent successes and no facades. The complete v1 engine
+  remains recoverable at git tag `legacy-v1-engine-snapshot`.
+- Multi-session subagent orchestration (Orca) is first-class: every run —
+  foreground chat, one-shot, storm/swarm worker, automation run — is a
+  session owned by one orchestrator. Subagent sessions persist as Desktop
+  division sub-chats (`kind='division'` + `parent_chat_id`). In the REPL:
+  `/spawn /sessions /tree /s /steer /kill /rm /broadcast`; typing during a
+  running turn queues steering on the resume session; ctrl-c interrupts the
+  turn. Background turn completions surface as one-line notices.
+- Cross-product contracts preserved and gated: shared Desktop SQLite schema
+  (user_version=45) and userData; runtime-doctor 3-product parity
+  (sync-runtime-doctor.sh PASS); experience taxonomy checksum;
+  desktop-terminal ontology loadout v2; portable Experience Bundle v1;
+  workforce ontology digests; mcp-child-launch env boundary; pinned
+  Agentlas OS Core harness. The known dev-only Hephaestus root defect and
+  the terminal-owned Desktop .app self-updater were removed (the latter
+  belongs to Desktop; `agentlas update` is npm-channel only).
+- smoke gate expanded to 47 checks (basic surface, no-arg guards, fresh
+  bootstrap, 30+ restored/new contract tests, doctor parity) — all green.
+  Not released; the version stays 0.9.10 until an explicit release decision.
+
 ## 0.9.10 — 2026-07-26
 
 - Concurrent Terminal work against the Desktop-shared SQLite database now uses

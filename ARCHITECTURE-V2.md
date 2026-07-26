@@ -1,8 +1,10 @@
 # Agentlas Terminal v2 — Ground-Up Rewrite Architecture
 
-Status: ACTIVE REWRITE (2026-07-26). v1 engine is preserved at git tag
-`legacy-v1-engine-snapshot`. Everything below `engine/` except the keep-list
-is deleted and rebuilt.
+Status: REWRITE COMPLETE (2026-07-27). The full v1 command surface (55
+commands) is live on the v2 engine; smoke runs 47 checks green including the
+runtime-doctor 3-product parity gate. v1 remains recoverable at git tag
+`legacy-v1-engine-snapshot`. Not yet released (release freeze applies);
+version stays 0.9.10 until an explicit release decision.
 
 ## Why
 

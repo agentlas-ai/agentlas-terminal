@@ -8,27 +8,53 @@ const HELP = `agentlas — the operating system for agents, in your terminal
   agentlas "<task>"        auto-route to the best agent and run once
 
 TALK & RUN
-  <agent>                  jump into a chat with one agent
+  <agent> · chat <agent>   jump into a chat with one agent
   run [agent] [prompt]     one-shot (-p print · --runtime · --permission; stdin ok)
-  chats [n]                recent conversations
+  firm <firm> [task]       delegate to a company's CEO
+  chats [n] · open <id>    recent conversations · resume one
 
 AGENTS & HUB
   search "<what you need>" discover agents in the Hub
+  install <slug>           install an agent from the Hub
+  plugin add <slug> · plugin list      Hub plugins (MCP servers)
+  build "<request>"        build/repair/package an agent or team
+  upload <path>            save owner-private in Agent Cloud (--visibility marketplace to publish)
+  import <path> · cd · native prepare  local folder agents
   list                     installed agents/companies + active runtime
+  experience <sub>         portable Experience: list|inspect|validate|save|publish|status|export|unpublish
+  variant resolve          local variant selection
+
+EXECUTE
+  storm <goal>             Goal+UltraCode harness: plan → allocate → execute → verify  [--research]
+  swarm <goal>             emergent agent swarm  [--parallel N]
+  workforce | network <request>   Agent Workforce Ontology route
+  call "a,b" "<ctx>" · browser · route "<req>" [--json] · research <sub>
+
+KNOWLEDGE
+  memory import · evolve   memory & prompt-evolution proposals
+  ontology · career-graph  project knowledge & source routing
+  journal <sub>            Stormbreaker run journal
+  project [status|init]    private .agentlas project state (init is explicit)
+  context <sub>            dependency map: refresh|locate|refs|slice|impact|verify
 
 ACCOUNT & OPS
   login | logout | whoami  Agentlas Cloud sign-in (browser flow)
-  usage · telegram · mcp   local usage · telegram bindings · MCP servers
-  doctor                   check runtimes, data, credentials
-  update                   check for a newer agentlas on npm
+  cloud <sub>              cloud assets: save|publish|package|list|restore|field-test
+  automation <sub>         list|add|on|off|remove|run <id>|runs|daemon
+  creds <sub> · env        credentials and shared env keys
+  usage · telegram · mcp   local usage · telegram bindings · MCP servers (mcp probe <id>)
+  multimodal               image/video/audio provider settings
+  doctor · setup · update  health check · first-run wizard · npm update check
+  oberon | film <sub>      AI film render (scaffold|render|list|open)
+  hep <sub…> · netadmin    Hephaestus passthrough · local network admin
   version · help
 
-IN-REPL (agentlas → interactive)
-  /spawn /sessions /tree /s /steer /kill /broadcast — Orca multi-session control
+IN-REPL (agentlas → interactive, Orca multi-session)
+  /spawn <agent> [task] · /sessions · /tree · /s <n> · /steer <n> <msg> ·
+  /kill <n> · /rm <n> · /broadcast <msg> · /use · /runtime · /permission
+  typing during a running turn queues steering; ctrl-c interrupts the turn
 
-REBUILDING (returns as each v2 module lands; full v1: npm agentlas@0.9.10)
-  install · plugin · build · upload · storm · swarm · network · workforce ·
-  call · automation · experience · cloud · memory · context · project · …
+Options: -p|--print · --runtime claude-code|codex|gemini · --permission read|write|full
 `;
 
 function run(ctx) {
