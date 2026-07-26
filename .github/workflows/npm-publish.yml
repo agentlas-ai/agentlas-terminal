@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      AGENTLAS_CORE_COMMIT: e76d8cd729c8c7f4a7d69be02c9e2c82ff5a97c5
+      AGENTLAS_CORE_COMMIT: 04258b7541f604479dc04279146a506e363ad85e
       HEPHAESTUS_RUNTIME_ROOT: ${{ github.workspace }}/Agentlas-OS
       HEPHAESTUS_PYTHON: python
     steps:

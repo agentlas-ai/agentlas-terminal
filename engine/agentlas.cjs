@@ -35,7 +35,11 @@ const desktopOntologyLoadout = require("./agentlas-desktop-loadout.cjs");
 const workloadRouting = require("./agentlas-workload-routing.cjs");
 const terminalExperienceIntake = require("./agentlas-experience-intake.cjs");
 const terminalMemoryGovernance = require("./agentlas-memory-governance.cjs");
-const { captureCoreJsonSync, resolveCoreRuntimeRoot } = require("./agentlas-core-harness.cjs");
+const {
+  captureCoreJsonSync,
+  resolveCoreRuntimeRoot,
+  spawnCoreModule,
+} = require("./agentlas-core-harness.cjs");
 
 // ── 앱과 동일한 userData 경로 (electron app.getPath('userData')와 일치) ──
 function userDataDir() {
@@ -8337,6 +8341,7 @@ function ensureTerminalProjectForExecutionCli(db, projectPath, permission = PERM
 
 function cliProjectContextSlice(projectPath, task) {
   if (!projectPath || !String(task || "").trim()) return "";
+  if (!fs.existsSync(path.join(projectPath, ".agentlas"))) return "";
   try {
     const coreRoot = resolveCoreRuntimeRoot();
     if (!coreRoot) return "";
@@ -8346,7 +8351,6 @@ function cliProjectContextSlice(projectPath, task) {
         "context", "slice",
         "--project", projectPath,
         "--task-stdin",
-        "--no-refresh",
         "--render",
       ],
       {
@@ -8364,6 +8368,33 @@ function cliProjectContextSlice(projectPath, task) {
   } catch {
     return "";
   }
+}
+
+function cliProjectContextCommand(projectPath, args) {
+  const coreRoot = resolveCoreRuntimeRoot();
+  const child = spawnCoreModule(
+    "agentlas_cloud",
+    ["context", ...args],
+    { cwd: projectPath, stdio: "inherit" },
+    coreRoot,
+  );
+  if (!child) {
+    process.stderr.write("Agentlas Context Map requires the installed Agentlas Core runtime and Python 3.9+.\n");
+    process.exitCode = 1;
+    return Promise.resolve(1);
+  }
+  return new Promise((resolve) => {
+    child.on("error", (error) => {
+      process.stderr.write(`Agentlas Context Map failed: ${error.message}\n`);
+      process.exitCode = 1;
+      resolve(1);
+    });
+    child.on("close", (code) => {
+      const status = code == null ? 1 : code;
+      if (status !== 0) process.exitCode = status;
+      resolve(status);
+    });
+  });
 }
 
 function cliMemoryContext(db, projectPath, agentId = null, task = "") {
@@ -12105,9 +12136,9 @@ async function main() {
       ensureTerminalProjectForExecutionCli(db, cwd, PERMISSION, "terminal-context");
       const contextArgs = rest.slice(1);
       const hasProject = contextArgs.includes("--project");
-      return parity().cmdHep(
-        db,
-        ["context", ...contextArgs, ...(hasProject ? [] : ["--project", cwd])],
+      return cliProjectContextCommand(
+        cwd,
+        [...contextArgs, ...(hasProject ? [] : ["--project", cwd])],
       );
     }
     case "evolve":

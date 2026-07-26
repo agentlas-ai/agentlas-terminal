@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.9.10 — 2026-07-26
+
+- `agentlas context refresh|refs|slice|impact|verify` now invokes the installed
+  Agentlas Core module directly. Context commands no longer fall through the
+  natural-language Hephaestus command route.
+- Context Slice generation refreshes the project fingerprint before each
+  concrete Terminal task, so a long-running Terminal session sees newly added
+  or changed CommonJS, ESM, TypeScript, and JavaScript files.
+- Release validation pins Agentlas Core v1.1.67 commit
+  `04258b7541f604479dc04279146a506e363ad85e`, including Code Map v2 backlinks,
+  functional Sitemap dependencies, and fail-closed impact verification.
+
 ## 0.9.9 — 2026-07-26
 
 - In an explicitly initialized project, ordinary runs, firms, Stormbreaker, and

@@ -17,10 +17,9 @@ Claude Code style, standalone: **no desktop app required.**
 Agentlas Terminal is the already-shipped independent terminal product. It is
 not a Desktop `cli/` mirror and does not require the Desktop app to run.
 
-> **Current source release candidate (2026-07-16):** `v0.9.1`. The source commit
-> does not prove a GitHub release or npm publication. After the immutable tag
-> and release gates pass, verify the independently published npm version with
-> `npm view agentlas version` before installation.
+> **Current source release candidate (2026-07-26):** `v0.9.10`. A source commit
+> does not prove npm publication. Verify the independently published package
+> before installation with `npm view agentlas version`.
 
 Release tags are published to npm through the repository's OIDC trusted
 publisher workflow. The workflow accepts only an exact immutable `vX.Y.Z` tag,
