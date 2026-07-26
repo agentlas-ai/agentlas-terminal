@@ -61,7 +61,12 @@ class Renderer {
         return;
       case "status": ui.status(ev.text); return;
       case "warn": ui.warn(ev.text); return;
-      case "error": ui.error(ev.text); return;
+      case "error":
+        // 사용자가 의도적으로 중단(kill)한 턴의 종료 에러(SIGTERM exit 등)는 소음 —
+        // 실사용 테스트에서 확인된 UX 결함. 중단 안내는 REPL이 이미 출력했다.
+        if (this.session && this.session.status === "killed") return;
+        ui.error(ev.text);
+        return;
       case "line": ui.line(ev.text); return;
       case "tool": ui.tool(ev.name, ev.summary); return;
       case "tool-result": ui.toolResult(ev.text, ev.ok); return;

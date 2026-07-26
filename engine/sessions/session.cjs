@@ -118,6 +118,13 @@ class Session extends EventEmitter {
     this.lastError = null;
     this._record({ type: "turn-start", at: Date.now(), prompt });
     store.appendMessage(this.db, this.chatId, "user", prompt);
+    // 데스크탑처럼 첫 프롬프트로 자동 제목 — "New chat"으로 남는 목록 방지(실사용 테스트 발견).
+    try {
+      const row = this.db.prepare("SELECT title FROM chats WHERE id=?").get(this.chatId);
+      if (row && (row.title === "New chat" || !row.title)) {
+        store.retitleChat(this.db, this.chatId, prompt.slice(0, 60));
+      }
+    } catch { /* 제목은 장식 — 실패해도 턴 진행 */ }
 
     // 데스크탑 러너 동형 프롬프트 조립: 언어지시 + 에이전트 프롬프트 + 연결 스킬 +
     // 거버넌스 메모리 컨텍스트 + 메모리 이미터 코어(+의도 시 전체 스키마/자격증명 리마인더).

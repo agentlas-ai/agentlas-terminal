@@ -56,7 +56,11 @@ async function startRepl(ctx, opts = {}) {
         if (result.runtime) ctx.prefs.runtime = result.runtime;
         ctx.prefs.onboarded = !!result.onboarded;
       }
-    } catch { /* 온보딩 실패는 REPL 진입을 막지 않는다 */ } finally {
+    } catch (e) {
+      // 온보딩 실패는 REPL 진입을 막지 않지만, 조용히 삼키면 마법사 프롬프트와
+      // REPL이 stdin을 경합하는 사고(실사용 테스트에서 실증)가 위장된다 — 표시한다.
+      ctx.err(ui.c.dim((en ? "setup wizard failed: " : "설정 마법사 실패: ") + String((e && e.message) || e)));
+    } finally {
       wizardRl.close();
     }
   }

@@ -13,7 +13,7 @@ async function runWizard(ctx, rl) {
   const result = await runOnboard({
     ui: ctx.uiInstance,
     rl,
-    helpers: { RUNTIME: RUNTIME_BIN, which: whichSync },
+    helpers: { RUNTIME_BIN, which: whichSync },
   });
   if (result && result.onboarded) {
     updatePrefs(userDataDir(), {
@@ -27,6 +27,12 @@ async function runWizard(ctx, rl) {
 }
 
 async function run(ctx) {
+  if (!process.stdin.isTTY) {
+    // 비-TTY에서 마법사를 돌리면 EOF로 이벤트 루프가 비어 exit 0으로 "조용히 성공"
+    // 하는 함정이 있다 — 정직하게 거부한다.
+    ctx.err(ctx.lang === "ko" ? "setup은 대화형 터미널에서만 실행됩니다." : "setup requires an interactive terminal.");
+    return 1;
+  }
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
     const result = await runWizard(ctx, rl);
