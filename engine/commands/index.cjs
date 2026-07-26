@@ -16,21 +16,28 @@ const COMMANDS = {
   doctor: () => require("./doctor.cjs"),
   mcp: () => require("./mcp.cjs"),
   help: () => require("./help.cjs"),
-  usage: () => require("./help.cjs"),
   run: () => require("./run.cjs"),
+  login: () => require("./login.cjs"),
+  logout: () => require("./logout.cjs"),
+  whoami: () => require("./whoami.cjs"),
+  search: () => require("./search.cjs"),
+  update: () => require("./update.cjs"),
+  usage: () => require("./usage.cjs"),
+  telegram: () => require("./telegram.cjs"),
+  setup: () => require("./setup.cjs"),
 };
 
 // v1에 존재했으나 아직 v2로 재구축되지 않은 명령 — 정직 정지 목록.
 // 재구축이 끝나면 여기서 지우고 COMMANDS에 올린다.
 const NOT_YET_PORTED = [
   "chat", "open", "firm", "import", "cd", "native",
-  "search", "install", "plugin", "build", "upload", "connect",
+  "install", "plugin", "build", "upload", "connect",
   "storm", "swarm", "network", "workforce", "taskforce", "legacy-network",
   "call", "browser", "route", "research", "netadmin", "journal",
-  "login", "logout", "whoami", "automation", "creds", "env", "memory",
+  "automation", "creds", "env", "memory",
   "evolve", "multimodal", "oberon", "film", "ontology", "career-graph",
-  "cloud", "experience", "variant", "telegram", "setup", "project",
-  "context", "update", "hep",
+  "cloud", "experience", "variant", "project",
+  "context", "hep",
 ];
 
 // 무인자 호출이 프롬프트로 오라우팅되면 안 되는 명령 (smoke 가드 대상)

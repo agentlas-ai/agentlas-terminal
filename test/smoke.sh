@@ -81,6 +81,8 @@ check "sqlite-driver-probe" node "$SCRIPT_DIR/sqlite-driver-probe.cjs"
 check "experience-taxonomy-parity" node "$SCRIPT_DIR/experience-taxonomy-parity.cjs"
 check "tool-workspace-boundary" node "$SCRIPT_DIR/tool-workspace-boundary.cjs"
 check "session-orchestrator-contract" node "$SCRIPT_DIR/session-orchestrator-contract.cjs"
+check "timeout-regression" node "$SCRIPT_DIR/timeout-regression.cjs"
+check "update-semver-contract" node "$SCRIPT_DIR/update-semver-contract.cjs"
 
 # 신선 환경 첫 실행
 FRESH="$(mktemp -d "${TMPDIR:-/tmp}/agentlas-smoke-XXXXXX")"

@@ -33,7 +33,7 @@ function pickDefaultAgent(db) {
   return null;
 }
 
-function startRepl(ctx, opts = {}) {
+async function startRepl(ctx, opts = {}) {
   const en = ctx.lang === "en";
   const ui = ctx.uiInstance;
   const db = ctx.db();
@@ -42,6 +42,23 @@ function startRepl(ctx, opts = {}) {
     process.stdout.write(renderBanner({ version: readVersion(), lang: ctx.lang }) + "\n");
   } catch {
     ctx.out(`agentlas ${readVersion()}`);
+  }
+
+  // 첫 실행 온보딩 (언어 → 런타임 → 권한). setup 명령으로 언제든 재실행 가능.
+  if (!ctx.prefs.onboarded && process.stdin.isTTY) {
+    const wizardRl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      const { runWizard } = require("../commands/setup.cjs");
+      const result = await runWizard(ctx, wizardRl);
+      if (result) {
+        if (result.lang) { ctx.prefs.language = result.lang; }
+        if (result.permission) ctx.prefs.permission = result.permission;
+        if (result.runtime) ctx.prefs.runtime = result.runtime;
+        ctx.prefs.onboarded = !!result.onboarded;
+      }
+    } catch { /* 온보딩 실패는 REPL 진입을 막지 않는다 */ } finally {
+      wizardRl.close();
+    }
   }
 
   const orch = new Orchestrator({ db, lang: ctx.lang });
