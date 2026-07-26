@@ -98,7 +98,20 @@ async function startRepl(ctx, opts = {}) {
   }
 
   return new Promise((resolve) => {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    // v1 input 모듈 재사용: 히스토리 영속 + 탭 완성(슬래시/에이전트/회사/@경로).
+    const input = require("../agentlas-input.cjs");
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+      completer: input.makeCompleter({
+        getAgentSlugs: () => { try { return listAgents(db).map((a) => a.slug); } catch { return []; } },
+        getFirmSlugs: () => {
+          try { return db.prepare("SELECT slug FROM firms ORDER BY slug").all().map((r) => r.slug); } catch { return []; }
+        },
+        getCwd: () => process.cwd(),
+      }),
+    });
+    input.attachHistory(rl);
     const PROMPT = "› ";
     const prompt = () => {
       if (!renderer.session || !renderer.session.isBusy()) {
@@ -184,6 +197,7 @@ async function startRepl(ctx, opts = {}) {
     });
 
     rl.on("close", () => {
+      input.persistHistory(rl);
       renderer.detach();
       orch.shutdown();
       ui.ensureNl();
