@@ -2,10 +2,19 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { spawn } = require("node:child_process");
 const { EventEmitter } = require("node:events");
 const { PassThrough } = require("node:stream");
 const { fetchHubCli, hubTimeoutConfig } = require("../engine/agentlas.cjs");
-const { runNativeTurn, nativeTimeoutConfig } = require("../engine/agentlas-native-host.cjs");
+const {
+  activeNativeProcessIds,
+  forceStopNativeProcessTree,
+  runNativeTurn,
+  nativeTimeoutConfig,
+} = require("../engine/agentlas-native-host.cjs");
 
 function delayedResponse(parts, delayMs, options = {}) {
   let timer = null;
@@ -206,9 +215,48 @@ async function testNativeTimeouts() {
   assert.deepEqual(cancellable.signals, ["SIGTERM"]);
 }
 
+async function testDetachedDescendantCancellation() {
+  if (process.platform === "win32") return;
+  assert.equal(activeNativeProcessIds([12345], null), null, "process verification must fail closed when ps is unavailable");
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "agentlas-native-tree-"));
+  const sentinel = path.join(tempDir, "must-not-exist.txt");
+  const descendantCode = [
+    "const fs = require('node:fs');",
+    `setTimeout(() => fs.writeFileSync(${JSON.stringify(sentinel)}, 'BAD\\n'), 700);`,
+    "setInterval(() => {}, 1000);",
+  ].join("\n");
+  const rootCode = [
+    "const { spawn } = require('node:child_process');",
+    `spawn(process.execPath, ['-e', ${JSON.stringify(descendantCode)}], { detached: true, stdio: 'ignore' }).unref();`,
+    "setInterval(() => {}, 1000);",
+  ].join("\n");
+  const root = spawn(process.execPath, ["-e", rootCode], {
+    detached: true,
+    stdio: "ignore",
+  });
+  root.__agentlasGroupedChild = true;
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const targets = forceStopNativeProcessTree(root);
+    assert.ok(targets.includes(root.pid), "forced tree must include the native runtime root");
+    assert.ok(targets.length >= 2, "forced tree must include a detached tool descendant");
+    const deadline = Date.now() + 2_000;
+    while (activeNativeProcessIds(targets).length && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.deepEqual(activeNativeProcessIds(targets), [], "cancelled native tree must be fully stopped");
+    await new Promise((resolve) => setTimeout(resolve, 750));
+    assert.equal(fs.existsSync(sentinel), false, "detached tool descendant must not finish a forbidden write");
+  } finally {
+    try { process.kill(-root.pid, "SIGKILL"); } catch { /* already gone */ }
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   await testHubTimeouts();
   await testNativeTimeouts();
+  await testDetachedDescendantCancellation();
   console.log("timeout-regression: PASS");
 }
 

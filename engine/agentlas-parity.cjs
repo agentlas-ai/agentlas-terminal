@@ -18,8 +18,11 @@ const fs = require("node:fs");
 const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
 const { Ui } = require("./agentlas-ui.cjs");
+const { truncateWidth, visWidth, wrapWidth } = require("./agentlas-composer.cjs");
+const permissionPolicy = require("./agentlas-permissions.cjs");
 const workloadRouting = require("./agentlas-workload-routing.cjs");
 const {
+  CONTEXT_MAP_MIN_CORE_VERSION,
   loadCoreStormbreakerHarness,
   resolveCoreRuntimeRoot,
   spawnCoreModule,
@@ -50,6 +53,122 @@ function loginStatesMatch(actual, expected) {
   const left = Buffer.from(String(actual || ""), "utf8");
   const right = Buffer.from(String(expected || ""), "utf8");
   return left.length === right.length && left.length > 0 && crypto.timingSafeEqual(left, right);
+}
+
+function routePreviewModel(value) {
+  const json = value && typeof value === "object" ? value : {};
+  const execution = json.execution && typeof json.execution === "object" ? json.execution : {};
+  const hubResults = Array.isArray(json.hub?.results) ? json.hub.results : [];
+  const idOf = (candidate) => {
+    if (typeof candidate === "string") return candidate;
+    return candidate && (candidate.slug || candidate.id || candidate.agent || candidate.name) || null;
+  };
+  const lookup = (candidate) => {
+    const id = idOf(candidate);
+    if (!id) return null;
+    const match = hubResults.find((item) => idOf(item) === id);
+    const source = match || (candidate && typeof candidate === "object" ? candidate : {});
+    return {
+      id,
+      name: source.name || source.nameEn || source.title || id,
+      nameEn: source.nameEn || source.name_en || source.name || source.title || id,
+      kind: source.kind || source.entityKind || "",
+    };
+  };
+  const selected = lookup(json.selected);
+  const primary = lookup(execution.primary_agent || execution.recommended_agents?.[0]);
+  const candidates = [];
+  const add = (candidate) => {
+    const normalized = lookup(candidate);
+    if (!normalized || candidates.some((item) => item.id === normalized.id)) return;
+    candidates.push(normalized);
+  };
+  add(selected);
+  add(primary);
+  for (const candidate of hubResults) add(candidate);
+  for (const candidate of execution.recommended_agents || []) add(candidate);
+  for (const candidate of execution.alternatives || []) add(candidate);
+  return {
+    selected,
+    primary,
+    candidates: candidates.slice(0, 6),
+    scope: json.scope || json.hub?.scope || null,
+    receiptId: json.receipt_id || null,
+    needsRouter: !selected && json.router_agent?.mode === "escalate_to_router_agent",
+  };
+}
+
+function researchPreviewModel(value) {
+  const json = value && typeof value === "object" ? value : {};
+  const request = json.request && typeof json.request === "object" ? json.request : {};
+  const receipt = json.receipt && typeof json.receipt === "object" ? json.receipt : {};
+  const policy = receipt.policy && typeof receipt.policy === "object"
+    ? receipt.policy
+    : (json.policy && typeof json.policy === "object" ? json.policy : {});
+  const capability = json.capability_summary && typeof json.capability_summary === "object"
+    ? json.capability_summary
+    : {};
+  const quality = policy.evidence_quality && typeof policy.evidence_quality === "object"
+    ? policy.evidence_quality
+    : {};
+  const coverage = policy.evidence_coverage && typeof policy.evidence_coverage === "object"
+    ? policy.evidence_coverage
+    : {};
+  const attempts = Array.isArray(receipt.attempts) ? receipt.attempts : [];
+  const results = Array.isArray(json.results) ? json.results : [];
+  const summary = json.summary && typeof json.summary === "object" ? json.summary : {};
+  const modules = [
+    ...(Array.isArray(receipt.module_chain) ? receipt.module_chain : []),
+    ...(Array.isArray(json.ready_mounted_modules) ? json.ready_mounted_modules : []),
+    ...(Array.isArray(json.mounted_modules) ? json.mounted_modules : []),
+  ].filter((item, index, array) => item && array.indexOf(item) === index);
+  const intent = request.intent || (
+    String(json.schema || "").includes(".status.") ? "status"
+      : String(json.schema || "").includes(".plan.") ? "plan"
+        : "research"
+  );
+  const maxRequests = request.max_cost?.requests
+    ?? policy.request_budget?.max_requests
+    ?? policy.max_cost_requests
+    ?? null;
+  const totalEvidenceFailure = ["search", "read", "gather"].includes(intent)
+    && results.length === 0
+    && (
+      capability.status === "missing_evidence"
+      || capability.trust?.can_use_for_build_context === false
+      || quality.status === "none"
+      || coverage.status === "missing"
+    );
+  return {
+    schema: json.schema || "",
+    status: json.status || "unknown",
+    intent,
+    query: request.query || "",
+    loadout: request.loadout || policy.loadout?.name || "",
+    depth: request.depth || "",
+    maxRequests,
+    networkWillRun: json.network_will_run ?? policy.network_will_run,
+    receiptWillBeWritten: policy.receipt_will_be_written,
+    privateHostsBlocked: policy.private_hosts_blocked,
+    browserMounted: policy.browser_modules_mounted,
+    goalReady: json.goal_ready,
+    coreReady: summary.core_engine_ok,
+    publicFallbackReady: summary.public_social_fallbacks_ok,
+    browserReady: summary.browser_hardpoint_ok,
+    socialReady: summary.credentialed_social_ok,
+    incompleteCount: summary.incomplete_count,
+    missingProofs: Array.isArray(summary.missing_or_unready_proofs) ? summary.missing_or_unready_proofs : [],
+    modules,
+    attempts,
+    results,
+    qualityStatus: quality.status || "",
+    qualityScore: quality.score,
+    coverageStatus: coverage.status || "",
+    warnings: Array.isArray(capability.trust?.warnings) ? capability.trust.warnings : [],
+    canUseForBuildContext: capability.trust?.can_use_for_build_context,
+    receiptId: receipt.receipt_id || json.receipt_id || "",
+    totalEvidenceFailure,
+  };
 }
 
 /**
@@ -125,6 +244,7 @@ function createLoginCallbackGuard(expectedState) {
 
 function create(deps) {
   const D = deps;
+  const isKo = () => D.prefsLang && D.prefsLang() === "ko";
 
   function newUi(lang) {
     return new Ui({ lang: lang || D.prefsLang() });
@@ -183,6 +303,306 @@ function create(deps) {
     if (!found) return null;
     if (found.kind === "bin") return spawn(found.exec, args, opts);
     return spawnCoreModule("agentlas_cloud", args, opts, found.root);
+  }
+
+  function renderRoutePreview(json, ui) {
+    const model = routePreviewModel(json);
+    const ko = ui.lang === "ko";
+    const room = Math.max(28, (ui.out.columns || 80) - 2);
+    const emit = (prefix, value, paint = (text) => ui.c.text(text)) => {
+      const label = String(prefix || "");
+      const continuation = " ".repeat(visWidth(label));
+      const lines = wrapWidth(String(value || ""), Math.max(2, room - visWidth(label)));
+      lines.forEach((line, index) => {
+        ui.line("  " + (index === 0 ? ui.c.faint(label) : continuation) + paint(line));
+      });
+    };
+    const scope = model.scope === "cloud"
+      ? (ko ? "내 Agent Cloud 보관함" : "my Agent Cloud library")
+      : model.scope === "network"
+        ? (ko ? "공개 Agentlas Hub" : "public Agentlas Hub")
+        : (model.scope || (ko ? "자동" : "automatic"));
+    ui.line("");
+    ui.rule(ko ? "라우팅 미리보기" : "Route preview");
+    emit(ko ? "범위: " : "Scope: ", scope);
+    if (model.selected) {
+      emit(ko ? "선택: " : "Selected: ", `${model.selected.name} (${model.selected.id})`, (text) => ui.c.emerald(text));
+    } else {
+      emit(
+        ko ? "결정: " : "Decision: ",
+        ko ? "아직 자동 선택하지 않음" : "no automatic selection yet",
+        (text) => ui.c.amber(text),
+      );
+    }
+    if (model.candidates.length) {
+      emit(ko ? "후보: " : "Candidates: ", ko ? `${model.candidates.length}개` : String(model.candidates.length));
+      model.candidates.forEach((candidate, index) => {
+        const primary = model.primary && candidate.id === model.primary.id
+          ? (ko ? " · 우선 후보" : " · primary candidate")
+          : "";
+        const name = ko ? candidate.name : candidate.nameEn;
+        emit(`${index + 1}. `, `${name} (${candidate.id})${primary}`);
+      });
+    }
+    if (model.needsRouter) {
+      emit(
+        ko ? "이유: " : "Why: ",
+        ko
+          ? "관련 후보는 찾았지만 자동 선택 확신이 부족합니다."
+          : "Candidates matched, but confidence was too low for an automatic choice.",
+      );
+    } else if (!model.candidates.length) {
+      emit(
+        ko ? "이유: " : "Why: ",
+        ko ? "일치하는 후보를 찾지 못했습니다." : "No matching candidate was found.",
+      );
+    }
+    if (!model.selected && model.primary) {
+      emit(
+        ko ? "다음: " : "Next: ",
+        `agentlas call "${model.primary.id}" "<request>"`,
+        (text) => ui.c.emerald(text),
+      );
+    }
+    if (model.receiptId) emit(ko ? "영수증: " : "Receipt: ", model.receiptId);
+  }
+
+  function captureHephaestus(args, opts = {}) {
+    const cwd = opts.cwd || D.runCwd();
+    const maxBytes = 2 * 1024 * 1024;
+    const timeoutMs = Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : 30_000;
+    return new Promise((resolve) => {
+      const child = spawnHephaestus(args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+      if (!child) return resolve({ code: 1, stdout: "", stderr: "Hephaestus runtime unavailable.", unavailable: true });
+      const stdout = [];
+      const stderr = [];
+      let bytes = 0;
+      let overflow = false;
+      let timedOut = false;
+      let settled = false;
+      const append = (target, chunk) => {
+        if (overflow) return;
+        bytes += chunk.length;
+        if (bytes > maxBytes) {
+          overflow = true;
+          child.kill("SIGTERM");
+          return;
+        }
+        target.push(chunk);
+      };
+      child.stdout.on("data", (chunk) => append(stdout, Buffer.from(chunk)));
+      child.stderr.on("data", (chunk) => append(stderr, Buffer.from(chunk)));
+      const onInterrupt = () => child.kill("SIGINT");
+      process.once("SIGINT", onInterrupt);
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGTERM");
+      }, timeoutMs);
+      if (timer.unref) timer.unref();
+      const done = (code, error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        process.removeListener("SIGINT", onInterrupt);
+        resolve({
+          code: overflow || timedOut || error ? 1 : (code ?? 0),
+          stdout: Buffer.concat(stdout).toString("utf8"),
+          stderr: error ? String(error.message || error) : Buffer.concat(stderr).toString("utf8"),
+          overflow,
+          timedOut,
+        });
+      };
+      child.on("error", (error) => done(1, error));
+      child.on("close", (code) => done(code));
+    });
+  }
+
+  async function runHephaestusRoute(args, opts = {}) {
+    const raw = args.includes("--json");
+    const cleanArgs = args.filter((arg) => arg !== "--json");
+    if (raw) return runHephaestusInteractive(cleanArgs, { ...opts, human: false });
+    if (!hephaestusBin()) return runHephaestusInteractive(cleanArgs, { ...opts, human: false });
+    const ui = opts.ui || newUi();
+    const result = await captureHephaestus(cleanArgs, opts);
+    let json = null;
+    try {
+      const start = result.stdout.indexOf("{");
+      const end = result.stdout.lastIndexOf("}");
+      if (start >= 0 && end > start) json = JSON.parse(result.stdout.slice(start, end + 1));
+    } catch { /* handled below */ }
+    const renderError = (message) => {
+      const room = Math.max(28, (ui.out.columns || 80) - 2);
+      wrapWidth(message, Math.max(2, room - 2)).forEach((line, index) => {
+        ui.line("  " + (index === 0 ? ui.c.paw("✗ ") : "  ") + ui.c.text(line));
+      });
+    };
+    if (json) renderRoutePreview(json, ui);
+    else {
+      const detail = (result.stderr || result.stdout || "").trim();
+      const message = detail || (ui.lang === "ko" ? "라우팅 결과를 읽지 못했습니다." : "Could not read the route result.");
+      renderError(message);
+    }
+    if (result.overflow) renderError(ui.lang === "ko" ? "라우팅 출력이 2MB 제한을 넘었습니다." : "Route output exceeded the 2 MB limit.");
+    if (result.timedOut) renderError(ui.lang === "ko" ? "라우팅이 30초 제한을 넘었습니다." : "Route timed out after 30 seconds.");
+    return result.code;
+  }
+
+  function renderResearchPreview(json, ui) {
+    const model = researchPreviewModel(json);
+    const ko = ui.lang === "ko";
+    const room = Math.max(28, (ui.out.columns || 80) - 2);
+    const emit = (prefix, value, paint = (text) => ui.c.text(text)) => {
+      const label = String(prefix || "");
+      const continuation = " ".repeat(visWidth(label));
+      const lines = wrapWidth(String(value ?? ""), Math.max(2, room - visWidth(label)));
+      lines.forEach((line, index) => {
+        ui.line("  " + (index === 0 ? ui.c.faint(label) : continuation) + paint(line));
+      });
+    };
+    const ready = (value) => value === true
+      ? (ko ? "준비됨" : "ready")
+      : value === false
+        ? (ko ? "준비 안 됨" : "not ready")
+        : (ko ? "확인 안 됨" : "unknown");
+    const status = model.status === "ok"
+      ? (ko ? "성공" : "ok")
+      : model.status === "partial"
+        ? (ko ? "일부만 완료" : "partial")
+        : model.status;
+    const title = model.intent === "status"
+      ? (ko ? "리서치 준비 상태" : "Research status")
+      : model.intent === "plan"
+        ? (ko ? "리서치 실행 계획" : "Research plan")
+        : model.intent === "read"
+          ? (ko ? "리서치 읽기 결과" : "Research read")
+          : model.intent === "gather"
+            ? (ko ? "리서치 수집 결과" : "Research gather")
+            : (ko ? "리서치 검색 결과" : "Research search");
+    ui.line("");
+    ui.rule(title);
+    emit(ko ? "상태: " : "Status: ", status, model.status === "ok" ? (text) => ui.c.emerald(text) : (text) => ui.c.amber(text));
+    if (model.query) emit(ko ? "질문: " : "Query: ", model.query);
+
+    if (model.intent === "status") {
+      emit(ko ? "전체: " : "Overall: ", ready(model.goalReady));
+      emit(ko ? "코어: " : "Core: ", ready(model.coreReady));
+      emit(ko ? "공개 소스: " : "Public sources: ", ready(model.publicFallbackReady));
+      emit(ko ? "브라우저: " : "Browser proof: ", ready(model.browserReady));
+      emit(ko ? "소셜: " : "Social proof: ", ready(model.socialReady));
+      if (model.incompleteCount != null) emit(ko ? "누락: " : "Missing: ", String(model.incompleteCount));
+      const proofNames = {
+        reddit_oauth_live_check: ko ? "Reddit OAuth 실시간 증거" : "Reddit OAuth live proof",
+        threads_live_graph_check: ko ? "Threads Graph 실시간 증거" : "Threads Graph live proof",
+        browser_hardpoint_live_check: ko ? "브라우저 hardpoint 실시간 증거" : "browser hardpoint live proof",
+      };
+      for (const proof of model.missingProofs.slice(0, 5)) emit("• ", proofNames[proof] || proof);
+      emit(ko ? "네트워크: " : "Network: ", model.networkWillRun ? (ko ? "실행함" : "will run") : (ko ? "실행 안 함" : "will not run"));
+      return;
+    }
+
+    if (model.intent === "plan") {
+      if (model.loadout) emit(ko ? "구성: " : "Loadout: ", model.loadout);
+      if (model.depth) emit(ko ? "깊이: " : "Depth: ", model.depth);
+      if (model.maxRequests != null) emit(ko ? "요청 한도: " : "Request limit: ", String(model.maxRequests));
+      emit(ko ? "네트워크: " : "Network: ", model.networkWillRun ? (ko ? "실행함" : "will run") : (ko ? "계획 단계에서는 실행 안 함" : "not run during planning"));
+      if (model.receiptWillBeWritten != null) {
+        emit(ko ? "영수증: " : "Receipt: ", model.receiptWillBeWritten ? (ko ? "기록함" : "will be written") : (ko ? "계획 단계에서는 기록 안 함" : "not written during planning"));
+      }
+      if (model.privateHostsBlocked != null) emit(ko ? "사설 주소: " : "Private hosts: ", model.privateHostsBlocked ? (ko ? "차단" : "blocked") : (ko ? "허용" : "allowed"));
+      if (model.browserMounted != null) emit(ko ? "브라우저: " : "Browser: ", model.browserMounted ? (ko ? "포함" : "mounted") : (ko ? "포함 안 함" : "not mounted"));
+      if (model.modules.length) emit(ko ? "모듈: " : "Modules: ", model.modules.join(", "));
+      return;
+    }
+
+    if (model.loadout) emit(ko ? "구성: " : "Loadout: ", model.loadout);
+    if (model.maxRequests != null) {
+      emit(
+        ko ? "요청: " : "Requests: ",
+        `${model.attempts.length}/${model.maxRequests}`,
+      );
+    }
+    if (model.coverageStatus) {
+      const coverage = {
+        search_only: ko ? "검색 스니펫만" : "search snippets only",
+        direct_read: ko ? "본문 직접 읽음" : "direct read",
+        missing: ko ? "증거 없음" : "missing",
+      };
+      emit(ko ? "증거: " : "Evidence: ", coverage[model.coverageStatus] || model.coverageStatus);
+    }
+    if (model.qualityStatus) {
+      const score = model.qualityScore == null ? "" : ` · ${model.qualityScore}/100`;
+      emit(ko ? "품질: " : "Quality: ", `${model.qualityStatus}${score}`);
+    }
+    if (model.modules.length) emit(ko ? "모듈: " : "Modules: ", model.modules.join(", "));
+    emit(ko ? "결과: " : "Results: ", String(model.results.length));
+    model.results.slice(0, 5).forEach((result, index) => {
+      emit(`${index + 1}. `, result.title || result.name || (ko ? "제목 없음" : "Untitled"), (text) => ui.c.emerald(text));
+      if (result.url) {
+        const urlLabel = ko ? "주소: " : "URL: ";
+        emit(urlLabel, truncateWidth(result.url, Math.max(8, room - visWidth(urlLabel))));
+      }
+      const meta = [result.confidence, result.freshness].filter(Boolean).join(" · ");
+      if (meta) emit(ko ? "근거: " : "Evidence: ", meta);
+    });
+    for (const warning of model.warnings.slice(0, 3)) {
+      const text = warning === "search_snippets_need_followup"
+        ? (ko ? "검색 스니펫은 원문 확인이 더 필요합니다." : "Search snippets still need a direct read.")
+        : warning;
+      emit(ko ? "주의: " : "Warning: ", text, (line) => ui.c.amber(line));
+    }
+    if (model.totalEvidenceFailure) {
+      emit(
+        ko ? "실패: " : "Failure: ",
+        ko ? "사용할 수 있는 증거를 얻지 못했습니다." : "No usable evidence was obtained.",
+        (text) => ui.c.paw(text),
+      );
+    }
+    if (model.receiptId) emit(ko ? "영수증: " : "Receipt: ", model.receiptId);
+  }
+
+  async function runHephaestusResearch(args, opts = {}) {
+    if (args.some((arg) => arg === "--help" || arg === "-h" || arg === "help")) {
+      return runHephaestusInteractive(args, { ...opts, human: false });
+    }
+    const raw = args.includes("--json");
+    const cleanArgs = args.filter((arg) => arg !== "--json");
+    if (!hephaestusBin()) return runHephaestusInteractive(cleanArgs, { ...opts, human: false });
+    const ui = opts.ui || newUi();
+    if (!raw) ui.startSpinner(ui.lang === "ko" ? "리서치 실행 중…" : "Running research…");
+    const result = await captureHephaestus(cleanArgs, {
+      ...opts,
+      timeoutMs: Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : 60_000,
+    });
+    if (!raw) ui.stopSpinner();
+    let json = null;
+    try {
+      const start = result.stdout.indexOf("{");
+      const end = result.stdout.lastIndexOf("}");
+      if (start >= 0 && end > start) json = JSON.parse(result.stdout.slice(start, end + 1));
+    } catch { /* handled below */ }
+    const preview = json ? researchPreviewModel(json) : null;
+    const code = result.code !== 0 || preview?.totalEvidenceFailure ? 1 : 0;
+    if (raw) {
+      if (result.stdout) process.stdout.write(result.stdout);
+      if (result.stderr) process.stderr.write(result.stderr);
+      return code;
+    }
+    const renderError = (message) => {
+      const room = Math.max(28, (ui.out.columns || 80) - 2);
+      wrapWidth(message, Math.max(2, room - 2)).forEach((line, index) => {
+        ui.line("  " + (index === 0 ? ui.c.paw("✗ ") : "  ") + ui.c.text(line));
+      });
+    };
+    if (json) {
+      renderResearchPreview(json, ui);
+    } else {
+      const message = (result.stderr || result.stdout || "").trim()
+        || (ui.lang === "ko" ? "리서치 결과를 읽지 못했습니다." : "Could not read the research result.");
+      renderError(message);
+    }
+    if (result.overflow) renderError(ui.lang === "ko" ? "리서치 출력이 2MB 제한을 넘었습니다." : "Research output exceeded the 2 MB limit.");
+    if (result.timedOut) renderError(ui.lang === "ko" ? "리서치가 60초 제한을 넘었습니다." : "Research timed out after 60 seconds.");
+    return code;
   }
 
   // ── storm — Agentlas 자체 Goal/UltraCode 하네스 ──
@@ -333,22 +753,47 @@ function create(deps) {
   // ── Hephaestus 네이티브 패스스루 — 엔진 전 기능을 터미널 1급으로 노출 ──
   // stdio inherit 로 돌려 색/프롬프트/스트리밍이 네이티브 그대로 나온다.
   function runHephaestusInteractive(args, opts = {}) {
+    if (args[0] === "route" && opts.human !== false) return runHephaestusRoute(args, opts);
+    if (args[0] === "research" && opts.human !== false) return runHephaestusResearch(args, opts);
     const isCareerGraph = args[0] === "career-graph" || args[0] === "career_graph";
-    const found = isCareerGraph ? careerGraphRuntime() : hephaestusBin();
+    // `context` is a versioned Core capability, not a natural-language router
+    // request. Older launcher scripts route unknown words through Hub search,
+    // which silently turns `context verify` into a completely different action.
+    // Bypass that wrapper and invoke only a Core root that actually contains
+    // the canonical context-map implementation.
+    const isContextMap = args[0] === "context";
+    const contextRoot = isContextMap
+      ? resolveCoreRuntimeRoot(
+          null,
+          [["agentlas_cloud", "context_map.py"]],
+          { minVersion: CONTEXT_MAP_MIN_CORE_VERSION },
+        )
+      : null;
+    const contextCapable = Boolean(
+      contextRoot && fs.existsSync(path.join(contextRoot, "agentlas_cloud", "context_map.py")),
+    );
+    const found = isContextMap
+      ? (contextCapable ? { kind: "python", root: contextRoot } : null)
+      : (isCareerGraph ? careerGraphRuntime() : hephaestusBin());
     if (!found) {
       process.stderr.write(
-        isCareerGraph
+        isContextMap
+          ? "Agentlas Core context-map capability is unavailable — update Agentlas OS / Hephaestus before using `agentlas context`.\n"
+          : isCareerGraph
           ? "Career Graph 런타임이 없습니다 — 최신 Agentlas OS / Hephaestus 설치 후 다시 시도하세요.\n"
           : "Hephaestus 런타임이 없습니다 — 데스크탑 앱 설치 또는 Hephaestus 인스톨러 실행 후 다시 시도하세요.\n",
       );
-      process.stderr.write(
-        isCareerGraph
-          ? "설치 또는 지정: HEPHAESTUS_CAREER_GRAPH_BIN=<경로> 또는 HEPHAESTUS_RUNTIME_ROOT=<경로>\n"
-          : "설치: https://agentlas.cloud  ·  또는 HEPHAESTUS_BIN=<경로> 지정\n",
-      );
+      if (!isContextMap) {
+        process.stderr.write(
+          isCareerGraph
+            ? "설치 또는 지정: HEPHAESTUS_CAREER_GRAPH_BIN=<경로> 또는 HEPHAESTUS_RUNTIME_ROOT=<경로>\n"
+            : "설치: https://agentlas.cloud  ·  또는 HEPHAESTUS_BIN=<경로> 지정\n",
+        );
+      }
       return Promise.resolve(1);
     }
-    const cwd = opts.cwd || D.runCwd();
+    const helpOnly = args.some((arg) => arg === "--help" || arg === "-h" || arg === "help");
+    const cwd = opts.cwd || (helpOnly ? process.cwd() : D.runCwd());
     const moduleName = found.kind === "python" && isCareerGraph ? "career_graph" : "agentlas_cloud";
     const moduleArgs = moduleName === "career_graph" ? args.slice(1) : args;
     const child =
@@ -896,23 +1341,35 @@ function create(deps) {
   async function cmdAutomation(db, args, runtimeOverride) {
     const sub = args[0] || "list";
     const now = new Date().toISOString();
+    const ko = isKo();
+    const usage = (tail) => ko
+      ? `사용법: agentlas automation ${tail}`
+      : `usage: agentlas automation ${tail}`;
+    const missingAutomation = (id) => ko ? `자동화를 찾지 못했습니다: ${id}` : `Automation not found: ${id}`;
 
     if (sub === "list") {
       const rows = db.prepare(
         "SELECT id, name, schedule, target_type, target_id, enabled, next_run_at, last_run_at, run_count, trigger_type FROM automations ORDER BY created_at DESC",
       ).all();
-      if (!rows.length) return D.out("No automations. Run agentlas automation add --help.");
+      if (!rows.length) return D.out(isKo()
+        ? "자동화가 없습니다. `agentlas automation add --help`로 추가 방법을 확인하세요."
+        : "No automations. Run agentlas automation add --help.");
       for (const r of rows) {
         const target = r.target_type + ":" + String(r.target_id).slice(0, 24);
         D.out(
           `${r.enabled ? "●" : "○"} ${String(r.id).slice(0, 8)}  ${String(r.name).padEnd(28).slice(0, 28)} ` +
             `${String(r.schedule || r.trigger_type).padEnd(14)} ${target.padEnd(32)} ` +
-            `next=${r.next_run_at ? r.next_run_at.slice(0, 16) : "-"} runs=${r.run_count}`,
+            `${ko ? "다음" : "next"}=${r.next_run_at ? r.next_run_at.slice(0, 16) : "-"} ` +
+            `${ko ? "성공" : "success"}=${r.run_count}`,
         );
       }
       D.out("");
-      D.out("Run now: agentlas automation run <id>  ·  daemon: agentlas automation daemon");
-      D.out("The Desktop scheduler also runs when the app is open; leases prevent duplicate runs.");
+      D.out(isKo()
+        ? "지금 실행: agentlas automation run <id>  ·  데몬: agentlas automation daemon"
+        : "Run now: agentlas automation run <id>  ·  daemon: agentlas automation daemon");
+      D.out(isKo()
+        ? "Desktop 앱이 열려 있을 때는 Desktop 스케줄러도 실행되며, 리스로 중복 실행을 막습니다."
+        : "The Desktop scheduler also runs when the app is open; leases prevent duplicate runs.");
       return;
     }
 
@@ -930,7 +1387,9 @@ function create(deps) {
         else if (a === "--disabled") flags.disabled = true;
       }
       if (!flags.cron || !flags.prompt || (!flags.agent && !flags.firm)) {
-        D.out('usage: agentlas automation add --name "name" --agent <slug>|--firm <slug> --cron "0 9 * * *" --prompt "instructions" [--tz Asia/Seoul] [--disabled]');
+        D.out(ko
+          ? '사용법: agentlas automation add --name "이름" --agent <슬러그>|--firm <슬러그> --cron "0 9 * * *" --prompt "지시" [--tz Asia/Seoul] [--disabled]'
+          : 'usage: agentlas automation add --name "name" --agent <slug>|--firm <slug> --cron "0 9 * * *" --prompt "instructions" [--tz Asia/Seoul] [--disabled]');
         process.exitCode = 1;
         return;
       }
@@ -939,19 +1398,21 @@ function create(deps) {
       let targetLabel;
       if (flags.agent) {
         const a = D.resolveAgent(db, flags.agent);
-        if (!a) return D.fail(`Agent not found: ${flags.agent}`);
+        if (!a) return D.fail(ko ? `에이전트를 찾지 못했습니다: ${flags.agent}` : `Agent not found: ${flags.agent}`);
         targetType = "agent";
         targetId = a.id;
         targetLabel = a.name;
       } else {
         const f = D.resolveFirm(db, flags.firm);
-        if (!f) return D.fail(`Company not found: ${flags.firm}`);
+        if (!f) return D.fail(ko ? `회사를 찾지 못했습니다: ${flags.firm}` : `Company not found: ${flags.firm}`);
         targetType = "firm";
         targetId = f.id;
         targetLabel = f.name;
       }
       const next = nextCronRun(flags.cron, new Date(), flags.tz || null);
-      if (!next) return D.fail(`Could not parse cron expression: "${flags.cron}" (5 fields: minute hour day month weekday)`);
+      if (!next) return D.fail(ko
+        ? `cron 표현식을 해석하지 못했습니다: "${flags.cron}" (5개 필드: 분 시 일 월 요일)`
+        : `Could not parse cron expression: "${flags.cron}" (5 fields: minute hour day month weekday)`);
       const id = crypto.randomUUID();
       db.prepare(
         `INSERT INTO automations (id, name, schedule, target_type, target_id, prompt_template, enabled, created_by,
@@ -973,33 +1434,35 @@ function create(deps) {
         "auto",
         "hub-allowed",
       );
-      D.out(`Created: ${id.slice(0, 8)}  ${flags.name || targetLabel}  next=${next.toISOString().slice(0, 16)}`);
-      D.out(`Run now: agentlas automation run ${id.slice(0, 8)}  ·  scheduled: agentlas automation daemon (or Desktop)`);
+      D.out(`${ko ? "생성됨" : "Created"}: ${id.slice(0, 8)}  ${flags.name || targetLabel}  ${ko ? "다음" : "next"}=${next.toISOString().slice(0, 16)}`);
+      D.out(ko
+        ? `지금 실행: agentlas automation run ${id.slice(0, 8)}  ·  예약 실행: agentlas automation daemon (또는 Desktop)`
+        : `Run now: agentlas automation run ${id.slice(0, 8)}  ·  scheduled: agentlas automation daemon (or Desktop)`);
       return;
     }
 
     if (sub === "on" || sub === "off") {
       const idPrefix = args[1];
-      if (!idPrefix) return D.fail(`usage: agentlas automation ${sub} <id>`);
+      if (!idPrefix) return D.fail(usage(`${sub} <id>`));
       const row = db.prepare("SELECT id, name, schedule, schedule_json, timezone FROM automations WHERE id LIKE ?").get(idPrefix + "%");
-      if (!row) return D.fail(`Automation not found: ${idPrefix}`);
+      if (!row) return D.fail(missingAutomation(idPrefix));
       if (sub === "on") {
         const next = nextAutomationRun(row) || null;
         db.prepare("UPDATE automations SET enabled=1, next_run_at=? WHERE id=?").run(next ? next.toISOString() : null, row.id);
       } else {
         db.prepare("UPDATE automations SET enabled=0 WHERE id=?").run(row.id);
       }
-      D.out(`${sub === "on" ? "Enabled" : "Disabled"}: ${row.id.slice(0, 8)}  ${row.name}`);
+      D.out(`${sub === "on" ? (ko ? "활성화됨" : "Enabled") : (ko ? "비활성화됨" : "Disabled")}: ${row.id.slice(0, 8)}  ${row.name}`);
       return;
     }
 
     if (sub === "remove" || sub === "rm") {
       const idPrefix = args[1];
-      if (!idPrefix) return D.fail("usage: agentlas automation remove <id>");
+      if (!idPrefix) return D.fail(usage("remove <id>"));
       const row = db.prepare("SELECT id, name FROM automations WHERE id LIKE ?").get(idPrefix + "%");
-      if (!row) return D.fail(`Automation not found: ${idPrefix}`);
+      if (!row) return D.fail(missingAutomation(idPrefix));
       db.prepare("DELETE FROM automations WHERE id=?").run(row.id);
-      D.out(`Deleted: ${row.id.slice(0, 8)}  ${row.name}`);
+      D.out(`${ko ? "삭제됨" : "Deleted"}: ${row.id.slice(0, 8)}  ${row.name}`);
       return;
     }
 
@@ -1009,10 +1472,13 @@ function create(deps) {
            LEFT JOIN automations a ON a.id = h.automation_id
            ORDER BY h.ran_at DESC LIMIT 15`,
       ).all();
-      if (!rows.length) return D.out("No run history.");
+      if (!rows.length) return D.out(ko ? "실행 기록이 없습니다." : "No run history.");
       for (const r of rows) {
+        const status = ko
+          ? (r.status === "ok" ? "성공" : r.status === "error" ? "오류" : (r.status || "?"))
+          : (r.status || "?");
         D.out(
-          `${(r.ran_at || "").slice(0, 16).padEnd(17)} ${(r.status || "?").padEnd(9)} ${(r.name || "(deleted)").slice(0, 30).padEnd(31)} ${r.error ? String(r.error).slice(0, 40) : ""}`,
+          `${(r.ran_at || "").slice(0, 16).padEnd(17)} ${status.padEnd(9)} ${(r.name || (ko ? "(삭제됨)" : "(deleted)")).slice(0, 30).padEnd(31)} ${r.error ? String(r.error).slice(0, 40) : ""}`,
         );
       }
       return;
@@ -1020,9 +1486,9 @@ function create(deps) {
 
     if (sub === "run") {
       const idPrefix = args[1];
-      if (!idPrefix) return D.fail("usage: agentlas automation run <id>");
+      if (!idPrefix) return D.fail(usage("run <id>"));
       const row = db.prepare("SELECT * FROM automations WHERE id LIKE ?").get(idPrefix + "%");
-      if (!row) return D.fail(`Automation not found: ${idPrefix}`);
+      if (!row) return D.fail(missingAutomation(idPrefix));
       const ui = newUi();
       // run-now는 스케줄을 건드리지 않는다 (앱의 advanceSchedule=false와 동일).
       const r = await runAutomationOnce(db, row, { ui, advanceSchedule: false, runtimeOverride });
@@ -1038,7 +1504,7 @@ function create(deps) {
       return automationDaemon(db, { intervalSec: interval });
     }
 
-    D.out("usage: agentlas automation list|add|on <id>|off <id>|remove <id>|run <id>|runs|daemon");
+    D.out(usage("list|add|on <id>|off <id>|remove <id>|run <id>|runs|daemon"));
   }
 
   // ── automation 실행기 — 앱 스케줄러와 같은 SQLite 리스(claimed_at TTL 15분)로 중복 실행 방지 ──
@@ -1071,13 +1537,28 @@ function create(deps) {
   // ctx: { ui, advanceSchedule?, runtimeOverride?, scheduledFor? }
   async function runAutomationOnce(db, row, ctx = {}) {
     const ui = ctx.ui || newUi();
+    const permission = permissionPolicy.normalize(
+      D.resolvePermission ? D.resolvePermission(ctx.permissionOverride) : (ctx.permissionOverride || "write"),
+      "read",
+    );
+    if (!row.enabled) {
+      ui.warn(ui.lang === "ko"
+        ? `이 자동화는 비활성화되어 실행하지 않았습니다: ${row.name}`
+        : `This automation is disabled and was not run: ${row.name}`);
+      return { ok: false, skipped: true, reason: "disabled" };
+    }
     // run-now도 리스를 잡는다 — 앱 스케줄러가 같은 행을 동시에 돌리는 것을 방지.
     if (!claimAutomation(db, row.id)) {
-      ui.warn(`Another runner holds this automation (lease TTL 15 minutes): ${row.name}`);
-      return { ok: false, skipped: true };
+      ui.warn(ui.lang === "ko"
+        ? `다른 실행기가 이 자동화 리스를 보유 중입니다(15분 TTL): ${row.name}`
+        : `Another runner holds this automation (lease TTL 15 minutes): ${row.name}`);
+      return { ok: false, skipped: true, reason: "lease" };
     }
     ui.line("");
-    ui.line(ui.c.paw("◤ ") + ui.c.bold(ui.c.text("automation")) + ui.c.dim(`  ${row.name}  (${String(row.id).slice(0, 8)})`));
+    const surface = ui.lang === "ko" ? "자동화" : "automation";
+    const suffix = `  (${String(row.id).slice(0, 8)})`;
+    const room = Math.max(4, (Number(ui.out?.columns) || 80) - visWidth(`◤ ${surface}  ${suffix}`));
+    ui.line(ui.c.paw("◤ ") + ui.c.bold(ui.c.text(surface)) + ui.c.dim(`  ${truncateWidth(row.name, room)}${suffix}`));
 
     try {
       // 타깃 해석 (agent/firm) — background/비공개 포함 id 직접 조회.
@@ -1095,14 +1576,17 @@ function create(deps) {
       }
 
       const cwd = D.runCwd();
-      const env = await D.buildChildEnvCli(db, { projectPath: null, agentId, permission: "write", cwd, lang: ui.lang });
+      const env = await D.buildChildEnvCli(db, { projectPath: null, agentId, permission, cwd, lang: ui.lang });
       const runtime = D.resolveRuntime(db, ctx.runtimeOverride);
-      ui.info(`${runtime.mode === "cli" ? runtime.kind : runtime.backend} · write · ${cwd}`);
-      ui.startSpinner(ui.lang === "ko" ? "자동화 실행 중…" : "running automation…");
+      ui.info(`${runtime.mode === "cli" ? runtime.kind : runtime.backend} · ${permission} · ${cwd}`);
+      // A top-level automation command has no persistent composer footer.
+      // Keep progress as a stable line so narrow terminals do not retain raw
+      // carriage-return spinner frames in scrollback or screen recordings.
+      ui.info(ui.lang === "ko" ? "자동화 실행 중…" : "running automation…");
 
       let text;
       if (runtime.mode === "cli") {
-        text = await D.captureRuntime(runtime.kind, system, row.prompt_template, { cwd, env, permission: "write" });
+        text = await D.captureRuntime(runtime.kind, system, row.prompt_template, { cwd, env, permission });
       } else {
         const r = await D.runApi(runtime.backend, runtime.model, system, row.prompt_template);
         text = typeof r === "string" ? r : (r && r.text) || "";
@@ -1192,12 +1676,16 @@ function create(deps) {
     try {
       rows = db.prepare("SELECT id, name, name_en, transport, enabled FROM mcp_servers ORDER BY installed_at ASC").all();
     } catch { /* 테이블 없음 */ }
-    if (!rows.length) return D.out("No MCP servers are installed. Configure them in Desktop or an agent package.");
+    if (!rows.length) return D.out(isKo()
+      ? "설치된 MCP 서버가 없습니다. Desktop 또는 에이전트 패키지에서 설정하세요."
+      : "No MCP servers are installed. Configure them in Desktop or an agent package.");
     for (const r of rows) {
       D.out(`${r.enabled ? "●" : "○"} ${String(r.name || r.name_en || r.id).padEnd(28).slice(0, 28)} ${String(r.transport || "stdio").padEnd(8)} ${String(r.id).slice(0, 12)}`);
     }
     D.out("");
-    D.out("Only full-access turns wire active (●) stdio servers into the runtime. In the REPL, use /mcp.");
+    D.out(isKo()
+      ? "활성(●) stdio 서버는 무제한 권한 턴에서만 런타임에 연결됩니다. REPL에서는 /mcp를 사용하세요."
+      : "Only full-access turns wire active (●) stdio servers into the runtime. In the REPL, use /mcp.");
   }
 
   function cmdChats(db, args) {
@@ -1211,12 +1699,14 @@ function create(deps) {
           ORDER BY c.updated_at DESC LIMIT ?`,
       ).all(limit);
     } catch { /* 스키마 차이 */ }
-    if (!rows.length) return D.out("No chats.");
+    if (!rows.length) return D.out(isKo() ? "대화가 없습니다." : "No chats.");
     for (const r of rows) {
       D.out(`${String(r.updated_at || "").slice(0, 16).padEnd(17)} ${String(r.agent_name_en || r.agent_name || "-").slice(0, 18).padEnd(19)} ${String(r.title || "(untitled)").slice(0, 60)}`);
     }
     D.out("");
-    D.out("These chats are shared with Desktop. Resume terminal sessions with /resume in the REPL.");
+    D.out(isKo()
+      ? "이 대화는 Desktop과 공유됩니다. 터미널 세션은 REPL의 /resume으로 이어가세요."
+      : "These chats are shared with Desktop. Resume terminal sessions with /resume in the REPL.");
   }
 
   // ── usage — 로컬 집계 ──
@@ -1227,20 +1717,27 @@ function create(deps) {
       try { return db.prepare(sql).get(...p) || {}; } catch { return {}; }
     };
     const ar = q("SELECT kind FROM active_runtime WHERE id=1");
-    const agents = q("SELECT COUNT(*) AS n FROM installed_agents");
+    // Match `agentlas list` and `/agents`: private/background architecture
+    // rows are runtime infrastructure, not user-installed agents.
+    const visibleAgents = D.listAgents?.(db);
+    const agents = { n: Array.isArray(visibleAgents) ? visibleAgents.length : "?" };
     const chats = q("SELECT COUNT(*) AS n FROM chats WHERE archived_at IS NULL");
     const msg24 = q("SELECT COUNT(*) AS n FROM chat_messages WHERE created_at > ?", day);
     const msg7 = q("SELECT COUNT(*) AS n FROM chat_messages WHERE created_at > ?", week);
     const auto = q("SELECT COUNT(*) AS n FROM automations WHERE enabled=1");
     const runs7 = q("SELECT COUNT(*) AS n, SUM(CASE WHEN status='error' OR error IS NOT NULL THEN 1 ELSE 0 END) AS err FROM run_history WHERE ran_at > ?", week);
-    D.out(`Active runtime    ${ar.kind || "(none)"}`);
-    D.out(`Installed agents  ${agents.n ?? "?"}`);
-    D.out(`Active chats      ${chats.n ?? "?"}`);
-    D.out(`Messages          24h ${msg24.n ?? 0}  ·  7d ${msg7.n ?? 0}`);
-    D.out(`Automations       ${auto.n ?? 0}`);
-    D.out(`Runs (7d)         ${runs7.n ?? 0}${runs7.err ? `  (${runs7.err} failed)` : ""}`);
+    D.out(isKo() ? `활성 런타임      ${ar.kind || "(없음)"}` : `Active runtime    ${ar.kind || "(none)"}`);
+    D.out(isKo() ? `설치 에이전트    ${agents.n ?? "?"}` : `Installed agents  ${agents.n ?? "?"}`);
+    D.out(isKo() ? `활성 대화        ${chats.n ?? "?"}` : `Active chats      ${chats.n ?? "?"}`);
+    D.out(isKo() ? `메시지           24시간 ${msg24.n ?? 0}  ·  7일 ${msg7.n ?? 0}` : `Messages          24h ${msg24.n ?? 0}  ·  7d ${msg7.n ?? 0}`);
+    D.out(isKo() ? `자동화           ${auto.n ?? 0}` : `Automations       ${auto.n ?? 0}`);
+    D.out(isKo()
+      ? `실행(7일)        ${runs7.n ?? 0}${runs7.err ? `  (실패 ${runs7.err})` : ""}`
+      : `Runs (7d)         ${runs7.n ?? 0}${runs7.err ? `  (${runs7.err} failed)` : ""}`);
     D.out("");
-    D.out("Session tokens/cost: /cost in chat. Provider quota dashboards are in Desktop.");
+    D.out(isKo()
+      ? "세션 토큰·비용은 대화에서 /cost로 확인합니다. 공급자 할당량 대시보드는 Desktop에 있습니다."
+      : "Session tokens/cost: /cost in chat. Provider quota dashboards are in Desktop.");
   }
 
   // ── telegram — 바인딩 현황 (읽기 전용) ──
@@ -1252,7 +1749,9 @@ function create(deps) {
       rows = [];
     }
     if (!rows.length) {
-      D.out("No Telegram bindings. Pair devices from Desktop Connect.");
+      D.out(isKo()
+        ? "Telegram 연결이 없습니다. Desktop Connect에서 기기를 연결하세요."
+        : "No Telegram bindings. Pair devices from Desktop Connect.");
       return;
     }
     for (const r of rows) {
@@ -1262,7 +1761,9 @@ function create(deps) {
       D.out(`${String(r.id).slice(0, 8)}  ${r.target_kind}:${String(r.target_id).slice(0, 20).padEnd(21)} ${String(bot).padEnd(24)} ${String(chat).slice(0, 28).padEnd(29)} ${status}`);
     }
     D.out("");
-    D.out("Pairing and bot issuance happen in Desktop Connect; this command only shows status.");
+    D.out(isKo()
+      ? "연결과 봇 발급은 Desktop Connect에서 수행하며, 이 명령은 상태만 보여줍니다."
+      : "Pairing and bot issuance happen in Desktop Connect; this command only shows status.");
   }
 
   // ── login / logout / whoami — Agentlas Cloud 세션 (데스크탑과 동일한 loopback 브라우저 플로우) ──
@@ -1375,7 +1876,9 @@ function create(deps) {
   async function cmdWhoami() {
     const cookie = await D.cloudSessionCookieCli();
     if (!cookie) {
-      D.out("You are signed out. Sign in with agentlas login.");
+      D.out(isKo()
+        ? "로그아웃 상태입니다. `agentlas login`으로 로그인하세요."
+        : "You are signed out. Sign in with agentlas login.");
       process.exitCode = 1;
       return;
     }
@@ -1384,13 +1887,17 @@ function create(deps) {
       if (j && j.authenticated) {
         const email = (j.user && j.user.email) || "?";
         const ws = j.workspace || {};
-        D.out(`Signed in: ${email}  ·  workspace: ${ws.name || "?"} (${ws.plan || "free"})`);
+        D.out(isKo()
+          ? `로그인됨: ${email}  ·  작업 공간: ${ws.name || "?"} (${ws.plan || "free"})`
+          : `Signed in: ${email}  ·  workspace: ${ws.name || "?"} (${ws.plan || "free"})`);
       } else {
-        D.out("The session is expired or invalid. Sign in again with agentlas login.");
+        D.out(isKo()
+          ? "세션이 만료되었거나 유효하지 않습니다. `agentlas login`으로 다시 로그인하세요."
+          : "The session is expired or invalid. Sign in again with agentlas login.");
         process.exitCode = 1;
       }
     } catch (e) {
-      D.fail("Session check failed: " + String((e && e.message) || e));
+      D.fail((isKo() ? "세션 확인 실패: " : "Session check failed: ") + String((e && e.message) || e));
     }
   }
 
@@ -1455,7 +1962,7 @@ function create(deps) {
     } catch { /* 로그인 없어도 검색은 가능 */ }
     let resp;
     try {
-      resp = await fetch(`${base.replace(/\/$/, "")}/tools/call`, {
+      resp = await D.fetchHub(`${base.replace(/\/$/, "")}/tools/call`, {
         method: "POST",
         headers,
         body: JSON.stringify({
@@ -1468,7 +1975,12 @@ function create(deps) {
       return D.fail(`Marketplace connection failed: ${(e && e.message) || e}`);
     }
     if (!resp.ok) return D.fail(`Marketplace returned ${resp.status}`);
-    const json = await resp.json();
+    let json;
+    try {
+      json = JSON.parse(resp.text || "null");
+    } catch {
+      return D.fail("Marketplace returned invalid JSON");
+    }
     if (json.error) return D.fail(json.error.message || "marketplace error");
     const result = json.result || {};
     const rawItems = result.results || result.agents || result.items || (Array.isArray(result) ? result : null);
@@ -1496,4 +2008,4 @@ function create(deps) {
   };
 }
 
-module.exports = { create, _test: { createLoginState, createLoginCallbackGuard } };
+module.exports = { create, _test: { createLoginState, createLoginCallbackGuard, routePreviewModel, researchPreviewModel } };

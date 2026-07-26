@@ -22,6 +22,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
+const { configureSqliteConnection } = require("../engine/agentlas-sqlite-policy.cjs");
 
 const REAL_SELF = (() => {
   try { return fs.realpathSync(__filename); } catch { return __filename; }
@@ -45,6 +46,11 @@ function userDataDir() {
 
 function dbPath() {
   return path.join(userDataDir(), "agentlas.sqlite");
+}
+
+function securePrivateMode(target, mode) {
+  if (process.platform === "win32") return;
+  fs.chmodSync(target, mode);
 }
 
 // ── SQLite 로더 (부트스트랩용): better-sqlite3 → node:sqlite ──
@@ -90,6 +96,7 @@ function openSqlite(p) {
   try {
     const Database = require("better-sqlite3");
     const db = new Database(p);
+    configureSqliteConnection(db);
     return { exec: (sql) => db.exec(sql), close: () => db.close(), driver: "better-sqlite3" };
   } catch { /* optional dep 미설치/ABI 불일치 */ }
   const major = Number(process.versions.node.split(".")[0]);
@@ -98,6 +105,7 @@ function openSqlite(p) {
   }
   const { DatabaseSync } = loadNodeSqliteQuietly();
   const db = new DatabaseSync(p);
+  configureSqliteConnection(db);
   return { exec: (sql) => db.exec(sql), close: () => db.close(), driver: "node:sqlite" };
 }
 
@@ -106,12 +114,17 @@ function openSqlite(p) {
 //  스키마가 생기면 엔진의 seedBuiltins가 빌트인 에이전트를 채운다.)
 function bootstrapDbIfMissing() {
   const p = dbPath();
-  if (exists(p)) return { created: false, path: p };
+  const dir = path.dirname(p);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  securePrivateMode(dir, 0o700);
+  if (exists(p)) {
+    securePrivateMode(p, 0o600);
+    return { created: false, path: p };
+  }
   const schemaFile = path.join(PKG_ROOT, "engine", "bootstrap-schema.sql");
   if (!exists(schemaFile)) {
     throw new Error(`Bootstrap schema not found: ${schemaFile}`);
   }
-  fs.mkdirSync(path.dirname(p), { recursive: true });
   const sql = fs.readFileSync(schemaFile, "utf8");
   // DB를 정식 경로에서 직접 만들면 두 첫 실행이 모두 exists=false를 본 뒤 한 프로세스의
   // 실패 cleanup이 다른 프로세스의 정상 DB까지 지울 수 있다. 각자 같은 볼륨의 임시 DB를
@@ -126,6 +139,9 @@ function bootstrapDbIfMissing() {
     throw new Error(`Database bootstrap failed: ${e.message}`);
   }
   db.close();
+  // chmod the inode before it can become visible at the final hard-link path.
+  // The winning and losing processes both harden the final path below.
+  securePrivateMode(temp, 0o600);
   let created = false;
   try {
     fs.linkSync(temp, p);
@@ -140,11 +156,16 @@ function bootstrapDbIfMissing() {
     try { fs.rmSync(temp + "-wal", { force: true }); } catch { /* noop */ }
     try { fs.rmSync(temp + "-shm", { force: true }); } catch { /* noop */ }
   }
+  securePrivateMode(p, 0o600);
   return { created, path: p };
 }
 
 function main() {
   const args = process.argv.slice(2);
+  const metadataOnly = args.some((arg) => arg === "help" || arg === "--help" || arg === "-h")
+    || args[0] === "version"
+    || args[0] === "--version"
+    || args[0] === "-V";
   const sqliteDriver = probeSqliteDriver();
   const engineFound = exists(ENGINE);
 
@@ -175,14 +196,16 @@ function main() {
     process.exit(1);
   }
 
-  try {
-    const boot = bootstrapDbIfMissing();
-    if (boot.created) {
-      process.stderr.write(`First run: initialized Agentlas data (${boot.path})\n`);
+  if (!metadataOnly) {
+    try {
+      const boot = bootstrapDbIfMissing();
+      if (boot.created) {
+        process.stderr.write("First run: Agentlas data initialized.\n");
+      }
+    } catch (e) {
+      process.stderr.write(`${e.message}\n`);
+      process.exit(1);
     }
-  } catch (e) {
-    process.stderr.write(`${e.message}\n`);
-    process.exit(1);
   }
 
   const child = spawn(process.execPath, [ENGINE, ...args], { stdio: "inherit" });

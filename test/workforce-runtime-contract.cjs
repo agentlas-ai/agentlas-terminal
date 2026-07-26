@@ -433,11 +433,13 @@ function harness(overrides = {}) {
   const receipts = [];
   const auditReceipts = [];
   const benchmarkArtifacts = [];
+  const goalBindings = [];
+  const goalTurns = [];
   let modelIndex = 0;
   let searchIndex = 0;
   let plannerLineage = null;
   const runtime = create({
-    resolveRuntime: () => ({ mode: "api", backend: "ollama", model: "qwen3:30b-a3b" }),
+    resolveRuntime: overrides.resolveRuntime || (() => ({ mode: "api", backend: "ollama", model: "qwen3:30b-a3b" })),
     buildChildEnv: async () => ({}),
     runModel: async (call) => {
       modelCalls.push(call);
@@ -479,11 +481,50 @@ function harness(overrides = {}) {
       benchmarkArtifacts.push(structuredClone(artifact));
       return "/tmp/workforce-benchmark-fixture.json";
     },
+    loadWorkforceGoalRuntime: overrides.loadWorkforceGoalRuntime || (async () => ({
+      schemaVersion: "agentlas.workforce-goal-runtime-context.v1",
+      status: "not-bound",
+      goals: [],
+    })),
+    bindWorkforceGoal: overrides.bindWorkforceGoal || (async ({ workOrder, prepared }) => {
+      const roster = prepared.executionRoster.map((row, index) => ({
+        rosterKey: `sha256:${String(index + 1).repeat(64).slice(0, 64)}`,
+        slotId: row.slotId,
+        agentReleaseId: row.agentReleaseId,
+        state: "active",
+      }));
+      const context = {
+        schemaVersion: "agentlas.workforce-goal-context.v1",
+        goals: [{
+          bindingId: "workforce-goal-binding:test",
+          goalId: `goal:auto:${"a".repeat(40)}`,
+          status: "active",
+          rosterRevision: 1,
+          roster,
+        }],
+      };
+      goalBindings.push({ workOrder: structuredClone(workOrder), prepared: structuredClone(prepared), context });
+      return context;
+    }),
+    recordWorkforceGoalTurn: overrides.recordWorkforceGoalTurn || (async (turn) => {
+      goalTurns.push(structuredClone(turn));
+      return { schemaVersion: "agentlas.workforce-goal-turn.v1", status: "recorded" };
+    }),
     now: () => new Date("2026-07-15T00:00:00.000Z"),
     listWorkforceTools: overrides.listWorkforceTools,
     supportsWorkforceToolAuthority: overrides.supportsWorkforceToolAuthority,
   });
-  return { ...f, runtime, modelCalls, hubCalls, receipts, auditReceipts, benchmarkArtifacts };
+  return {
+    ...f,
+    runtime,
+    modelCalls,
+    hubCalls,
+    receipts,
+    auditReceipts,
+    benchmarkArtifacts,
+    goalBindings,
+    goalTurns,
+  };
 }
 
 async function successContract() {
@@ -510,6 +551,9 @@ async function successContract() {
   assert.equal(h.receipts[0].preparationReceiptId, h.prepared.preparationReceiptId);
   assert.equal(h.receipts[0].orchestrator.status, "completed");
   assert.equal(h.receipts[0].planner.parseSuccess, true);
+  assert.equal(h.goalBindings.length, 1, "the prepared exact roster must be durably bound before execution");
+  assert.equal(h.goalTurns.length, 1, "the actual invocation must append one durable goal-turn receipt");
+  assert.equal(h.goalTurns[0].decision, "recruit");
   assert.equal(h.receipts[0].workers.every((row) =>
     row.status === "completed"
     && row.executionMode === "direct"
@@ -551,6 +595,11 @@ async function codexCliFailsClosedBeforeAnyModelOrHubCall() {
       hubCalls += 1;
       throw new Error("must never execute");
     },
+    loadWorkforceGoalRuntime: async () => ({
+      schemaVersion: "agentlas.workforce-goal-runtime-context.v1",
+      status: "not-bound",
+      goals: [],
+    }),
     appendAuditReceipt: (receipt) => auditReceipts.push(structuredClone(receipt)),
     now: () => new Date("2026-07-15T00:00:00.000Z"),
   });
@@ -578,6 +627,11 @@ async function failedBenchmarkArtifactsNeverOverwriteEachOther() {
       buildChildEnv: async () => ({}),
       captureRuntime: async () => "must never execute",
       callHubTool: async () => { throw new Error("must never execute"); },
+      loadWorkforceGoalRuntime: async () => ({
+        schemaVersion: "agentlas.workforce-goal-runtime-context.v1",
+        status: "not-bound",
+        goals: [],
+      }),
       receiptFile: () => path.join(directory, "workforce-execution-receipts.jsonl"),
       now: () => new Date("2026-07-15T00:00:00.000Z"),
     });
@@ -734,6 +788,30 @@ async function terminalBufferedFetchAdapterContract() {
     },
     appendReceipt: () => {},
     persistBenchmarkArtifact: () => "/tmp/workforce-buffered-fetch-adapter.json",
+    loadWorkforceGoalRuntime: async () => ({
+      schemaVersion: "agentlas.workforce-goal-runtime-context.v1",
+      status: "not-bound",
+      goals: [],
+    }),
+    bindWorkforceGoal: async ({ prepared }) => ({
+      schemaVersion: "agentlas.workforce-goal-context.v1",
+      goals: [{
+        bindingId: "workforce-goal-binding:buffered-fetch",
+        goalId: `goal:auto:${"c".repeat(40)}`,
+        status: "active",
+        rosterRevision: 1,
+        roster: prepared.executionRoster.map((row, index) => ({
+          rosterKey: `sha256:${String(index + 3).repeat(64).slice(0, 64)}`,
+          slotId: row.slotId,
+          agentReleaseId: row.agentReleaseId,
+          state: "active",
+        })),
+      }],
+    }),
+    recordWorkforceGoalTurn: async () => ({
+      schemaVersion: "agentlas.workforce-goal-turn.v1",
+      status: "recorded",
+    }),
     now: () => new Date("2026-07-15T00:00:00.000Z"),
   });
   const result = await runtime.workforceRun({}, "hard payment buffered fetch adapter benchmark", {
@@ -1730,7 +1808,7 @@ function sourceBoundaryContract() {
   assert.match(cli, /case "network":[\s\S]*?cmdWorkforce/);
   assert.match(cli, /case "legacy-network"[\s\S]*?hep-network/);
   const repl = require("node:fs").readFileSync(require.resolve("../engine/agentlas-repl.cjs"), "utf8");
-  assert.match(repl, /prefs\.autoNetwork && H\.workforceRun/);
+  assert.match(repl, /\(hasActiveWorkforceGoal \|\| prefs\.autoNetwork\) && H\.workforceRun/);
   assert.doesNotMatch(repl, /prefs\.autoNetwork && H\.hepRun/);
   assert.match(source, /absence makes the assignment impossible/);
   assert.match(source, /distinct primary responsibility/);
@@ -1770,11 +1848,125 @@ function sourceBoundaryContract() {
   assert.doesNotMatch(prompts.selectionSystem, /Return exactly one envelope/);
 }
 
+function incumbentRuntimeContext(f) {
+  const prepared = bindPreparedContext(structuredClone(f.prepared), f.workOrder, f.selection);
+  return {
+    schemaVersion: "agentlas.workforce-goal-runtime-context.v1",
+    status: "ready",
+    goals: [{
+      goalId: `goal:auto:${"b".repeat(40)}`,
+      bindingId: "workforce-goal-binding:incumbent",
+      status: "active",
+      executionAllowed: true,
+      plans: [{
+        revision: 1,
+        status: "ready",
+        sources: ["hub"],
+        rosterKeys: [`sha256:${"1".repeat(64)}`, `sha256:${"2".repeat(64)}`],
+        agentReleaseIds: f.selection.assignments.map((row) => row.agentReleaseId),
+        leaseExpiresAt: "2026-07-16T00:00:00.000Z",
+        preparation: {
+          schemaVersion: "agentlas.workforce-terminal-continuation.v1",
+          status: "prepared",
+          runtimeSourcePins: prepared.executionRoster.map((row) => ({
+            slotId: row.slotId,
+            agentReleaseId: row.agentReleaseId,
+            source: "hub",
+          })),
+          workOrder: f.workOrder,
+          candidateSet: f.candidates,
+          selection: f.selection,
+          validationReceipt: f.validationReceipt,
+          executionPlan: prepared,
+        },
+      }],
+    }],
+  };
+}
+
+async function incumbentRosterIsReusedWithoutAnotherNetworkCall() {
+  const f = fixture();
+  const context = incumbentRuntimeContext(f);
+  const h = harness({
+    fixture: f,
+    resolveRuntime: () => ({ mode: "api", backend: "openai", model: "gpt-5.4" }),
+    loadWorkforceGoalRuntime: async () => structuredClone(context),
+    modelOutputs: [
+      JSON.stringify({
+        schemaVersion: "agentlas.workforce-goal-turn-decision.v1",
+        decision: "reuse",
+        planRevision: 1,
+        reasonCode: "incumbent-fit",
+      }),
+      JSON.stringify(f.plan),
+      "Backend handoff for the next turn.",
+      "Verifier handoff for the next turn.",
+      "Integrated second-turn deliverable.",
+      JSON.stringify({
+        schemaVersion: "agentlas.workforce-verification.v1",
+        status: "passed",
+        checks: [{ checkId: "check:continuity", status: "passed", evidence: "same pinned releases executed" }],
+        issues: [],
+      }),
+    ],
+  });
+  const result = await h.runtime.workforceRun({}, "continue the multi-day work", {
+    silent: true,
+    concurrency: 2,
+  });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  assert.deepEqual(h.hubCalls, [], "an active incumbent lease must not search, validate, or prepare again");
+  assert.equal(h.goalBindings.length, 0, "reuse must not create a duplicate binding");
+  assert.equal(h.goalTurns.length, 1);
+  assert.equal(h.goalTurns[0].decision, "reuse");
+  assert.deepEqual(h.goalTurns[0].usedRosterKeys, context.goals[0].plans[0].rosterKeys);
+  assert.deepEqual(
+    result.prepared.executionRoster.map((row) => row.agentReleaseId),
+    f.prepared.executionRoster.map((row) => row.agentReleaseId),
+  );
+}
+
+async function incumbentGoalCanChooseLocalOnlyWithoutEndingTheRoster() {
+  const f = fixture();
+  const context = incumbentRuntimeContext(f);
+  const h = harness({
+    fixture: f,
+    loadWorkforceGoalRuntime: async () => structuredClone(context),
+    modelOutputs: [JSON.stringify({
+      schemaVersion: "agentlas.workforce-goal-turn-decision.v1",
+      decision: "local-only",
+      planRevision: null,
+      reasonCode: "host-sufficient",
+    })],
+  });
+  const result = await h.runtime.workforceRun({}, "small local formatting turn", { silent: true });
+  assert.equal(result.ok, true);
+  assert.equal(result.localOnly, true);
+  assert.deepEqual(h.hubCalls, []);
+  assert.equal(h.goalTurns.length, 1);
+  assert.equal(h.goalTurns[0].decision, "local-only");
+  assert.equal(result.receipt.goalBinding.status, "active");
+}
+
 function workforcePreferenceDefaults() {
   const { applyPreferenceDefaults } = require("../engine/agentlas-repl.cjs");
-  assert.equal(applyPreferenceDefaults({}).autoNetwork, true, "new and untouched installs must use Workforce by default");
+  assert.equal(applyPreferenceDefaults({}).autoNetwork, false, "new and untouched installs must require explicit Workforce opt-in");
   assert.equal(applyPreferenceDefaults({ autoNetwork: false }).autoNetwork, false, "explicit opt-out must survive upgrades");
   assert.equal(applyPreferenceDefaults({ autoNetwork: true }).autoNetwork, true);
+}
+
+function workforceMemoryContinuityWiring() {
+  const source = fs.readFileSync(path.join(__dirname, "..", "engine", "agentlas-repl.cjs"), "utf8");
+  const start = source.indexOf("async function runWorkforceTurn");
+  const end = source.indexOf("async function handleSlash", start);
+  assert.ok(start >= 0 && end > start, "REPL must own a dedicated Workforce turn lifecycle");
+  const block = source.slice(start, end);
+  assert.match(block, /H\.beginMemoryTurn/);
+  assert.match(block, /H\.completeMemoryTurn/);
+  assert.match(block, /invokeCurator: Boolean\(result\?\.ok\)/);
+  assert.match(block, /H\.finalizeExperienceRun/);
+  assert.match(source, /runWorkforceTurn\(goal,/);
+  assert.match(source, /runWorkforceTurn\(t,/);
 }
 
 async function privateWorkOrderRepairsLocallyAndNeverCallsHubOnExhaustion() {
@@ -1793,6 +1985,9 @@ async function privateWorkOrderRepairsLocallyAndNeverCallsHubOnExhaustion() {
 
 async function main() {
   await successContract();
+  await incumbentRosterIsReusedWithoutAnotherNetworkCall();
+  await incumbentGoalCanChooseLocalOnlyWithoutEndingTheRoster();
+  workforceMemoryContinuityWiring();
   await codexCliFailsClosedBeforeAnyModelOrHubCall();
   await failedBenchmarkArtifactsNeverOverwriteEachOther();
   await nestedTeamGraphExecutesEveryDeclaredWorkerWithoutFlattening();

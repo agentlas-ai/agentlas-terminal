@@ -419,9 +419,15 @@ function createDecisionReceipt({ taskId, stage, decision, resolution }) {
   } : { phase: cleanText(stage, 80) || null, allocation: null });
   const featureHash = `sha256:${crypto.createHash("sha256").update(featurePayload, "utf8").digest("hex")}`;
   const source = resolution && resolution.source;
-  const status = source === "user-pin"
+  const hasResolvedCurrent = Boolean(
+    resolution
+    && resolution.ok
+    && cleanText(resolution.model, 255)
+    && cleanText(resolution.runtimeId, 255),
+  );
+  const status = source === "user-pin" && hasResolvedCurrent
     ? "user-pin"
-    : source === "fallback"
+    : source === "fallback" && hasResolvedCurrent
       ? "fallback-current"
       : normalized && resolution && resolution.ok
         ? "resolved"
@@ -437,7 +443,6 @@ function createDecisionReceipt({ taskId, stage, decision, resolution }) {
     requested: {
       tier: normalized ? normalized.tier : null,
       modelClass: normalized ? normalized.modelClass : null,
-      sessionId: normalized ? normalized.runtimeId : null,
       modelId: normalized && normalized.exactModelId
         ? normalized.exactModelId
         : source === "user-pin" ? cleanText(resolution && resolution.model, 255) || null : null,

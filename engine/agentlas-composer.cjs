@@ -15,6 +15,9 @@
 const readline = require("node:readline");
 const i18n = require("./agentlas-i18n.cjs");
 const permissions = require("./agentlas-permissions.cjs");
+const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+const MARK_RE = /\p{Mark}/u;
+const EXTENDED_PICTOGRAPHIC_RE = /\p{Extended_Pictographic}/u;
 
 // East-Asian width: CJK / Hangul / Kana / fullwidth glyphs occupy 2 terminal cells.
 function isWide(cp) {
@@ -36,12 +39,54 @@ function isWide(cp) {
 function charWidth(ch) {
   const cp = ch.codePointAt(0);
   if (cp < 0x20) return 0;
+  if (
+    cp === 0x200d || // zero-width joiner
+    (cp >= 0xfe00 && cp <= 0xfe0f) || // variation selectors
+    (cp >= 0xe0100 && cp <= 0xe01ef) ||
+    (cp >= 0x1f3fb && cp <= 0x1f3ff) || // emoji skin tones
+    MARK_RE.test(ch)
+  ) return 0;
   return isWide(cp) ? 2 : 1;
+}
+function graphemeSegments(value) {
+  return [...GRAPHEME_SEGMENTER.segment(String(value || ""))];
+}
+function graphemeWidth(segment) {
+  const text = String(segment || "");
+  if (
+    EXTENDED_PICTOGRAPHIC_RE.test(text) ||
+    /[\u{1f1e6}-\u{1f1ff}]/u.test(text) ||
+    text.includes("\u20e3")
+  ) return 2;
+  let width = 0;
+  for (const ch of text) width += charWidth(ch);
+  return width;
+}
+function previousGraphemeIndex(value, index) {
+  const text = String(value || "");
+  const cursor = Math.max(0, Math.min(Number(index) || 0, text.length));
+  let previous = 0;
+  for (const entry of GRAPHEME_SEGMENTER.segment(text)) {
+    const end = entry.index + entry.segment.length;
+    if (cursor <= entry.index) return previous;
+    if (cursor <= end) return entry.index;
+    previous = entry.index;
+  }
+  return previous;
+}
+function nextGraphemeIndex(value, index) {
+  const text = String(value || "");
+  const cursor = Math.max(0, Math.min(Number(index) || 0, text.length));
+  for (const entry of GRAPHEME_SEGMENTER.segment(text)) {
+    const end = entry.index + entry.segment.length;
+    if (cursor < end) return end;
+  }
+  return text.length;
 }
 function visWidth(s) {
   const clean = String(s).replace(/\x1b\[[0-9;]*m/g, "");
   let n = 0;
-  for (const ch of clean) n += charWidth(ch);
+  for (const entry of GRAPHEME_SEGMENTER.segment(clean)) n += graphemeWidth(entry.segment);
   return n;
 }
 
@@ -51,13 +96,79 @@ function truncateWidth(value, max) {
   let out = "";
   let width = 0;
   const room = Math.max(0, max - 1);
-  for (const ch of text) {
-    const cells = charWidth(ch);
+  for (const entry of GRAPHEME_SEGMENTER.segment(text)) {
+    const cells = graphemeWidth(entry.segment);
     if (width + cells > room) break;
-    out += ch;
+    out += entry.segment;
     width += cells;
   }
   return out + "…";
+}
+
+function splitWidth(value, max) {
+  const text = String(value || "");
+  const limit = Math.max(1, Math.floor(Number(max) || 1));
+  const lines = [];
+  let line = "";
+  let width = 0;
+  for (const entry of GRAPHEME_SEGMENTER.segment(text)) {
+    const cells = graphemeWidth(entry.segment);
+    if (line && width + cells > limit) {
+      lines.push(line);
+      line = "";
+      width = 0;
+    }
+    line += entry.segment;
+    width += cells;
+  }
+  if (line || !lines.length) lines.push(line);
+  return lines;
+}
+
+function wrapWidth(value, max) {
+  const limit = Math.max(2, Math.floor(Number(max) || 2));
+  const lines = [];
+  const pushWord = (word, state) => {
+    if (!word) return;
+    const cells = visWidth(word);
+    if (state.line && state.width + 1 + cells <= limit) {
+      state.line += " " + word;
+      state.width += 1 + cells;
+      return;
+    }
+    if (state.line) {
+      lines.push(state.line);
+      state.line = "";
+      state.width = 0;
+    }
+    if (cells <= limit) {
+      state.line = word;
+      state.width = cells;
+      return;
+    }
+    let chunk = "";
+    let chunkWidth = 0;
+    for (const entry of GRAPHEME_SEGMENTER.segment(word)) {
+      const width = graphemeWidth(entry.segment);
+      if (chunk && chunkWidth + width > limit) {
+        lines.push(chunk);
+        chunk = "";
+        chunkWidth = 0;
+      }
+      chunk += entry.segment;
+      chunkWidth += width;
+    }
+    state.line = chunk;
+    state.width = chunkWidth;
+  };
+  const paragraphs = String(value || "").split(/\r?\n/);
+  paragraphs.forEach((paragraph) => {
+    const state = { line: "", width: 0 };
+    for (const word of paragraph.trim().split(/\s+/u).filter(Boolean)) pushWord(word, state);
+    if (state.line) lines.push(state.line);
+    else if (!paragraph.trim()) lines.push("");
+  });
+  return lines.length ? lines : [""];
 }
 
 function identityPalette() {
@@ -82,18 +193,18 @@ function buildComposerFrame(state, ctx = {}, palette, width = 80) {
 
   // horizontal scroll by visual width — keep the cursor visible (CJK-safe)
   let start = Math.min(state.scroll, state.cur);
-  while (start < state.cur && visWidth(state.buf.slice(start, state.cur)) > fieldW - 2) start++;
+  while (start < state.cur && visWidth(state.buf.slice(start, state.cur)) > fieldW - 2) {
+    start = nextGraphemeIndex(state.buf, start);
+  }
   state.scroll = start;
 
   let shown = "";
   let shownWidth = 0;
-  for (let i = start; i < state.buf.length; ) {
-    const ch = state.buf.codePointAt(i) > 0xffff ? state.buf.slice(i, i + 2) : state.buf[i];
-    const cw = charWidth(ch);
+  for (const entry of GRAPHEME_SEGMENTER.segment(state.buf.slice(start))) {
+    const cw = graphemeWidth(entry.segment);
     if (shownWidth + cw > fieldW - 2) break;
-    shown += ch;
+    shown += entry.segment;
     shownWidth += cw;
-    i += ch.length;
   }
 
   const prefix = (ctx.glyph || "›") + " ";
@@ -113,6 +224,7 @@ function buildComposerFrame(state, ctx = {}, palette, width = 80) {
   // 연결 LLM 세션 사용량 상시 표시줄 — 입력박스 바로 아래에 항상 유지된다.
   const usageText = typeof ctx.usage === "function" ? ctx.usage() : ctx.usage;
   if (usageText) lines.push(c.faint(truncateWidth(String(usageText), w)));
+  if (state.notice) lines.push(c.faint(truncateWidth(String(state.notice), w)));
   if (ctx.confirmation) {
     const prefix = ctx.confirmationTone === "danger" ? "! " : "✓ ";
     const paint = ctx.confirmationTone === "danger" && c.paw ? c.paw : c.green || c.emerald || ((value) => value);
@@ -120,7 +232,15 @@ function buildComposerFrame(state, ctx = {}, palette, width = 80) {
   }
 
   const rows = state.suggest || [];
-  rows.slice(0, 8).forEach((row, index) => {
+  const terminalRows = Math.max(5, Number(ctx.rows) || 24);
+  const maxSuggestions = Math.min(8, Math.max(0, terminalRows - lines.length - 1));
+  const selected = Math.max(0, Math.min(Number(state.suggestSel) || 0, Math.max(0, rows.length - 1)));
+  const startRow = Math.min(
+    Math.max(0, selected - maxSuggestions + 1),
+    Math.max(0, rows.length - maxSuggestions),
+  );
+  rows.slice(startRow, startRow + maxSuggestions).forEach((row, offset) => {
+    const index = startRow + offset;
     const cmd = String(row.command || "").padEnd(16);
     const desc = String(row.description || "");
     const descRoom = Math.max(0, w - visWidth(" " + cmd + " "));
@@ -128,7 +248,9 @@ function buildComposerFrame(state, ctx = {}, palette, width = 80) {
     const label = " " + cmd + " " + clippedDesc;
     lines.push(index === state.suggestSel ? c.inverse(label) : " " + c.blue(cmd) + " " + c.dim(clippedDesc));
   });
-  if (rows.length) lines.push(c.faint("  " + i18n.t(ctx.lang || "en", "palette.controls")));
+  if (rows.length && lines.length < terminalRows) {
+    lines.push(c.faint("  " + i18n.t(ctx.lang || "en", "palette.controls")));
+  }
 
   return { lines, curCol: visWidth(prefix) + visWidth(state.buf.slice(start, state.cur)) };
 }
@@ -140,7 +262,10 @@ function createComposer(opts) {
   const c = ui.c;
   const loadHistory = opts.loadHistory || (() => []);
   const saveHistory = opts.saveHistory || (() => {});
+  const getHistoryScope = opts.getHistoryScope || (() => "");
+  let loadedHistoryScope = String(getHistoryScope() || "");
   let history = (loadHistory() || []).filter((x) => typeof x === "string"); // index 0 = most recent
+  let idleExitArmedUntil = 0;
 
   function cols() {
     return Math.max(30, out.columns || process.stdout.columns || 80);
@@ -151,7 +276,12 @@ function createComposer(opts) {
 
   // Build the rendered block (array of lines) + the cursor target column on the input line.
   function frame(state, ctx) {
-    return buildComposerFrame(state, ctx, c, boxWidth());
+    return buildComposerFrame(
+      state,
+      { ...ctx, rows: out.rows || process.stdout.rows || 24 },
+      c,
+      boxWidth(),
+    );
   }
 
   function render(state, ctx) {
@@ -176,8 +306,14 @@ function createComposer(opts) {
 
   function read(ctx) {
     ctx = ctx || {};
+    const nextHistoryScope = String(getHistoryScope() || "");
+    if (nextHistoryScope !== loadedHistoryScope) {
+      history = (loadHistory() || []).filter((x) => typeof x === "string");
+      loadedHistoryScope = nextHistoryScope;
+    }
     return new Promise((resolve) => {
-      const state = { buf: "", cur: 0, scroll: 0, drawn: 0, suggest: [], suggestSel: 0, hist: -1, stash: "", dismissed: null };
+      const state = { buf: "", cur: 0, scroll: 0, drawn: 0, suggest: [], suggestSel: 0, hist: -1, stash: "", dismissed: null, notice: null };
+      let scheduledDraw = null;
 
       function refreshSuggest() {
         if (ctx.suggest && state.buf !== state.dismissed) {
@@ -188,8 +324,20 @@ function createComposer(opts) {
         if (state.suggestSel >= state.suggest.length) state.suggestSel = 0;
       }
       function draw() {
+        if (scheduledDraw) {
+          clearImmediate(scheduledDraw);
+          scheduledDraw = null;
+        }
         refreshSuggest();
         render(state, ctx);
+      }
+      function drawSoon() {
+        if (scheduledDraw) return;
+        scheduledDraw = setImmediate(() => {
+          scheduledDraw = null;
+          refreshSuggest();
+          render(state, ctx);
+        });
       }
 
       const wasRaw = !!inp.isRaw;
@@ -197,17 +345,22 @@ function createComposer(opts) {
       readline.emitKeypressEvents(inp);
       inp.resume();
 
-      let ctrlc = 0;
       function done(result) {
+        if (scheduledDraw) {
+          clearImmediate(scheduledDraw);
+          scheduledDraw = null;
+        }
+        if (typeof out.removeListener === "function") out.removeListener("resize", drawSoon);
         inp.removeListener("keypress", onKey);
         try { if (inp.setRawMode) inp.setRawMode(wasRaw); } catch { /* ignore */ }
         resolve(result);
       }
-      function setBuf(s, cur) {
+      function setBuf(s, cur, deferDraw = false) {
         state.buf = s;
         state.cur = cur == null ? s.length : Math.max(0, Math.min(cur, s.length));
         state.dismissed = null;
-        draw();
+        if (deferDraw) drawSoon();
+        else draw();
       }
       function submit() {
         const value = state.buf;
@@ -225,6 +378,17 @@ function createComposer(opts) {
         key = key || {};
         const name = key.name;
         const shiftTab = name === "tab" && key.shift;
+        // Node's keypress decoder keeps a lone Escape open briefly in case it
+        // starts a longer sequence. If Ctrl-C arrives in that window, the
+        // event can be reported as meta-C with sequence ESC+ETX and
+        // `key.ctrl === false`. ETX still means cancel; never leave the prior
+        // buffer armed for the next submitted command.
+        const keySequence = String(key.sequence ?? str ?? "");
+        const ctrlC = (key.ctrl && name === "c") || keySequence.includes("\x03");
+        if (!ctrlC) {
+          state.notice = null;
+          idleExitArmedUntil = 0;
+        }
 
         if (!shiftTab && ctx.onPermissionCycleCancel) {
           const hadConfirmation = Boolean(ctx.confirmation);
@@ -233,12 +397,21 @@ function createComposer(opts) {
           if (hadConfirmation && !ctx.confirmation) draw();
         }
 
-        if (key.ctrl && name === "c") {
-          if (state.buf.length) { ctrlc = 0; return setBuf("", 0); }
+        if (ctrlC) {
+          if (ctx.continuation) {
+            clearBox(state);
+            return done({ cancel: true });
+          }
+          if (state.buf.length) { idleExitArmedUntil = 0; return setBuf("", 0); }
           const now = Date.now();
-          if (now < ctrlc) { clearBox(state); return done({ exit: true }); }
-          ctrlc = now + 1500;
-          return;
+          if (now < idleExitArmedUntil) {
+            idleExitArmedUntil = 0;
+            clearBox(state);
+            return done({ exit: true });
+          }
+          idleExitArmedUntil = now + 3000;
+          state.notice = i18n.t(ctx.lang || "en", "ctrlcAgain");
+          return draw();
         }
         if (key.ctrl && name === "d") {
           if (!state.buf.length) { clearBox(state); return done({ eof: true }); }
@@ -250,19 +423,37 @@ function createComposer(opts) {
           return setBuf("", 0);
         }
         if (name === "backspace" || (key.ctrl && name === "h")) {
-          if (state.cur > 0) setBuf(state.buf.slice(0, state.cur - 1) + state.buf.slice(state.cur), state.cur - 1);
+          if (state.cur > 0) {
+            const previous = previousGraphemeIndex(state.buf, state.cur);
+            setBuf(state.buf.slice(0, previous) + state.buf.slice(state.cur), previous, true);
+          }
           return;
         }
-        if (name === "delete") return setBuf(state.buf.slice(0, state.cur) + state.buf.slice(state.cur + 1), state.cur);
-        if (name === "left") { if (state.cur > 0) { state.cur--; draw(); } return; }
-        if (name === "right") { if (state.cur < state.buf.length) { state.cur++; draw(); } return; }
+        if (name === "delete") {
+          const next = nextGraphemeIndex(state.buf, state.cur);
+          return setBuf(state.buf.slice(0, state.cur) + state.buf.slice(next), state.cur, true);
+        }
+        if (name === "left") {
+          if (state.cur > 0) {
+            state.cur = previousGraphemeIndex(state.buf, state.cur);
+            draw();
+          }
+          return;
+        }
+        if (name === "right") {
+          if (state.cur < state.buf.length) {
+            state.cur = nextGraphemeIndex(state.buf, state.cur);
+            draw();
+          }
+          return;
+        }
         if (name === "home" || (key.ctrl && name === "a")) { state.cur = 0; draw(); return; }
         if (name === "end" || (key.ctrl && name === "e")) { state.cur = state.buf.length; draw(); return; }
-        if (key.ctrl && name === "u") return setBuf(state.buf.slice(state.cur), 0);
-        if (key.ctrl && name === "k") return setBuf(state.buf.slice(0, state.cur), state.cur);
+        if (key.ctrl && name === "u") return setBuf(state.buf.slice(state.cur), 0, true);
+        if (key.ctrl && name === "k") return setBuf(state.buf.slice(0, state.cur), state.cur, true);
         if (key.ctrl && name === "w") {
           const left = state.buf.slice(0, state.cur).replace(/\s*\S+\s*$/, "");
-          return setBuf(left + state.buf.slice(state.cur), left.length);
+          return setBuf(left + state.buf.slice(state.cur), left.length, true);
         }
         if (name === "up") {
           if (state.suggest.length) { state.suggestSel = (state.suggestSel - 1 + state.suggest.length) % state.suggest.length; state.buf = state.suggest[state.suggestSel].command; state.cur = state.buf.length; return render(state, ctx); }
@@ -296,7 +487,7 @@ function createComposer(opts) {
         // printable insert (single char or paste). Strip control/newlines → single-line field.
         if (str && !key.ctrl && !key.meta) {
           const text = String(str).replace(/[\r\n\t]+/g, " ").replace(/[\x00-\x1f]/g, "");
-          if (text) return setBuf(state.buf.slice(0, state.cur) + text + state.buf.slice(state.cur), state.cur + text.length);
+          if (text) return setBuf(state.buf.slice(0, state.cur) + text + state.buf.slice(state.cur), state.cur + text.length, true);
         }
       }
 
@@ -310,10 +501,18 @@ function createComposer(opts) {
         const v = i === -1 ? state.stash : history[i];
         state.buf = v;
         state.cur = v.length;
+        // A recalled slash command is history, not a newly opened palette.
+        // Keep Up/Down on history until the user edits the recalled value.
+        state.dismissed = v;
         draw();
       }
 
       inp.on("keypress", onKey);
+      // stdout emits `resize` when the real terminal changes dimensions. The
+      // composer owns the visible frame while read() is pending, so repaint it
+      // immediately instead of leaving a stale soft-wrapped footer until the
+      // next keypress.
+      if (typeof out.on === "function") out.on("resize", drawSoon);
       draw();
     });
   }
@@ -321,4 +520,13 @@ function createComposer(opts) {
   return { read, setHistory: (h) => { history = (h || []).filter((x) => typeof x === "string"); } };
 }
 
-module.exports = { createComposer, visWidth, buildComposerFrame, truncateWidth };
+module.exports = {
+  createComposer,
+  visWidth,
+  buildComposerFrame,
+  truncateWidth,
+  splitWidth,
+  wrapWidth,
+  previousGraphemeIndex,
+  nextGraphemeIndex,
+};

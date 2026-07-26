@@ -6,6 +6,20 @@ set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN="$SCRIPT_DIR/../bin/agentlas.cjs"
+SMOKE_USER_DATA="$(mktemp -d "${TMPDIR:-/tmp}/agentlas-smoke-state-XXXXXX")"
+export AGENTLAS_USER_DATA_DIR="$SMOKE_USER_DATA"
+
+cleanup_smoke_state() {
+  if [ -n "${SMOKE_USER_DATA:-}" ] && [ -d "$SMOKE_USER_DATA" ]; then
+    destination="$HOME/.Trash/agentlas-smoke-state-$(date +%s)-$$"
+    mv "$SMOKE_USER_DATA" "$destination" 2>/dev/null || true
+    SMOKE_USER_DATA=""
+  fi
+}
+trap cleanup_smoke_state EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 pass=0
 fail=0
@@ -62,6 +76,7 @@ check "workload-routing-contract" node "$SCRIPT_DIR/workload-routing-contract.cj
 check "workforce-runtime-contract" node "$SCRIPT_DIR/workforce-runtime-contract.cjs"
 check "update-safety" node "$SCRIPT_DIR/update-safety.cjs"
 check "semver-precedence" node "$SCRIPT_DIR/semver-precedence.cjs"
+check "architecture-seed-precedence" node "$SCRIPT_DIR/architecture-seed-precedence.cjs"
 # 공개 저장소 push 가드가 test/ 아래 신규 파일을 막아 이 스크립트는 로컬에만 존재한다.
 # 있으면 돌리고, 없으면(공개 clone/CI) 조용히 건너뛴다 — 실패로 잡지 않는다.
 if [ -f "$SCRIPT_DIR/plugin-add-contract.cjs" ]; then

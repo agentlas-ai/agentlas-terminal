@@ -8,8 +8,8 @@
  *
  * 명령:
  *   agentlas list                  설치된 에이전트/회사 + 활성 런타임
- *   agentlas cd <agent>            에이전트 폴더 경로 출력 (CLAUDE.md/AGENTS.md/GEMINI.md 생성)
- *                                  → cd "$(agentlas cd seo)" && claude
+ *   agentlas cd <agent>            에이전트 폴더 경로만 출력 (읽기 전용)
+ *   agentlas native prepare <agent> CLAUDE.md/AGENTS.md/GEMINI.md 명시적 생성
  *   agentlas run <agent> [prompt]  활성(또는 --runtime) CLI로 1회 실행. prompt 없으면 stdin.
  *   agentlas chat <agent>          대화형 REPL
  *   agentlas env [list]            공유 env 키 목록 (이름만)
@@ -35,7 +35,18 @@ const desktopOntologyLoadout = require("./agentlas-desktop-loadout.cjs");
 const workloadRouting = require("./agentlas-workload-routing.cjs");
 const terminalExperienceIntake = require("./agentlas-experience-intake.cjs");
 const terminalMemoryGovernance = require("./agentlas-memory-governance.cjs");
-const { captureCoreJsonSync, resolveCoreRuntimeRoot } = require("./agentlas-core-harness.cjs");
+const i18n = require("./agentlas-i18n.cjs");
+const {
+  CONTEXT_MAP_MIN_CORE_VERSION,
+  captureCoreJson,
+  captureCoreJsonSync,
+  resolveCoreRuntimeRoot,
+} = require("./agentlas-core-harness.cjs");
+const {
+  SQLITE_BUSY_TIMEOUT_MS,
+  configureSqliteConnection,
+  runWriteTransaction,
+} = require("./agentlas-sqlite-policy.cjs");
 
 // ── 앱과 동일한 userData 경로 (electron app.getPath('userData')와 일치) ──
 function userDataDir() {
@@ -62,6 +73,7 @@ const MULTIMODAL_META_KEY = "multimodal_settings";
 // `--permission full` 로 셸 명령 포함 전체 자동(npm/mkdir 등) 허용. main()에서 설정.
 let PERMISSION = "write";
 let PERMISSION_EXPLICIT = false; // true once --permission is passed (overrides saved prefs)
+let PRINT_MODE = false;
 
 function dbPath() {
   return path.join(userDataDir(), "agentlas.sqlite");
@@ -74,7 +86,11 @@ function openDb() {
   }
   try {
     const Database = require("better-sqlite3");
-    return new Database(p, { readonly: false, fileMustExist: true });
+    return configureSqliteConnection(new Database(p, {
+      readonly: false,
+      fileMustExist: true,
+      timeout: SQLITE_BUSY_TIMEOUT_MS,
+    }));
   } catch (e) {
     try {
       return openNodeSqliteDb(p);
@@ -91,6 +107,7 @@ function openNodeSqliteDb(p) {
   installNodeSqliteWarningFilter();
   const { DatabaseSync } = require("node:sqlite");
   const db = new DatabaseSync(p);
+  configureSqliteConnection(db);
   return {
     prepare(sql) {
       const stmt = db.prepare(sql);
@@ -114,8 +131,8 @@ function openNodeSqliteDb(p) {
       return rows;
     },
     transaction(fn) {
-      return (...args) => {
-        db.exec("BEGIN");
+      const run = (begin, args) => {
+        db.exec(begin);
         try {
           const result = fn(...args);
           db.exec("COMMIT");
@@ -129,6 +146,11 @@ function openNodeSqliteDb(p) {
           throw err;
         }
       };
+      const transaction = (...args) => run("BEGIN", args);
+      transaction.deferred = transaction;
+      transaction.immediate = (...args) => run("BEGIN IMMEDIATE", args);
+      transaction.exclusive = (...args) => run("BEGIN EXCLUSIVE", args);
+      return transaction;
     },
     close: () => db.close(),
   };
@@ -667,9 +689,9 @@ const ROUTE_JUDGE_DIRECT_LABEL = "direct";
 const ROUTE_JUDGE_META_LABEL = "meta-builder";
 const ROUTE_JUDGE_APP_LABEL = "app-builder";
 const APP_BUILDER_ROUTE_SLUG = "agentlas-app-builder";
-async function resolveAutoRoute(db, prompt, lang) {
+async function resolveAutoRoute(db, prompt, lang, signal, runtime) {
   const resolvedLang = lang || prefsLang();
-  ensureJudgmentRunnerInstalled(db);
+  ensureJudgmentRunnerInstalled(db, runtime);
   let judgment;
   try {
     judgment = require("./agentlas-judgment.cjs");
@@ -732,6 +754,7 @@ async function resolveAutoRoute(db, prompt, lang) {
     ].join("\n"),
     multi: false,
     fallback: [],
+    signal,
     // Routing is a one-shot pre-run gate: correctness matters more than latency,
     // and a local 30B model with a full roster can need well over the 20s default.
     // The judge's abort signal is threaded into the request, so a genuinely hung
@@ -1072,15 +1095,20 @@ function upsertLocalTeamFirmCli(db, dir, ceoAgentId, agentSlug, name, tagline) {
   return { id, slug: firmSlug };
 }
 function cmdImport(db, absPath) {
-  if (!absPath) fail("Usage: agentlas import <folder-path>");
+  const ko = prefsLang() === "ko";
+  if (!absPath) fail(ko ? "사용법: agentlas import <폴더-경로>" : "Usage: agentlas import <folder-path>");
   const r = importLocalFolderCli(db, absPath);
-  out(`${r.updated ? "Updated" : "Imported"}: ${r.name}  (${r.kind})`);
-  out(`  slug:    ${r.slug}`);
-  out(`  runtime: ${r.runtime}  [${r.labels.join(", ")}]`);
-  out(`  path:    ${r.path}`);
-  if (r.firmSlug) out(`  firm:    ${r.firmSlug}  (registered in Firms — Desktop sidebar + 'agentlas firm ${r.firmSlug}')`);
+  out(`${r.updated ? (ko ? "업데이트됨" : "Updated") : (ko ? "가져옴" : "Imported")}: ${r.name}  (${r.kind})`);
+  out(`  ${ko ? "슬러그" : "slug"}:    ${r.slug}`);
+  out(`  ${ko ? "런타임" : "runtime"}: ${r.runtime}  [${r.labels.join(", ")}]`);
+  out(`  ${ko ? "경로" : "path"}:    ${r.path}`);
+  if (r.firmSlug) out(ko
+    ? `  회사:    ${r.firmSlug}  (회사로 등록됨 — Desktop 사이드바 + 'agentlas firm ${r.firmSlug}')`
+    : `  firm:    ${r.firmSlug}  (registered in Firms — Desktop sidebar + 'agentlas firm ${r.firmSlug}')`);
   out("");
-  out(`Run: agentlas ${r.slug} "..."   ·   agentlas run ${r.slug} "..."   (run from the target project folder)`);
+  out(ko
+    ? `실행: agentlas ${r.slug} "..."   ·   agentlas run ${r.slug} "..."   (대상 프로젝트 폴더에서 실행)`
+    : `Run: agentlas ${r.slug} "..."   ·   agentlas run ${r.slug} "..."   (run from the target project folder)`);
 }
 
 // ── Agentlas Cloud packaging / marketplace ────────────────────────────────
@@ -2333,6 +2361,183 @@ async function cloudSessionCookieCli() {
   }
 }
 
+async function workforceAccountContextCli() {
+  const cookie = await cloudSessionCookieCli();
+  if (!cookie) throw new Error("Agentlas sign-in is required for cross-session Workforce continuity.");
+  const webBase = (process.env.AGENTLAS_WEB_BASE_URL || "https://agentlas.cloud").replace(/\/$/, "");
+  const mcpBase = (process.env.AGENTLAS_MCP_BASE_URL || `${webBase}/api/mcp/v1`).replace(/\/$/, "");
+  const response = await fetchHubCli(mcpBase, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json",
+      cookie,
+      origin: webBase,
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: crypto.randomUUID(),
+      method: "tools/call",
+      params: { name: "agentlas.account_context", arguments: {} },
+    }),
+  });
+  if (!response.ok) throw new Error(`Agentlas account context failed with HTTP ${response.status}.`);
+  const rpc = parseHubJsonCli(response, "Agentlas account context");
+  const text = rpc?.result?.content?.[0]?.text;
+  let payload;
+  try { payload = JSON.parse(String(text || "")); } catch { payload = null; }
+  if (
+    !payload ||
+    payload.schemaVersion !== "agentlas.account-context.v1" ||
+    !/^sha256:[0-9a-f]{64}$/.test(String(payload.accountSubject || "")) ||
+    payload.leaseWindowHours !== 24 ||
+    payload.billingAuthority !== "agentlas-web"
+  ) {
+    throw new Error("Agentlas account context returned an invalid continuity receipt.");
+  }
+  return { ...payload, webBase };
+}
+
+function implicitWorkforceGoalIdCli(workOrder) {
+  const seed = String(workOrder?.workOrderId || "").trim();
+  if (!seed) throw new Error("Workforce WorkOrder id is required for automatic continuity.");
+  return `goal:auto:${crypto.createHash("sha256").update(seed, "utf8").digest("hex").slice(0, 40)}`;
+}
+
+async function withPrivateWorkforcePlanCli(plan, callback) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agentlas-workforce-goal-"));
+  try {
+    fs.chmodSync(directory, 0o700);
+    const file = path.join(directory, "prepared.json");
+    fs.writeFileSync(file, `${JSON.stringify(plan)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    return await callback(file);
+  } finally {
+    try {
+      const file = path.join(directory, "prepared.json");
+      if (fs.existsSync(file) && !fs.lstatSync(file).isSymbolicLink()) fs.unlinkSync(file);
+      fs.rmdirSync(directory);
+    } catch {
+      // The private temp path contains only this call's prepared plan. A later
+      // OS temp cleanup remains safe if an external scanner raced the unlink.
+    }
+  }
+}
+
+async function bindWorkforceGoalCli({ workOrder, candidateSet, selection, validationReceipt, prepared, cwd, goalId }) {
+  const coreRoot = resolveCoreRuntimeRoot();
+  if (!coreRoot) throw new Error("Agentlas Core is unavailable for mandatory Workforce goal binding.");
+  const account = await workforceAccountContextCli();
+  const resolvedGoalId = String(goalId || "").trim() || implicitWorkforceGoalIdCli(workOrder);
+  const continuation = {
+    schemaVersion: "agentlas.workforce-terminal-continuation.v1",
+    status: "prepared",
+    runtimeSourcePins: (prepared?.executionRoster || []).map((row) => ({
+      slotId: row.slotId,
+      agentReleaseId: row.agentReleaseId,
+      source: "hub",
+    })),
+    workOrder,
+    candidateSet,
+    selection,
+    validationReceipt,
+    executionPlan: prepared,
+  };
+  return withPrivateWorkforcePlanCli(continuation, (file) =>
+    captureCoreJson(
+      "agentlas_cloud",
+      [
+        "workforce", "goal-bind", resolvedGoalId, file,
+        "--project", path.resolve(cwd || process.cwd()),
+        "--account-subject", account.accountSubject,
+        "--hub-base-url", account.webBase,
+        "--label", "automatic Terminal Workforce continuity",
+      ],
+      { cwd: path.resolve(cwd || process.cwd()) },
+      coreRoot,
+    )
+  );
+}
+
+async function workforceGoalRuntimeCli(cwd, goalId = null) {
+  const coreRoot = resolveCoreRuntimeRoot();
+  if (!coreRoot) throw new Error("Agentlas Core is unavailable for Workforce continuation.");
+  const account = await workforceAccountContextCli();
+  const args = [
+    "workforce", "goal-runtime",
+    "--project", path.resolve(cwd || process.cwd()),
+    "--account-subject", account.accountSubject,
+    "--hub-base-url", account.webBase,
+  ];
+  if (goalId) args.push("--goal-id", String(goalId));
+  return captureCoreJson(
+    "agentlas_cloud",
+    args,
+    { cwd: path.resolve(cwd || process.cwd()) },
+    coreRoot,
+  );
+}
+
+async function completeWorkforceGoalCli(cwd, goalId = null, status = "completed") {
+  const coreRoot = resolveCoreRuntimeRoot();
+  if (!coreRoot) throw new Error("Agentlas Core is unavailable for explicit Workforce completion.");
+  const account = await workforceAccountContextCli();
+  const project = path.resolve(cwd || process.cwd());
+  let resolvedGoalId = String(goalId || "").trim();
+  if (!resolvedGoalId) {
+    const context = await workforceGoalRuntimeCli(project);
+    resolvedGoalId = String(context?.goals?.[0]?.goalId || "");
+  }
+  if (!resolvedGoalId) throw new Error("No active Workforce goal exists in this account/project.");
+  return captureCoreJson(
+    "agentlas_cloud",
+    [
+      "workforce", "goal-complete", resolvedGoalId,
+      "--project", project,
+      "--account-subject", account.accountSubject,
+      "--hub-base-url", account.webBase,
+      "--status", status === "cancelled" ? "cancelled" : "completed",
+      "--reason", "explicit-terminal-user-command",
+      "--explicit",
+    ],
+    { cwd: project },
+    coreRoot,
+  );
+}
+
+async function recordWorkforceGoalTurnCli({
+  cwd,
+  goalId,
+  decision,
+  usedRosterKeys = [],
+  localSkillIds = [],
+  gapCodes = [],
+  hostRuntime = null,
+  turnId = null,
+}) {
+  const coreRoot = resolveCoreRuntimeRoot();
+  if (!coreRoot) throw new Error("Agentlas Core is unavailable for Workforce turn receipts.");
+  const account = await workforceAccountContextCli();
+  const args = [
+    "workforce", "goal-turn",
+    String(goalId),
+    String(turnId || `turn:terminal:${crypto.randomUUID()}`),
+    String(decision),
+    "--project", path.resolve(cwd || process.cwd()),
+    "--account-subject", account.accountSubject,
+    "--hub-base-url", account.webBase,
+  ];
+  if (hostRuntime) args.push("--host-runtime", String(hostRuntime));
+  for (const key of usedRosterKeys) args.push("--use-roster", String(key));
+  for (const skill of localSkillIds) args.push("--local-skill", String(skill));
+  for (const gap of gapCodes) args.push("--gap", String(gap));
+  return captureCoreJson(
+    "agentlas_cloud",
+    args,
+    { cwd: path.resolve(cwd || process.cwd()) },
+    coreRoot,
+  );
+}
+
 async function cmdCloudInstall(db, slug) {
   if (!slug) fail("usage: agentlas cloud install <slug>");
   const listing = await fetchCloudManifestCli(slug);
@@ -2815,8 +3020,7 @@ function persistCloudListingCli(db, listing) {
   };
   let dbCommitted = false;
   try {
-    if (typeof db.transaction === "function") db.transaction(mutate)();
-    else mutate();
+    runWriteTransaction(db, mutate);
     dbCommitted = true;
     restore?.commit();
   } catch (error) {
@@ -3687,26 +3891,35 @@ function ensureMemoryContextColumn(db) {
     }
   } catch { /* ignore */ }
 }
+function shouldApplyBuiltinArchitectureSeed(installedVersion, bundleVersion, installedCount, bundleCount) {
+  if (!parseSemVer(bundleVersion)) return false;
+  if (installedVersion == null || installedVersion === "") return true;
+  const precedence = compareSemVer(installedVersion, bundleVersion);
+  // An unparseable installed version may belong to a newer/foreign seed format.
+  // Fail closed instead of rewriting shared Desktop data with an older Terminal.
+  if (precedence == null || precedence > 0) return false;
+  if (precedence < 0) return true;
+  const have = Number.isSafeInteger(Number(installedCount)) ? Number(installedCount) : 0;
+  const expected = Number.isSafeInteger(Number(bundleCount)) ? Number(bundleCount) : 0;
+  return have < expected;
+}
 // 앱의 seedBuiltinAgents와 동일한 멱등·버전 게이팅 로직(CJS 버전). 스키마가 아직 v12가 아니면
 // (= 앱이 마이그레이션 전) 건너뜀 — 앱을 한 번 켜면 마이그레이션+시드가 수행된다.
 function seedBuiltins(db) {
   const arch = loadArch();
   if (!arch.agents || !arch.agents.length) return;
   if (!tableExists(db, "meta") || !columnExists(db, "installed_agents", "builtin")) return;
-  let installedVersion = null;
-  try {
-    const r = db.prepare("SELECT value FROM meta WHERE key='architecture_version'").get();
-    installedVersion = r ? r.value : null;
-  } catch { return; }
-  if (installedVersion === arch.version) {
-    try {
-      const have = db.prepare("SELECT COUNT(*) AS n FROM installed_agents WHERE builtin=1").get();
-      if (have.n >= arch.agents.length) return;
-    } catch { /* fallthrough */ }
-  }
   const now = new Date().toISOString();
   try {
-    const tx = db.transaction(() => {
+    runWriteTransaction(db, () => {
+      const installed = db.prepare("SELECT value FROM meta WHERE key='architecture_version'").get();
+      const have = db.prepare("SELECT COUNT(*) AS n FROM installed_agents WHERE builtin=1").get();
+      if (!shouldApplyBuiltinArchitectureSeed(
+        installed ? installed.value : null,
+        arch.version,
+        have ? have.n : 0,
+        arch.agents.length,
+      )) return false;
       const hasVisibility = columnExists(db, "installed_agents", "visibility");
       for (const def of arch.agents) {
         const visibility = def.visibility || "background";
@@ -3734,8 +3947,8 @@ function seedBuiltins(db) {
         }
       }
       db.prepare("INSERT INTO meta(key,value) VALUES('architecture_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(arch.version);
+      return true;
     });
-    tx();
   } catch { /* best-effort */ }
 }
 
@@ -7489,9 +7702,13 @@ function ontologySourceManifestSkeletonCli(root) {
   };
 }
 
-function ensureOntologyCli(projectPath) {
+function ensureOntologyCli(projectPath, lang) {
   const paths = ontologyPathsForCli(projectPath);
-  ensureProjectMemoryCli(paths.root, path.basename(paths.root) || "Project");
+  if (!initializedAgentlasProjectPathCli(paths.root)) {
+    throw new Error(lang === "ko"
+      ? "Agentlas 프로젝트 상태가 초기화되지 않았습니다. 먼저 `agentlas project init`을 명시적으로 실행하세요."
+      : "Agentlas project state is not initialized. Run `agentlas project init` explicitly first.");
+  }
   fs.mkdirSync(paths.inboxPath, { recursive: true });
   if (!fs.existsSync(paths.sourceManifestPath)) {
     writeJsonSafeCli(paths.sourceManifestPath, ontologySourceManifestSkeletonCli(paths.root));
@@ -7528,7 +7745,21 @@ function readOntologySourcesCli(sourceManifestPath) {
   return Array.isArray(manifest.sources) ? manifest.sources : [];
 }
 
-function ontologyUsageLinesCli() {
+function ontologyUsageLinesCli(lang) {
+  if (lang === "ko") {
+    return [
+      "온톨로지 명령:",
+      "  /ontology                         이 프로젝트의 온톨로지 상태 표시",
+      "  /ontology list                    수신함 파일과 등록 폴더 목록",
+      "  /ontology open                    프로젝트 온톨로지 수신함 열기",
+      "  /ontology add ./docs              폴더를 비공개 프로젝트 지식으로 등록",
+      "  /ontology company ./docs          회사 문서를 비공개로 등록",
+      "  /ontology personal ~/notes        개인 문서를 비공개로 등록",
+      "",
+      "안전: 현재 프로젝트 수신함과 명시적으로 등록한 폴더만 사용합니다.",
+      "홈 폴더나 이웃 프로젝트 스캔은 시작하지 않습니다.",
+    ];
+  }
   return [
     "Ontology commands:",
     "  /ontology                         turn on/show this project's ontology",
@@ -7671,38 +7902,39 @@ function parseOntologyNaturalArgsCli(text, cwd) {
     return ["add", source, "--kind", kind, "--scope", scope];
   }
   if (/(enable|activate|start|turn on|켜|시작|활성)/i.test(lower)) return ["status"];
-  return ["status"];
+  return null;
 }
 
-function formatOntologyStatusCli(paths) {
+function formatOntologyStatusCli(paths, lang) {
+  const ko = lang === "ko";
   const sources = readOntologySourcesCli(paths.sourceManifestPath);
   const inbox = listOntologyInboxCli(paths.inboxPath);
   const lines = [
-    "Ontology: active",
-    `  project: ${paths.root}`,
-    `  inbox:  ${paths.inboxPath}`,
-    `  db:     ${paths.dbPath}`,
-    "  policy: inbox_and_registered_sources_only",
-    "  scan:   no home folder, no sibling projects",
+    ko ? "온톨로지: 활성" : "Ontology: active",
+    `  ${ko ? "프로젝트" : "project"}: ${paths.root}`,
+    `  ${ko ? "수신함" : "inbox"}:  ${paths.inboxPath}`,
+    `  DB:     ${paths.dbPath}`,
+    `  ${ko ? "정책" : "policy"}: inbox_and_registered_sources_only`,
+    ko ? "  검색: 홈 폴더·형제 프로젝트 제외" : "  scan:   no home folder, no sibling projects",
     "",
-    `Inbox (${inbox.length}):`,
+    `${ko ? "수신함" : "Inbox"} (${inbox.length}):`,
   ];
-  for (const item of inbox) lines.push(`  ${item.supported ? "✓" : "!"} ${item.name}  ${item.supported ? "supported" : "adapter pending"}`);
-  if (!inbox.length) lines.push("  (empty)");
-  lines.push("", `Sources (${sources.length}):`);
+  for (const item of inbox) lines.push(`  ${item.supported ? "✓" : "!"} ${item.name}  ${item.supported ? (ko ? "지원됨" : "supported") : (ko ? "어댑터 대기" : "adapter pending")}`);
+  if (!inbox.length) lines.push(ko ? "  (비어 있음)" : "  (empty)");
+  lines.push("", `${ko ? "소스" : "Sources"} (${sources.length}):`);
   for (const source of sources) {
     const sourcePath = path.resolve(String(source.path || ""));
     lines.push(`  ${fs.existsSync(sourcePath) ? "✓" : "!"} ${sourcePath}  ${source.kind || "project"} / ${source.scope || "internal"}`);
   }
-  if (!sources.length) lines.push("  (none)");
+  if (!sources.length) lines.push(ko ? "  (없음)" : "  (none)");
   lines.push(
     "",
-    "Add sources:",
+    ko ? "소스 추가:" : "Add sources:",
     "  /ontology add ./docs",
     "  /ontology company ./docs",
     "  /ontology personal ~/notes",
     "",
-    "Natural examples:",
+    ko ? "자연어 예시:" : "Natural examples:",
     "  /ontology use ./docs as company knowledge",
     "  /ontology attach ~/notes as personal private memory",
     "  /ontology open the inbox",
@@ -7710,10 +7942,13 @@ function formatOntologyStatusCli(paths) {
   return lines;
 }
 
-function registerOntologySourceCli(paths, source, kind, scope, cwd) {
-  if (!source) throw new Error("usage: /ontology add <path>  or  /ontology company ./docs");
+function registerOntologySourceCli(paths, source, kind, scope, cwd, lang) {
+  const ko = lang === "ko";
+  if (!source) throw new Error(ko
+    ? "사용법: /ontology add <경로>  또는  /ontology company ./docs"
+    : "usage: /ontology add <path>  or  /ontology company ./docs");
   const sourcePath = resolveOntologyPathCli(source, cwd || paths.root);
-  if (!fs.existsSync(sourcePath)) throw new Error(`source not found: ${sourcePath}`);
+  if (!fs.existsSync(sourcePath)) throw new Error(ko ? `소스를 찾지 못했습니다: ${sourcePath}` : `source not found: ${sourcePath}`);
   const manifest = readJsonSafeCli(paths.sourceManifestPath, ontologySourceManifestSkeletonCli(paths.root));
   const nextSources = (Array.isArray(manifest.sources) ? manifest.sources : [])
     .filter((item) => path.resolve(String(item.path || "")) !== sourcePath);
@@ -7723,54 +7958,85 @@ function registerOntologySourceCli(paths, source, kind, scope, cwd) {
   manifest.projectRoot = paths.root;
   manifest.sources = nextSources;
   writeJsonSafeCli(paths.sourceManifestPath, manifest);
-  return [
-    `Registered ontology source: ${sourcePath}`,
-    `  kind:  ${kind}`,
-    `  scope: ${scope}`,
-    "  copy:  no",
-    "  scan:  only this registered folder, not home/sibling projects",
-  ];
+  return ko
+    ? [
+        `온톨로지 소스 등록됨: ${sourcePath}`,
+        `  종류:  ${kind}`,
+        `  범위: ${scope}`,
+        "  복사:  안 함",
+        "  스캔:  이 등록 폴더만 사용하며 홈/이웃 프로젝트는 스캔하지 않음",
+      ]
+    : [
+        `Registered ontology source: ${sourcePath}`,
+        `  kind:  ${kind}`,
+        `  scope: ${scope}`,
+        "  copy:  no",
+        "  scan:  only this registered folder, not home/sibling projects",
+      ];
 }
 
 function runOntologyCli(args, opts) {
   opts = opts || {};
+  const ko = opts.lang === "ko";
   const cwd = path.resolve(opts.cwd || process.cwd());
   const projectPath = path.resolve(opts.projectPath || cwd);
   const normalizedArgs = Array.isArray(args) ? args : [];
   const sub = normalizedArgs[0] || "status";
-  const paths = ensureOntologyCli(projectPath);
+  const passivePaths = ontologyPathsForCli(projectPath);
   if (sub === "status" || sub === "list") {
-    return formatOntologyStatusCli(paths);
+    if (!initializedAgentlasProjectPathCli(projectPath)) {
+      return [
+        ko ? "온톨로지: 초기화되지 않음" : "Ontology: not initialized",
+        `  ${ko ? "프로젝트" : "project"}: ${projectPath}`,
+        ko ? "  생성된 파일 없음" : "  no files were created",
+        ko ? "  명시적 초기화: agentlas project init" : "  initialize explicitly: agentlas project init",
+      ];
+    }
+    return formatOntologyStatusCli(passivePaths, opts.lang);
   }
+  if (sub === "help" || sub === "--help" || sub === "-h") return ontologyUsageLinesCli(opts.lang);
+  const directOntologyCommand = ["open", "add", "company", "personal", "project"].includes(String(sub).toLowerCase())
+    || isOntologyPathishCli(sub, cwd, true);
+  if (!directOntologyCommand) {
+    const parsed = parseOntologyNaturalArgsCli(normalizedArgs.join(" "), cwd);
+    if (!parsed) throw new Error(ko
+      ? "사용법: /ontology status|list|open|add <경로>"
+      : "usage: /ontology status|list|open|add <path>");
+    return runOntologyCli(parsed, opts);
+  }
+  const paths = ensureOntologyCli(projectPath, opts.lang);
   if (sub === "open") {
     if (!opts.noOpen) openLocalPathCli(paths.inboxPath);
-    return [`Opened ontology inbox: ${paths.inboxPath}`];
-  }
-  if (sub === "help" || sub === "--help" || sub === "-h") {
-    return ontologyUsageLinesCli();
+    return [`${ko ? "온톨로지 수신함을 열었습니다" : "Opened ontology inbox"}: ${paths.inboxPath}`];
   }
   if (sub === "add") {
     const flags = parseCloudFlags(normalizedArgs.slice(1));
     const source = flags._[0];
     const kind = inferOntologyKindCli(flags.kind || flags._[1], normalizedArgs.join(" "));
     const scope = inferOntologyScopeCli(flags.scope || flags._[2], normalizedArgs.join(" "), kind);
-    return registerOntologySourceCli(paths, source, kind, scope, cwd);
+    return registerOntologySourceCli(paths, source, kind, scope, cwd, opts.lang);
   }
   if (["company", "personal", "project"].includes(String(sub).toLowerCase())) {
     const flags = parseCloudFlags(normalizedArgs.slice(1));
     const kind = inferOntologyKindCli(sub, normalizedArgs.join(" "));
     const scope = inferOntologyScopeCli(flags.scope || flags._[1], normalizedArgs.join(" "), kind);
-    return registerOntologySourceCli(paths, flags._[0], kind, scope, cwd);
+    return registerOntologySourceCli(paths, flags._[0], kind, scope, cwd, opts.lang);
   }
   if (isOntologyPathishCli(sub, cwd, true)) {
-    return registerOntologySourceCli(paths, sub, inferOntologyKindCli(null, normalizedArgs.join(" ")), inferOntologyScopeCli(null, normalizedArgs.join(" "), "project"), cwd);
+    return registerOntologySourceCli(paths, sub, inferOntologyKindCli(null, normalizedArgs.join(" ")), inferOntologyScopeCli(null, normalizedArgs.join(" "), "project"), cwd, opts.lang);
   }
-  return runOntologyCli(parseOntologyNaturalArgsCli(normalizedArgs.join(" "), cwd), opts);
+  throw new Error(ko
+    ? "사용법: /ontology status|list|open|add <경로>"
+    : "usage: /ontology status|list|open|add <path>");
 }
 
 function runOntologyNaturalCli(text, opts) {
   const cwd = path.resolve((opts && opts.cwd) || process.cwd());
-  return runOntologyCli(parseOntologyNaturalArgsCli(text, cwd), { ...(opts || {}), cwd });
+  const parsed = parseOntologyNaturalArgsCli(text, cwd);
+  if (!parsed) throw new Error((opts && opts.lang) === "ko"
+    ? "사용법: /ontology status|list|open|add <경로>"
+    : "usage: /ontology status|list|open|add <path>");
+  return runOntologyCli(parsed, { ...(opts || {}), cwd });
 }
 
 function careerGraphPathsForCli(projectPath) {
@@ -7796,9 +8062,13 @@ function careerGraphSourceManifestSkeletonCli(root) {
   };
 }
 
-function ensureCareerGraphCli(projectPath) {
+function ensureCareerGraphCli(projectPath, lang) {
   const paths = careerGraphPathsForCli(projectPath);
-  ensureProjectMemoryCli(paths.root, path.basename(paths.root) || "Project");
+  if (!initializedAgentlasProjectPathCli(paths.root)) {
+    throw new Error(lang === "ko"
+      ? "Agentlas 프로젝트 상태가 초기화되지 않았습니다. 먼저 `agentlas project init`을 명시적으로 실행하세요."
+      : "Agentlas project state is not initialized. Run `agentlas project init` explicitly first.");
+  }
   fs.mkdirSync(paths.inboxPath, { recursive: true });
   if (!fs.existsSync(paths.sourceManifestPath)) {
     writeJsonSafeCli(paths.sourceManifestPath, careerGraphSourceManifestSkeletonCli(paths.root));
@@ -7811,7 +8081,19 @@ function readCareerGraphSourcesCli(sourceManifestPath) {
   return Array.isArray(manifest.sources) ? manifest.sources : [];
 }
 
-function careerGraphUsageLinesCli() {
+function careerGraphUsageLinesCli(lang) {
+  if (lang === "ko") {
+    return [
+      "커리어 그래프 명령:",
+      "  career-graph status               소스 라우팅 파일과 인덱스 상태 표시",
+      "  career-graph list                 수신함 파일과 등록 소스 참조 목록",
+      "  career-graph open                 프로젝트 커리어 그래프 수신함 열기",
+      "  career-graph add ./docs           폴더를 비공개 소스 자료로 등록",
+      "",
+      "전체 그래프 인덱스 실행은 Agentlas OS / Hephaestus에서 제공합니다.",
+      "안전: 그래프는 재생성 가능하며 Markdown·JSONL·sitemap·code map이 원본입니다.",
+    ];
+  }
   return [
     "Career Graph commands:",
     "  career-graph status               show source-routing files and index state",
@@ -7841,44 +8123,46 @@ function existingCareerGraphCanonicalRefsCli(root) {
   ].filter((rel) => fs.existsSync(path.join(root, rel)));
 }
 
-function formatCareerGraphStatusCli(paths) {
+function formatCareerGraphStatusCli(paths, lang) {
+  const ko = lang === "ko";
   const sources = readCareerGraphSourcesCli(paths.sourceManifestPath);
   const inbox = listOntologyInboxCli(paths.inboxPath);
   const canonical = existingCareerGraphCanonicalRefsCli(paths.root);
   const lines = [
-    "Career Graph: active",
-    `  project: ${paths.root}`,
-    `  inbox:  ${paths.inboxPath}`,
-    `  db:     ${paths.dbPath}`,
-    `  index:  ${fs.existsSync(paths.dbPath) ? "present" : "pending"}`,
-    "  policy: ledger_first_derived_index",
-    "  source of truth: Markdown / JSONL / JSON files",
+    ko ? "커리어 그래프: 활성" : "Career Graph: active",
+    `  ${ko ? "프로젝트" : "project"}: ${paths.root}`,
+    `  ${ko ? "수신함" : "inbox"}:  ${paths.inboxPath}`,
+    `  DB:     ${paths.dbPath}`,
+    `  ${ko ? "인덱스" : "index"}:  ${fs.existsSync(paths.dbPath) ? (ko ? "있음" : "present") : (ko ? "대기" : "pending")}`,
+    `  ${ko ? "정책" : "policy"}: ledger_first_derived_index`,
+    ko ? "  원본 기준: Markdown / JSONL / JSON 파일" : "  source of truth: Markdown / JSONL / JSON files",
     "",
-    `Canonical source refs (${canonical.length}):`,
+    `${ko ? "기본 소스 참조" : "Canonical source refs"} (${canonical.length}):`,
   ];
   for (const rel of canonical) lines.push(`  ${rel}`);
-  if (!canonical.length) lines.push("  (none yet)");
-  lines.push("", `Inbox (${inbox.length}):`);
-  for (const item of inbox) lines.push(`  ${item.supported ? "ok" : "!"} ${item.name}  ${item.supported ? "supported" : "adapter pending"}`);
-  if (!inbox.length) lines.push("  (empty)");
-  lines.push("", `Registered source refs (${sources.length}):`);
+  if (!canonical.length) lines.push(ko ? "  (아직 없음)" : "  (none yet)");
+  lines.push("", `${ko ? "수신함" : "Inbox"} (${inbox.length}):`);
+  for (const item of inbox) lines.push(`  ${item.supported ? "ok" : "!"} ${item.name}  ${item.supported ? (ko ? "지원됨" : "supported") : (ko ? "어댑터 대기" : "adapter pending")}`);
+  if (!inbox.length) lines.push(ko ? "  (비어 있음)" : "  (empty)");
+  lines.push("", `${ko ? "등록된 소스 참조" : "Registered source refs"} (${sources.length}):`);
   for (const source of sources) {
     const sourcePath = path.resolve(String(source.path || ""));
     lines.push(`  ${fs.existsSync(sourcePath) ? "ok" : "!"} ${sourcePath}  ${source.kind || "project"} / ${source.scope || "private"}`);
   }
-  if (!sources.length) lines.push("  (none)");
+  if (!sources.length) lines.push(ko ? "  (없음)" : "  (none)");
   lines.push(
     "",
-    "Build the derived index with Agentlas OS:",
+    ko ? "Agentlas OS로 파생 인덱스 만들기:" : "Build the derived index with Agentlas OS:",
     `  hephaestus career-graph ingest --project ${JSON.stringify(paths.root)}`,
   );
   return lines;
 }
 
-function registerCareerGraphSourceCli(paths, source, kind, scope, cwd) {
-  if (!source) throw new Error("usage: career-graph add <path>");
+function registerCareerGraphSourceCli(paths, source, kind, scope, cwd, lang) {
+  const ko = lang === "ko";
+  if (!source) throw new Error(ko ? "사용법: career-graph add <경로>" : "usage: career-graph add <path>");
   const sourcePath = resolveOntologyPathCli(source, cwd || paths.root);
-  if (!fs.existsSync(sourcePath)) throw new Error(`source not found: ${sourcePath}`);
+  if (!fs.existsSync(sourcePath)) throw new Error(ko ? `소스를 찾지 못했습니다: ${sourcePath}` : `source not found: ${sourcePath}`);
   const manifest = readJsonSafeCli(paths.sourceManifestPath, careerGraphSourceManifestSkeletonCli(paths.root));
   const nextSources = (Array.isArray(manifest.sources) ? manifest.sources : [])
     .filter((item) => path.resolve(String(item.path || "")) !== sourcePath);
@@ -7888,51 +8172,83 @@ function registerCareerGraphSourceCli(paths, source, kind, scope, cwd) {
   manifest.projectRoot = paths.root;
   manifest.sources = nextSources;
   writeJsonSafeCli(paths.sourceManifestPath, manifest);
-  return [
-    `Registered Career Graph source: ${sourcePath}`,
-    `  kind:  ${kind}`,
-    `  scope: ${scope}`,
-    "  copy:  no",
-    "  scan:  only this registered folder, not home/sibling projects",
-  ];
+  return ko
+    ? [
+        `커리어 그래프 소스 등록됨: ${sourcePath}`,
+        `  종류:  ${kind}`,
+        `  범위: ${scope}`,
+        "  복사:  안 함",
+        "  스캔:  이 등록 폴더만 사용하며 홈/이웃 프로젝트는 스캔하지 않음",
+      ]
+    : [
+        `Registered Career Graph source: ${sourcePath}`,
+        `  kind:  ${kind}`,
+        `  scope: ${scope}`,
+        "  copy:  no",
+        "  scan:  only this registered folder, not home/sibling projects",
+      ];
 }
 
 function runCareerGraphCli(args, opts) {
   opts = opts || {};
+  const ko = opts.lang === "ko";
   const cwd = path.resolve(opts.cwd || process.cwd());
   const projectPath = path.resolve(opts.projectPath || cwd);
   const normalizedArgs = Array.isArray(args) ? args : [];
   const sub = normalizedArgs[0] || "status";
-  const paths = ensureCareerGraphCli(projectPath);
+  const passivePaths = careerGraphPathsForCli(projectPath);
   if (sub === "status" || sub === "list") {
-    return formatCareerGraphStatusCli(paths);
+    if (!initializedAgentlasProjectPathCli(projectPath)) {
+      return [
+        ko ? "커리어 그래프: 초기화되지 않음" : "Career Graph: not initialized",
+        `  ${ko ? "프로젝트" : "project"}: ${projectPath}`,
+        ko ? "  생성된 파일 없음" : "  no files were created",
+        ko ? "  명시적 초기화: agentlas project init" : "  initialize explicitly: agentlas project init",
+      ];
+    }
+    return formatCareerGraphStatusCli(passivePaths, opts.lang);
   }
+  if (sub === "help" || sub === "--help" || sub === "-h") return careerGraphUsageLinesCli(opts.lang);
+  if (["ingest", "query", "verify", "trace"].includes(String(sub))) {
+    return [
+      ko
+        ? "Career Graph 인덱스 실행은 Agentlas OS / Hephaestus에서 제공합니다."
+        : "Career Graph index execution is provided by Agentlas OS / Hephaestus.",
+      `${ko ? "실행" : "Run"}: hephaestus career-graph ${normalizedArgs.join(" ")} --project ${JSON.stringify(passivePaths.root)}`,
+    ];
+  }
+  const directCareerCommand = ["open", "add"].includes(String(sub));
+  if (!directCareerCommand) {
+    const parsed = parseOntologyNaturalArgsCli(normalizedArgs.join(" "), cwd);
+    if (!parsed) throw new Error(ko
+      ? "사용법: /career-graph status|list|open|add <경로>"
+      : "usage: /career-graph status|list|open|add <path>");
+    return runCareerGraphCli(parsed, opts);
+  }
+  const paths = ensureCareerGraphCli(projectPath, opts.lang);
   if (sub === "open") {
     if (!opts.noOpen) openLocalPathCli(paths.inboxPath);
-    return [`Opened Career Graph inbox: ${paths.inboxPath}`];
-  }
-  if (sub === "help" || sub === "--help" || sub === "-h") {
-    return careerGraphUsageLinesCli();
+    return [`${ko ? "커리어 그래프 수신함을 열었습니다" : "Opened Career Graph inbox"}: ${paths.inboxPath}`];
   }
   if (sub === "add") {
     const flags = parseCloudFlags(normalizedArgs.slice(1));
     const source = flags._[0];
     const kind = inferOntologyKindCli(flags.kind || flags._[1], normalizedArgs.join(" "));
     const scope = inferOntologyScopeCli(flags.scope || flags._[2], normalizedArgs.join(" "), kind);
-    return registerCareerGraphSourceCli(paths, source, kind, scope, cwd);
+    return registerCareerGraphSourceCli(paths, source, kind, scope, cwd, opts.lang);
   }
-  if (["ingest", "query", "verify", "trace"].includes(String(sub))) {
-    return [
-      "Career Graph index execution is provided by Agentlas OS / Hephaestus.",
-      `Run: hephaestus career-graph ${normalizedArgs.join(" ")} --project ${JSON.stringify(paths.root)}`,
-    ];
-  }
-  return runCareerGraphCli(parseOntologyNaturalArgsCli(normalizedArgs.join(" "), cwd), opts);
+  throw new Error(ko
+    ? "사용법: /career-graph status|list|open|add <경로>"
+    : "usage: /career-graph status|list|open|add <path>");
 }
 
 function runCareerGraphNaturalCli(text, opts) {
   const cwd = path.resolve((opts && opts.cwd) || process.cwd());
-  return runCareerGraphCli(parseOntologyNaturalArgsCli(text, cwd), { ...(opts || {}), cwd });
+  const parsed = parseOntologyNaturalArgsCli(text, cwd);
+  if (!parsed) throw new Error((opts && opts.lang) === "ko"
+    ? "사용법: /career-graph status|list|open|add <경로>"
+    : "usage: /career-graph status|list|open|add <path>");
+  return runCareerGraphCli(parsed, { ...(opts || {}), cwd });
 }
 
 async function cmdCareerGraph(args) {
@@ -7943,7 +8259,7 @@ async function cmdCareerGraph(args) {
     return;
   }
   try {
-    for (const line of runCareerGraphCli(args, { cwd: process.cwd(), projectPath: process.cwd() })) out(line);
+    for (const line of runCareerGraphCli(args, { cwd: process.cwd(), projectPath: process.cwd(), lang: prefsLang() })) out(line);
   } catch (e) {
     fail((e && e.message) || String(e));
   }
@@ -7951,7 +8267,7 @@ async function cmdCareerGraph(args) {
 
 function cmdOntology(args) {
   try {
-    for (const line of runOntologyCli(args, { cwd: process.cwd(), projectPath: process.cwd() })) out(line);
+    for (const line of runOntologyCli(args, { cwd: process.cwd(), projectPath: process.cwd(), lang: prefsLang() })) out(line);
   } catch (e) {
     fail((e && e.message) || String(e));
   }
@@ -8239,7 +8555,11 @@ function ensureCoreProjectCli(projectPath, options = {}) {
     return cached === "core";
   }
   projectBootstrapStates.delete(root);
-  const coreRoot = resolveCoreRuntimeRoot(options.coreRoot);
+  const coreRoot = resolveCoreRuntimeRoot(
+    options.coreRoot,
+    [],
+    { minVersion: CONTEXT_MAP_MIN_CORE_VERSION },
+  );
   const hasCanonicalBootstrap = Boolean(
     coreRoot && fs.existsSync(path.join(coreRoot, "agentlas_cloud", "project_bootstrap.py")),
   );
@@ -8287,7 +8607,7 @@ function ensureCoreProjectCli(projectPath, options = {}) {
 }
 
 // Passive checks never increment visits or touch the project. Activation is
-// reserved for an actual write/full Terminal execution or an explicit ensure.
+// reserved for the explicit project-initialization boundary.
 function recordCliFolderVisit(db, projectPath, options = {}) {
   const root = terminalProjectCandidateCli(projectPath);
   if (!root) return { activated: false };
@@ -8315,7 +8635,7 @@ function recordCliFolderVisit(db, projectPath, options = {}) {
   } catch (error) {
     // An activation failure can mean that the project-local privacy boundary
     // could not be established (for example, a symlinked or oversized
-    // .gitignore). Never continue a write/full execution in that state.
+    // .gitignore). Explicit initialization must fail closed in that state.
     if (activate) throw error;
     return { activated: false };
   }
@@ -8331,10 +8651,43 @@ function activeProjectPath(db, options = {}) {
 function ensureTerminalProjectForExecutionCli(db, projectPath, permission = PERMISSION, reason = "terminal-first-contact") {
   const root = terminalProjectCandidateCli(projectPath);
   if (!root) return null;
-  if (permission === "read") return activeProjectPath(db, { projectPath: root });
-  return activeProjectPath(db, { projectPath: root, activate: true, reason });
+  // Every ordinary execution mode is passive. Only `agentlas project init`
+  // may create .agentlas state or edit .gitignore; write/full permission is
+  // authority for the requested task, not consent to initialize the folder.
+  void permission;
+  void reason;
+  const active = activeProjectPath(db, { projectPath: root });
+  if (!active) return null;
+  return initializedAgentlasProjectPathCli(root);
 }
 
+function initializedAgentlasProjectPathCli(projectPath) {
+  const root = terminalProjectCandidateCli(projectPath);
+  if (!root) return null;
+  try {
+    const stateDir = path.join(root, ".agentlas");
+    const soul = path.join(stateDir, "project-soul-memory.md");
+    const ignore = readRegularUtf8FileNoFollowCli(path.join(root, ".gitignore")).content;
+    if (!fs.existsSync(soul) || !ignore.includes(AGENTLAS_PROJECT_STATE_IGNORE_START) || !/^\.agentlas\/$/m.test(ignore)) {
+      return null;
+    }
+    assertNoSymlinkInAgentlasStateCli(stateDir);
+    return root;
+  } catch {
+    return null;
+  }
+}
+
+function initializeTerminalProjectCli(db, projectPath, reason = "terminal-explicit-project-init", options = {}) {
+  const root = terminalProjectCandidateCli(projectPath);
+  if (!root) throw new Error("Agentlas project initialization requires a safe project directory");
+  return activeProjectPath(db, {
+    projectPath: root,
+    activate: true,
+    reason,
+    coreRoot: options.coreRoot,
+  });
+}
 function cliProjectContextSlice(projectPath, task) {
   if (!projectPath || !String(task || "").trim()) return "";
   try {
@@ -8351,7 +8704,7 @@ function cliProjectContextSlice(projectPath, task) {
       ],
       {
         cwd: projectPath,
-        input: String(task).slice(0, 12_000),
+        input: String(task || "").slice(0, 12_000),
         timeout: 4_000,
       },
       coreRoot,
@@ -8438,8 +8791,9 @@ function parseMemoryEventsCli(text) {
   if (fence) { try { const d = JSON.parse(fence[1].trim()); if (Array.isArray(d)) events = d; } catch { /* ignore */ } }
   let cut = text.length;
   if (fence && fence.index != null) cut = idx + heading.length + fence.index + fence[0].length;
-  else cut = idx;
-  return { events, cleaned: (text.slice(0, idx) + text.slice(cut)).trim() };
+  const before = text.slice(0, idx).replace(/<!--\s*$/u, "");
+  const remainder = text.slice(cut).replace(/^\s*-->/u, "");
+  return { events, cleaned: (before + remainder).trim() };
 }
 function curateCliReply(db, text, ctx) {
   const { events, cleaned } = parseMemoryEventsCli(text);
@@ -8494,6 +8848,18 @@ function prefsLang() {
     return require("./agentlas-config.cjs").loadPrefs(userDataDir()).lang || "en";
   } catch {
     return "en";
+  }
+}
+
+function resolveTerminalPermission(override) {
+  const policy = require("./agentlas-permissions.cjs");
+  if (override) return policy.normalize(override, "read");
+  if (PERMISSION_EXPLICIT) return policy.normalize(PERMISSION, "read");
+  try {
+    const saved = require("./agentlas-config.cjs").loadPrefs(userDataDir()).permission;
+    return policy.persistent(saved, "write");
+  } catch {
+    return "write";
   }
 }
 
@@ -8768,11 +9134,15 @@ function installJudgmentRunner(db, rt) {
 // `run`/auto-route would always fall to the deterministic label without this.
 // Uses the active runtime (CLI or API/Ollama/BYOK); a pinned override still
 // reinstalls in executeOnce for the actual task turn.
-function ensureJudgmentRunnerInstalled(db) {
+function ensureJudgmentRunnerInstalled(db, preferredRuntime = null) {
   let judgment;
   try {
     judgment = require("./agentlas-judgment.cjs");
   } catch {
+    return;
+  }
+  if (preferredRuntime) {
+    installJudgmentRunner(db, preferredRuntime);
     return;
   }
   if (judgment.hasJudgmentRunner()) return;
@@ -8836,6 +9206,15 @@ async function cmdInternalJudge(db) {
 }
 
 function resolveRuntime(db, override) {
+  // The saved CLI choice is the Terminal default on every execution surface,
+  // not only inside the interactive REPL. Explicit --runtime still wins, and
+  // an unavailable saved CLI safely falls through.
+  if (!override) {
+    try {
+      const saved = require("./agentlas-config.cjs").loadPrefs(userDataDir()).runtime;
+      if (saved && saved !== "auto" && RUNTIME_BIN[saved] && which(RUNTIME_BIN[saved])) override = saved;
+    } catch { /* fall through to app-active/discovered runtime */ }
+  }
   const ar = activeRuntime(db);
   const activeCli = ar && RUNTIME_BIN[ar.kind]
     ? {
@@ -8847,7 +9226,7 @@ function resolveRuntime(db, override) {
       }
     : null;
   if (override) {
-    if (!RUNTIME_BIN[override]) fail(`Unknown runtime: ${override} (claude-code|codex|gemini)`);
+    if (!RUNTIME_BIN[override]) fail(i18n.t(prefsLang(), "runtimeUnknown", override));
     return activeCli && activeCli.kind === override ? activeCli : { mode: "cli", kind: override };
   }
   if (activeCli) return activeCli;
@@ -8857,7 +9236,7 @@ function resolveRuntime(db, override) {
   for (const kind of Object.keys(RUNTIME_BIN)) {
     if (which(RUNTIME_BIN[kind])) return { mode: "cli", kind };
   }
-  fail("No runtime is available. Install a CLI (claude/codex/gemini) or configure an API key/Ollama in the app.");
+  fail(i18n.t(prefsLang(), "runtimeUnavailable"));
 }
 
 // Build the executable runtime inventory for the parent allocator.  It is
@@ -9189,11 +9568,36 @@ async function executeOnce(db, system, prompt, override, ctx) {
     const permission = ctx.permission || "write";
     const env = await buildChildEnvCli(db, { ...ctx, cwd });
     process.stderr.write(`▸ ${rt.kind} · ${permission} · ${cwd}\n`);
-    // one-shot(`agentlas "작업"`)도 REPL과 동일한 리치 렌더(⏺ 툴 / └ 결과 / 토큰)로 출력한다.
+    // A TTY gets the rich renderer. Pipes and explicit -p/--print keep stdout
+    // as the final answer only; runtime activity, errors, and usage stay on stderr.
     const { runNativeTurn } = require("./agentlas-native-host.cjs");
     const { Ui } = require("./agentlas-ui.cjs");
     const { makeMemoryGuard } = require("./agentlas-repl.cjs");
-    const ui = new Ui({ lang: prefsLang() });
+    const cleanStdout = PRINT_MODE || !process.stdout.isTTY;
+    const ui = new Ui({ lang: prefsLang(), stream: cleanStdout ? process.stderr : process.stdout });
+    const eventUi = cleanStdout
+      ? {
+          c: ui.c,
+          lang: ui.lang,
+          t: (...args) => ui.t(...args),
+          streamStart: () => {},
+          streamDelta: () => {},
+          streamEnd: () => {},
+          stopSpinner: (...args) => ui.stopSpinner(...args),
+          tool: (...args) => ui.tool(...args),
+          toolResult: (...args) => ui.toolResult(...args),
+          info: (...args) => ui.info(...args),
+          warn: (...args) => ui.warn(...args),
+          error: (...args) => ui.error(...args),
+          status: (...args) => ui.status(...args),
+          ok: (...args) => ui.ok(...args),
+          cost: (...args) => ui.cost(...args),
+          line: (...args) => ui.line(...args),
+          applyTaskTool: (...args) => ui.applyTaskTool(...args),
+          applyTaskResult: (...args) => ui.applyTaskResult(...args),
+          replaceTasks: (...args) => ui.replaceTasks(...args),
+        }
+      : ui;
     let mcpServers = [];
     if (permission === "full") {
       if (Array.isArray(ctx.mcpServers)) {
@@ -9207,7 +9611,14 @@ async function executeOnce(db, system, prompt, override, ctx) {
       }
     }
     ui.beginTurn();
-    const memoryGuard = makeMemoryGuard(ui, loadArch().eventsHeading);
+    const memoryGuard = makeMemoryGuard(eventUi, loadArch().eventsHeading);
+    const turnAbort = new AbortController();
+    const onOneShotInterrupt = () => {
+      if (turnAbort.signal.aborted) return;
+      process.stderr.write("\n! cancelling — waiting for child processes to stop\n");
+      turnAbort.abort(new Error("interrupted"));
+    };
+    process.once("SIGINT", onOneShotInterrupt);
     let res;
     try {
       res = await runNativeTurn({
@@ -9224,10 +9635,13 @@ async function executeOnce(db, system, prompt, override, ctx) {
         mcpAllowlistMode: ctx.mcpAllowlistMode,
         env,
         ui: memoryGuard,
+        signal: turnAbort.signal,
       });
     } finally {
+      process.removeListener("SIGINT", onOneShotInterrupt);
       ui.endTurn();
     }
+    if (turnAbort.signal.aborted && res?.terminationVerified) process.stderr.write("! interrupted\n");
     const nativeText = String(res.text || "");
     const memoryResult = await completeMemoryTurnCli(db, nativeText, ctx, rt, {
       model: ctx.model || rt.model,
@@ -9240,6 +9654,12 @@ async function executeOnce(db, system, prompt, override, ctx) {
     memorySettled = true;
     for (const memory of memoryResult.curatedMemories || []) {
       if (memory && !curatedMemories.some((item) => item.id === memory.id)) curatedMemories.push(memory);
+    }
+    const cleanedNativeText = require("./agentlas-style.cjs")
+      .sanitizeAssistantText(memoryResult.cleaned ?? nativeText)
+      .trim();
+    if (cleanStdout && !res.error && !turnAbort.signal.aborted && cleanedNativeText) {
+      process.stdout.write(cleanedNativeText + "\n");
     }
     finalizeExperienceExecutionCli(db, {
       agentId: ctx.agentId,
@@ -9786,6 +10206,56 @@ function codexCaptureAgentText(jsonl) {
   return [...latest.values()].join("");
 }
 
+function capturedRuntimeAgentText(kind, raw) {
+  const text = String(raw || "");
+  const events = [];
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      events.push(JSON.parse(line));
+    } catch {
+      // Native CLIs normally return plain text in capture mode. If even one
+      // line is not JSON, preserve the complete result instead of guessing.
+      return text.trim();
+    }
+  }
+  if (!events.length) return "";
+
+  if (kind === "claude-code") {
+    const isProtocol = events.some((event) =>
+      ["system", "stream_event", "result", "rate_limit_event"].includes(event?.type),
+    );
+    if (!isProtocol) return text.trim();
+    const final = [...events].reverse().find(
+      (event) => event?.type === "result" && typeof event.result === "string",
+    );
+    if (final) return final.result;
+    return events.map((event) => {
+      const delta = event?.type === "stream_event" ? event.event?.delta : null;
+      return delta?.type === "text_delta" && typeof delta.text === "string" ? delta.text : "";
+    }).join("");
+  }
+
+  if (kind === "gemini") {
+    const isProtocol = events.some((event) =>
+      ["init", "message", "tool_use", "tool_result", "result", "error"].includes(event?.type),
+    );
+    if (!isProtocol) return text.trim();
+    const assistant = events
+      .filter((event) => event?.type === "message" && event.role === "assistant")
+      .map((event) => typeof event.content === "string" ? event.content : "")
+      .join("");
+    if (assistant) return assistant;
+    const final = [...events].reverse().find((event) =>
+      event?.type === "result" &&
+      (typeof event.result === "string" || typeof event.response === "string"),
+    );
+    return final ? String(final.result ?? final.response) : "";
+  }
+
+  return text.trim();
+}
+
 // `claude` 치면 바로 대화형 세션 뜨듯이 — 에이전트 폴더(CLAUDE.md/AGENTS.md/GEMINI.md 보유)에서
 // 네이티브 CLI를 인자 없이(대화형) 실행. 에이전트 페르소나는 그 폴더의 프로젝트 지시로 자동 로드. (A+B 결합)
 // 보스턴테리어 터미널(대화형 TUI)로 진입. agentlas 가 항상 "호스트"다 —
@@ -9833,7 +10303,7 @@ function buildHelpers(db) {
     listFirms,
     firmSystemPrompt,
     autoRouteAgent: (db_, prompt, lang) => autoRouteAgent(db_, prompt, lang),
-    resolveAutoRoute: (db_, prompt, lang) => resolveAutoRoute(db_, prompt, lang),
+    resolveAutoRoute: (db_, prompt, lang, signal, runtime) => resolveAutoRoute(db_, prompt, lang, signal, runtime),
     autoRouteNote: (choice, lang) => autoRouteNote(choice, lang),
     autoRoutePreamble: (choice, lang) => autoRoutePreamble(choice, lang),
     directSystemPrompt: (lang) => directSystemPrompt(lang),
@@ -9905,6 +10375,9 @@ function buildHelpers(db) {
     stormRun: (db_, goal, ctx) => parity().stormRun(db_, goal, ctx),
     swarmRun: (db_, goal, ctx) => parity().swarmRun(db_, goal, ctx),
     workforceRun: (db_, goal, ctx) => workforce().workforceRun(db_, goal, ctx),
+    workforceGoalRuntime: (cwd_, goalId = null) => workforceGoalRuntimeCli(cwd_ || projectCwd(), goalId),
+    workforceGoalComplete: (cwd_, goalId = null, status = "completed") =>
+      completeWorkforceGoalCli(cwd_ || projectCwd(), goalId, status),
     terminalBuild: (db_, args, ctx = {}) => terminalAssets.cmdBuild({
       db: db_,
       args: Array.isArray(args) ? args : terminalAssets.tokenizeBuildCommandLine(String(args || "")),
@@ -9928,10 +10401,12 @@ function buildHelpers(db) {
     careerGraphCommand: (text, ctx) => runCareerGraphNaturalCli(text, {
       cwd: (ctx && ctx.cwd) || projectCwd(),
       projectPath: (ctx && ctx.cwd) || projectCwd(),
+      lang: (ctx && ctx.lang) || prefsLang(),
     }),
     ontologyCommand: (text, ctx) => runOntologyNaturalCli(text, {
       cwd: (ctx && ctx.cwd) || projectCwd(),
       projectPath: (ctx && ctx.cwd) || projectCwd(),
+      lang: (ctx && ctx.lang) || prefsLang(),
     }),
     // /cwd 로 작업 폴더를 바꿀 때 그 폴더의 활성 프로젝트 경로(또는 null)를 재계산 — activeProjectPath의 명시-dir 버전.
     projectPathFor: (db_, dir) => {
@@ -9945,13 +10420,29 @@ function buildHelpers(db) {
     },
     ensureProjectForExecution: (db_, dir, permission, reason) =>
       ensureTerminalProjectForExecutionCli(db_, dir, permission, reason || "terminal-interactive-turn"),
-    doctor: async (db_, ui) => {
+    initializeProject: (db_, dir) =>
+      initializeTerminalProjectCli(db_, dir, "terminal-explicit-project-init"),
+    doctor: async (db_, ui, ctx = {}) => {
+      const ko = ui.lang === "ko";
+      const terminalWidth = Math.max(20, Number(ui.out?.columns) || 80);
+      const { truncateWidth, visWidth } = require("./agentlas-composer.cjs");
+      const shorten = require("./agentlas-banner.cjs").shorten;
+      const infoValue = (label, value) => {
+        const room = Math.max(8, terminalWidth - 4 - visWidth(label));
+        ui.info(label + truncateWidth(String(value || ""), room));
+      };
       ui.line("");
-      ui.info("userData: " + userDataDir());
-      ui.info("db: " + (fs.existsSync(dbPath()) ? "OK" : "missing"));
+      infoValue(ko ? "사용자 데이터: " : "userData: ", shorten(userDataDir()));
+      ui.info((ko ? "데이터베이스: " : "db: ") + (fs.existsSync(dbPath()) ? (ko ? "열림" : "open") : (ko ? "없음" : "missing")));
       const ar = activeRuntime(db_);
-      ui.info("Active runtime: " + (ar ? ar.kind : "(none)"));
-      // CLI 런타임: 설치 + 로그인(인증 파일) 휴리스틱
+      const sessionRuntime = ctx.runtime;
+      const sessionLabel = sessionRuntime
+        ? sessionRuntime.kind || sessionRuntime.backend || (ko ? "(알 수 없음)" : "(unknown)")
+        : (ko ? "(없음)" : "(none)");
+      infoValue(ko ? "세션 런타임: " : "Session runtime: ", sessionLabel);
+      infoValue(ko ? "앱 활성 런타임: " : "App active runtime: ", ar ? ar.kind : (ko ? "(없음)" : "(none)"));
+      // 파일 존재는 만료되지 않은 로그인 세션의 증명이 아니므로
+      // 자격정보 존재와 실제 유효성을 구분해 표시한다.
       const home = os.homedir();
       const authFiles = {
         "claude-code": [path.join(home, ".claude.json"), path.join(home, ".claude", ".credentials.json")],
@@ -9962,17 +10453,30 @@ function buildHelpers(db) {
       for (const [kind, bin] of Object.entries(RUNTIME_BIN)) {
         const installed = !!which(bin);
         const authed = (authFiles[kind] || []).some(has);
-        ui.info(`  ${kind.padEnd(12)} ${!installed ? "not installed" : authed ? "installed · signed in" : "installed · sign-in unverified"}`);
+        const status = !installed
+          ? (ko ? "설치 안 됨" : "not installed")
+          : authed
+            ? (ko ? "설치됨 · 자격정보 있음 (유효성 미확인)" : "installed · credentials present (validity unverified)")
+            : (ko ? "설치됨 · 자격정보 없음" : "installed · credentials not found");
+        infoValue(`  ${kind.padEnd(12)} `, status);
       }
       // BYOK 키 (keytar) + 클라우드 세션
       const byok = [];
       for (const b of ["anthropic", "openai", "google", "upstage"]) {
         try { if (await apiKey(b)) byok.push(b); } catch { /* keytar 미사용 */ }
       }
-      ui.info("BYOK keys: " + (byok.length ? byok.join(", ") : "(none — App settings → BYOK)"));
+      infoValue(
+        ko ? "BYOK 키: " : "BYOK keys: ",
+        byok.length ? byok.join(", ") : (ko ? "(없음 — 앱 설정 → BYOK)" : "(none — App settings → BYOK)"),
+      );
       let cloud = false;
       try { cloud = !!(await cloudSessionCookieCli()); } catch { /* ignore */ }
-      ui.info("Cloud session: " + (cloud ? "signed in" : "signed out"));
+      infoValue(
+        ko ? "Cloud 세션: " : "Cloud session: ",
+        cloud
+          ? (ko ? "자격정보 있음 (유효성 미확인)" : "credential present (validity unverified)")
+          : (ko ? "자격정보 없음" : "credential not found"),
+      );
     },
   };
 }
@@ -9993,8 +10497,16 @@ function launchTui(db, subject, runtimeOverride) {
     override = prefs.runtime;
   }
   const runtime = resolveRuntime(db, override);
-  // Permission: explicit --permission wins; else the saved default; else "write".
-  const permission = PERMISSION_EXPLICIT ? PERMISSION : prefs.permission || PERMISSION;
+  // Permission: explicit --permission wins for this process. Persisted `full`
+  // values from older Terminal builds are migrated fail-closed because the UI
+  // contract defines unrestricted access as session-only.
+  const permissionPolicy = require("./agentlas-permissions.cjs");
+  const savedPermission = permissionPolicy.persistent(prefs.permission, "write");
+  if (prefs.permission === "full") {
+    prefs.permission = savedPermission;
+    config.updatePrefs(dir, { permission: savedPermission });
+  }
+  const permission = PERMISSION_EXPLICIT ? PERMISSION : savedPermission;
   startRepl({
     db,
     subject,
@@ -10004,7 +10516,8 @@ function launchTui(db, subject, runtimeOverride) {
     projectPath: activeProjectPath(db),
     helpers: buildHelpers(db),
     prefs,
-    savePrefs: (p) => config.savePrefs(dir, p),
+    loadPrefs: () => config.loadPrefs(dir),
+    savePrefs: (p, patch) => config.updatePrefs(dir, patch || p),
   });
 }
 
@@ -10054,11 +10567,13 @@ function captureRuntime(kind, systemPrompt, prompt, opts) {
     let child;
     try {
       const spawnImpl = opts.spawn || spawn;
-      const env = require("./agentlas-native-host.cjs").runtimeEnvForKind(kind, opts.env || process.env, {
+      const nativeHost = require("./agentlas-native-host.cjs");
+      const env = nativeHost.runtimeEnvForKind(kind, opts.env || process.env, {
         permission: opts.permission,
         mcpServers: [],
         mcpAllowlistMode: kind === "gemini" ? "exact" : undefined,
       });
+      const groupedChild = process.platform !== "win32" && spawnImpl === spawn;
       child = spawnImpl(bin, buildArgs(kind, systemPrompt, prompt, opts.permission, {
         model: opts.model,
         effort: opts.effort,
@@ -10068,7 +10583,10 @@ function captureRuntime(kind, systemPrompt, prompt, opts) {
         cwd,
         stdio: ["ignore", "pipe", "pipe"],
         env,
+        detached: groupedChild,
+        windowsHide: true,
       });
+      child.__agentlasGroupedChild = groupedChild;
     } catch (error) {
       reject(error);
       return;
@@ -10122,11 +10640,11 @@ function captureRuntime(kind, systemPrompt, prompt, opts) {
       if (idleTimer) clearTimeout(idleTimer);
       if (totalTimer) clearTimeout(totalTimer);
       idleTimer = totalTimer = null;
-      try { child.kill("SIGTERM"); } catch { /* ignore */ }
+      require("./agentlas-native-host.cjs").terminateNativeChild(child, "SIGTERM");
       if (settled) return;
       killTimer = setTimeout(() => {
         if (settled) return;
-        try { child.kill("SIGKILL"); } catch { /* ignore */ }
+        require("./agentlas-native-host.cjs").terminateNativeChild(child, "SIGKILL");
         if (settled) return;
         forceTimer = setTimeout(() => finishReject(terminationError), Math.max(250, Math.min(1_000, timeout.killGraceMs)));
       }, timeout.killGraceMs);
@@ -10176,10 +10694,15 @@ function captureRuntime(kind, systemPrompt, prompt, opts) {
         return;
       }
       const raw = stdout.trim() || stderr.trim();
-      const captured = kind === "codex" && opts.authorityMode === "no-authority"
-        ? codexCaptureAgentText(raw)
-        : "";
-      finishResolve(captured || raw);
+      if (kind === "codex" && opts.authorityMode === "no-authority") {
+        finishResolve(codexCaptureAgentText(raw));
+        return;
+      }
+      if (kind === "claude-code" || kind === "gemini") {
+        finishResolve(capturedRuntimeAgentText(kind, raw));
+        return;
+      }
+      finishResolve(raw);
     };
     onAbort = () => {
       const reason = opts.signal && opts.signal.reason;
@@ -10221,6 +10744,7 @@ function parity() {
       autoRouteAgent,
       prefsLang,
       cloudSessionCookieCli,
+      fetchHub: (url, init) => fetchHubCli(url, init),
       cliSessionPath,
       firmSystemPrompt,
       out,
@@ -10228,6 +10752,7 @@ function parity() {
       RUNTIME_BIN,
       which,
       apiKey,
+      resolvePermission: resolveTerminalPermission,
     });
   }
   return parity._i;
@@ -10319,6 +10844,9 @@ function workforce() {
       fetchHub: (url, init) => fetchHubCli(url, init),
       listWorkforceTools: listWorkforceToolsCli,
       supportsWorkforceToolAuthority: async () => false,
+      bindWorkforceGoal: bindWorkforceGoalCli,
+      loadWorkforceGoalRuntime: workforceGoalRuntimeCli,
+      recordWorkforceGoalTurn: recordWorkforceGoalTurnCli,
       projectContextSlice: cliProjectContextSlice,
       prefsLang,
       out,
@@ -10332,10 +10860,19 @@ function cmdList(db) {
   const agents = listAgents(db);
   const ar = activeRuntime(db);
   let lang = "en";
-  try { lang = require("./agentlas-config.cjs").loadPrefs(userDataDir()).lang || "en"; } catch { /* default en */ }
+  let prefs = {};
+  try {
+    prefs = require("./agentlas-config.cjs").loadPrefs(userDataDir());
+    lang = prefs.lang || "en";
+  } catch { /* default en */ }
   const nm = (a) => (lang === "en" && a.name_en && a.name_en !== a.name ? a.name_en : a.name);
-  out(`Active runtime: ${ar ? `${ar.kind}${ar.backend ? " · " + ar.backend : ""}${ar.model ? " · " + ar.model : ""}` : "(none)"}`);
-  out(`${agents.length} agent(s) installed:`);
+  out(lang === "ko"
+    ? `터미널 기본 런타임: ${prefs.runtime || "auto"}`
+    : `Terminal default runtime: ${prefs.runtime || "auto"}`);
+  out(lang === "ko"
+    ? `앱 활성 런타임: ${ar ? `${ar.kind}${ar.backend ? " · " + ar.backend : ""}${ar.model ? " · " + ar.model : ""}` : "(없음)"}`
+    : `App active runtime: ${ar ? `${ar.kind}${ar.backend ? " · " + ar.backend : ""}${ar.model ? " · " + ar.model : ""}` : "(none)"}`);
+  out(lang === "ko" ? `설치된 에이전트 ${agents.length}개:` : `${agents.length} agent(s) installed:`);
   const routes = routesMap();
   for (const a of agents) {
     const local = routes[a.id] ? "  [local]" : "";
@@ -10344,7 +10881,7 @@ function cmdList(db) {
   }
   const firms = listFirms(db);
   if (firms.length) {
-    out(`\n${firms.length} company(ies):`);
+    out(lang === "ko" ? `\n회사 ${firms.length}개:` : `\n${firms.length} company(ies):`);
     for (const f of firms) out(`  ${f.slug.padEnd(28)} ${nm(f)}  (CEO)`);
   }
   if (!agents.length) {
@@ -10368,35 +10905,67 @@ function cmdList(db) {
   } catch {
     /* 홈 배너 실패는 무해 */
   }
-  out("\nRun: agentlas <agent>  ·  agentlas firm <firm>  ·  agentlas run <agent> \"...\"");
+  out(lang === "ko"
+    ? "\n실행: agentlas <에이전트>  ·  agentlas firm <회사>  ·  agentlas run <에이전트> \"...\""
+    : "\nRun: agentlas <agent>  ·  agentlas firm <firm>  ·  agentlas run <agent> \"...\"");
 }
 
 function ensureNativeFiles(agent, folder) {
   fs.mkdirSync(folder, { recursive: true });
   const sys = agentSystemPromptCli(agent);
-  writeIfMissing(path.join(folder, "system-prompt.md"), sys);
+  const created = [];
+  if (writeIfMissing(path.join(folder, "system-prompt.md"), sys)) created.push("system-prompt.md");
   const header = `# ${agent.name}\n\n${agent.tagline || ""}\n\n${sys}\n`;
   // 네이티브 CLI가 프로젝트 지시로 자동 인식하는 파일들
-  writeIfMissing(path.join(folder, "CLAUDE.md"), header);
-  writeIfMissing(path.join(folder, "AGENTS.md"), header);
-  writeIfMissing(path.join(folder, "GEMINI.md"), header);
+  if (writeIfMissing(path.join(folder, "CLAUDE.md"), header)) created.push("CLAUDE.md");
+  if (writeIfMissing(path.join(folder, "AGENTS.md"), header)) created.push("AGENTS.md");
+  if (writeIfMissing(path.join(folder, "GEMINI.md"), header)) created.push("GEMINI.md");
+  return created;
 }
 function writeIfMissing(file, content) {
-  try {
-    if (!fs.existsSync(file)) fs.writeFileSync(file, content.endsWith("\n") ? content : content + "\n", "utf8");
-  } catch {
-    /* ignore */
+  try { fs.lstatSync(file); return false; } catch (error) {
+    if (!error || error.code !== "ENOENT") throw error;
   }
+  const fd = fs.openSync(file, "wx", 0o600);
+  try {
+    fs.writeFileSync(fd, content.endsWith("\n") ? content : content + "\n", "utf8");
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  return true;
 }
 
 function cmdCd(db, query) {
   const agent = resolveAgent(db, query);
-  if (!agent) fail(`Agent not found: ${query}`);
+  if (!agent) fail(prefsLang() === "ko" ? `에이전트를 찾지 못했습니다: ${query}` : `Agent not found: ${query}`);
   const folder = agentFolder(agent);
-  ensureNativeFiles(agent, folder);
-  // 경로만 stdout으로 (cd "$(agentlas cd seo)") — 안내는 stderr로.
-  process.stderr.write(`# ${agent.name} — native CLI context ready (CLAUDE.md/AGENTS.md/GEMINI.md)\n`);
+  // Path query only. This must stay observationally read-only so
+  // `cd "$(agentlas cd seo)"` cannot mutate or reclassify the source package.
   process.stdout.write(folder + "\n");
+}
+
+function cmdNative(db, args) {
+  const ko = prefsLang() === "ko";
+  const sub = String(args[0] || "help");
+  const query = args[1];
+  if (sub === "help" || sub === "--help" || sub === "-h") {
+    out(ko
+      ? "사용법: agentlas native prepare <에이전트>  ·  네이티브 CLI 문맥 파일을 명시적으로 생성"
+      : "usage: agentlas native prepare <agent>  ·  explicitly create native CLI context files");
+    return;
+  }
+  if (sub !== "prepare" || !query) fail(ko
+    ? "사용법: agentlas native prepare <에이전트>"
+    : "usage: agentlas native prepare <agent>");
+  const agent = resolveAgent(db, query);
+  if (!agent) fail(ko ? `에이전트를 찾지 못했습니다: ${query}` : `Agent not found: ${query}`);
+  const folder = agentFolder(agent);
+  const created = ensureNativeFiles(agent, folder);
+  out(`${ko ? "네이티브 CLI 문맥" : "Native CLI context"}: ${folder}`);
+  out(created.length
+    ? `${ko ? "생성됨" : "Created"}: ${created.join(", ")}`
+    : (ko ? "변경 없음: 필요한 파일이 이미 있습니다." : "No changes: the context files already exist."));
 }
 
 function parseRunExperienceArgs(args) {
@@ -10853,20 +11422,24 @@ async function multimodalStatusCli(db) {
   }
   return rows;
 }
-function setMultimodalCli(db, modality, providerId) {
+function setMultimodalCli(db, modality, providerId, lang) {
+  const ko = lang === "ko";
   const mm = loadMultimodalCatalog();
-  if (!["image", "video", "audio"].includes(modality)) fail("usage: agentlas multimodal set <image|video|audio> <provider-id>");
+  if (!["image", "video", "audio"].includes(modality)) fail(ko
+    ? "사용법: agentlas multimodal set <image|video|audio> <공급자-id>"
+    : "usage: agentlas multimodal set <image|video|audio> <provider-id>");
   const provider = mm.MULTIMODAL_PROVIDERS.find((p) => p.id === providerId && p.modality === modality);
-  if (!provider) fail(`Provider not found: ${providerId} (${modality})`);
+  if (!provider) fail(ko ? `공급자를 찾지 못했습니다: ${providerId} (${modality})` : `Provider not found: ${providerId} (${modality})`);
   const key = modality === "image" ? "imageProvider" : modality === "video" ? "videoProvider" : "audioProvider";
   return saveMultimodalSettingsCli(db, { [key]: providerId });
 }
 async function cmdMultimodal(db, args) {
   const sub = args[0] || "status";
   const mm = loadMultimodalCatalog();
+  const ko = prefsLang() === "ko";
   if (sub === "set") {
-    const settings = setMultimodalCli(db, args[1], args[2]);
-    out(`✓ multimodal ${args[1]} provider → ${args[2]}`);
+    const settings = setMultimodalCli(db, args[1], args[2], ko ? "ko" : "en");
+    out(`✓ ${ko ? "멀티모달" : "multimodal"} ${args[1]} ${ko ? "공급자" : "provider"} → ${args[2]}`);
     out(`  image=${settings.imageProvider}  video=${settings.videoProvider}  audio=${settings.audioProvider}`);
     return;
   }
@@ -10874,29 +11447,43 @@ async function cmdMultimodal(db, args) {
     for (const modality of ["image", "video", "audio"]) {
       out(`${modality}:`);
       for (const p of mm.MULTIMODAL_PROVIDERS.filter((x) => x.modality === modality)) {
-        out(`  ${p.id.padEnd(22)} ${p.label}${p.envKeys && p.envKeys.length ? "  env: " + p.envKeys.join(",") : "  env: none"}`);
+        out(`  ${p.id.padEnd(22)} ${p.label}${p.envKeys && p.envKeys.length
+          ? `  ${ko ? "환경 변수" : "env"}: ` + p.envKeys.join(",")
+          : `  ${ko ? "환경 변수 없음" : "env: none"}`}`);
       }
     }
-    out("\nSet: agentlas multimodal set <image|video|audio> <provider-id>");
+    out(ko
+      ? "\n설정: agentlas multimodal set <image|video|audio> <공급자-id>"
+      : "\nSet: agentlas multimodal set <image|video|audio> <provider-id>");
     return;
   }
   const rows = await multimodalStatusCli(db);
-  out("Multimodal fallback:");
+  out(ko ? "멀티모달 대체 공급자:" : "Multimodal fallback:");
   for (const row of rows) {
-    const env = row.env.length ? row.env.map((e) => `${e.key}:${e.hasValue ? "set" : "missing"}`).join(" ") : "no key";
+    const env = row.env.length
+      ? row.env.map((e) => `${e.key}:${e.hasValue ? (ko ? "설정됨" : "set") : (ko ? "없음" : "missing")}`).join(" ")
+      : (ko ? "키 불필요" : "no key");
     out(`  ${row.modality.padEnd(5)} ${row.provider.id.padEnd(20)} ${row.provider.label}  ${env}`);
   }
-  out("\nCommands: agentlas multimodal providers  ·  agentlas multimodal set image openai-image");
+  out(ko
+    ? "\n명령: agentlas multimodal providers  ·  agentlas multimodal set image openai-image"
+    : "\nCommands: agentlas multimodal providers  ·  agentlas multimodal set image openai-image");
 }
 
 function cmdDoctor(db) {
-  out(`userData: ${userDataDir()}`);
-  out(`db: ${fs.existsSync(dbPath()) ? "OK" : "missing"}`);
+  const lang = prefsLang();
+  out(`${lang === "ko" ? "사용자 데이터" : "userData"}: ${userDataDir()}`);
+  out(`${lang === "ko" ? "데이터베이스" : "db"}: ${fs.existsSync(dbPath()) ? "OK" : (lang === "ko" ? "없음" : "missing")}`);
   const ar = activeRuntime(db);
-  out(`active runtime: ${ar ? ar.kind : "(none)"}`);
+  let prefs = {};
+  try { prefs = require("./agentlas-config.cjs").loadPrefs(userDataDir()); } catch { /* default */ }
+  out(`${lang === "ko" ? "터미널 기본 런타임" : "terminal default runtime"}: ${prefs.runtime || "auto"}`);
+  out(`${lang === "ko" ? "앱 활성 런타임" : "app active runtime"}: ${ar ? ar.kind : (lang === "ko" ? "(없음)" : "(none)")}`);
   for (const [kind, bin] of Object.entries(RUNTIME_BIN)) {
     const p = which(bin);
-    out(`  ${kind.padEnd(12)} ${p ? "installed: " + p : "not found on PATH"}`);
+    out(`  ${kind.padEnd(12)} ${p
+      ? (lang === "ko" ? "설치됨: " : "installed: ") + p
+      : (lang === "ko" ? "PATH에서 찾지 못함" : "not found on PATH")}`);
   }
 }
 
@@ -11679,6 +12266,54 @@ function oberonSampleTitles(title) {
   };
 }
 
+function writeOberonManifestCli(outPath, manifest, options = {}) {
+  const overwrite = options.overwrite === true;
+  let existing = null;
+  try { existing = fs.lstatSync(outPath); } catch (error) {
+    if (!error || error.code !== "ENOENT") throw error;
+  }
+  if (existing && existing.isSymbolicLink()) {
+    const error = new Error(`Refusing to write through a symbolic link: ${outPath}`);
+    error.code = "AGENTLAS_OBERON_SYMLINK";
+    throw error;
+  }
+  if (existing && !existing.isFile()) {
+    const error = new Error(`Manifest target is not a regular file: ${outPath}`);
+    error.code = "AGENTLAS_OBERON_NOT_FILE";
+    throw error;
+  }
+  if (existing && !overwrite) {
+    const error = new Error(`Manifest already exists: ${outPath}`);
+    error.code = "AGENTLAS_OBERON_EXISTS";
+    throw error;
+  }
+
+  const dir = path.dirname(outPath);
+  const tmp = path.join(dir, `.${path.basename(outPath)}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`);
+  let fd;
+  try {
+    fd = fs.openSync(tmp, "wx", 0o600);
+    fs.writeFileSync(fd, JSON.stringify(manifest, null, 2) + "\n", "utf8");
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+    try { fs.chmodSync(tmp, 0o644); } catch { /* win32 */ }
+    if (overwrite) {
+      fs.renameSync(tmp, outPath);
+    } else {
+      // link(2) is an atomic no-clobber publish. If another writer created the
+      // target after our lstat, EEXIST preserves that file.
+      fs.linkSync(tmp, outPath);
+      fs.unlinkSync(tmp);
+    }
+  } finally {
+    if (fd != null) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+    try { fs.unlinkSync(tmp); } catch { /* already published or never created */ }
+  }
+}
+
 function oberonScaffold(args) {
   const { flags, rest } = oberonParseFlags(args);
   const outPath = path.resolve(rest[0] || "oberon-manifest.json");
@@ -11707,7 +12342,14 @@ function oberonScaffold(args) {
     shots,
   };
   if (flags.titles) manifest.titles = oberonSampleTitles(title);
-  fs.writeFileSync(outPath, JSON.stringify(manifest, null, 2), "utf8");
+  try {
+    writeOberonManifestCli(outPath, manifest, { overwrite: !!flags.overwrite });
+  } catch (error) {
+    if (error && error.code === "AGENTLAS_OBERON_EXISTS") {
+      fail(`Manifest already exists; it was not changed. Re-run with --overwrite to replace it: ${outPath}`);
+    }
+    fail((error && error.message) || String(error));
+  }
   out(`✓ Manifest created: ${outPath}`);
   out(`  · ${shotCount} shots · ${aspect} · ${manifest.provider}`);
   out(`  · fill prompts, then run: agentlas oberon render ${path.basename(outPath)}`);
@@ -11902,8 +12544,8 @@ function oberonHelp() {
     [
       "agentlas oberon — AI film rendering from the terminal",
       "",
-      "  oberon scaffold [out.json] [--title T] [--aspect 16:9] [--shots N] [--titles]",
-      "                         create an editable render manifest (--titles: include title/subtitle burn-in samples)",
+      "  oberon scaffold [out.json] [--title T] [--aspect 16:9] [--shots N] [--titles] [--overwrite]",
+      "                         create an editable manifest; existing files require explicit --overwrite",
       "  oberon render <manifest.json> [--delivery DIR] [--max-shots N] [--open] [--dry-run]",
       "                         spawn full Electron render + stream progress (GEMINI_API_KEY vault required)",
       "  oberon list            최근 렌더 산출물",
@@ -11941,12 +12583,83 @@ function cmdHelp() {
   const H = (s) => `\n\x1b[1m${s}\x1b[0m`;
   const useColor = process.stdout.isTTY && process.env.NO_COLOR == null;
   const hdr = (s) => (useColor ? H(s) : "\n" + s);
+  if (prefsLang() === "ko") {
+    out(
+      [
+        "agentlas — 터미널에서 사용하는 에이전트 운영체제",
+        "",
+        "  agentlas                 터미널 열기",
+        "  agentlas \"<작업>\"        알맞은 에이전트로 자동 라우팅해 한 번 실행",
+        "  agentlas -p \"<작업>\"     stdout에는 최종 답만 출력",
+        "",
+        hdr("대화와 실행"),
+        "  <에이전트>               해당 에이전트 대화로 이동",
+        "  run [에이전트] [요청]    한 번 실행; 에이전트 생략 시 자동 라우팅",
+        "  firm <회사> [명령]        회사 CEO에게 위임",
+        "  chats [개수]              최근 대화; REPL에서 /resume으로 이어가기",
+        "",
+        hdr("에이전트와 허브"),
+        "  search \"<필요한 일>\"     Hub와 로컬에서 에이전트 찾기",
+        "  install <슬러그>          Hub 에이전트 설치",
+        "  plugin add <슬러그>       Hub 플러그인 설치",
+        "  build \"<요청>\"           에이전트·팀 제작, 수리, 패키징",
+        "  upload <경로>             Agent Cloud에 소유자 비공개로 저장",
+        "  connect [하위 명령]       Telegram 등 플랫폼 연결",
+        "  import <경로>             로컬 에이전트·팀 가져오기",
+        "  list                      설치 항목과 활성 런타임 보기",
+        "  experience <하위 명령>    Experience 목록·검사·저장·게시·내보내기",
+        "  variant resolve           로컬 변형 선택 결과 확인",
+        "",
+        hdr("실행"),
+        "  storm <목표>              계획→할당→실행→검증 Goal 하네스",
+        "  swarm <목표>              병렬 작업자와 종합 에이전트 스웜",
+        "  network <요청>            호스트 LLM Workforce 구성·실행",
+        "  workforce <요청>          Agent Workforce Ontology 명시 경로",
+        "  legacy-network <요청>     호환용 Hephaestus 네트워크 경로",
+        "  call \"a,b\" \"<맥락>\"      지정한 Hub·Cloud 에이전트 호출",
+        "  browser [하위 명령]       실제 브라우저 실행",
+        "  route \"<요청>\"           라우팅 미리보기; --json은 원본 영수증",
+        "",
+        hdr("지식과 리서치"),
+        "  research <하위 명령>      status|gather|search|read|plan",
+        "  career-graph <하위 명령>  출처 라우팅 인덱스: status|list|add",
+        "  ontology <하위 명령>      프로젝트 지식: status|list|add",
+        "  journal <하위 명령>       실행 저널: status|verify|repair|gate",
+        "",
+        hdr("계정과 운영"),
+        "  login | logout | whoami  Agentlas Cloud 로그인 상태",
+        "  automation <하위 명령>    로컬 자동화 목록·추가·실행·데몬",
+        "  creds <하위 명령> · env   자격증명 보관함과 공유 환경 키",
+        "  multimodal                이미지·영상·오디오 공급자 설정",
+        "  usage · telegram · mcp   로컬 사용량·Telegram·MCP 상태",
+        "  doctor                   런타임·데이터·자격증명 점검",
+        "  update                   npm의 새 Agentlas 확인",
+        "  setup                    언어·런타임·기본 권한 다시 설정",
+        "  project [status|init]     비공개 프로젝트 상태 확인·초기화",
+        "  context <하위 명령>       코드 위치·역참조·작업 조각·변경 영향 검사",
+        "  version                  CLI 버전 출력",
+        "",
+        hdr("고급"),
+        "  hep <하위 명령>           전체 Hephaestus 명령 전달",
+        "  netadmin <하위 명령>      로컬 네트워크 관리",
+        "  cloud <하위 명령>         Cloud 자산 저장·게시·복구·현장 시험",
+        "  cd <에이전트>             에이전트 폴더 경로만 출력 (읽기 전용)",
+        "  native prepare <에이전트> 네이티브 CLI 문맥 파일을 명시적으로 생성",
+        "  oberon <하위 명령>        AI 영화 렌더",
+        "",
+        "옵션: -p|--print  ·  --runtime claude-code|codex|gemini  ·  --permission read|write|full",
+        "REPL에서 / 를 입력하면 명령 팔레트가 열립니다.",
+      ].join("\n"),
+    );
+    return;
+  }
   out(
     [
       "agentlas — the operating system for agents, in your terminal",
       "",
       "  agentlas                 open the terminal (wordmark, then type a task)",
       "  agentlas \"<task>\"        auto-route to the best agent and run once",
+      "  agentlas -p \"<task>\"     print one clean final answer on stdout",
       "",
       hdr("TALK & RUN"),
       "  <agent>                  jump into a chat with one agent (e.g. agentlas seo)",
@@ -11978,13 +12691,12 @@ function cmdHelp() {
       "  legacy-network <request> compatibility-only Hephaestus network route",
       "  call \"a,b\" \"<ctx>\"       invoke named Hub/Cloud agents                    (hep-call)",
       "  browser [<sub>]          real browser execution hardpoint                 (hep-browser)",
-      "  route \"<request>\"        routing preview — which agent/pipeline would take this",
+      "  route \"<request>\"        human routing preview; add --json for the raw receipt",
       "",
       hdr("KNOWLEDGE & RESEARCH"),
       "  research <sub>           Research Engine: status|gather|search|read|plan",
       "  career-graph <sub>       source routing index: status|list|add",
       "  ontology <sub>           project knowledge: status|list|add   (REPL: /ontology)",
-      "  context <sub>            project map: refresh|locate|refs|slice|impact|verify",
       "  journal <sub>            Stormbreaker run journal: status|verify|repair|gate",
       "",
       hdr("ACCOUNT & OPS"),
@@ -11996,27 +12708,203 @@ function cmdHelp() {
       "  doctor                   check runtimes, data, credentials",
       "  update                   check for a newer agentlas on npm",
       "  setup                    re-run first-launch setup (language · runtime · permission)",
+      "  project [status|init]     inspect or explicitly initialize private project state",
+      "  context <sub>            dependency map: refresh|locate|refs|slice|impact|verify",
       "  version                  print the Agentlas CLI version",
       "",
       hdr("ADVANCED"),
       "  hep <sub…>               full Hephaestus passthrough (wizard·security·cards·ao·plugins·meta-agent…)",
       "  netadmin <sub>           local network admin: init|status|reindex|bench|add-source",
       "  cloud <sub>              cloud assets: save|publish|package|list|restore|field-test",
-      "  cd <agent>               print the agent folder — cd \"$(agentlas cd seo)\" && claude",
+      "  cd <agent>               print only the agent folder (read-only)",
+      "  native prepare <agent>   explicitly create native CLI context files",
       "  oberon <sub>             AI film render (scaffold|render|list)",
       "",
-      "Options: --runtime claude-code|codex|gemini  ·  --permission read|write|full (default write)",
+      "Options: -p|--print  ·  --runtime claude-code|codex|gemini  ·  --permission read|write|full (default write)",
       "In the REPL, type / for the command palette (/build /route /research /storm /swarm …).",
     ].join("\n"),
   );
 }
 
+const TOP_LEVEL_COMMAND_USAGE = Object.freeze({
+  automation: "usage: agentlas automation <list|add|on|off|remove|run|runs|daemon> [args]",
+  automations: "usage: agentlas automations <list|add|on|off|remove|run|runs|daemon> [args]",
+  build: 'usage: agentlas build "<request>"',
+  browser: "usage: agentlas browser <url-or-query|subcommand>",
+  call: 'usage: agentlas call "<agent-slugs>" "<context>"',
+  career_graph: "usage: agentlas career-graph <status|list|add> [args]",
+  "career-graph": "usage: agentlas career-graph <status|list|add> [args]",
+  chat: "usage: agentlas chat <agent>",
+  chats: "usage: agentlas chats [n]",
+  cloud: "usage: agentlas cloud <save|publish|package|list|restore|field-test> [args]",
+  cd: "usage: agentlas cd <agent>",
+  native: "usage: agentlas native prepare <agent>",
+  connect: "usage: agentlas connect [status|telegram|help]",
+  context: "usage: agentlas context <refresh|locate|refs|slice|impact|verify> [args]",
+  creds: "usage: agentlas creds <list|set|remove> [args]",
+  doctor: "usage: agentlas doctor",
+  env: "usage: agentlas env",
+  evolve: "usage: agentlas evolve <list|inspect|apply|rollback> [args]",
+  experience: "usage: agentlas experience <list|inspect|validate|save|publish|status|export|unpublish> [args]",
+  film: "usage: agentlas film <scaffold|render|list|open> [args]",
+  firm: 'usage: agentlas firm <company> ["<request>"]',
+  graph: "usage: agentlas career-graph <status|list|add> [args]",
+  hep: "usage: agentlas hep <subcommand> [args]",
+  hephaestus: "usage: agentlas hephaestus <subcommand> [args]",
+  import: "usage: agentlas import <agent-or-team-folder>",
+  install: "usage: agentlas install <hub-slug>",
+  journal: "usage: agentlas journal <status|verify|repair|gate> --run-id <id> | --journal <path>",
+  "legacy-network": 'usage: agentlas legacy-network "<request>"',
+  list: "usage: agentlas list",
+  login: "usage: agentlas login",
+  logout: "usage: agentlas logout",
+  mcp: "usage: agentlas mcp",
+  memory: "usage: agentlas memory [--apply]",
+  multimodal: "usage: agentlas multimodal [args]",
+  netadmin: "usage: agentlas netadmin <init|status|reindex|bench|add-source> [args]",
+  network: 'usage: agentlas network "<request>" [--parallel N] [--benchmark] [--json]',
+  oberon: "usage: agentlas oberon <scaffold|render|list|open> [args]",
+  ontology: "usage: agentlas ontology <status|list|add> [args]",
+  open: "usage: agentlas open <agent>",
+  plugin: "usage: agentlas plugin <add <slug>|list>",
+  plugins: "usage: agentlas plugins <add <slug>|list>",
+  project: "usage: agentlas project <status|init>",
+  research: "usage: agentlas research <status|gather|search|read|plan> [args]",
+  route: 'usage: agentlas route "<request>" [--json]',
+  run: 'usage: agentlas run [agent] ["<prompt>"] [experience options]',
+  search: 'usage: agentlas search "<what you need>" [--limit N]',
+  setup: "usage: agentlas setup",
+  storm: 'usage: agentlas storm "<goal>" [--research]',
+  swarm: 'usage: agentlas swarm "<goal>" [--parallel N]',
+  taskforce: 'usage: agentlas taskforce "<request>" [--parallel N] [--benchmark] [--json]',
+  telegram: "usage: agentlas telegram [args]",
+  tg: "usage: agentlas telegram [args]",
+  update: "usage: agentlas update [--check]",
+  upload: "usage: agentlas upload <agent-folder-path> [--visibility marketplace]",
+  usage: "usage: agentlas usage",
+  variant: "usage: agentlas variant <resolve> [args]",
+  whoami: "usage: agentlas whoami",
+  workforce: 'usage: agentlas workforce "<request>" [--parallel N] [--benchmark] [--json]',
+});
+
+const TOP_LEVEL_COMMAND_HELP = Object.freeze({
+  automation: {
+    en: "List, create, enable, disable, run, or daemonize local scheduled automations.",
+    ko: "로컬 예약 자동화를 조회·추가·활성화·비활성화·실행하거나 데몬으로 운영합니다.",
+  },
+  "career-graph": {
+    en: "Inspect or update the Career Graph source-routing index.",
+    ko: "Career Graph 출처 라우팅 인덱스를 확인하거나 갱신합니다.",
+  },
+  chats: {
+    en: "List recent user conversations shared with Desktop.",
+    ko: "Desktop과 공유되는 최근 사용자 대화를 조회합니다.",
+  },
+  doctor: {
+    en: "Check local data, runtime availability, and credential presence.",
+    ko: "로컬 데이터·런타임 가용성·자격증명 존재 여부를 점검합니다.",
+  },
+  list: {
+    en: "List installed agents, firms, and runtime state.",
+    ko: "설치된 에이전트·회사와 런타임 상태를 조회합니다.",
+  },
+  mcp: {
+    en: "Show configured MCP servers and their active state.",
+    ko: "설정된 MCP 서버와 활성 상태를 조회합니다.",
+  },
+  ontology: {
+    en: "Inspect or update private project knowledge.",
+    ko: "비공개 프로젝트 지식을 확인하거나 갱신합니다.",
+  },
+  plugin: {
+    en: "Install or list Hub plugins and their MCP packages.",
+    ko: "Hub 플러그인과 MCP 패키지를 설치하거나 조회합니다.",
+  },
+  project: {
+    en: "Inspect or explicitly initialize private project state.",
+    ko: "비공개 프로젝트 상태를 확인하거나 명시적으로 초기화합니다.",
+  },
+  telegram: {
+    en: "Show or manage Telegram connection state.",
+    ko: "Telegram 연결 상태를 확인하거나 관리합니다.",
+  },
+  usage: {
+    en: "Show local agents, chats, messages, automations, and run counts.",
+    ko: "로컬 에이전트·대화·메시지·자동화·실행 수를 조회합니다.",
+  },
+  whoami: {
+    en: "Show the current Agentlas Cloud sign-in and workspace.",
+    ko: "현재 Agentlas Cloud 로그인과 작업 공간 상태를 조회합니다.",
+  },
+});
+
+function localizedTopLevelUsage(cmd, lang = prefsLang()) {
+  const usage = TOP_LEVEL_COMMAND_USAGE[cmd];
+  if (!usage) return null;
+  if (lang !== "ko") return usage;
+  return usage
+    .replace(/^usage:/, "사용법:")
+    .replace(/\[args\]/g, "[인자]")
+    .replace(/<subcommand>/g, "<하위-명령>");
+}
+
+function topLevelCommandUsage(cmd) {
+  const usage = localizedTopLevelUsage(cmd);
+  if (!usage) return false;
+  out(usage);
+  const help = TOP_LEVEL_COMMAND_HELP[cmd];
+  if (help) out(prefsLang() === "ko" ? help.ko : help.en);
+  return true;
+}
+
+function isHelpToken(value) {
+  return value === "help" || value === "--help" || value === "-h";
+}
+
 // ── 유틸 ──────────────────────────────────────────────────
+function formatTopLevelRows(value, columns, firstPrefix = "", continuationPrefix = "  ↳ ") {
+  const { stripAnsi } = require("./agentlas-ui.cjs");
+  const { visWidth, wrapWidth } = require("./agentlas-composer.cjs");
+  const width = Math.max(12, Math.floor(Number(columns) || 80));
+  const rows = [];
+  for (const rawLine of String(value ?? "").split(/\r?\n/)) {
+    const line = stripAnsi(rawLine);
+    if (visWidth(firstPrefix + line) <= width) {
+      rows.push(firstPrefix + line);
+      continue;
+    }
+    const indent = (line.match(/^\s*/) || [""])[0];
+    const content = line.slice(indent.length);
+    const firstLead = firstPrefix + indent;
+    const room = Math.max(
+      2,
+      Math.min(width - visWidth(firstLead), width - visWidth(continuationPrefix)),
+    );
+    const wrapped = wrapWidth(content, room);
+    rows.push(firstLead + (wrapped[0] || ""));
+    for (const chunk of wrapped.slice(1)) rows.push(continuationPrefix + chunk);
+  }
+  return rows;
+}
+
+function writeTopLevel(stream, value, firstPrefix = "") {
+  if (!stream.isTTY || PRINT_MODE) {
+    stream.write(firstPrefix + String(value ?? "") + "\n");
+    return;
+  }
+  const columns = stream.columns || process.stdout.columns || 80;
+  stream.write(formatTopLevelRows(value, columns, firstPrefix).join("\n") + "\n");
+}
+
 function out(s) {
-  process.stdout.write(s + "\n");
+  writeTopLevel(process.stdout, s);
 }
 function fail(msg) {
-  process.stderr.write("✖ " + msg + "\n");
+  let detail = String(msg ?? "");
+  if (prefsLang() === "ko" && detail === "fetch failed") {
+    detail = "네트워크 연결 실패(fetch failed). 연결 상태를 확인한 뒤 다시 시도하세요.";
+  }
+  writeTopLevel(process.stderr, detail, "✖ ");
   process.exit(1);
 }
 function readStdin() {
@@ -12035,7 +12923,9 @@ async function main() {
   let runtimeOverride = null;
   const rest = [];
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === "--runtime") {
+    if (argv[i] === "-p" || argv[i] === "--print") {
+      PRINT_MODE = true;
+    } else if (argv[i] === "--runtime") {
       runtimeOverride = argv[++i];
     } else if (argv[i] === "--permission" || argv[i] === "-P") {
       const p = (argv[++i] || "").toLowerCase();
@@ -12046,10 +12936,72 @@ async function main() {
       rest.push(argv[i]);
     }
   }
+  if (PRINT_MODE && !rest.length) fail('usage: agentlas -p "<task>"');
   const cmd = rest[0] || "";
   if (cmd === "help" || cmd === "--help" || cmd === "-h") return cmdHelp();
   if (cmd === "version" || cmd === "--version" || cmd === "-V") return cmdVersion();
+  // Resolve the process-wide permission once after parsing CLI overrides.
+  // Every one-shot surface must honor the same saved Desktop/Terminal
+  // preference as the interactive composer. Explicit --permission remains a
+  // session-only override.
+  PERMISSION = resolveTerminalPermission();
+  if (cmd === "route" && !rest.slice(1).some((value) => value !== "--json")) {
+    return fail(localizedTopLevelUsage("route"));
+  }
+  if (cmd === "research" && rest.slice(1).some(isHelpToken)) {
+    return parity().cmdHep(null, ["research", ...rest.slice(1)]);
+  }
+  // Subcommand help is a local, zero-network operation. Never let a literal
+  // "--help" become a Hub/Cloud routing query.
+  if (rest.slice(1).some(isHelpToken)) {
+    if (!topLevelCommandUsage(cmd)) cmdHelp();
+    return;
+  }
   if (cmd === "update") return cmdUpdate(rest.slice(1));
+  const missingArgumentUsage = {
+    build: localizedTopLevelUsage("build"),
+    call: localizedTopLevelUsage("call"),
+    cd: localizedTopLevelUsage("cd"),
+    firm: localizedTopLevelUsage("firm"),
+    "legacy-network": localizedTopLevelUsage("legacy-network"),
+    network: localizedTopLevelUsage("network"),
+    open: localizedTopLevelUsage("open"),
+    route: localizedTopLevelUsage("route"),
+    taskforce: localizedTopLevelUsage("taskforce"),
+    workforce: localizedTopLevelUsage("workforce"),
+  };
+  if (!rest[1] && missingArgumentUsage[cmd]) return fail(missingArgumentUsage[cmd]);
+  if (cmd === "connect" && !rest[1]) {
+    topLevelCommandUsage(cmd);
+    return;
+  }
+  if (cmd === "experience" && rest[1] === "validate" && (!rest[2] || rest[2].startsWith("-"))) {
+    return fail("usage: agentlas experience validate <bundle.agentlas-experience.json>");
+  }
+  if (cmd === "research" && !["status", "gather", "search", "read", "plan"].includes(rest[1])) {
+    return fail(
+      prefsLang() === "ko"
+        ? "사용법: agentlas research <status|gather|search|read|plan> [인자]"
+        : localizedTopLevelUsage("research"),
+    );
+  }
+  if (cmd === "netadmin" && !["init", "status", "reindex", "bench", "add-source"].includes(rest[1])) {
+    return fail(localizedTopLevelUsage("netadmin"));
+  }
+  if (
+    (cmd === "automation" || cmd === "automations")
+    && rest[1]
+    && !["list", "add", "on", "off", "remove", "run", "runs", "daemon"].includes(rest[1])
+  ) {
+    return fail(localizedTopLevelUsage("automation"));
+  }
+  if (
+    cmd === "journal"
+    && rest[1] === "status"
+    && !rest.slice(2).some((value) => value === "--run-id" || value === "--journal")
+  ) {
+    return fail(localizedTopLevelUsage("journal"));
+  }
 
   const db = openDb();
 
@@ -12085,6 +13037,8 @@ async function main() {
       return cmdImport(db, rest[1]);
     case "cd":
       return cmdCd(db, rest[1]);
+    case "native":
+      return cmdNative(db, rest.slice(1));
     case "run": {
       const runInput = parseRunExperienceArgs(rest.slice(2));
       return cmdRun(db, rest[1], runInput.prompt, runtimeOverride, runInput.experience);
@@ -12099,17 +13053,6 @@ async function main() {
     case "memory":
       // Phase 1b: 기존 마크다운 메모리 → 공유 agentlas.sqlite 이관(dry-run 기본, --apply).
       return require("./agentlas-memory-import.cjs").cmdMemory({ db, args: rest.slice(1), out, fail });
-    case "context": {
-      if (!rest[1]) return fail("usage: agentlas context refresh|locate|refs|slice|impact|verify [options]");
-      const cwd = projectCwd();
-      ensureTerminalProjectForExecutionCli(db, cwd, PERMISSION, "terminal-context");
-      const contextArgs = rest.slice(1);
-      const hasProject = contextArgs.includes("--project");
-      return parity().cmdHep(
-        db,
-        ["context", ...contextArgs, ...(hasProject ? [] : ["--project", cwd])],
-      );
-    }
     case "evolve":
       // Phase 2/2+: 데스크탑 트리거가 만든 성장 제안 검토·적용·되돌리기(공유 DB).
       return require("./agentlas-evolution.cjs").cmdEvolve({ db, args: rest.slice(1), out, fail, agentFolder });
@@ -12213,12 +13156,16 @@ async function main() {
     case "legacy-network": // explicit compatibility escape hatch only
       return parity().cmdHep(db, ["hep-network", ...rest.slice(1)]);
     case "route": // 라우팅 미리보기 (실행 없음)
-      return parity().cmdHep(
-        db,
-        rest.length > 1
-          ? ["route", rest.slice(1).join(" "), "--project", runCwd(), "--runtime", "terminal"]
-          : ["route"],
-      );
+      {
+        const routeRaw = rest.slice(1).includes("--json");
+        const routeQuery = rest.slice(1).filter((value) => value !== "--json").join(" ").trim();
+        return parity().cmdHep(
+          db,
+          routeQuery
+            ? ["route", routeQuery, "--project", projectCwd(), "--runtime", "terminal", ...(routeRaw ? ["--json"] : [])]
+            : ["route"],
+        );
+      }
     case "research": // Research Engine
       return parity().cmdHep(db, ["research", ...rest.slice(1)]);
     case "netadmin": // 로컬 에이전트 네트워크 관리 (init|status|reindex|bench|add-source)
@@ -12246,10 +13193,44 @@ async function main() {
       // re-run the first-launch onboarding wizard (language → runtime → permission)
       const cfg = require("./agentlas-config.cjs");
       const dir = userDataDir();
-      const p = cfg.loadPrefs(dir);
-      delete p.onboarded;
-      cfg.savePrefs(dir, p);
+      cfg.updatePrefs(dir, { onboarded: false });
       return launchTui(db, null, runtimeOverride);
+    }
+    case "project": {
+      const action = (rest[1] || "status").toLowerCase();
+      const cwd = projectCwd();
+      const lang = prefsLang();
+      if (action === "status") {
+        const active = ensureTerminalProjectForExecutionCli(db, cwd, "read", "terminal-project-status");
+        out(`${lang === "ko" ? "프로젝트" : "project"}: ${cwd}`);
+        out(`${lang === "ko" ? "Agentlas 상태" : "Agentlas state"}: ${active
+          ? (lang === "ko" ? "초기화됨" : "initialized")
+          : (lang === "ko" ? "초기화되지 않음" : "not initialized")}`);
+        if (!active) out(lang === "ko"
+          ? "비공개 .agentlas 상태와 로컬 제외 파일을 만들려면 `agentlas project init`을 실행하세요."
+          : "Run `agentlas project init` to create private .agentlas state and update local ignore files.");
+        return;
+      }
+      if (action === "init") {
+        out(lang === "ko"
+          ? "비공개 Agentlas 프로젝트 상태를 초기화합니다. .agentlas/ 생성, .gitignore 갱신, 로컬 자격증명·서명 템플릿 추가가 포함될 수 있습니다."
+          : "Initializing private Agentlas project state. This may create .agentlas/, update .gitignore, and add local credential/signing templates.");
+        initializeTerminalProjectCli(db, cwd);
+        out(`${lang === "ko" ? "초기화됨" : "Initialized"}: ${cwd}`);
+        return;
+      }
+      return fail(localizedTopLevelUsage("project"));
+    }
+    case "context": {
+      if (!rest[1]) return fail(localizedTopLevelUsage("context"));
+      const cwd = projectCwd();
+      ensureTerminalProjectForExecutionCli(db, cwd, PERMISSION, "terminal-context");
+      const contextArgs = rest.slice(1);
+      const hasProject = contextArgs.includes("--project");
+      return parity().cmdHep(
+        db,
+        ["context", ...contextArgs, ...(hasProject ? [] : ["--project", cwd])],
+      );
     }
     default: {
       // 알려진 명령이 아니면 에이전트명 → (없으면) 회사명 → 대화형 세션
@@ -12266,7 +13247,12 @@ async function main() {
 
 // 런처가 스폰하는 실행 파일일 때만 CLI main을 돌린다. 회귀 테스트/라이브러리 require는 종료하지 않는다.
 if (require.main === module) {
-  main().catch((e) => fail(String(e && e.stack ? e.stack : e)));
+  main().catch((e) => {
+    const detail = process.env.AGENTLAS_DEBUG === "1" && e && e.stack
+      ? e.stack
+      : ((e && e.message) || String(e));
+    fail(detail);
+  });
 }
 
 module.exports = {
@@ -12285,6 +13271,7 @@ module.exports = {
   hubTimeoutConfig,
   compareSemVer,
   parseSemVer,
+  shouldApplyBuiltinArchitectureSeed,
   updateTimeoutConfig,
   fetchUpdateMetadata,
   validateDesktopUpdateArtifact,
@@ -12294,6 +13281,7 @@ module.exports = {
   captureRuntime,
   buildArgs,
   codexCaptureAgentText,
+  capturedRuntimeAgentText,
   captureOutputLimit,
   materializeCloudListingCli,
   recoverCloudInstallJournalCli,
@@ -12315,6 +13303,7 @@ module.exports = {
   cloudPortableExecutableForFile,
   parseRunExperienceArgs,
   resolveRuntimeExperienceCli,
+  writeOberonManifestCli,
   runTerminalBuilder,
   resolveRuntime,
   listAvailableRuntimes,
@@ -12334,6 +13323,9 @@ module.exports = {
   credentialIndexReminderFor,
   ensureCoreProjectCli,
   ensureTerminalProjectForExecutionCli,
+  initializeTerminalProjectCli,
+  formatTopLevelRows,
+  localizedTopLevelUsage,
   ensureAgentlasProjectStateIgnoreCli,
   DEFAULT_API_MODEL,
   ANTHROPIC_COMPAT_API,

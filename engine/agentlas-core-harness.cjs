@@ -5,10 +5,13 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
+const { compareSemVer, normalizeSemVer } = require("./semver.cjs");
 
 const HARNESS_SCHEMA_VERSION = "agentlas.stormbreaker.goal-ultracode-harness.v1";
 const HARNESS_ID = "agentlas-core/stormbreaker-goal-ultracode";
 const HARNESS_MODE = "stormbreaker-goal-ultracode";
+const CONTEXT_MAP_MIN_CORE_VERSION = "1.1.66";
+const CORE_MANIFEST_MAX_BYTES = 64 * 1024;
 const CORE_RUNTIME_MARKERS = [
   ["agentlas_cloud", "__main__.py"],
   ["schemas", "workforce-work-order.schema.json"],
@@ -42,17 +45,55 @@ function runtimeRoots(explicitRoot) {
   return unique(roots);
 }
 
-function resolveCoreRuntimeRoot(explicitRoot) {
-  for (const root of runtimeRoots(explicitRoot)) {
+function readCoreRuntimeVersion(root) {
+  const jsonCandidates = [
+    path.join(root, "manifest.json"),
+    path.join(root, "host_adapters", "manifest.json"),
+  ];
+  for (const manifestPath of jsonCandidates) {
     try {
-      if (CORE_RUNTIME_MARKERS.every((segments) => fs.existsSync(path.join(root, ...segments)))) {
-        return root;
+      const stat = fs.statSync(manifestPath);
+      if (!stat.isFile() || stat.size > CORE_MANIFEST_MAX_BYTES) continue;
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+      const version = normalizeSemVer(String(manifest.version || ""));
+      if (version) return version;
+    } catch {
+      // Try the next bounded local manifest.
+    }
+  }
+  try {
+    const releasePath = path.join(root, "RELEASE");
+    const stat = fs.statSync(releasePath);
+    if (stat.isFile() && stat.size <= 256) {
+      return normalizeSemVer(fs.readFileSync(releasePath, "utf8").trim());
+    }
+  } catch {
+    // A legacy runtime may not publish RELEASE metadata.
+  }
+  return null;
+}
+
+function resolveCoreRuntimeRootFromCandidates(candidateRoots, requiredMarkers = [], options = {}) {
+  const markers = [...CORE_RUNTIME_MARKERS, ...requiredMarkers];
+  const minVersion = options.minVersion ? normalizeSemVer(String(options.minVersion)) : null;
+  if (options.minVersion && !minVersion) throw new Error(`Invalid minimum Core version: ${options.minVersion}`);
+  for (const root of unique(candidateRoots)) {
+    try {
+      if (!markers.every((segments) => fs.existsSync(path.join(root, ...segments)))) continue;
+      if (minVersion) {
+        const version = readCoreRuntimeVersion(root);
+        if (!version || compareSemVer(version, minVersion) < 0) continue;
       }
+      return root;
     } catch {
       // Continue to the next installed/bundled root.
     }
   }
   return null;
+}
+
+function resolveCoreRuntimeRoot(explicitRoot, requiredMarkers = [], options = {}) {
+  return resolveCoreRuntimeRootFromCandidates(runtimeRoots(explicitRoot), requiredMarkers, options);
 }
 
 function pythonCandidates() {
@@ -200,7 +241,10 @@ module.exports = {
   HARNESS_SCHEMA_VERSION,
   HARNESS_ID,
   HARNESS_MODE,
+  CONTEXT_MAP_MIN_CORE_VERSION,
   PY_BOOTSTRAP,
+  readCoreRuntimeVersion,
+  resolveCoreRuntimeRootFromCandidates,
   resolveCoreRuntimeRoot,
   resolvePython,
   spawnCoreModule,

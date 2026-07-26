@@ -283,6 +283,32 @@ async function main() {
   assert.match(receipt.inputFeatureHash, /^sha256:[0-9a-f]{64}$/);
   assert.equal(receipt.packetId, "worker-1");
   assert.equal(receipt.status, "resolved");
+  assert.deepEqual(Object.keys(receipt.requested).sort(), [
+    "effort", "modelClass", "modelId", "tier",
+  ], "Terminal requested receipt must match the strict Core v1 nested schema");
+  assert.deepEqual(Object.keys(receipt.resolved).sort(), [
+    "effort", "modelId", "provider", "sessionId", "tier",
+  ], "Terminal resolved receipt must match the strict Core v1 nested schema");
+  const unresolvedFallbackReceipt = routing.createDecisionReceipt({
+    taskId: "worker-no-current-model",
+    stage: "worker",
+    decision: economy,
+    resolution: {
+      ok: false,
+      tier: "economy",
+      model: null,
+      effort: null,
+      provider: "codex",
+      runtimeId: null,
+      source: "fallback",
+      fallbackReason: "no_compatible_model",
+    },
+  });
+  assert.equal(
+    unresolvedFallbackReceipt.status,
+    "unresolved",
+    "fallback-current requires a verified current runtime/model pair",
+  );
   const redactedReceipt = routing.createDecisionReceipt({
     taskId: "worker-private-reason",
     taskText: "another task",

@@ -14,34 +14,34 @@ const COPY = {
     read: {
       label: "read only",
       short: "inspect only",
-      description: "inspect files and reason; runtime tools cannot change the workspace",
+      description: "inspect only; workspace writes blocked",
     },
     write: {
       label: "workspace write",
       short: "edit workspace",
-      description: "read and edit the current workspace inside the runtime sandbox",
+      description: "workspace + runtime temp writes; external MCP off",
     },
     full: {
       label: "unrestricted",
       short: "unrestricted",
-      description: "bypass runtime approvals and sandboxing; use only in a trusted environment",
+      description: "bypass approvals and sandbox; trusted use only",
     },
   },
   ko: {
     read: {
       label: "읽기 전용",
       short: "조회만",
-      description: "파일을 읽고 판단하지만 런타임 도구가 작업 공간을 변경할 수 없음",
+      description: "조회만; 작업 공간 쓰기 차단",
     },
     write: {
       label: "작업 공간 쓰기",
       short: "작업 공간 편집",
-      description: "런타임 샌드박스 안에서 현재 작업 공간을 읽고 편집",
+      description: "작업 공간·런타임 임시 경로 쓰기; 외부 MCP 꺼짐",
     },
     full: {
       label: "무제한 권한",
       short: "무제한",
-      description: "런타임 승인과 샌드박스를 우회함; 신뢰할 수 있는 환경에서만 사용",
+      description: "승인과 샌드박스를 우회; 신뢰 환경 전용",
     },
   },
 };
@@ -50,6 +50,13 @@ function normalize(value, fallback = "read") {
   const level = String(value || "").trim().toLowerCase();
   if (LEVELS.includes(level)) return level;
   return LEVELS.includes(fallback) ? fallback : "read";
+}
+
+function persistent(value, fallback = "write") {
+  const level = normalize(value, fallback);
+  if (level !== "full") return level;
+  const safeFallback = normalize(fallback, "write");
+  return safeFallback === "full" ? "write" : safeFallback;
 }
 
 function next(value) {
@@ -87,4 +94,4 @@ function createCycleController(options = {}) {
   };
 }
 
-module.exports = { LEVELS, normalize, next, copy, createCycleController };
+module.exports = { LEVELS, normalize, persistent, next, copy, createCycleController };

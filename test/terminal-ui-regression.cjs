@@ -2,18 +2,57 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { spawn, spawnSync } = require("node:child_process");
 const { EventEmitter } = require("node:events");
 const { PassThrough } = require("node:stream");
 const { Ui, stripAnsi } = require("../engine/agentlas-ui.cjs");
-const { buildComposerFrame, createComposer, visWidth } = require("../engine/agentlas-composer.cjs");
+const { buildComposerFrame, createComposer, visWidth, splitWidth, wrapWidth } = require("../engine/agentlas-composer.cjs");
 const { runNativeTurn } = require("../engine/agentlas-native-host.cjs");
 const terminalInput = require("../engine/agentlas-input.cjs");
+const terminalConfig = require("../engine/agentlas-config.cjs");
+const i18n = require("../engine/agentlas-i18n.cjs");
 const banner = require("../engine/agentlas-banner.cjs");
-const { makeStyleGuard } = require("../engine/agentlas-repl.cjs");
+const { makeMemoryGuard, makeStyleGuard, sanitizeShellDisplay } = require("../engine/agentlas-repl.cjs");
+const { formatTopLevelRows, localizedTopLevelUsage } = require("../engine/agentlas.cjs");
 
 function palette() {
   const id = (value) => String(value);
   return { faint: id, emerald: id, text: id, paw: id, amber: id, blue: id, dim: id, inverse: id };
+}
+
+function testLocalizedTopLevelRuntimeErrors() {
+  assert.equal(
+    i18n.t("ko", "runtimeUnknown", "future"),
+    "알 수 없는 런타임: future (claude-code|codex|gemini)",
+  );
+  assert.match(i18n.t("ko", "runtimeUnavailable"), /^사용 가능한 런타임이 없습니다\./);
+}
+
+function testLocalizedRuntimeFailureWiring() {
+  const userData = fs.mkdtempSync(path.join(os.tmpdir(), "agentlas-runtime-i18n-"));
+  terminalConfig.updatePrefs(userData, {
+    onboarded: true,
+    lang: "ko",
+    runtime: "claude-code",
+    permission: "write",
+  });
+  const enginePath = path.resolve(__dirname, "../engine/agentlas.cjs");
+  const worker = [
+    `const terminal=require(${JSON.stringify(enginePath)});`,
+    'terminal.resolveRuntime({prepare(){throw new Error("no database");}}, "future");',
+  ].join("");
+  const result = spawnSync(process.execPath, ["-e", worker], {
+    encoding: "utf8",
+    env: { ...process.env, AGENTLAS_USER_DATA_DIR: userData, NO_COLOR: "1" },
+  });
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  assert.equal(result.stderr, "✖ 알 수 없는 런타임: future (claude-code|codex|gemini)\n");
+  assert.doesNotMatch(result.stderr, /Unknown runtime:|First run:/);
+  fs.rmSync(userData, { recursive: true, force: true });
 }
 
 function captureStream({ tty = false, columns = 88 } = {}) {
@@ -24,6 +63,17 @@ function captureStream({ tty = false, columns = 88 } = {}) {
     write(chunk) { value += String(chunk); return true; },
     value() { return value; },
   };
+}
+
+function resizableStream({ columns = 88, rows = 24 } = {}) {
+  const stream = new EventEmitter();
+  let value = "";
+  stream.isTTY = true;
+  stream.columns = columns;
+  stream.rows = rows;
+  stream.write = (chunk) => { value += String(chunk); return true; };
+  stream.value = () => value;
+  return stream;
 }
 
 class FakeInput extends EventEmitter {
@@ -38,7 +88,7 @@ class FakeInput extends EventEmitter {
 
 function plainTerminal(value) {
   // SGR + cursor movement/erase sequences; the remaining text is enough for hierarchy assertions.
-  return stripAnsi(value).replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+  return stripAnsi(value).replace(/\x1b[78]/g, "").replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
 }
 
 function virtualScreen(value) {
@@ -46,16 +96,42 @@ function virtualScreen(value) {
   const rows = [[]];
   let row = 0;
   let col = 0;
+  let saved = null;
   const ensure = () => { while (rows.length <= row) rows.push([]); };
   for (let index = 0; index < input.length; ) {
+    if (input[index] === "\x1b" && (input[index + 1] === "7" || input[index + 1] === "8")) {
+      if (input[index + 1] === "7") saved = { row, col };
+      if (input[index + 1] === "8" && saved) {
+        row = saved.row;
+        col = saved.col;
+        ensure();
+      }
+      index += 2;
+      continue;
+    }
     if (input[index] === "\x1b" && input[index + 1] === "[") {
-      const match = /^\x1b\[([0-9]*)([AJ])/.exec(input.slice(index));
+      const match = /^\x1b\[([0-9;]*)([AHJKrsu])/.exec(input.slice(index));
       if (match) {
         const amount = Number(match[1] || (match[2] === "A" ? 1 : 0));
         if (match[2] === "A") row = Math.max(0, row - amount);
+        if (match[2] === "H") {
+          const [targetRow = "1", targetCol = "1"] = match[1].split(";");
+          row = Math.max(0, Number(targetRow || 1) - 1);
+          col = Math.max(0, Number(targetCol || 1) - 1);
+          ensure();
+        }
+        if (match[2] === "K") {
+          rows[row] = [];
+        }
         if (match[2] === "J") {
           rows[row] = rows[row].slice(0, col);
           rows.length = row + 1;
+        }
+        if (match[2] === "s") saved = { row, col };
+        if (match[2] === "u" && saved) {
+          row = saved.row;
+          col = saved.col;
+          ensure();
         }
         index += match[0].length;
         continue;
@@ -114,6 +190,89 @@ function testComposerHierarchy() {
   assert.match(usageFn.lines[usageFn.lines.length - 1], /tokens {2}claude 1\.0k→200/, "usage may be a live getter");
 }
 
+function testGraphemeAwareWidthWrapping() {
+  const copy = "workspace + runtime temp writes; external MCP off";
+  const lines = wrapWidth(copy, 18);
+  assert.equal(lines.join(" "), copy);
+  for (const line of lines) assert.ok(visWidth(line) <= 18, `wrapped line overflowed: ${line}`);
+
+  const unicode = "가족 👨‍👩‍👧‍👦 작업 공간·임시 경로";
+  const unicodeLines = wrapWidth(unicode, 12);
+  assert.equal(unicodeLines.join(" "), unicode);
+  assert.doesNotMatch(unicodeLines.join(""), /\uFFFD/, "wrapping must preserve complete grapheme clusters");
+  for (const line of unicodeLines) assert.ok(visWidth(line) <= 12, `Unicode wrapped line overflowed: ${line}`);
+
+  const longToken = wrapWidth("AGENTLAS_SESSION", 8);
+  assert.equal(longToken.join(""), "AGENTLAS_SESSION");
+  for (const line of longToken) assert.ok(visWidth(line) <= 8, `long token overflowed: ${line}`);
+
+  const exact = "  +가족 👨‍👩‍👧‍👦  keeps  spacing";
+  const exactLines = splitWidth(exact, 9);
+  assert.equal(exactLines.join(""), exact, "hard display wrapping must preserve diff whitespace and graphemes byte-for-byte");
+  for (const line of exactLines) assert.ok(visWidth(line) <= 9, `exact split line overflowed: ${line}`);
+}
+
+function testNarrowUiMessagesWrap() {
+  for (const lang of ["en", "ko"]) {
+    const stream = captureStream({ columns: 40 });
+    const ui = new Ui({ color: false, lang, stream });
+    ui.info(lang === "ko"
+      ? "이미 충분히 compact 상태입니다 (123개 메시지)"
+      : "context is already compact (123 messages)");
+    ui.warn(lang === "ko"
+      ? "알 수 없는 명령: /companies. / 를 입력하면 명령 목록이 열립니다."
+      : "unknown command: /companies. Type / for the command list.");
+    ui.error(lang === "ko"
+      ? "에이전트 없음: 아주-긴-에이전트-식별자"
+      : "no agent: a-very-long-agent-identifier");
+    for (const line of stream.value().trimEnd().split("\n")) {
+      assert.ok(visWidth(line) <= 40, `${lang} narrow UI message overflowed: ${line}`);
+    }
+    assert.match(stream.value(), /companies/, "wrapping must preserve the command that caused the warning");
+  }
+}
+
+function testTopLevelTerminalWrappingAndUsageLocalization() {
+  for (const width of [40, 80]) {
+    const rows = formatTopLevelRows(
+      "  storm <goal>  Agentlas Goal+UltraCode harness: plan → allocate → execute → verify [--research]",
+      width,
+    );
+    assert.ok(rows.length > 1);
+    for (const row of rows) assert.ok(visWidth(row) <= width, `top-level row overflowed at ${width}: ${row}`);
+    assert.match(rows.slice(1).join("\n"), /↳/, "wrapped terminal information needs a visible continuation marker");
+  }
+  assert.match(localizedTopLevelUsage("automation", "ko"), /^사용법:/);
+  assert.match(localizedTopLevelUsage("automation", "ko"), /\[인자\]/);
+  assert.match(localizedTopLevelUsage("automation", "en"), /^usage:/);
+  const tokenRows = formatTopLevelRows(
+    "  install <slug>  install an agent from the Hub and keep cloud search readable",
+    40,
+  );
+  assert.doesNotMatch(tokenRows.join("\n"), /cloud s\n.*earch/, "wrapping must not split an ordinary command token");
+}
+
+function testShellDisplayControlSanitization() {
+  const safe = sanitizeShellDisplay(
+    "\x1b[31mREADY\x1b[0m\rprogress\x1b[2J\x1b]0;spoofed\x07\nDONE\u0000",
+  );
+  assert.equal(safe, "READY\nprogress\nDONE");
+  assert.doesNotMatch(safe, /\x1b|\u0000/, "shell output must not control or spoof Agentlas chrome");
+}
+
+function testQuotedCommandTokenization() {
+  assert.deepEqual(
+    terminalInput.tokenizeCommandLine('plan --query "Agentlas Terminal UI" --loadout safe'),
+    ["plan", "--query", "Agentlas Terminal UI", "--loadout", "safe"],
+  );
+  assert.deepEqual(
+    terminalInput.tokenizeCommandLine("read 'https://example.com/a b' --max-requests 1"),
+    ["read", "https://example.com/a b", "--max-requests", "1"],
+  );
+  assert.deepEqual(terminalInput.tokenizeCommandLine('search ""'), ["search", ""]);
+  assert.throws(() => terminalInput.tokenizeCommandLine('plan --query "unfinished'), /unclosed quote/);
+}
+
 function testCompactLocalizedStartup() {
   const stream = captureStream({ columns: 100 });
   const ui = new Ui({ color: false, lang: "ko", stream });
@@ -132,6 +291,23 @@ function testCompactLocalizedStartup() {
   assert.equal(output.trim().split("\n").length, 3, "startup chrome must stay compact");
   assert.doesNotMatch(output, /[╭╮│╰╯]/, "startup must not render the old oversized status card");
   assert.doesNotMatch(output, /████/, "startup must not render the six-row wordmark");
+
+  for (const lang of ["en", "ko"]) {
+    const narrowStream = captureStream({ columns: 40 });
+    const narrowUi = new Ui({ color: false, lang, stream: narrowStream });
+    banner.renderBanner({
+      ui: narrowUi,
+      version: "0.9.8",
+      runtimeLabel: "codex",
+      subjectLabel: null,
+      permission: "write",
+      cwd: "/tmp/project",
+    });
+    for (const line of narrowStream.value().split("\n")) {
+      assert.ok(visWidth(line) <= 40, `${lang} 40-column banner overflowed: ${line}`);
+    }
+    assert.match(narrowStream.value(), /Agent OS/, "narrow responsive banner must keep its product identity readable");
+  }
 
   const statusStream = captureStream({ columns: 48 });
   const statusUi = new Ui({ color: false, lang: "ko", stream: statusStream });
@@ -184,7 +360,122 @@ function testCompactToolActivity() {
   }
 }
 
-function testPersistentTurnFooter() {
+function testMemoryGuardHidesCommentEnvelope() {
+  const stream = captureStream({ columns: 100 });
+  const ui = new Ui({ color: false, lang: "en", stream });
+  const guard = makeMemoryGuard(makeStyleGuard(ui), "## Memory Events");
+  guard.streamStart();
+  for (const chunk of ["visible answer\n\n<!", "--\n## Memory", " Events\n```json\n{}\n```\n-->"]) {
+    guard.streamDelta(chunk);
+  }
+  guard.streamEnd();
+  assert.match(stream.value(), /visible answer/);
+  assert.doesNotMatch(stream.value(), /<!--|Memory Events|```json/, "private memory envelope must never leak into live output");
+}
+
+function waitForChild(child) {
+  return new Promise((resolve, reject) => {
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`history worker exited ${code}: ${stderr}`));
+    });
+  });
+}
+
+async function testConcurrentHistoryPersistenceAndRecovery() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "agentlas-history-regression-"));
+  const userData = path.join(root, "user");
+  const scopeA = path.join(root, "project-a");
+  const scopeB = path.join(root, "project-b");
+  fs.mkdirSync(scopeA);
+  fs.mkdirSync(scopeB);
+  const inputModule = path.resolve(__dirname, "../engine/agentlas-input.cjs");
+  const worker = [
+    `const input=require(${JSON.stringify(inputModule)});`,
+    "const ok=input.saveHistory([process.argv[1]], process.argv[2]);",
+    "process.exit(ok ? 0 : 2);",
+  ].join("");
+  const children = [];
+  for (let index = 0; index < 12; index++) {
+    const scope = index % 2 ? scopeA : scopeB;
+    const child = spawn(process.execPath, ["-e", worker, `entry-${index}`, scope], {
+      env: { ...process.env, AGENTLAS_USER_DATA_DIR: userData },
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    children.push(waitForChild(child));
+  }
+  await Promise.all(children);
+  const file = path.join(userData, "cli-history.json");
+  const document = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.equal(document.version, 2);
+  assert.equal(document.entries.length, 12, "serialized read-merge-write must preserve every concurrent scope update");
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  const previousUserData = process.env.AGENTLAS_USER_DATA_DIR;
+  process.env.AGENTLAS_USER_DATA_DIR = userData;
+  assert.equal(terminalInput.loadHistory(scopeA).length, 6);
+  assert.equal(terminalInput.loadHistory(scopeB).length, 6);
+
+  fs.writeFileSync(file, "{\"version\":2", { mode: 0o600 });
+  assert.equal(terminalInput.saveHistory(["recovered"], scopeA), true);
+  const recovered = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.ok(recovered.entries.some((entry) => entry.text === "recovered" && entry.cwd === scopeA));
+  assert.ok(
+    fs.readdirSync(userData).some((name) => name.startsWith("cli-history.json.corrupt-")),
+    "malformed primary history must be quarantined before recovery",
+  );
+
+  const prefsDir = path.join(root, "prefs");
+  const configModule = path.resolve(__dirname, "../engine/agentlas-config.cjs");
+  const configWorker = [
+    `const config=require(${JSON.stringify(configModule)});`,
+    "const patch=JSON.parse(process.argv[2]);",
+    "process.exit(config.updatePrefs(process.argv[1],patch) ? 0 : 2);",
+  ].join("");
+  await Promise.all([
+    waitForChild(spawn(process.execPath, ["-e", configWorker, prefsDir, JSON.stringify({ autoStorm: true })], {
+      stdio: ["ignore", "ignore", "pipe"],
+    })),
+    waitForChild(spawn(process.execPath, ["-e", configWorker, prefsDir, JSON.stringify({ autoNetwork: true })], {
+      stdio: ["ignore", "ignore", "pipe"],
+    })),
+  ]);
+  assert.deepEqual(
+    { autoStorm: terminalConfig.loadPrefs(prefsDir).autoStorm, autoNetwork: terminalConfig.loadPrefs(prefsDir).autoNetwork },
+    { autoStorm: true, autoNetwork: true },
+    "concurrent preference patches must merge instead of acknowledging a lost update",
+  );
+  assert.equal(fs.statSync(terminalConfig.prefsPath(prefsDir)).mode & 0o777, 0o600);
+
+  const helpDir = path.join(root, "help-only-user-data");
+  fs.mkdirSync(helpDir);
+  const launcher = path.resolve(__dirname, "../bin/agentlas.cjs");
+  const helpCommands = [
+    ["run", "--help"],
+    ["login", "--help"],
+    ["logout", "--help"],
+    ["setup", "--help"],
+    ["import", "--help"],
+    ["experience", "validate", "--help"],
+  ];
+  await Promise.all(helpCommands.map((args) => waitForChild(spawn(process.execPath, [launcher, ...args], {
+    env: { ...process.env, AGENTLAS_USER_DATA_DIR: helpDir },
+    stdio: ["ignore", "ignore", "pipe"],
+  }))));
+  assert.deepEqual(
+    fs.readdirSync(helpDir),
+    [],
+    "help must be handled before database bootstrap, runtime execution, auth, network, or onboarding",
+  );
+
+  if (previousUserData == null) delete process.env.AGENTLAS_USER_DATA_DIR;
+  else process.env.AGENTLAS_USER_DATA_DIR = previousUserData;
+  fs.rmSync(root, { recursive: true, force: true });
+}
+
+function testAppendOnlyTurnStatus() {
   const stream = captureStream({ tty: true, columns: 84 });
   const ui = new Ui({ color: false, lang: "ko", stream });
   ui.beginTurn({ permission: "write", permissionLabel: "읽기 + 쓰기", status: "codex · 자동 라우팅", usage: () => "토큰  codex 2.0k→800" });
@@ -194,23 +485,21 @@ function testPersistentTurnFooter() {
   ui.streamStart(true);
   ui.write("최종 답변\n");
   ui.streamEnd();
+  ui.cost({ input_tokens: 4321, output_tokens: 876 });
   const afterFirstEnd = stream.value();
-  const screen = virtualScreen(afterFirstEnd);
-  assert.equal((screen.match(/^─+$/gm) || []).length, 2, "footer redraws must leave exactly two separators on screen");
-  assert.equal((screen.match(/^›$/gm) || []).length, 1, "footer redraws must leave one composer anchor on screen");
-  assert.match(screen, /● Read/);
-  assert.match(screen, /최종 답변/);
+  assert.doesNotMatch(afterFirstEnd, /4321→876 tok/, "turn usage must not be duplicated as a transcript line");
+  assert.doesNotMatch(afterFirstEnd, /\x1b\[[0-9;]*[HKr]|\x1b7|\x1b8/, "active turns must never reposition the cursor or reserve a scroll region");
+  assert.match(afterFirstEnd, /● Read/);
+  assert.match(afterFirstEnd, /최종 답변/);
   ui.streamEnd();
-  assert.equal(stream.value(), afterFirstEnd, "a duplicate runtime streamEnd must not append a second footer");
+  assert.equal(stream.value(), afterFirstEnd, "a duplicate runtime streamEnd must not append output");
   ui.endTurn();
   const output = plainTerminal(stream.value());
-  assert.match(output, /› /, "the input anchor must remain visible during a turn");
   assert.match(output, /Codex로 생각 중/);
-  assert.match(output, /ctrl-c로 중단/);
-  assert.match(output, /읽기 \+ 쓰기/);
+  assert.match(output, /Ctrl-C로 중단/);
+  assert.equal((output.match(/Codex로 생각 중/g) || []).length, 1, "active status must be append-only and emitted once");
   assert.match(output, /● Read/);
   assert.match(output, /└ ✓ 3 lines read/);
-  assert.match(output, /토큰 {2}codex 2\.0k→800/, "usage bar must stay visible in the persistent turn footer");
 }
 
 function testRuntimeTaskPanelAndCtrlT() {
@@ -231,20 +520,50 @@ function testRuntimeTaskPanelAndCtrlT() {
     ],
   }, "todo-1");
   assert.deepEqual(ui._turnTasks.map((task) => task.status), ["in_progress", "completed", "pending"]);
-  assert.match(virtualScreen(stream.value()), /CHECKLIST_GHOST_SENTINEL/);
-  const expandedRows = ui._footerDrawnRows;
+  assert.doesNotMatch(plainTerminal(stream.value()), /CHECKLIST_GHOST_SENTINEL/, "task details start collapsed");
 
   input.emit("keypress", "\x14", { ctrl: true, name: "t" });
-  assert.equal(ui._tasksExpanded, false);
-  assert.ok(ui._footerDrawnRows < expandedRows, "collapsed task surface must use fewer footer rows");
-  assert.doesNotMatch(virtualScreen(stream.value()), /CHECKLIST_GHOST_SENTINEL/, "old task rows must be erased without ghosts");
-  input.emit("keypress", "\x14", { ctrl: true, name: "t" });
   assert.equal(ui._tasksExpanded, true);
+  assert.match(plainTerminal(stream.value()), /CHECKLIST_GHOST_SENTINEL/);
+  assert.equal(
+    (plainTerminal(stream.value()).match(/CHECKLIST_GHOST_SENTINEL/g) || []).length,
+    1,
+    "Ctrl-T must append one task snapshot without repainting it",
+  );
+  input.emit("keypress", "\x14", { ctrl: true, name: "t" });
+  assert.equal(ui._tasksExpanded, false);
+  assert.equal(
+    (plainTerminal(stream.value()).match(/CHECKLIST_GHOST_SENTINEL/g) || []).length,
+    1,
+    "hiding task details must preserve the immutable transcript without duplicating the snapshot",
+  );
+  assert.equal(
+    (plainTerminal(stream.value()).match(/작업 상세를 숨겼습니다/g) || []).length,
+    1,
+    "hiding task details must append one truthful notice",
+  );
   input.emit("keypress", "\x03", { ctrl: true, name: "c" });
   assert.equal(interrupted, 1, "raw-mode Ctrl-C must still interrupt the active turn");
 
   ui.endTurn();
   assert.equal(input.isRaw, false, "turn cleanup must restore prior terminal raw mode");
+}
+
+function testActiveTurnDoesNotRepaintOnResize() {
+  const input = new FakeInput();
+  const stream = resizableStream({ columns: 80, rows: 24 });
+  const ui = new Ui({ color: false, lang: "en", stream, input });
+  ui.beginTurn({ permission: "write", status: "Running shell…" });
+  ui.status("Running shell");
+  const before = stream.value().length;
+  stream.columns = 40;
+  stream.rows = 18;
+  stream.emit("resize");
+  const delta = stream.value().slice(before);
+  assert.equal(delta, "", "active-turn resize must not repaint or mutate scrollback");
+  assert.equal(stream.listenerCount("resize"), 0, "append-only active turns must not install a resize listener");
+  ui.endTurn();
+  assert.equal(stream.listenerCount("resize"), 0, "active-turn resize listener must be removed at turn end");
 }
 
 function testCrossRuntimeTaskNormalization() {
@@ -309,11 +628,144 @@ async function testShiftTabKeyboardAndLocalizedPalette() {
   const paletteText = terminalInput.renderSlashPalette(bareSlashRows, 0, { lang: "ko", columns: 48 });
   assert.ok(paletteText.length > 0, "localized command palette must render content");
   for (const line of paletteText.split("\n")) assert.ok(visWidth(line) <= 48, `localized palette line overflowed: ${line}`);
+  const narrowPalette = terminalInput.renderSlashPalette(bareSlashRows, 0, { lang: "ko", columns: 40 });
+  for (const line of narrowPalette.split("\n")) assert.ok(visWidth(line) <= 40, `40-column palette line overflowed: ${line}`);
   const careerRows = terminalInput.slashCommandSuggestions("/career", 12, "ko");
   const careerIndex = careerRows.findIndex((entry) => entry.examples?.length);
   assert.ok(careerIndex >= 0, "career palette fixture must include examples");
   const careerPalette = terminalInput.renderSlashPalette(careerRows, careerIndex, { lang: "ko", columns: 48 });
   for (const line of careerPalette.split("\n")) assert.ok(visWidth(line) <= 48, `localized examples line overflowed: ${line}`);
+}
+
+async function testComposerDoubleCtrlCExit() {
+  const input = new FakeInput();
+  const stream = captureStream({ tty: true, columns: 88 });
+  const ui = new Ui({ color: false, lang: "ko", stream, input });
+  const composer = createComposer({ ui, input, stream, loadHistory: () => [], saveHistory: () => {} });
+  const pending = composer.read({ lang: "ko", permission: "write" });
+  input.emit("keypress", "\u0003", { name: "c", ctrl: true });
+  assert.match(plainTerminal(stream.value()), /종료하려면 Ctrl-C를 한 번 더/);
+  input.emit("keypress", "\u0003", { name: "c", ctrl: true });
+  assert.deepEqual(await pending, { exit: true }, "second idle Ctrl-C within the grace window must exit");
+}
+
+async function testComposerEscapePrefixedCtrlCClearsBuffer() {
+  const input = new FakeInput();
+  const stream = captureStream({ tty: true, columns: 80 });
+  const ui = new Ui({ color: false, lang: "en", stream, input });
+  const saved = [];
+  const composer = createComposer({
+    ui,
+    input,
+    stream,
+    loadHistory: () => [],
+    saveHistory: (history) => saved.push([...history]),
+  });
+  const pending = composer.read({
+    lang: "en",
+    permission: "read",
+    suggest: (value) => value.startsWith("/per")
+      ? [
+          { command: "/permission", description: "permission level" },
+          { command: "/permissions", description: "permission screen" },
+        ]
+      : [],
+  });
+  input.emit("keypress", "/per", { name: "/per", sequence: "/per" });
+  input.emit("keypress", "\x1b[B", { name: "down", sequence: "\x1b[B" });
+  input.emit("keypress", "\x1b[A", { name: "up", sequence: "\x1b[A" });
+  // Actual macOS/tmux/Node behavior when Ctrl-C follows a lone Escape inside
+  // the key decoder's prefix window: one meta event, not separate escape and
+  // ctrl-c events.
+  input.emit("keypress", "\x1b\x03", { name: "c", meta: true, ctrl: false, sequence: "\x1b\x03" });
+  input.emit("keypress", "/permissions", { name: "/permissions", sequence: "/permissions" });
+  input.emit("keypress", "\r", { name: "return", sequence: "\r" });
+  assert.deepEqual(await pending, { value: "/permissions" });
+  assert.deepEqual(saved.at(-1), ["/permissions"], "Escape-prefixed Ctrl-C must clear the prior slash selection");
+}
+
+async function testComposerBulkEditCoalescesRedraws() {
+  const input = new FakeInput();
+  const stream = captureStream({ tty: true, columns: 80 });
+  const ui = new Ui({ color: false, lang: "en", stream, input });
+  const composer = createComposer({ ui, input, stream, loadHistory: () => [], saveHistory: () => {} });
+  const pending = composer.read({ lang: "en", permission: "write" });
+  const beforePaste = stream.value().length;
+  for (let index = 0; index < 512; index += 1) input.emit("keypress", "x", { name: "x" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const pastedBytes = stream.value().length - beforePaste;
+  assert.ok(pastedBytes < 5_000, `bulk paste should coalesce redraws, wrote ${pastedBytes} bytes`);
+
+  const beforeDelete = stream.value().length;
+  for (let index = 0; index < 512; index += 1) input.emit("keypress", "\x7f", { name: "backspace" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const deletedBytes = stream.value().length - beforeDelete;
+  assert.ok(deletedBytes < 5_000, `bulk backspace should coalesce redraws, wrote ${deletedBytes} bytes`);
+  input.emit("keypress", "\r", { name: "return" });
+  assert.deepEqual(await pending, { value: "" });
+}
+
+async function testComposerRedrawsOnResize() {
+  const input = new FakeInput();
+  const stream = resizableStream({ columns: 80, rows: 24 });
+  const ui = new Ui({ color: false, lang: "ko", stream, input });
+  const composer = createComposer({ ui, input, stream, loadHistory: () => [], saveHistory: () => {} });
+  const pending = composer.read({ lang: "ko", permission: "write", status: "codex · 자동 라우팅" });
+  const before = stream.value().length;
+  stream.columns = 40;
+  stream.rows = 8;
+  stream.emit("resize");
+  await new Promise((resolve) => setImmediate(resolve));
+  const resized = stream.value().slice(before);
+  assert.ok(resized.length > 0, "resize must trigger a compositor write without waiting for a key");
+  assert.match(plainTerminal(resized), /─{39}/, "resize repaint must use the new terminal width");
+  input.emit("keypress", "\r", { name: "return" });
+  assert.deepEqual(await pending, { value: "" });
+  assert.equal(stream.listenerCount("resize"), 0, "completed reads must not leak resize listeners");
+}
+
+async function testComposerUnicodeGraphemeEditing() {
+  assert.equal(visWidth("e\u0301"), 1, "combining mark must not add a terminal cell");
+  assert.equal(visWidth("👨‍👩‍👧‍👦"), 2, "ZWJ emoji family must occupy one grapheme cell pair");
+  assert.equal(visWidth("🇰🇷"), 2, "regional-indicator flag must occupy one grapheme cell pair");
+
+  const runEdit = async (value, keys) => {
+    const input = new FakeInput();
+    const stream = captureStream({ tty: true, columns: 80 });
+    const ui = new Ui({ color: false, lang: "en", stream, input });
+    const composer = createComposer({ ui, input, stream, loadHistory: () => [], saveHistory: () => {} });
+    const pending = composer.read({ lang: "en", permission: "write" });
+    input.emit("keypress", value, { name: value });
+    for (const [str, key] of keys) input.emit("keypress", str, key);
+    input.emit("keypress", "\r", { name: "return" });
+    return pending;
+  };
+
+  assert.deepEqual(
+    await runEdit("/model 😀", [
+      ["\x7f", { name: "backspace" }],
+      ["OK", { name: "OK" }],
+    ]),
+    { value: "/model OK" },
+    "Backspace must remove an emoji as one grapheme",
+  );
+  assert.deepEqual(
+    await runEdit("/model A😀B", [
+      ["", { name: "left" }],
+      ["", { name: "left" }],
+      ["X", { name: "x" }],
+    ]),
+    { value: "/model AX😀B" },
+    "Left must never place the cursor inside a surrogate pair",
+  );
+  assert.deepEqual(
+    await runEdit("/model 👨‍👩‍👧‍👦X", [
+      ["", { name: "left" }],
+      ["\x7f", { name: "backspace" }],
+    ]),
+    { value: "/model X" },
+    "Backspace must remove a full ZWJ emoji cluster",
+  );
 }
 
 class FakeChild extends EventEmitter {
@@ -454,15 +906,30 @@ async function testClaudeAndGeminiTaskEvents() {
 }
 
 async function main() {
+  testLocalizedTopLevelRuntimeErrors();
+  testLocalizedRuntimeFailureWiring();
   testComposerHierarchy();
+  testGraphemeAwareWidthWrapping();
+  testNarrowUiMessagesWrap();
+  testTopLevelTerminalWrappingAndUsageLocalization();
+  testShellDisplayControlSanitization();
+  testQuotedCommandTokenization();
   testCompactLocalizedStartup();
   testCompactToolActivity();
-  testPersistentTurnFooter();
+  testMemoryGuardHidesCommentEnvelope();
+  testAppendOnlyTurnStatus();
   testRuntimeTaskPanelAndCtrlT();
+  testActiveTurnDoesNotRepaintOnResize();
   testCrossRuntimeTaskNormalization();
   await testShiftTabKeyboardAndLocalizedPalette();
+  await testComposerDoubleCtrlCExit();
+  await testComposerEscapePrefixedCtrlCClearsBuffer();
+  await testComposerBulkEditCoalescesRedraws();
+  await testComposerRedrawsOnResize();
+  await testComposerUnicodeGraphemeEditing();
   await testCodexEventRendering();
   await testClaudeAndGeminiTaskEvents();
+  await testConcurrentHistoryPersistenceAndRecovery();
   console.log("terminal-ui-regression: PASS");
 }
 

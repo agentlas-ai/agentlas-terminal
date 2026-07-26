@@ -12,6 +12,7 @@
 
 const assert = require("node:assert/strict");
 const { autoRouteAgent, resolveAutoRoute, autoRouteNote, autoRoutePreamble, directSystemPrompt, installJudgmentRunner } = require("../engine/agentlas.cjs");
+const { routePreviewModel, researchPreviewModel } = require("../engine/agentlas-parity.cjs")._test;
 const caps = require("../engine/agentlas-capabilities.cjs");
 const { needsImage, needsImageLexical, autoRuntimeFor } = caps;
 const judgment = require("../engine/agentlas-judgment.cjs");
@@ -118,6 +119,68 @@ const db = makeDb(AGENTS, META);
 // 7) 직답 시스템 프롬프트 — 페르소나 없음, 양 언어 모두 존재
 assert.match(directSystemPrompt("ko"), /기본 어시스턴트/);
 assert.match(directSystemPrompt("en"), /default assistant/);
+
+// A Hephaestus route receipt is rendered as a small truthful preview, not raw
+// internal JSON. A primary candidate is still only a candidate when selected is null.
+{
+  const preview = routePreviewModel({
+    scope: "cloud",
+    selected: null,
+    receipt_id: "receipt-test",
+    execution: {
+      primary_agent: "agent-a",
+      recommended_agents: [{ agent: "agent-a" }],
+      alternatives: ["agent-b"],
+    },
+    hub: {
+      results: [
+        { slug: "agent-a", name: "에이전트 A", nameEn: "Agent A", kind: "cloud-callable" },
+        { slug: "agent-b", name: "Agent B", kind: "install-only" },
+      ],
+    },
+    router_agent: { mode: "escalate_to_router_agent" },
+  });
+  assert.equal(preview.selected, null, "a primary candidate must not be mislabeled as selected");
+  assert.equal(preview.primary.id, "agent-a");
+  assert.equal(preview.primary.name, "에이전트 A");
+  assert.equal(preview.primary.nameEn, "Agent A");
+  assert.deepEqual(preview.candidates.map((candidate) => candidate.id), ["agent-a", "agent-b"]);
+  assert.equal(preview.scope, "cloud");
+  assert.equal(preview.needsRouter, true);
+  assert.equal(preview.receiptId, "receipt-test");
+}
+
+{
+  const preview = researchPreviewModel({
+    schema: "agentlas.research.v0",
+    status: "partial",
+    request: {
+      intent: "search",
+      query: "Agentlas Terminal UI",
+      loadout: "safe",
+      max_cost: { requests: 1 },
+    },
+    results: [],
+    capability_summary: {
+      status: "missing_evidence",
+      trust: { can_use_for_build_context: false, warnings: [] },
+    },
+    receipt: {
+      receipt_id: "research-test",
+      module_chain: ["search.ddg_html"],
+      attempts: [{ status: "error" }],
+      policy: {
+        evidence_coverage: { status: "missing" },
+        evidence_quality: { status: "none", score: 0 },
+      },
+    },
+  });
+  assert.equal(preview.query, "Agentlas Terminal UI");
+  assert.equal(preview.maxRequests, 1);
+  assert.equal(preview.results.length, 0);
+  assert.equal(preview.totalEvidenceFailure, true, "zero-result missing evidence must fail the process contract");
+  assert.equal(preview.receiptId, "research-test");
+}
 
 // ── 2026-07-12 두 번째 오라우팅 사고 고정 ─────────────────────────────────────
 // 사고: "/Users/operator/Documents/법인관련/Appbridge_Template.이 양식으로 …" 프롬프트가

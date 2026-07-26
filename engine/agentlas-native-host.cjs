@@ -12,7 +12,7 @@
  *
  * 스키마는 실측으로 확인됨 (cli/agentlas.cjs 상단 주석 참고).
  */
-const { spawn } = require("node:child_process");
+const { execFileSync, spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -821,6 +821,7 @@ function runNativeTurn(req) {
     let child;
     try {
       const spawnImpl = req.spawn || spawn;
+      const groupedChild = process.platform !== "win32" && spawnImpl === spawn;
       const childEnv = launchReq.prepareRuntimeEnv === false
         ? (launchReq.env || process.env)
         : runtimeEnvForKind(kind, launchReq.env || process.env, launchReq);
@@ -828,7 +829,11 @@ function runNativeTurn(req) {
         cwd,
         stdio: ["ignore", "pipe", "pipe"],
         env: childEnv,
+        detached: groupedChild,
+        windowsHide: true,
       });
+      child.__agentlasNativeChild = spawnImpl === spawn;
+      child.__agentlasGroupedChild = groupedChild;
     } catch (e) {
       ui.error(uiText(ui, "runtime.failed", kind, e.message));
       return resolve({ text: "", session: st.session, error: e.message });
@@ -840,6 +845,7 @@ function runNativeTurn(req) {
     let totalTimer = null;
     let killTimer = null;
     let forceTimer = null;
+    let verifyTimer = null;
     let removeLineReader = () => {};
     let stderrBuf = "";
     const clearWatchdogs = () => {
@@ -847,7 +853,8 @@ function runNativeTurn(req) {
       if (totalTimer) clearTimeout(totalTimer);
       if (killTimer) clearTimeout(killTimer);
       if (forceTimer) clearTimeout(forceTimer);
-      idleTimer = totalTimer = killTimer = forceTimer = null;
+      if (verifyTimer) clearTimeout(verifyTimer);
+      idleTimer = totalTimer = killTimer = forceTimer = verifyTimer = null;
     };
     const cleanup = () => {
       clearWatchdogs();
@@ -866,7 +873,29 @@ function runNativeTurn(req) {
       ui.stopSpinner();
       const text = (st.finalText || st.text || "").trim();
       if (st.usage) ui.cost(st.usage);
-      finish({ text, session: st.session, usage: st.usage, error: termination ? termination.message : "native runtime stopped" });
+      finish({
+        text,
+        session: st.session,
+        usage: st.usage,
+        error: termination ? termination.message : "native runtime stopped",
+        terminationVerified: Boolean(termination?.verified),
+      });
+    };
+    const verifyTermination = () => {
+      if (settled || !termination) return;
+      if (verifyTimer) return;
+      if (child.__agentlasNativeChild === true && !(termination.pids || []).length) return;
+      const alive = activeNativeProcessIds(termination.pids || []);
+      if (Array.isArray(alive) && !alive.length) {
+        termination.verified = true;
+        terminationResult();
+        return;
+      }
+      for (const pid of alive || termination.pids || []) signalNativePid(pid, "SIGKILL");
+      verifyTimer = setTimeout(() => {
+        verifyTimer = null;
+        verifyTermination();
+      }, 25);
     };
     const requestStop = (reason) => {
       if (termination || settled) return;
@@ -878,11 +907,17 @@ function runNativeTurn(req) {
       if (idleTimer) clearTimeout(idleTimer);
       if (totalTimer) clearTimeout(totalTimer);
       idleTimer = totalTimer = null;
-      try { child.kill("SIGTERM"); } catch { /* ignore */ }
+      const forcedTree = forceStopNativeProcessTree(child);
+      if (forcedTree.length) {
+        termination.pids = forcedTree;
+        verifyTermination();
+        return;
+      }
+      terminateNativeChild(child, "SIGTERM");
       if (settled) return;
       killTimer = setTimeout(() => {
         if (settled) return;
-        try { child.kill("SIGKILL"); } catch { /* ignore */ }
+        terminateNativeChild(child, "SIGKILL");
         if (settled) return;
         forceTimer = setTimeout(terminationResult, Math.max(250, Math.min(1_000, timeout.killGraceMs)));
       }, timeout.killGraceMs);
@@ -920,7 +955,7 @@ function runNativeTurn(req) {
     child.on("error", (err) => {
       if (settled) return;
       if (termination) {
-        terminationResult();
+        verifyTermination();
         return;
       }
       ui.stopSpinner();
@@ -930,7 +965,7 @@ function runNativeTurn(req) {
     child.on("close", (code) => {
       if (settled) return;
       if (termination) {
-        terminationResult();
+        verifyTermination();
         return;
       }
       ui.streamEnd();
@@ -940,7 +975,7 @@ function runNativeTurn(req) {
       if (st.error && !st.errorShown) {
         // claude `result` is_error 등 — 이전에 표시되지 않은 에러를 노출
         ui.error(String(st.error));
-      } else if (code !== 0 && !text) {
+      } else if (code !== 0) {
         // Runtime Doctor — 아는 시스템 원인(미인증 OAuth MCP 플러그인 등)이면 즉시 수리하고
         // 1회 자동 재시도한다(2026-07-08 notion@openai-curated가 codex 전멸시킨 사고).
         if (!req._doctorRetried) {
@@ -966,7 +1001,10 @@ function runNativeTurn(req) {
         ui.warn(uiText(ui, "runtime.noOutput", kind) + (errTail ? ` (${errTail.slice(-200)})` : ""));
       }
       if (st.usage) ui.cost(st.usage);
-      finish({ text, session: st.session, usage: st.usage, error: st.error });
+      const exitError = code === 0
+        ? st.error
+        : st.error || `${kind} exited with code ${code == null ? "unknown" : code}`;
+      finish({ text, session: st.session, usage: st.usage, error: exitError });
     });
 
     armIdle();
@@ -976,6 +1014,150 @@ function runNativeTurn(req) {
       else req.signal.addEventListener("abort", onAbort, { once: true });
     }
   });
+}
+
+function nativeProcessRows() {
+  if (process.platform === "win32") return [];
+  try {
+    const output = execFileSync("/bin/ps", ["-axo", "pid=,ppid=,stat="], {
+      encoding: "utf8",
+      maxBuffer: 4 * 1024 * 1024,
+      timeout: 1_000,
+    });
+    return String(output || "").split(/\r?\n/).map((line) => {
+      const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)/);
+      return match
+        ? { pid: Number(match[1]), ppid: Number(match[2]), stat: match[3] }
+        : null;
+    }).filter(Boolean);
+  } catch {
+    return null;
+  }
+}
+
+function nativeProcessTreeIds(rootPid, rows = nativeProcessRows()) {
+  if (!Number.isInteger(rootPid) || rootPid <= 1 || !Array.isArray(rows)) return [];
+  const children = new Map();
+  for (const row of rows) {
+    if (!children.has(row.ppid)) children.set(row.ppid, []);
+    children.get(row.ppid).push(row.pid);
+  }
+  const ordered = [];
+  const seen = new Set();
+  const visit = (pid) => {
+    if (seen.has(pid)) return;
+    seen.add(pid);
+    for (const childPid of children.get(pid) || []) visit(childPid);
+    ordered.push(pid);
+  };
+  visit(rootPid);
+  return ordered;
+}
+
+function activeNativeProcessIds(pids, rows = nativeProcessRows()) {
+  if (!Array.isArray(pids) || !pids.length) return [];
+  if (!Array.isArray(rows)) return null;
+  const wanted = new Set(pids);
+  return rows
+    .filter((row) => wanted.has(row.pid) && !String(row.stat || "").startsWith("Z"))
+    .map((row) => row.pid);
+}
+
+function signalNativePid(pid, signal) {
+  if (!Number.isInteger(pid) || pid <= 1) return false;
+  try {
+    process.kill(pid, signal);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function forceStopNativeProcessTree(child) {
+  if (
+    process.platform === "win32" &&
+    child?.__agentlasNativeChild === true &&
+    Number.isInteger(child.pid) &&
+    child.pid > 1
+  ) {
+    try {
+      execFileSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
+        stdio: "ignore",
+        timeout: 5_000,
+        windowsHide: true,
+      });
+      return [child.pid];
+    } catch {
+      return [];
+    }
+  }
+  if (
+    !child ||
+    child.__agentlasGroupedChild !== true ||
+    !Number.isInteger(child.pid) ||
+    child.pid <= 1
+  ) return [];
+
+  // Native model CLIs may place tool shells in their own process groups. A
+  // group-only kill can therefore close the model process while a Bash tool
+  // keeps writing in the background. Freeze the whole observed ancestry first
+  // so no descendant can advance, take one more snapshot for races, then kill
+  // every owned process. The caller does not report cancellation until all
+  // captured non-zombie PIDs are gone.
+  const firstRows = nativeProcessRows();
+  if (!Array.isArray(firstRows)) return [];
+  const first = nativeProcessTreeIds(child.pid, firstRows);
+  for (const pid of first) signalNativePid(pid, "SIGSTOP");
+  const secondRows = nativeProcessRows();
+  const second = Array.isArray(secondRows) ? nativeProcessTreeIds(child.pid, secondRows) : [];
+  const all = [...new Set([...first, ...second])];
+  for (const pid of second) signalNativePid(pid, "SIGSTOP");
+  for (const pid of all) signalNativePid(pid, "SIGKILL");
+  return all;
+}
+
+function terminateNativeChild(child, signal = "SIGTERM") {
+  if (!child) return false;
+  let signalled = false;
+  if (
+    process.platform !== "win32" &&
+    child.__agentlasGroupedChild === true &&
+    Number.isInteger(child.pid) &&
+    child.pid > 1
+  ) {
+    try {
+      process.kill(-child.pid, signal);
+      signalled = true;
+    } catch {
+      // The group may already be gone while the direct child is still
+      // observable. Fall through to the direct-child signal.
+    }
+  }
+  if (!signalled) {
+    try {
+      signalled = child.kill(signal);
+    } catch {
+      signalled = false;
+    }
+  }
+  if (
+    process.platform === "win32" &&
+    signal === "SIGKILL" &&
+    Number.isInteger(child.pid) &&
+    child.pid > 1
+  ) {
+    try {
+      const killer = spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+      killer.unref();
+      signalled = true;
+    } catch {
+      // Direct child.kill above remains the best available fallback.
+    }
+  }
+  return signalled;
 }
 
 module.exports = {
@@ -997,4 +1179,8 @@ module.exports = {
   codexMcpArgs,
   nativeTimeoutConfig,
   directNativeTimeoutConfig,
+  nativeProcessTreeIds,
+  activeNativeProcessIds,
+  forceStopNativeProcessTree,
+  terminateNativeChild,
 };

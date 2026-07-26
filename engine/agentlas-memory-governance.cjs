@@ -31,6 +31,7 @@ const SEMANTIC_DISPOSITIONS = new Set(["retain", "session", "discard", "review"]
 const CONFIDENCE_LEVELS = new Set(["high", "medium", "low"]);
 
 const { SECRET_PATTERNS } = require("./agentlas-secret-patterns.cjs");
+const { runWriteTransaction } = require("./agentlas-sqlite-policy.cjs");
 const ABSOLUTE_PATH_PATTERNS = [
   /(?:^|[\s("'`])~\/[A-Za-z0-9._-]/,
   /(?:^|[\s("'`])\/(?:Users|home|private|var|tmp|opt|etc|Volumes|Applications|System|Library)\//,
@@ -258,7 +259,7 @@ function beginTurn(db, input = {}) {
     : legacyRequestFingerprint;
   const now = new Date().toISOString();
 
-  const run = db.transaction(() => {
+  const result = runWriteTransaction(db, () => {
     if (explicitTurnId) {
       const existing = db.prepare("SELECT * FROM terminal_memory_turn_intents WHERE turn_id=?").get(explicitTurnId);
       // Accept the pre-v1 host fingerprint for an in-flight turn created
@@ -299,8 +300,6 @@ function beginTurn(db, input = {}) {
       reused: false,
     };
   });
-
-  const result = run();
   let storedPolicy = policy;
   try { storedPolicy = JSON.parse(result.row.owner_policy_json || "{}"); } catch { /* use current safe policy */ }
   return {
@@ -852,7 +851,7 @@ async function completeTurn(db, input = {}) {
   let retainedMemories = [];
   let decisionBatch = null;
   let replayedByRace = false;
-  const run = db.transaction(() => {
+  runWriteTransaction(db, () => {
     const raced = readExistingReceipt(db, turnId);
     if (raced) {
       ticket = raced;
@@ -953,7 +952,6 @@ async function completeTurn(db, input = {}) {
       "UPDATE terminal_memory_turn_intents SET status='completed', completed_at=? WHERE turn_id=?",
     ).run(timestamp, turnId);
   });
-  run();
 
   if (normalizePermission(turn.permission) !== "read" && projectContextMatches && ownerContextMatches) {
     mirrorCoreLogs(boundProjectPath, ticket, decisionBatch, input.coreFiles);

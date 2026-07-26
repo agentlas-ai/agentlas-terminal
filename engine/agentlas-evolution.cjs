@@ -15,6 +15,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { createHash, randomUUID } = require("node:crypto");
+const { runWriteTransaction } = require("./agentlas-sqlite-policy.cjs");
 
 function sha256(content) {
   return createHash("sha256").update(String(content), "utf8").digest("hex");
@@ -217,7 +218,7 @@ function cmdApply(db, id, out, fail, agentFolder) {
     fs.writeFileSync(file, row.before_content, "utf8");
     return fail("Applied content did not match the approved hash; restored the original.");
   }
-  const tx = db.transaction(() => {
+  runWriteTransaction(db, () => {
     db.prepare("UPDATE installed_agents SET system_prompt = ? WHERE id = ?").run(row.after_content, row.agent_id);
     insertReceipt(db, row, "apply", row.before_hash, row.after_hash, now);
     db.prepare(
@@ -227,7 +228,6 @@ function cmdApply(db, id, out, fail, agentFolder) {
        WHERE id = ? AND status = 'candidate'`,
     ).run(now, now, row.id);
   });
-  tx();
   out(`applied ${id} → ${row.target_path} (agent ${row.agent_id}). Revert with: agentlas evolve revert ${id}`);
 }
 
@@ -255,7 +255,7 @@ function cmdRevert(db, id, out, fail, agentFolder) {
     fs.writeFileSync(file, row.after_content, "utf8");
     return fail("Reverted content did not match the original hash; restored the applied version.");
   }
-  const tx = db.transaction(() => {
+  runWriteTransaction(db, () => {
     db.prepare("UPDATE installed_agents SET system_prompt = ? WHERE id = ?").run(row.before_content, row.agent_id);
     insertReceipt(db, row, "rollback", row.after_hash, row.before_hash, now);
     db.prepare(
@@ -265,7 +265,6 @@ function cmdRevert(db, id, out, fail, agentFolder) {
        WHERE id = ? AND status IN ('applied','measured')`,
     ).run(now, now, row.id);
   });
-  tx();
   out(`reverted ${id} → restored ${row.target_path} (agent ${row.agent_id}).`);
 }
 

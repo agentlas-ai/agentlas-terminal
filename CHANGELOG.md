@@ -1,6 +1,26 @@
 # Changelog
 
-## 0.9.9 — 2026-07-26
+## 0.9.10 — 2026-07-26
+
+- Concurrent Terminal work against the Desktop-shared SQLite database now uses
+  one bounded lock policy. Every Terminal write transaction acquires writer
+  authority before reading mutable shared state, preventing deferred
+  read-to-write upgrades from failing with `database is locked` after a
+  provider already completed the user's work.
+- One-shot runs now honor the saved read/write boundary across run, firm,
+  Stormbreaker, swarm, build, Workforce, and context surfaces; an explicit
+  `--permission` remains a session-only override.
+- `agentlas context` invokes the compatible Agentlas Core context-map
+  capability directly and fails closed when it is unavailable. Older
+  Hephaestus launchers can no longer reinterpret `context verify` as a Hub
+  search. When multiple local Core installations coexist, Terminal now checks
+  bounded version metadata and skips an earlier runtime that cannot satisfy the
+  v1.1.66 context contract.
+- Scheduled automation output now renders only the model's final answer instead
+  of leaking Claude or Gemini stream-protocol JSON. The slash palette also
+  respects a real 40-column terminal while preserving arrow-key selection.
+- Top-level runtime failures follow the saved Terminal language, including
+  unknown runtime names and the no-runtime-available recovery message.
 
 - In an explicitly initialized project, ordinary runs, firms, Stormbreaker, and
   Workforce now receive the same local Context Slice from Agentlas OS v1.1.66

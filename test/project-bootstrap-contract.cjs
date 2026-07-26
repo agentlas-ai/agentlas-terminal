@@ -24,6 +24,7 @@ const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "agentlas-terminal-proje
 const project = path.join(workspace, "new-core-project");
 const readOnlyIntent = path.join(workspace, "read-intent-project");
 const readExistingIgnore = path.join(workspace, "read-existing-ignore-project");
+const writeIntent = path.join(workspace, "write-intent-project");
 const fallbackProject = path.join(workspace, "old-core-fallback-project");
 const symlinkProject = path.join(workspace, "symlink-project");
 const oversizeProject = path.join(workspace, "oversize-gitignore-project");
@@ -43,7 +44,7 @@ function noTablesDb() {
 }
 
 try {
-  for (const dir of [project, readOnlyIntent, readExistingIgnore, fallbackProject, symlinkProject, oversizeProject, gitignoreSymlinkProject]) {
+  for (const dir of [project, readOnlyIntent, readExistingIgnore, writeIntent, fallbackProject, symlinkProject, oversizeProject, gitignoreSymlinkProject]) {
     fs.mkdirSync(dir, { recursive: true });
   }
   fs.writeFileSync(path.join(project, "main.js"), "function terminalFirstContact() { return true; }\n");
@@ -75,6 +76,23 @@ try {
   assert.equal(terminal.ensureTerminalProjectForExecutionCli(noTablesDb(), readExistingIgnore, "read"), null);
   assert.equal(fs.readFileSync(path.join(readExistingIgnore, ".gitignore"), "utf8"), "keep-read-only\n");
   assert.equal(fs.existsSync(path.join(readExistingIgnore, ".agentlas")), false);
+  assert.equal(
+    terminal.ensureTerminalProjectForExecutionCli(noTablesDb(), writeIntent, "full", "terminal-write-contract"),
+    null,
+    "ordinary write/full execution must not initialize unrelated project files",
+  );
+  assert.equal(fs.existsSync(path.join(writeIntent, ".agentlas")), false);
+  assert.equal(fs.existsSync(path.join(writeIntent, ".gitignore")), false);
+  assert.equal(
+    terminal.initializeTerminalProjectCli(noTablesDb(), writeIntent, "terminal-explicit-project-init", { coreRoot }),
+    writeIntent,
+  );
+  assert.equal(fs.existsSync(path.join(writeIntent, ".agentlas", "project-soul-memory.md")), true);
+  assert.equal(
+    terminal.ensureTerminalProjectForExecutionCli(noTablesDb(), writeIntent, "full", "terminal-write-contract"),
+    writeIntent,
+    "an explicitly initialized project remains available to later turns",
+  );
   const readReply = terminal.curateCliReply(
     noTablesDb(),
     'safe answer\n\n## Memory Events\n```json\n[{"memory_kind":"decision","content":"must not persist","suggested_scope":"project"}]\n```',
@@ -82,6 +100,18 @@ try {
   );
   assert.match(readReply, /safe answer/);
   assert.doesNotMatch(readReply, /must not persist/);
+  const commentedReadReply = terminal.curateCliReply(
+    noTablesDb(),
+    'visible answer\n<!--\n## Memory Events\n```json\n[]\n```\n-->',
+    { projectPath: readOnlyIntent, permission: "read", curatedMemories: [] },
+  );
+  assert.equal(commentedReadReply, "visible answer", "hidden memory comments must not leak an opening marker");
+  const unfencedReadReply = terminal.curateCliReply(
+    noTablesDb(),
+    "visible answer\n## Memory Events\nmalformed hidden metadata",
+    { projectPath: readOnlyIntent, permission: "read", curatedMemories: [] },
+  );
+  assert.equal(unfencedReadReply, "visible answer", "malformed hidden metadata must be removed from the user reply");
   assert.equal(terminal.finalizeExperienceExecutionCli(noTablesDb(), { permission: "read", agentId: "agent:test" }), null);
   const readSystem = terminal.augmentSystem(noTablesDb(), "base", { projectPath: readOnlyIntent, permission: "read" }, true, "remember this");
   assert.doesNotMatch(readSystem, /Each item: memory_kind/, "read mode must not solicit durable memory writes");
@@ -134,11 +164,11 @@ try {
     /exceeds the 1048576-byte safe bootstrap limit/,
   );
   assert.throws(
-    () => terminal.ensureTerminalProjectForExecutionCli(
+    () => terminal.initializeTerminalProjectCli(
       noTablesDb(),
       oversizeProject,
-      "full",
       "terminal-write-contract",
+      { coreRoot },
     ),
     /exceeds the 1048576-byte safe bootstrap limit/,
     "a real write/full execution must fail closed when its local-state privacy boundary is unsafe",

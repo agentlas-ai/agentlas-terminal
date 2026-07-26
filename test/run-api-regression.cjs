@@ -10,6 +10,8 @@ const {
   runApi,
   DEFAULT_API_MODEL,
   ANTHROPIC_COMPAT_API,
+  resolveRuntime,
+  writeOberonManifestCli,
 } = require("../engine/agentlas.cjs");
 const { create: createParity } = require("../engine/agentlas-parity.cjs");
 
@@ -153,6 +155,60 @@ async function testProviderErrorsNeverExitTheHostProcess() {
     assert.equal(exitCalls, 0, "runApi must throw to swarm/automation instead of exiting");
   } finally {
     process.exit = originalExit;
+  }
+}
+
+function testSavedRuntimeAndSafeOberonWrites() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agentlas-runtime-oberon-"));
+  const bin = path.join(dir, "bin");
+  const data = path.join(dir, "data");
+  fs.mkdirSync(bin);
+  fs.mkdirSync(data);
+  const previousPath = process.env.PATH;
+  const previousData = process.env.AGENTLAS_USER_DATA_DIR;
+  try {
+    for (const name of ["claude", "codex", "gemini"]) {
+      const file = path.join(bin, name);
+      fs.writeFileSync(file, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    }
+    fs.writeFileSync(path.join(data, "cli-prefs.json"), JSON.stringify({ runtime: "codex" }), { mode: 0o600 });
+    process.env.PATH = bin;
+    process.env.AGENTLAS_USER_DATA_DIR = data;
+    const emptyDb = { prepare() { throw new Error("no active runtime table"); } };
+    assert.equal(resolveRuntime(emptyDb).kind, "codex", "every CLI surface must honor the saved Terminal runtime");
+    assert.equal(resolveRuntime(emptyDb, "gemini").kind, "gemini", "an explicit runtime override must still win");
+
+    const manifestPath = path.join(dir, "film.json");
+    writeOberonManifestCli(manifestPath, { title: "first" });
+    const before = fs.readFileSync(manifestPath, "utf8");
+    assert.throws(
+      () => writeOberonManifestCli(manifestPath, { title: "second" }),
+      (error) => error && error.code === "AGENTLAS_OBERON_EXISTS",
+    );
+    assert.equal(fs.readFileSync(manifestPath, "utf8"), before, "default scaffold writes must preserve an existing manifest");
+    writeOberonManifestCli(manifestPath, { title: "second" }, { overwrite: true });
+    assert.equal(JSON.parse(fs.readFileSync(manifestPath, "utf8")).title, "second");
+
+    const real = path.join(dir, "real.json");
+    const link = path.join(dir, "link.json");
+    fs.writeFileSync(real, "{}\n");
+    fs.symlinkSync(real, link);
+    assert.throws(
+      () => writeOberonManifestCli(link, { title: "blocked" }, { overwrite: true }),
+      (error) => error && error.code === "AGENTLAS_OBERON_SYMLINK",
+    );
+    assert.equal(fs.readFileSync(real, "utf8"), "{}\n", "even explicit overwrite must refuse symbolic links");
+    assert.equal(
+      fs.readdirSync(dir).filter((name) => name.includes(".tmp")).length,
+      0,
+      "atomic manifest publication must not leave temporary files",
+    );
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    if (previousData === undefined) delete process.env.AGENTLAS_USER_DATA_DIR;
+    else process.env.AGENTLAS_USER_DATA_DIR = previousData;
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 }
 
@@ -300,6 +356,36 @@ async function testSwarmAndAutomationContainProviderFailure() {
     assert.ok(Date.parse(afterScheduledSuccess.next_run_at) > Date.now());
     assert.equal(afterScheduledSuccess.run_count, 1);
     assert.equal(afterScheduledSuccess.enabled, 1);
+
+    db.prepare(
+      `INSERT INTO automations(
+        id, name, schedule, target_type, target_id, prompt_template, enabled,
+        next_run_at, timezone, trigger_type, run_count
+      ) VALUES ('automation-3', 'Read Boundary Automation', 'cron:*/5 * * * *', 'agent', 'agent-1', 'Inspect', 1,
+        '2026-01-01T00:00:00.000Z', 'UTC', 'schedule', 0)`,
+    ).run();
+    const observedPermissions = [];
+    const permissionParity = createParity({
+      prefsLang: () => "en",
+      resolveRuntime: () => ({ mode: "cli", kind: "codex" }),
+      resolvePermission: () => "read",
+      buildChildEnvCli: async (_db, options) => {
+        observedPermissions.push(["env", options.permission]);
+        return {};
+      },
+      captureRuntime: async (_kind, _system, _prompt, options) => {
+        observedPermissions.push(["runtime", options.permission]);
+        return "inspected";
+      },
+      runApi: async () => "",
+      runCwd: () => dir,
+      out() {},
+      fail(message) { throw new Error(message); },
+    });
+    const permissionRow = db.prepare("SELECT * FROM automations WHERE id = ?").get("automation-3");
+    const permissionRun = await permissionParity.runAutomationOnce(db, permissionRow, { ui: quietUi() });
+    assert.equal(permissionRun.ok, true);
+    assert.deepEqual(observedPermissions, [["env", "read"], ["runtime", "read"]], "automation must preserve the saved read-only boundary");
   } finally {
     process.exit = originalExit;
     process.exitCode = originalExitCode;
@@ -312,6 +398,7 @@ async function main() {
   await testAnthropicCompatibleProviders();
   await testCustomBaseUrlComesFromSharedDb();
   await testProviderErrorsNeverExitTheHostProcess();
+  testSavedRuntimeAndSafeOberonWrites();
   await testSwarmAndAutomationContainProviderFailure();
   process.stdout.write("run-api regression: PASS (BYOK parity + swarm/automation failure containment)\n");
 }

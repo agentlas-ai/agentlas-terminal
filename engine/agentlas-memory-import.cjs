@@ -13,6 +13,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { createHash, randomUUID } = require("node:crypto");
+const { runWriteTransaction } = require("./agentlas-sqlite-policy.cjs");
 
 const SOURCE_TOKEN_PREFIX = "mem-import:v1";
 const MAX_FILES = 400;
@@ -286,7 +287,7 @@ function cmdMemory(ctx) {
   const insert = db.prepare(
     "INSERT INTO memory_entries (id,scope,kind,content,project_id,project_path,agent_id,chat_id,confidence,sensitivity,evidence_json,context_json,superseded_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)",
   );
-  const write = db.transaction((list) => {
+  runWriteTransaction(db, (list) => {
     for (const e of list) {
       if (e.redacted || existsByToken(db, e.token)) continue;
       const confidence = /\(20\d\d-\d\d-\d\d\)|Date:\s*20\d\d/.test(e.content) ? "high" : "medium";
@@ -295,8 +296,7 @@ function cmdMemory(ctx) {
       insert.run(randomUUID(), e.scope, e.kind, e.content, null, null, e.ownerAgentId, null, confidence, "internal", evidence, context, now);
       imported += 1;
     }
-  });
-  write(entries);
+  }, entries);
 
   out("");
   out(`imported ${imported} memory entries into the shared DB. (Embedding runs in the desktop app on next open.)`);

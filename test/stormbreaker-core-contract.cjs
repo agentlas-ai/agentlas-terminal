@@ -10,8 +10,11 @@ const {
   HARNESS_ID,
   HARNESS_MODE,
   HARNESS_SCHEMA_VERSION,
+  CONTEXT_MAP_MIN_CORE_VERSION,
   loadCoreStormbreakerHarness,
+  readCoreRuntimeVersion,
   resolveCoreRuntimeRoot,
+  resolveCoreRuntimeRootFromCandidates,
   validateCoreStormbreakerHarness,
 } = require("../engine/agentlas-core-harness.cjs");
 
@@ -20,6 +23,42 @@ async function main() {
   assert.ok(requestedRoot, "HEPHAESTUS_RUNTIME_ROOT must point to an Agentlas-OS checkout or installed runtime");
   const root = resolveCoreRuntimeRoot(requestedRoot);
   assert.equal(path.resolve(root), path.resolve(requestedRoot));
+  assert.ok(readCoreRuntimeVersion(root), "Core runtime must publish bounded version metadata");
+
+  const compatibilityRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agentlas-core-compat-"));
+  const staleRoot = path.join(compatibilityRoot, "stale");
+  const currentRoot = path.join(compatibilityRoot, "current");
+  for (const [candidate, version] of [[staleRoot, "1.1.65"], [currentRoot, CONTEXT_MAP_MIN_CORE_VERSION]]) {
+    fs.mkdirSync(path.join(candidate, "agentlas_cloud"), { recursive: true });
+    fs.mkdirSync(path.join(candidate, "schemas"), { recursive: true });
+    fs.writeFileSync(path.join(candidate, "agentlas_cloud", "__main__.py"), "", "utf8");
+    fs.writeFileSync(path.join(candidate, "agentlas_cloud", "context_map.py"), "", "utf8");
+    fs.writeFileSync(path.join(candidate, "schemas", "workforce-work-order.schema.json"), "{}\n", "utf8");
+    fs.writeFileSync(path.join(candidate, "schemas", "workforce-selection.schema.json"), "{}\n", "utf8");
+    const manifestDir = candidate === staleRoot ? path.join(candidate, "host_adapters") : candidate;
+    fs.mkdirSync(manifestDir, { recursive: true });
+    fs.writeFileSync(path.join(manifestDir, "manifest.json"), `${JSON.stringify({ version })}\n`, "utf8");
+  }
+  assert.equal(readCoreRuntimeVersion(staleRoot), "1.1.65", "legacy host-adapter version metadata must remain readable");
+  assert.equal(
+    resolveCoreRuntimeRootFromCandidates(
+      [staleRoot],
+      [["agentlas_cloud", "context_map.py"]],
+      { minVersion: CONTEXT_MAP_MIN_CORE_VERSION },
+    ),
+    null,
+    "capability routing must fail closed when every installed Core runtime is incompatible",
+  );
+  assert.equal(
+    resolveCoreRuntimeRootFromCandidates(
+      [staleRoot, currentRoot],
+      [["agentlas_cloud", "context_map.py"]],
+      { minVersion: CONTEXT_MAP_MIN_CORE_VERSION },
+    ),
+    currentRoot,
+    "capability routing must skip an earlier but incompatible Core runtime",
+  );
+  fs.rmSync(compatibilityRoot, { recursive: true, force: true });
 
   const harness = await loadCoreStormbreakerHarness(process.cwd(), root);
   assert.equal(harness.schema_version, HARNESS_SCHEMA_VERSION);

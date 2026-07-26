@@ -15,6 +15,7 @@ const permissions = require("../engine/agentlas-permissions.cjs");
 const {
   buildArgs: legacyBuildArgs,
   codexCaptureAgentText,
+  capturedRuntimeAgentText,
 } = require("../engine/agentlas.cjs");
 
 const mcpServers = [{
@@ -133,6 +134,9 @@ function testFailClosedAndCopy() {
   assert.equal(permissions.copy("write", "en").label, "workspace write");
   assert.match(permissions.copy("full", "ko").description, /승인과 샌드박스를 우회/);
   assert.deepEqual(permissions.LEVELS, ["read", "write", "full"]);
+  assert.equal(permissions.persistent("read"), "read");
+  assert.equal(permissions.persistent("write"), "write");
+  assert.equal(permissions.persistent("full"), "write", "full must never become a fresh-session default");
 }
 
 function testShiftTabFullConfirmation() {
@@ -218,6 +222,25 @@ function testWorkforceDefenseInDepthCaptureArgs() {
     JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } }),
   ].join("\n"));
   assert.equal(captured, '{"schemaVersion":"fixture.v1"}', "no-authority Codex JSONL must yield only the final agent message to the workforce parser");
+
+  const claudeCaptured = capturedRuntimeAgentText("claude-code", [
+    JSON.stringify({ type: "system", subtype: "init", session_id: "fixture" }),
+    JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "visible answer" } } }),
+    JSON.stringify({ type: "result", subtype: "success", result: "visible answer" }),
+  ].join("\n"));
+  assert.equal(claudeCaptured, "visible answer", "background Claude capture must hide stream protocol envelopes");
+
+  const geminiCaptured = capturedRuntimeAgentText("gemini", [
+    JSON.stringify({ type: "init", session_id: "fixture" }),
+    JSON.stringify({ type: "message", role: "assistant", content: "gemini answer" }),
+    JSON.stringify({ type: "result", status: "success" }),
+  ].join("\n"));
+  assert.equal(geminiCaptured, "gemini answer", "background Gemini capture must hide stream protocol envelopes");
+  assert.equal(
+    capturedRuntimeAgentText("claude-code", '{"customer":"plain json result"}'),
+    '{"customer":"plain json result"}',
+    "plain model JSON must not be mistaken for provider protocol",
+  );
 }
 
 testClaude();

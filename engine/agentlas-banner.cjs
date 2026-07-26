@@ -77,6 +77,8 @@ function sessionValues(ctx) {
     subject: ctx.subjectLabel || ui.t("composer.autoroute"),
     permission: permissions.copy(ctx.permission || "write", ui.lang).label,
     runtime: ctx.runtimeLabel || "—",
+    model: ctx.modelLabel || "auto",
+    effort: ctx.effortLabel || "auto",
     cwd: ctx.cwd ? shorten(ctx.cwd) : process.cwd(),
   };
 }
@@ -86,7 +88,14 @@ function renderStatusCard(ctx, opts = {}) {
   const c = ui.c;
   const value = sessionValues(ctx);
   const columns = ui.out.columns || 80;
-  const labels = [ui.t("status.runtime"), ui.t("status.agent"), ui.t("status.permission"), ui.t("status.directory")].map((label) => `${label}:`);
+  const labels = [
+    ui.t("status.runtime"),
+    ui.t("status.model"),
+    ui.t("status.effort"),
+    ui.t("status.agent"),
+    ui.t("status.permission"),
+    ui.t("status.directory"),
+  ].map((label) => `${label}:`);
   const labelCells = Math.min(Math.max(...labels.map((label) => visWidth(label))) + 2, Math.max(12, Math.floor(columns * 0.42)));
   const line = (label, text) => {
     const labelText = `${label}:`;
@@ -97,6 +106,8 @@ function renderStatusCard(ctx, opts = {}) {
   ui.line("");
   ui.rule(ui.t("status.title"));
   line(ui.t("status.runtime"), value.runtime);
+  line(ui.t("status.model"), value.model);
+  line(ui.t("status.effort"), value.effort);
   line(ui.t("status.agent"), value.subject);
   line(ui.t("status.permission"), value.permission);
   line(ui.t("status.directory"), value.cwd);
@@ -107,9 +118,19 @@ function renderBanner(ctx) {
   const ui = ctx.ui;
   const c = ui.c;
   const value = sessionValues(ctx);
-  const room = Math.max(20, (ui.out.columns || 80) - 4);
+  const columns = ui.out.columns || 80;
+  const room = Math.max(20, columns - 4);
+  const headlineRoom = Math.max(12, columns - 2);
+  const version = value.version ? "  v" + value.version : "";
+  const separator = "  ·  ";
+  const headline = `${WORDMARK_COMPACT}${version}${separator}${ui.t("banner.product")}`;
   ui.line("");
-  ui.line("  " + c.bold(c.emerald(WORDMARK_COMPACT)) + (value.version ? c.faint("  v" + value.version) : "") + c.dim("  ·  " + ui.t("banner.product")));
+  if (visWidth(headline) <= headlineRoom) {
+    ui.line("  " + c.bold(c.emerald(WORDMARK_COMPACT)) + c.faint(version) + c.dim(separator + ui.t("banner.product")));
+  } else {
+    ui.line("  " + c.bold(c.emerald(WORDMARK_COMPACT)) + c.faint(version));
+    ui.line("  " + c.dim(ui.t("banner.product")));
+  }
   ui.line("  " + c.text(truncateWidth(ui.t("banner.session", value.runtime, value.subject, value.permission), room)));
   ui.line("  " + c.faint(truncateWidth(ui.t("banner.location", value.cwd), room)));
   ui.line("");

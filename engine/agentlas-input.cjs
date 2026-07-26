@@ -23,39 +23,177 @@ function userDataDir() {
 }
 
 const HISTORY_MAX = 500;
+const HISTORY_SCHEMA_VERSION = 2;
+const HISTORY_LOCK_WAIT_MS = 2_000;
+const HISTORY_LOCK_STALE_MS = 30_000;
 function historyPath() {
   return path.join(userDataDir(), "cli-history.json");
 }
-// readline keeps history with index 0 = most-recent. We persist that array verbatim.
-function loadHistory() {
+
+function historyBackupPath() {
+  return historyPath() + ".bak";
+}
+
+function normalizeHistoryDocument(raw) {
+  if (Array.isArray(raw)) {
+    // Legacy history had no project identity. Keep it quarantined on disk so
+    // migration is non-destructive, but never surface it in another project.
+    return {
+      version: HISTORY_SCHEMA_VERSION,
+      entries: [],
+      legacyUnscoped: raw.filter((x) => typeof x === "string").slice(0, HISTORY_MAX),
+    };
+  }
+  if (raw && raw.version === HISTORY_SCHEMA_VERSION && Array.isArray(raw.entries)) {
+    return {
+      version: HISTORY_SCHEMA_VERSION,
+      entries: raw.entries,
+      legacyUnscoped: Array.isArray(raw.legacyUnscoped) ? raw.legacyUnscoped.slice(0, HISTORY_MAX) : [],
+    };
+  }
+  return null;
+}
+
+function readHistoryFile(file) {
   try {
-    const a = JSON.parse(fs.readFileSync(historyPath(), "utf8"));
-    return Array.isArray(a) ? a.filter((x) => typeof x === "string").slice(0, HISTORY_MAX) : [];
+    return normalizeHistoryDocument(JSON.parse(fs.readFileSync(file, "utf8")));
   } catch {
-    return [];
+    return null;
   }
 }
-function saveHistory(list) {
+
+function historyScope(cwd = process.cwd()) {
+  try { return path.resolve(String(cwd || process.cwd())); } catch { return String(cwd || process.cwd()); }
+}
+
+function readHistoryDocument() {
+  const current = readHistoryFile(historyPath());
+  if (current) return current;
+  const backup = readHistoryFile(historyBackupPath());
+  if (backup) return backup;
+  return { version: HISTORY_SCHEMA_VERSION, entries: [], legacyUnscoped: [] };
+}
+
+function sleepSync(ms) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    const until = Date.now() + ms;
+    while (Date.now() < until) { /* old Node fallback */ }
+  }
+}
+
+function withHistoryLock(callback) {
+  const lock = historyPath() + ".lock";
+  const deadline = Date.now() + HISTORY_LOCK_WAIT_MS;
+  while (true) {
+    try {
+      fs.mkdirSync(lock, { mode: 0o700 });
+      break;
+    } catch (error) {
+      if (!error || error.code !== "EEXIST") throw error;
+      try {
+        const stat = fs.statSync(lock);
+        if (Date.now() - stat.mtimeMs > HISTORY_LOCK_STALE_MS) {
+          fs.rmdirSync(lock);
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      if (Date.now() >= deadline) throw new Error("history lock timeout");
+      sleepSync(10);
+    }
+  }
+  try {
+    return callback();
+  } finally {
+    try { fs.rmdirSync(lock); } catch { /* another process will recover a stale lock */ }
+  }
+}
+
+function atomicWriteHistoryFile(file, document) {
+  const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+  let fd;
+  try {
+    fd = fs.openSync(tmp, "wx", 0o600);
+    fs.writeFileSync(fd, JSON.stringify(document), "utf8");
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+    fs.renameSync(tmp, file);
+    try { fs.chmodSync(file, 0o600); } catch { /* win32 */ }
+  } finally {
+    if (fd != null) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+    try { fs.unlinkSync(tmp); } catch { /* already renamed or never created */ }
+  }
+}
+
+function quarantineMalformedHistory() {
+  const file = historyPath();
+  if (!fs.existsSync(file) || readHistoryFile(file)) return;
+  const quarantine = `${file}.corrupt-${Date.now()}-${process.pid}`;
+  try { fs.renameSync(file, quarantine); } catch { /* keep fail-closed recovery from backup */ }
+}
+
+// readline keeps history with index 0 = most recent. Only the current working
+// folder's entries are returned; legacy unscoped strings are never displayed.
+function loadHistory(cwd = process.cwd()) {
+  const scope = historyScope(cwd);
+  return readHistoryDocument().entries
+    .filter((entry) => entry && entry.cwd === scope && typeof entry.text === "string")
+    .sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0))
+    .map((entry) => entry.text)
+    .slice(0, HISTORY_MAX);
+}
+
+function saveHistory(list, cwd = process.cwd()) {
   try {
     fs.mkdirSync(userDataDir(), { recursive: true });
     const clean = (list || []).filter((x) => typeof x === "string" && x.trim()).slice(0, HISTORY_MAX);
-    fs.writeFileSync(historyPath(), JSON.stringify(clean), "utf8");
-    return true;
+    const scope = historyScope(cwd);
+    return withHistoryLock(() => {
+      const currentFileWasValid = Boolean(readHistoryFile(historyPath()));
+      const document = readHistoryDocument();
+      quarantineMalformedHistory();
+      const existingScope = document.entries
+        .filter((entry) => entry && entry.cwd === scope && typeof entry.text === "string")
+        .sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0));
+      const mergedTexts = [...clean];
+      for (const entry of existingScope) {
+        if (!mergedTexts.includes(entry.text)) mergedTexts.push(entry.text);
+      }
+      const other = document.entries.filter((entry) => entry && entry.cwd !== scope && typeof entry.text === "string");
+      const now = Date.now();
+      const current = mergedTexts.slice(0, HISTORY_MAX).map((text, index) => ({ text, cwd: scope, ts: now - index }));
+      const next = {
+        version: HISTORY_SCHEMA_VERSION,
+        entries: [...current, ...other]
+          .sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0))
+          .slice(0, HISTORY_MAX),
+        legacyUnscoped: document.legacyUnscoped,
+      };
+      if (currentFileWasValid) atomicWriteHistoryFile(historyBackupPath(), document);
+      atomicWriteHistoryFile(historyPath(), next);
+      return true;
+    });
   } catch {
     return false;
   }
 }
 // Seed an interactive readline with saved history (no-op on non-TTY).
-function attachHistory(rl) {
+function attachHistory(rl, cwd = process.cwd()) {
   try {
-    if (rl && rl.terminal && Array.isArray(rl.history)) rl.history = loadHistory();
+    if (rl && rl.terminal && Array.isArray(rl.history)) rl.history = loadHistory(cwd);
   } catch {
     /* ignore */
   }
 }
-function persistHistory(rl) {
+function persistHistory(rl, cwd = process.cwd()) {
   try {
-    if (rl && Array.isArray(rl.history)) saveHistory(rl.history);
+    if (rl && Array.isArray(rl.history)) saveHistory(rl.history, cwd);
   } catch {
     /* ignore */
   }
@@ -69,6 +207,55 @@ function isContinuation(line) {
 }
 function stripContinuation(line) {
   return (line || "").replace(/\\$/, "");
+}
+
+function tokenizeCommandLine(value) {
+  const text = String(value || "");
+  const tokens = [];
+  let token = "";
+  let tokenStarted = false;
+  let quote = null;
+  let escaped = false;
+  const push = () => {
+    if (!tokenStarted) return;
+    tokens.push(token);
+    token = "";
+    tokenStarted = false;
+  };
+  for (const char of text) {
+    if (escaped) {
+      token += char;
+      tokenStarted = true;
+      escaped = false;
+      continue;
+    }
+    if (char === "\\" && quote !== "'") {
+      escaped = true;
+      tokenStarted = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) quote = null;
+      else token += char;
+      tokenStarted = true;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      tokenStarted = true;
+      continue;
+    }
+    if (/\s/u.test(char)) {
+      push();
+      continue;
+    }
+    token += char;
+    tokenStarted = true;
+  }
+  if (escaped) token += "\\";
+  if (quote) throw new Error("unclosed quote");
+  push();
+  return tokens;
 }
 
 // ── completion ────────────────────────────────────────────
@@ -89,6 +276,7 @@ const SLASH_COMMAND_META = [
   { command: "/permission", description: "Set read/write/full permission", category: "Settings", usage: "/permission full", detail: "No argument shows what read, write, and full mean.", aliases: ["/perm"] },
   { command: "/permissions", description: "Show or set current permission", category: "Settings", usage: "/permissions", detail: "Codex-style permission screen for Agentlas read/write/full." },
   { command: "/setup", description: "Run first-time setup again", category: "Settings", usage: "/setup", detail: "Re-run language, runtime, and default permission setup in-place." },
+  { command: "/project", description: "Inspect or explicitly initialize local project state", category: "Files", usage: "/project status|init", detail: "Ordinary turns never seed project files. `init` explicitly creates private .agentlas state and updates local ignore/templates." },
   { command: "/config", description: "Explicit on/off for Stormbreaker and Workforce Ontology auto engagement", category: "Settings", usage: "/config [storm|network] [on|off]", detail: "Both engines default to off — no automatic activation. Turn one on to let direct-routed real-work prompts engage it; /storm and /network stay available explicitly either way.", examples: ["/config", "/config storm on", "/config network off"], aliases: ["/toggles"] },
   { command: "/cwd", description: "Show or change the working folder", category: "Files", usage: "/cwd <path>", detail: "Change the folder used for tools, file mentions, and local commands." },
   { command: "/memory", description: "Show the memory injected into this run", category: "Context", usage: "/memory", detail: "Print the project memory that Agentlas adds to agent turns." },
@@ -139,6 +327,7 @@ const HELP_KEY_BY_COMMAND = {
   "/permission": "help.permission",
   "/permissions": "help.permissions",
   "/setup": "help.setup",
+  "/project": "help.project",
   "/config": "help.config",
   "/cwd": "help.cwd",
   "/memory": "help.memory",
@@ -162,6 +351,7 @@ const HELP_KEY_BY_COMMAND = {
   "/research": "help.research",
   "/search": "help.search",
   "/network": "help.network",
+  "/legacy-network": "help.legacyNetwork",
   "/browser": "help.browser",
   "/connect": "help.connect",
   "/doctor": "help.doctor",
@@ -177,10 +367,26 @@ function localizeSlashEntry(entry, lang) {
   const helpKey = HELP_KEY_BY_COMMAND[entry.command];
   const description = helpKey ? i18n.t(lang, helpKey) : entry.description;
   const category = entry.category ? i18n.t(lang, `category.${entry.category}`) : entry.category;
+  const usage = lang === "ko"
+    ? String(entry.usage || entry.command)
+      .replaceAll("<goal>", "<목표>")
+      .replaceAll("<request>", "<요청>")
+      .replaceAll("<task>", "<작업>")
+      .replaceAll("<question>", "<질문>")
+      .replaceAll("<query>", "<검색어>")
+      .replaceAll("<slug>", "<식별자>")
+      .replaceAll("<path>", "<경로>")
+      .replaceAll("<name>", "<이름>")
+      .replaceAll("<what you need>", "<필요한 작업>")
+      .replaceAll("<what to build>", "<빌드할 대상>")
+      .replaceAll("\"query\"", "\"검색어\"")
+      .replaceAll("[sub]", "[하위 명령]")
+    : entry.usage;
   return {
     ...entry,
     description,
     category,
+    usage,
     // English keeps the longer authored detail. Other languages must not fall back to
     // an English paragraph under an otherwise-localized command palette.
     detail: lang === "en" ? entry.detail : description,
@@ -226,7 +432,8 @@ function slashCommandSuggestions(line, limit = 12, lang = "en") {
       !entry.command.toLowerCase().startsWith(q) &&
       (entry.command.toLowerCase().includes(q.slice(1)) || entry.description.toLowerCase().includes(q.slice(1))),
   );
-  return (starts.length ? starts.concat(contains) : entries).slice(0, limit);
+  if (q === "/") return entries.slice(0, limit);
+  return starts.concat(contains).slice(0, limit);
 }
 
 function padVisible(value, width) {
@@ -280,7 +487,7 @@ function visibleWidthLite(value) {
 
 function renderSlashPalette(rows, selectedIndex, opts = {}) {
   if (!rows.length) return "";
-  const columns = Math.max(48, Number(opts.columns || 88));
+  const columns = Math.max(12, Math.floor(Number(opts.columns || 88)));
   const fallbackColors = {
     faint: (s) => String(s),
     dim: (s) => String(s),
@@ -290,16 +497,24 @@ function renderSlashPalette(rows, selectedIndex, opts = {}) {
   };
   const c = { ...fallbackColors, ...(opts.colors || {}) };
   const lang = opts.lang || "en";
-  const commandWidth = Math.min(24, Math.max(16, rows.reduce((n, row) => Math.max(n, row.command.length), 0) + 2));
-  const descWidth = Math.max(12, columns - commandWidth - 8);
-  const lineWidth = Math.min(columns - 1, commandWidth + descWidth + 5);
+  const lineWidth = Math.max(1, columns - 1);
+  const desiredCommandWidth = Math.max(
+    8,
+    rows.reduce((n, row) => Math.max(n, visibleWidthLite(row.command)), 0) + 2,
+  );
+  const commandWidth = Math.min(
+    24,
+    desiredCommandWidth,
+    Math.max(8, Math.floor((lineWidth - 2) * 0.55)),
+  );
+  const descWidth = Math.max(0, lineWidth - commandWidth - 1);
   const selected = rows[Math.max(0, Math.min(selectedIndex, rows.length - 1))] || rows[0];
   const out = [
     c.faint(truncateVisible(`${i18n.t(lang, "palette.title")}  ${i18n.t(lang, "palette.search")}`, lineWidth)),
     c.faint("─".repeat(lineWidth)),
   ];
   rows.forEach((row, index) => {
-    const command = padVisible(row.command, commandWidth);
+    const command = padVisible(truncateVisible(row.command, commandWidth), commandWidth);
     const desc = truncateVisible(row.description, descWidth);
     const body = " " + c.blue(command) + c.text(desc);
     out.push(index === selectedIndex ? c.inverse(padVisible(body, lineWidth)) : body);
@@ -531,6 +746,7 @@ module.exports = {
   attachSlashPalette,
   isContinuation,
   stripContinuation,
+  tokenizeCommandLine,
   isAbsolutePathTask,
   makeCompleter,
   completePath,

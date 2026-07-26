@@ -37,6 +37,10 @@ Promise.all(Array.from({ length: 8 }, () => runOne()))
     const db = path.join(temp, "agentlas.sqlite");
     assert.equal(fs.existsSync(db), true);
     assert.ok(fs.statSync(db).size > 0);
+    if (process.platform !== "win32") {
+      assert.equal(fs.statSync(temp).mode & 0o777, 0o700, "userData must be private");
+      assert.equal(fs.statSync(db).mode & 0o777, 0o600, "SQLite must be private");
+    }
     assert.deepEqual(fs.readdirSync(temp).filter((name) => name.includes(".bootstrap-")), []);
     console.log(JSON.stringify({ ok: true, workers: results.length, created: 1 }, null, 2));
   })

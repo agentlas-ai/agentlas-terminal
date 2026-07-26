@@ -9,15 +9,29 @@
  */
 const readline = require("node:readline");
 const crypto = require("node:crypto");
+const { StringDecoder } = require("node:string_decoder");
 const { Ui } = require("./agentlas-ui.cjs");
 const banner = require("./agentlas-banner.cjs");
-const { runNativeTurn } = require("./agentlas-native-host.cjs");
+const { runNativeTurn, terminateNativeChild } = require("./agentlas-native-host.cjs");
 const { runApiTurn } = require("./agentlas-api-agent.cjs");
 const caps = require("./agentlas-capabilities.cjs");
 const input = require("./agentlas-input.cjs");
 const i18n = require("./agentlas-i18n.cjs");
 const style = require("./agentlas-style.cjs");
 const permissions = require("./agentlas-permissions.cjs");
+
+function sanitizeShellDisplay(value) {
+  return String(value || "")
+    // OSC, DCS, SOS, PM, and APC terminal-control payloads.
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g, "")
+    .replace(/\x1b[P^_X][\s\S]*?(?:\x1b\\|$)/g, "")
+    // Shell output is text inside Agentlas chrome; it must not repaint or
+    // spoof that chrome with cursor, erase, color, or mode control sequences.
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b/g, "")
+    .replace(/\r(?!\n)/g, "\n")
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
+}
 
 function runtimeLabel(rt) {
   if (!rt) return "(none)";
@@ -46,16 +60,26 @@ function terminalLang(prefs, opts) {
 // Hides the trailing "## Memory Events" block from the live stream while keeping the full
 // text for curation. Holds back the last heading.length chars so a split heading is safe too.
 function makeMemoryGuard(ui, heading) {
-  const N = heading.length;
+  // Also retain the optional HTML-comment opener immediately before the
+  // heading. Otherwise a chunk boundary can print a bare "<!--" before the
+  // hidden Memory Events heading arrives.
+  const N = heading.length + 8;
   let acc = "";
   let printed = 0;
   let cut = false;
+  const hiddenBlockStart = (headingIndex) => {
+    const opener = acc.lastIndexOf("<!--", headingIndex);
+    return opener >= printed && /^\s*$/.test(acc.slice(opener + 4, headingIndex))
+      ? opener
+      : headingIndex;
+  };
   const flush = () => {
     if (cut) return;
     const idx = acc.indexOf(heading);
     if (idx >= 0) {
-      if (idx > printed) ui.streamDelta(acc.slice(printed, idx));
-      printed = idx;
+      const end = hiddenBlockStart(idx);
+      if (end > printed) ui.streamDelta(acc.slice(printed, end));
+      printed = end;
       cut = true;
     } else if (acc.length > printed) {
       ui.streamDelta(acc.slice(printed));
@@ -75,8 +99,9 @@ function makeMemoryGuard(ui, heading) {
       acc += t;
       const idx = acc.indexOf(heading);
       if (idx >= 0) {
-        if (idx > printed) ui.streamDelta(acc.slice(printed, idx));
-        printed = idx;
+        const end = hiddenBlockStart(idx);
+        if (end > printed) ui.streamDelta(acc.slice(printed, end));
+        printed = end;
         cut = true;
         return;
       }
@@ -172,6 +197,41 @@ function startRepl(opts) {
   const H = opts.helpers;
   const prefs = applyPreferenceDefaults(opts.prefs || {});
   prefs.agentRuntime = prefs.agentRuntime || {}; // { agentSlug|firmSlug: runtimeSpec|"auto" }
+  function replaceLocalPrefs(next) {
+    if (!next || typeof next !== "object" || Array.isArray(next)) return;
+    for (const key of Object.keys(prefs)) delete prefs[key];
+    Object.assign(prefs, applyPreferenceDefaults({ ...next }));
+    prefs.agentRuntime = prefs.agentRuntime || {};
+  }
+  function persistPrefs(patch) {
+    if (!patch || typeof patch !== "object") return false;
+    for (const [key, value] of Object.entries(patch)) {
+      if (
+        value && typeof value === "object" && !Array.isArray(value)
+        && prefs[key] && typeof prefs[key] === "object" && !Array.isArray(prefs[key])
+      ) {
+        prefs[key] = { ...prefs[key], ...value };
+      } else {
+        prefs[key] = value;
+      }
+    }
+    if (!opts.savePrefs) return true;
+    const saved = opts.savePrefs(prefs, patch);
+    if (saved && typeof saved === "object") replaceLocalPrefs(saved);
+    return saved !== false && saved != null;
+  }
+  function syncSharedEnginePrefs(notify = false) {
+    if (typeof opts.loadPrefs !== "function") return;
+    const latest = opts.loadPrefs();
+    if (!latest || typeof latest !== "object") return;
+    const changed = [];
+    for (const key of ["autoStorm", "autoNetwork"]) {
+      const next = Boolean(latest[key]);
+      if (Boolean(prefs[key]) !== next) changed.push(key === "autoStorm" ? "storm" : "network");
+      prefs[key] = next;
+    }
+    if (notify && changed.length) ui.info(ui.t("config.externalChange", changed.join(", ")));
+  }
   let baseRuntime = opts.runtime; // session default; per-agent runtime auto-routes from this
   const ui = new Ui({ lang: terminalLang(prefs, opts) });
   const state = {
@@ -206,19 +266,25 @@ function startRepl(opts) {
     getCwd: () => state.cwd,
   });
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: !!process.stdin.isTTY, completer, historySize: input.HISTORY_MAX });
-  input.attachHistory(rl);
+  input.attachHistory(rl, state.cwd);
   const slashPalette = input.attachSlashPalette(rl, { ui, force: true });
   // Raw-mode bottom input box (Claude Code / Hermes style). TTY only; readline is the fallback.
   const { createComposer } = require("./agentlas-composer.cjs");
   const useComposer = !!process.stdin.isTTY && process.env.AGENTLAS_CLASSIC_INPUT !== "1";
   const composer = useComposer
-    ? createComposer({ ui, loadHistory: () => input.loadHistory(), saveHistory: (h) => input.saveHistory(h) })
+    ? createComposer({
+        ui,
+        loadHistory: () => input.loadHistory(state.cwd),
+        saveHistory: (h) => input.saveHistory(h, state.cwd),
+        getHistoryScope: () => state.cwd,
+      })
     : null;
   let handoff = false; // set before rl.close() when handing stdin to the composer
   let busy = false;
   let closed = false;
   let currentAbort = null;
   let idleExitArmedUntil = 0;
+  let commandFullPermissionArmedUntil = 0;
   const permissionCycle = permissions.createCycleController();
   rl.on("close", () => {
     if (handoff) return; // intentionally closed to hand stdin to the raw-mode composer
@@ -229,8 +295,9 @@ function startRepl(opts) {
     // In composer mode rl is closed; Ctrl-C at the box is a keypress, so process SIGINT only fires mid-turn.
     process.on("SIGINT", () => {
       if (busy && currentAbort) {
+        ui.status(ui.t("cancelling"));
+        ui.info(ui.t("cancelling"));
         currentAbort.abort();
-        ui.warn(ui.t("interrupted"));
       }
     });
     process.on("exit", () => {
@@ -239,8 +306,9 @@ function startRepl(opts) {
   }
   rl.on("SIGINT", () => {
     if (busy && currentAbort) {
+      ui.status(ui.t("cancelling"));
+      ui.info(ui.t("cancelling"));
       currentAbort.abort();
-      ui.warn(ui.t("interrupted"));
     } else {
       const now = Date.now();
       if (now < idleExitArmedUntil) {
@@ -263,9 +331,11 @@ function startRepl(opts) {
     const persist = options.persist !== false;
     const level = permissions.normalize(value);
     state.permission = level;
-    if (persist) {
-      prefs.permission = level;
-      if (opts.savePrefs) opts.savePrefs(prefs);
+    // `full` is an explicit break-glass grant for this process only. Persisting
+    // it would make a later fresh terminal silently start unrestricted even
+    // though the confirmation copy promises a session-scoped grant.
+    if (persist && level !== "full") {
+      persistPrefs({ permission: level });
     }
     if (notify) ui.ok(ui.t("permSet", level));
     return level;
@@ -281,6 +351,20 @@ function startRepl(opts) {
       if (usage.cost_usd) e.cost += usage.cost_usd;
       if (usage.duration_ms) e.ms += usage.duration_ms;
     }
+  }
+
+  function beginInteractiveTurn(activity = "") {
+    ui.beginTurn({
+      ...composerMeta(),
+      activity,
+      usage: () => usageSummaryLine(),
+      onInterrupt: () => {
+        if (!currentAbort || currentAbort.signal.aborted) return;
+        ui.status(ui.t("cancelling"));
+        ui.info(ui.t("cancelling"));
+        currentAbort.abort();
+      },
+    });
   }
 
   // /resume 용 세션 영속화 — 네이티브 런타임 세션ID + 에이전트/런타임/cwd/제목을 파일에 저장.
@@ -305,9 +389,11 @@ function startRepl(opts) {
 
   // ── run one turn ──
   async function runTurn(prompt, runOptions = {}) {
+    const turnAbort = runOptions.abortController || new AbortController();
+    let turnResult = { ok: false, cancelled: false, cancellationVerified: true, text: "", error: null };
     busy = true;
-    currentAbort = new AbortController();
-    const signal = currentAbort.signal;
+    currentAbort = turnAbort;
+    const signal = turnAbort.signal;
     let experienceRunId = `terminal-run:${crypto.randomUUID()}`;
     const runStartedAt = Date.now();
     let experienceFinalized = false;
@@ -319,15 +405,7 @@ function startRepl(opts) {
     let memoryOutput = "";
     let memoryOutcome = "failed";
     try {
-      ui.beginTurn({
-        ...composerMeta(),
-        usage: () => usageSummaryLine(), // 턴 중에도 최신 사용량을 footer에 라이브 반영
-        onInterrupt: () => {
-          if (!currentAbort || currentAbort.signal.aborted) return;
-          currentAbort.abort();
-          ui.warn(ui.t("interrupted"));
-        },
-      }); // 작업 중에도 composer/status bar와 실제 runtime task 목록을 화면 하단에 유지
+      if (!runOptions.turnStarted) beginInteractiveTurn();
       if (H.ensureProjectForExecution) {
         state.projectPath = H.ensureProjectForExecution(
           db,
@@ -343,7 +421,7 @@ function startRepl(opts) {
       const priorContextDigest = crypto.createHash("sha256")
         .update(JSON.stringify(state.history.map((item) => ({ role: item.role, text: item.text }))))
         .digest("hex");
-      const memoryTurn = typeof H.beginMemoryTurn === "function"
+      const memoryTurn = !runOptions.side && typeof H.beginMemoryTurn === "function"
         ? H.beginMemoryTurn(db, prompt, {
             ...ctxNow(),
             surface: runOptions.side ? "terminal-side-turn" : "terminal-interactive-turn",
@@ -396,7 +474,12 @@ function startRepl(opts) {
       ui.status(thinkingText);
       if (rt.mode === "cli") {
         const bin = H.which(H.RUNTIME_BIN[rt.kind]) || H.RUNTIME_BIN[rt.kind];
-        const session = state.native[rt.kind] || (state.native[rt.kind] = {});
+        // /side must be a genuinely isolated provider conversation. Excluding
+        // it from state.history is insufficient when Claude/Codex resume a
+        // server-side session by id.
+        const session = runOptions.side
+          ? {}
+          : state.native[rt.kind] || (state.native[rt.kind] = {});
         const subjectSystem = state.routePreambleOnce
           ? `${state.routePreambleOnce}\n\n${state.subject.system}`
           : state.subject.system;
@@ -432,7 +515,7 @@ function startRepl(opts) {
           signal,
         });
         memoryOutput = String(res.text || "");
-        memoryOutcome = res.error ? "failed" : "succeeded";
+        memoryOutcome = signal.aborted ? "cancelled" : (res.error ? "failed" : "succeeded");
         let at = "";
         let memoryResult = null;
         if (typeof H.completeMemoryTurn === "function") {
@@ -454,6 +537,13 @@ function startRepl(opts) {
         } else {
           at = (H.sanitizeAssistantText(res.text || "") || "").trim();
         }
+        turnResult = {
+          ok: !res.error && !signal.aborted,
+          cancelled: signal.aborted,
+          cancellationVerified: !signal.aborted || res.terminationVerified === true,
+          text: at,
+          error: signal.aborted ? null : (res.error || null),
+        };
         if (recordHistoryEntry && at && !res.error) state.history.push({ role: "user", text: prompt }, { role: "assistant", text: at });
         recordCost(costLabel, res.usage);
         if (!runOptions.side && session.id && !res.error) persistSession(rt.kind, session.id, prompt);
@@ -468,7 +558,10 @@ function startRepl(opts) {
             mcpServers: connectedMcpServers,
             curatedMemories,
             taskHint: prompt,
-            outcome: { status: res.error ? "failed" : "succeeded", failureCode: res.error ? "runtime-error" : null },
+            outcome: {
+              status: signal.aborted ? "cancelled" : (res.error ? "failed" : "succeeded"),
+              failureCode: signal.aborted ? "operator-cancelled" : (res.error ? "runtime-error" : null),
+            },
             usage: res.usage,
             durationMs: Date.now() - runStartedAt,
             runId: experienceRunId,
@@ -527,6 +620,7 @@ function startRepl(opts) {
         } else {
           cleaned = (H.sanitizeAssistantText(res.text || "") || "").trim();
         }
+        turnResult = { ok: true, cancelled: false, text: cleaned, error: null };
         if (recordHistoryEntry && cleaned) state.history.push({ role: "user", text: prompt }, { role: "assistant", text: cleaned });
         recordCost(costLabel, ui._lastUsage);
         if (typeof H.finalizeExperienceRun === "function") {
@@ -551,6 +645,13 @@ function startRepl(opts) {
     } catch (e) {
       ui.stopSpinner();
       memoryOutcome = signal.aborted ? "cancelled" : "failed";
+      turnResult = {
+        ok: false,
+        cancelled: signal.aborted,
+        cancellationVerified: true,
+        text: "",
+        error: signal.aborted ? null : ((e && e.message) || String(e)),
+      };
       if (!experienceFinalized && experienceContext && typeof H.finalizeExperienceRun === "function") {
         H.finalizeExperienceRun(db, {
           agentId: experienceContext.ctx.agentId,
@@ -591,10 +692,17 @@ function startRepl(opts) {
             : "The memory receipt could not be persisted; the response run is preserved.");
         }
       }
-      busy = false;
       ui.endTurn();
-      currentAbort = null;
+      if (signal.aborted && !runOptions.turnStarted) {
+        if (turnResult.cancellationVerified === false) ui.error(ui.t("cancellationUnverified"));
+        else ui.warn(ui.t("interrupted"));
+      }
+      if (currentAbort === turnAbort) {
+        busy = false;
+        currentAbort = null;
+      }
     }
+    return turnResult;
   }
 
   // ── slash commands ──
@@ -736,43 +844,54 @@ function startRepl(opts) {
     return caps.autoRuntimeFor(agentRow, { installedKinds: installedKinds(), activeSpec: caps.specOf(baseRuntime) });
   }
 
+  function printWrapped(value, options = {}) {
+    const { wrapWidth } = require("./agentlas-composer.cjs");
+    const indent = Math.max(0, Number(options.indent) || 0);
+    const room = Math.max(2, (ui.out.columns || 80) - indent);
+    const paint = options.paint || ui.c.text;
+    for (const line of wrapWidth(String(value ?? ""), room)) {
+      ui.line(" ".repeat(indent) + paint(line));
+    }
+  }
+
   function printRoster() {
     const ags = H.listAgents(db);
     const firms = H.listFirms(db);
     ui.line("");
-    ui.line(ui.c.dim("  " + ui.t("picker.agents")));
+    printWrapped(ui.t("picker.agents"), { indent: 2, paint: ui.c.dim });
     ags.forEach((a, i) => {
       const spec = resolvedSpec(a, a.slug);
       const bdg = caps.needsImage(a) ? (caps.capsFor(spec).image ? "[image]" : "[image missing]") : "";
-      ui.line(
-        "   " + ui.c.faint(String(i + 1).padStart(2)) + "  " + ui.c.emerald(a.slug.padEnd(26)) + " " +
-          ui.c.text((displayName(a) || "").padEnd(16)) + " " + ui.c.blue(spec) + (bdg ? " " + bdg : ""),
+      printWrapped(
+        `${String(i + 1).padStart(2)}  ${a.slug}  ${displayName(a) || ""}  ${spec}${bdg ? `  ${bdg}` : ""}`,
+        { indent: 3 },
       );
     });
     if (firms.length) {
-      ui.line(ui.c.dim("  " + ui.t("picker.companies")));
+      printWrapped(ui.t("picker.companies"), { indent: 2, paint: ui.c.dim });
       firms.forEach((f) =>
-        ui.line("       " + ui.c.emerald(("firm " + f.slug).padEnd(26)) + " " + ui.c.text(displayName(f)) + ui.c.dim(" (CEO)")),
+        printWrapped(`firm ${f.slug}  ${displayName(f)} (CEO)`, { indent: 3 }),
       );
     }
-    if (!ags.length && !firms.length) ui.line("   " + ui.c.dim(ui.t("picker.none")));
+    if (!ags.length && !firms.length) printWrapped(ui.t("picker.none"), { indent: 3, paint: ui.c.dim });
   }
 
   // /team — show or assign each agent's runtime (LLM). Auto-routed by capability unless pinned.
   function printTeam() {
     const ags = H.listAgents(db);
     ui.line("");
-    ui.line(ui.c.dim("  " + ui.t("team.title")));
+    printWrapped(ui.t("team.title"), { indent: 2, paint: ui.c.dim });
     for (const a of ags) {
       const pinned = prefs.agentRuntime[a.slug] && prefs.agentRuntime[a.slug] !== "auto";
       const spec = resolvedSpec(a, a.slug);
       const bdg = caps.needsImage(a) ? (caps.capsFor(spec).image ? "[image]" : "[image missing]") : "";
-      ui.line(
-        "   " + ui.c.emerald(a.slug.padEnd(28)) + ui.c.blue((spec + (bdg ? " " + bdg : "")).padEnd(14)) +
-          ui.c.faint(pinned ? ui.t("team.pinned") : ui.t("team.auto")),
+      printWrapped(
+        `${a.slug}  ${spec}${bdg ? ` ${bdg}` : ""}  ${pinned ? ui.t("team.pinned") : ui.t("team.auto")}`,
+        { indent: 3 },
       );
     }
-    ui.line("   " + ui.c.faint(ui.t("team.usage")));
+    if (!ags.length) printWrapped(ui.t("picker.none"), { indent: 3, paint: ui.c.dim });
+    printWrapped(ui.t("team.usage"), { indent: 3, paint: ui.c.faint });
   }
   function setTeam(arg) {
     const parts = arg.trim().split(/\s+/);
@@ -786,8 +905,7 @@ function startRepl(opts) {
     if (!spec) return printTeam();
     const valid = ["auto", "claude-code", "codex", "gemini", "anthropic", "openai", "google", "ollama", "upstage"];
     if (!valid.includes(spec)) return ui.warn(ui.t("team.usage"));
-    prefs.agentRuntime[slug] = spec;
-    if (opts.savePrefs) opts.savePrefs(prefs);
+    persistPrefs({ agentRuntime: { [slug]: spec } });
     ui.ok(ui.t("team.set", slug, spec === "auto" ? ui.t("team.auto") : spec));
     if (state.subject && state.subject.slug === slug) {
       applyRuntimeFor(state.subject);
@@ -799,7 +917,7 @@ function startRepl(opts) {
     const labels = Object.keys(state.cost);
     ui.line("");
     if (!labels.length) return ui.info(ui.t("noCost"));
-    ui.line(ui.c.dim("  " + ui.t("cost.title")));
+    printWrapped(ui.t("cost.title"), { indent: 2, paint: ui.c.dim });
     let tIn = 0, tOut = 0, tCost = 0, tMs = 0, tTurns = 0;
     const fmt = (e) => {
       const bits = [e.turns + (e.turns === 1 ? " turn" : " turns")];
@@ -811,37 +929,59 @@ function startRepl(opts) {
     for (const label of labels) {
       const e = state.cost[label];
       tIn += e.in; tOut += e.out; tCost += e.cost; tMs += e.ms; tTurns += e.turns;
-      ui.line("   " + ui.c.blue(label.padEnd(22)) + ui.c.faint(fmt(e)));
+      printWrapped(`${label}  ${fmt(e)}`, { indent: 3 });
     }
-    ui.line("   " + ui.c.emerald(ui.t("cost.total").padEnd(22)) + ui.c.text(fmt({ turns: tTurns, in: tIn, out: tOut, cost: tCost, ms: tMs })));
+    printWrapped(`${ui.t("cost.total")}  ${fmt({ turns: tTurns, in: tIn, out: tOut, cost: tCost, ms: tMs })}`, { indent: 3 });
   }
 
   function printSlashSkills() {
+    const { truncateWidth } = require("./agentlas-composer.cjs");
+    const room = Math.max(28, (ui.out.columns || 80) - 2);
     ui.line("");
     ui.rule(ui.t("skills.title"));
     for (const entry of input.slashCommandEntries(ui.lang)) {
-      const tag = entry.category ? ui.c.faint(entry.category.padEnd(10)) : "";
-      ui.line("  " + ui.c.emerald(entry.command.padEnd(18)) + tag + ui.c.dim(entry.description));
-      if (!entry.aliasOf && entry.usage) ui.line("  " + ui.c.faint(" ".repeat(18) + entry.usage));
+      const category = entry.category ? `[${entry.category}] ` : "";
+      const usage = entry.aliasOf ? entry.command : (entry.usage || entry.command);
+      ui.line("  " + ui.c.text(truncateWidth(`${category}${usage} — ${entry.description}`, room)));
     }
+    ui.info(truncateWidth(
+      ui.lang === "ko"
+        ? "전체 목록입니다. 이전 항목은 터미널 스크롤로 확인하세요."
+        : "This is the full list. Use terminal scrollback to review earlier entries.",
+      room,
+    ));
   }
 
   function printPermissions() {
+    const { truncateWidth, visWidth, wrapWidth } = require("./agentlas-composer.cjs");
+    const room = Math.max(28, (ui.out.columns || 80) - 2);
     ui.line("");
     ui.rule(ui.t("permissions.title"));
-    ui.line("  " + ui.c.faint(ui.t("permissions.current")) + "  " + ui.c.emerald(state.permission));
+    ui.line("  " + ui.c.text(truncateWidth(`${ui.t("permissions.current")}: ${state.permission}`, room)));
     for (const level of permissions.LEVELS) {
       const description = permissions.copy(level, ui.lang).description;
       const mark = level === state.permission ? "› " : "  ";
-      ui.line("  " + ui.c.emerald((mark + level).padEnd(10)) + ui.c.dim(description));
+      const prefix = `${mark}${level} — `;
+      const continuation = " ".repeat(visWidth(prefix));
+      const lines = wrapWidth(description, Math.max(2, room - visWidth(prefix)));
+      lines.forEach((line, lineIndex) => {
+        ui.line("  " + ui.c.text((lineIndex === 0 ? prefix : continuation) + line));
+      });
     }
-    ui.line("  " + ui.c.faint("usage: /permission read|write|full"));
+    ui.line("  " + ui.c.faint(truncateWidth(ui.t("permUsage"), room)));
   }
 
   async function rerunSetup() {
+    const setupRl = rl.closed
+      ? readline.createInterface({
+          input: process.stdin,
+          output: process.stdout,
+          terminal: !!process.stdin.isTTY,
+        })
+      : rl;
     try {
       const { runOnboard } = require("./agentlas-onboard.cjs");
-      const result = await runOnboard({ ui, rl, helpers: H });
+      const result = await runOnboard({ ui, rl: setupRl, helpers: H });
       Object.assign(prefs, result);
       ui.lang = terminalLang(prefs, opts);
       state.permission = prefs.permission || state.permission;
@@ -850,9 +990,11 @@ function startRepl(opts) {
         baseRuntime = state.runtime;
         state.native = {};
       }
-      if (opts.savePrefs) opts.savePrefs(prefs);
+      persistPrefs(result);
     } catch (e) {
       ui.error((e && e.message) || String(e));
+    } finally {
+      if (setupRl !== rl) setupRl.close();
     }
   }
 
@@ -869,35 +1011,202 @@ function startRepl(opts) {
 
   function showDiff() {
     const { spawnSync } = require("node:child_process");
+    const { splitWidth } = require("./agentlas-composer.cjs");
     const opt = { cwd: state.cwd, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 };
     const stat = spawnSync("git", ["-C", state.cwd, "--no-pager", "diff", "--stat"], opt);
     if (stat.status !== 0 && /not a git repository/i.test(stat.stderr || "")) return ui.warn(ui.t("diffNoGit"));
     const body = spawnSync("git", ["-C", state.cwd, "--no-pager", "diff"], opt);
-    const statTxt = (stat.stdout || "").trim();
-    const bodyTxt = (body.stdout || "").trim();
+    const trimOuterLineBreaks = (value) => String(value || "")
+      .replace(/^(?:\r?\n)+/, "")
+      .replace(/(?:\r?\n)+$/, "");
+    const statTxt = trimOuterLineBreaks(stat.stdout);
+    const bodyTxt = trimOuterLineBreaks(body.stdout);
+    const emitExact = (line, paint) => {
+      const continuation = "  ↳ ";
+      const chunks = splitWidth(line, Math.max(2, (ui.out.columns || 80) - 4));
+      chunks.forEach((chunk, index) => ui.line((index ? continuation : "") + paint(chunk)));
+    };
     ui.line("");
     if (!statTxt && !bodyTxt) return ui.info(ui.t("diffClean"));
-    if (statTxt) ui.markdown(statTxt);
+    if (statTxt) {
+      for (const line of statTxt.split("\n")) emitExact(line, ui.c.dim);
+    }
     if (bodyTxt) {
       ui.line("");
       for (const ln of bodyTxt.split("\n").slice(0, 500)) {
-        if (ln.startsWith("+") && !ln.startsWith("+++")) ui.line(ui.c.green(ln));
-        else if (ln.startsWith("-") && !ln.startsWith("---")) ui.line(ui.c.paw(ln));
-        else if (ln.startsWith("@@")) ui.line(ui.c.blue(ln));
-        else ui.line(ui.c.dim(ln));
+        const paint = ln.startsWith("+") && !ln.startsWith("+++")
+          ? ui.c.green
+          : ln.startsWith("-") && !ln.startsWith("---")
+            ? ui.c.paw
+            : ln.startsWith("@@")
+              ? ui.c.blue
+              : ui.c.dim;
+        emitExact(ln, paint);
       }
     }
   }
 
   // !cmd — run a shell command in the working folder and show its output (display-only).
-  function runShell(cmd) {
+  async function runShell(cmd) {
     if (!cmd) return;
-    const { spawnSync } = require("node:child_process");
+    if (state.permission !== "full") {
+      ui.warn(ui.lang === "ko"
+        ? "셸 명령은 작업 공간 경계를 강제할 수 없어 무제한 권한에서만 실행됩니다."
+        : "Shell commands require full permission because they cannot enforce the workspace boundary.");
+      return;
+    }
+    const { spawn } = require("node:child_process");
+    const turnAbort = new AbortController();
+    busy = true;
+    currentAbort = turnAbort;
+    const shellStatus = ui.lang === "ko" ? "셸 실행 중…" : "Running shell…";
+    beginInteractiveTurn(shellStatus);
+    ui.status(shellStatus);
     ui.tool("$ " + cmd);
-    const r = spawnSync("bash", ["-lc", cmd], { cwd: state.cwd, encoding: "utf8", timeout: 120000, maxBuffer: 8 * 1024 * 1024 });
-    const out = ((r.stdout || "") + (r.stderr || "")).trim();
-    // `!command` is explicit user output, unlike autonomous runtime traces: keep it inspectable.
-    ui.toolResult(out || ("exit " + (r.status == null ? "?" : r.status)), r.status === 0 || r.status == null, { verbose: true });
+    const maxBytes = 8 * 1024 * 1024;
+    try {
+      await new Promise((resolve) => {
+        const grouped = process.platform !== "win32";
+        let child;
+        let stdout = "";
+        let stderr = "";
+        let combined = "";
+        let bytes = 0;
+        let stoppedForLimit = false;
+        let forceTimer = null;
+        const stdoutDecoder = new StringDecoder("utf8");
+        const stderrDecoder = new StringDecoder("utf8");
+        const liveLimitChars = 64 * 1024;
+        let liveChars = 0;
+        let liveStarted = false;
+        let liveCapped = false;
+        const emitLive = (value) => {
+          const safe = sanitizeShellDisplay(value);
+          if (!safe) return;
+          if (!liveStarted) {
+            ui.streamStart(true);
+            liveStarted = true;
+          }
+          const before = liveChars;
+          if (before < liveLimitChars) {
+            const visible = safe.slice(0, liveLimitChars - before);
+            if (visible) {
+              ui.streamDelta(visible);
+              liveChars += visible.length;
+            }
+          }
+          if (before + safe.length > liveLimitChars && !liveCapped) {
+            liveCapped = true;
+            ui.streamDelta(ui.lang === "ko"
+              ? "\n[실시간 셸 출력은 64K자로 제한됩니다. 프로세스는 계속 실행 중입니다.]\n"
+              : "\n[Live shell output is capped at 64K characters; the process is still running.]\n");
+          }
+        };
+        const append = (target, chunk, decoder) => {
+          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          bytes += buffer.length;
+          if (bytes > maxBytes) {
+            stoppedForLimit = true;
+            terminateNativeChild(child, "SIGTERM");
+            return target;
+          }
+          const text = decoder.write(buffer);
+          combined += text;
+          emitLive(text);
+          return target + text;
+        };
+        const flushDecoder = (target, decoder) => {
+          const text = decoder.end();
+          if (!text) return target;
+          combined += text;
+          emitLive(text);
+          return target + text;
+        };
+        try {
+          child = spawn("bash", ["-lc", cmd], {
+            cwd: state.cwd,
+            env: process.env,
+            stdio: ["ignore", "pipe", "pipe"],
+            detached: grouped,
+            windowsHide: true,
+          });
+          child.__agentlasGroupedChild = grouped;
+        } catch (error) {
+          ui.error((error && error.message) || String(error));
+          resolve();
+          return;
+        }
+        const onAbort = () => {
+          terminateNativeChild(child, "SIGTERM");
+          forceTimer = setTimeout(() => terminateNativeChild(child, "SIGKILL"), 2_000);
+          forceTimer.unref?.();
+        };
+        turnAbort.signal.addEventListener("abort", onAbort, { once: true });
+        child.stdout.on("data", (chunk) => { stdout = append(stdout, chunk, stdoutDecoder); });
+        child.stderr.on("data", (chunk) => { stderr = append(stderr, chunk, stderrDecoder); });
+        child.once("error", (error) => {
+          ui.error((error && error.message) || String(error));
+        });
+        child.once("close", async (code, signal) => {
+          turnAbort.signal.removeEventListener("abort", onAbort);
+          if (forceTimer) clearTimeout(forceTimer);
+          stdout = flushDecoder(stdout, stdoutDecoder);
+          stderr = flushDecoder(stderr, stderrDecoder);
+          if (turnAbort.signal.aborted) {
+            // The shell leader can close a moment before its descendants have
+            // observed the group signal. Keep the composer unavailable until
+            // the process group is actually gone, then force the same group if
+            // the grace period expires.
+            if (grouped && Number.isInteger(child.pid) && child.pid > 1) {
+              const deadline = Date.now() + 2_500;
+              let forced = false;
+              while (Date.now() < deadline) {
+                let alive = false;
+                try {
+                  process.kill(-child.pid, 0);
+                  alive = true;
+                } catch {
+                  alive = false;
+                }
+                if (!alive) break;
+                if (!forced && Date.now() + 2_000 >= deadline) {
+                  forced = true;
+                  terminateNativeChild(child, "SIGKILL");
+                }
+                await new Promise((done) => setTimeout(done, 25));
+              }
+            }
+            if (liveStarted) ui.streamEnd();
+            const stoppedBy = signal || (code == null ? "SIGTERM" : `exit ${code}`);
+            ui.toolResult(
+              ui.lang === "ko" ? `취소됨 · ${stoppedBy}` : `cancelled · ${stoppedBy}`,
+              false,
+              { verbose: true },
+            );
+            resolve();
+            return;
+          }
+          const output = sanitizeShellDisplay(combined || (stdout + stderr)).trim();
+          const exit = code == null ? (signal || "unknown") : String(code);
+          if (liveStarted) ui.streamEnd();
+          if (stoppedForLimit) ui.error(ui.lang === "ko" ? "셸 출력이 8MB 제한을 넘어 중단했습니다." : "Shell output exceeded the 8MB limit and was stopped.");
+          if (liveStarted) {
+            ui.toolResult(`exit ${exit}`, code === 0 && !stoppedForLimit, { verbose: true });
+          } else {
+            const detail = output ? `${output}\nexit ${exit}` : `exit ${exit}`;
+            ui.toolResult(detail, code === 0 && !stoppedForLimit, { verbose: true });
+          }
+          resolve();
+        });
+      });
+    } finally {
+      if (turnAbort.signal.aborted) ui.warn(ui.t("interrupted"));
+      ui.endTurn();
+      if (currentAbort === turnAbort) {
+        busy = false;
+        currentAbort = null;
+      }
+    }
   }
 
   // @path — inline the contents of mentioned files into the prompt as fenced context.
@@ -923,6 +1232,95 @@ function startRepl(opts) {
     return blocks.length ? text + "\n\n" + blocks.join("\n\n") : text;
   }
 
+  async function runWorkforceTurn(prompt, options = {}) {
+    const startedAt = Date.now();
+    if (H.ensureProjectForExecution) {
+      state.projectPath = H.ensureProjectForExecution(
+        db,
+        state.cwd,
+        state.permission,
+        options.surface || "terminal-workforce",
+      );
+    }
+    const targetLang = H.detectResponseLanguage ? H.detectResponseLanguage(prompt, ui.lang) : ui.lang;
+    const rt = state.runtime;
+    const memoryTurn = typeof H.beginMemoryTurn === "function"
+      ? H.beginMemoryTurn(db, prompt, {
+          ...ctxNow(),
+          surface: options.surface || "terminal-workforce",
+          priorContextDigest: crypto.createHash("sha256")
+            .update(JSON.stringify(state.history.map((item) => ({ role: item.role, text: item.text }))))
+            .digest("hex"),
+          stableTurnId: `terminal-workforce-turn:${crypto.randomUUID()}`,
+        })
+      : null;
+    const curatedMemories = [];
+    const context = {
+      ...ctxNow(),
+      lang: targetLang,
+      uiLang: ui.lang,
+      curatedMemories,
+      memoryTurn,
+      turnId: memoryTurn?.turnId || null,
+    };
+    const result = await H.workforceRun(db, prompt, options);
+    // local-only immediately continues through runTurn, which owns its own
+    // complete memory/experience lifecycle. Never create a duplicate ticket.
+    if (result?.localOnly) return result;
+    const output = String(result?.finalText || result?.error?.message || "");
+    let cleaned = output;
+    if (typeof H.completeMemoryTurn === "function") {
+      let memoryResult = null;
+      try {
+        memoryResult = await H.completeMemoryTurn(db, output, context, rt, {
+          model: state.modelPinned ? rt.model : null,
+          outcome: result?.ok ? "succeeded" : "failed",
+          requestText: prompt,
+          invokeCurator: Boolean(result?.ok),
+        });
+      } catch {
+        memoryResult = await H.completeMemoryTurn(db, output, context, rt, {
+          model: state.modelPinned ? rt.model : null,
+          outcome: result?.ok ? "succeeded" : "failed",
+          requestText: prompt,
+          invokeCurator: false,
+        });
+      }
+      cleaned = H.sanitizeAssistantText
+        ? H.sanitizeAssistantText(memoryResult?.cleaned ?? output)
+        : memoryResult?.cleaned ?? output;
+      for (const memory of memoryResult?.curatedMemories || []) {
+        if (memory && !curatedMemories.some((item) => item.id === memory.id)) curatedMemories.push(memory);
+      }
+    }
+    if (result?.ok && cleaned.trim()) {
+      state.history.push(
+        { role: "user", text: prompt },
+        { role: "assistant", text: cleaned.trim() },
+      );
+    }
+    if (typeof H.finalizeExperienceRun === "function") {
+      H.finalizeExperienceRun(db, {
+        agentId: context.agentId,
+        projectPath: context.projectPath,
+        cwd: state.cwd,
+        runtime: rt,
+        permission: state.permission,
+        model: state.modelPinned ? rt.model : null,
+        curatedMemories,
+        taskHint: prompt,
+        outcome: {
+          status: result?.ok ? "succeeded" : "failed",
+          failureCode: result?.ok ? null : result?.error?.code || "workforce-runtime-error",
+        },
+        durationMs: Date.now() - startedAt,
+        runId: `terminal-workforce-run:${memoryTurn?.turnId || crypto.randomUUID()}`,
+        lang: targetLang,
+      });
+    }
+    return result;
+  }
+
   async function handleSlash(line) {
     const [cmd, ...rest] = line.slice(1).split(/\s+/);
     const arg = rest.join(" ");
@@ -937,13 +1335,38 @@ function startRepl(opts) {
       case "skills":
         printSlashSkills();
         return true;
+      case "project": {
+        const action = (arg || "status").trim().toLowerCase();
+        if (action === "status") {
+          const active = H.projectPathFor ? H.projectPathFor(db, state.cwd) : null;
+          ui.info(active
+            ? (ui.lang === "ko" ? "이 작업 폴더는 Agentlas 프로젝트 상태가 초기화되어 있습니다." : "Agentlas project state is initialized for this folder.")
+            : (ui.lang === "ko" ? "이 작업 폴더는 초기화되지 않았습니다. 필요할 때 /project init을 실행하세요." : "This folder is not initialized. Run /project init only when you want local Agentlas project state."));
+          return true;
+        }
+        if (action !== "init") {
+          ui.warn(ui.lang === "ko" ? "사용법: /project status|init" : "usage: /project status|init");
+          return true;
+        }
+        if (!H.initializeProject) {
+          ui.warn(ui.lang === "ko" ? "프로젝트 초기화를 사용할 수 없습니다." : "Project initialization is unavailable.");
+          return true;
+        }
+        ui.warn(ui.lang === "ko"
+          ? ".agentlas/ 로컬 상태를 만들고 .gitignore를 갱신하며 자격증명/서명 템플릿을 추가할 수 있습니다."
+          : "This may create .agentlas/, update .gitignore, and add local credential/signing templates.");
+        state.projectPath = H.initializeProject(db, state.cwd);
+        ui.ok(ui.lang === "ko" ? "Agentlas 프로젝트 상태 초기화 완료" : "Agentlas project state initialized");
+        return true;
+      }
       case "team":
         arg ? setTeam(arg) : printTeam();
         return true;
       case "firms": {
         const fs = H.listFirms(db);
         ui.line("");
-        for (const f of fs) ui.line("  " + ui.c.emerald(f.slug.padEnd(28)) + ui.c.text(f.name) + ui.c.dim("  (CEO)"));
+        if (!fs.length) printWrapped(ui.t("picker.none"), { indent: 2, paint: ui.c.dim });
+        for (const f of fs) printWrapped(`${f.slug}  ${displayName(f)}  (CEO)`, { indent: 2 });
         return true;
       }
       case "agent":
@@ -959,31 +1382,43 @@ function startRepl(opts) {
         return true;
       case "config":
       case "toggles": {
+        syncSharedEnginePrefs(true);
         // 클로드코드 /config 스타일 — 자동 엔진 개입은 전부 명시적 opt-in (기본 off).
         const ENGINE_FLAGS = [
           { key: "storm", pref: "autoStorm", label: ui.t("config.storm") },
           { key: "network", pref: "autoNetwork", label: ui.t("config.network") },
         ];
         const showConfig = () => {
+          const { visWidth, wrapWidth } = require("./agentlas-composer.cjs");
+          const room = Math.max(2, (ui.out.columns || 80) - 2);
           ui.line("");
-          ui.rule(ui.t("config.title"));
+          ui.rule(ui.lang === "ko" ? "엔진 설정" : "Engine settings");
+          printWrapped(ui.t("config.title"), { indent: 2, paint: ui.c.dim });
           for (const f of ENGINE_FLAGS) {
             const on = !!prefs[f.pref];
-            ui.line("  " + (on ? ui.c.green("● on ") : ui.c.dim("○ off")) + "  " + ui.c.emerald(f.key.padEnd(9)) + ui.c.dim(f.label));
+            const stateLabel = on ? "● on" : "○ off";
+            const prefix = `${stateLabel}  ${f.key.padEnd(9)} `;
+            const continuation = " ".repeat(visWidth(prefix));
+            const lines = wrapWidth(f.label, Math.max(2, room - visWidth(prefix)));
+            lines.forEach((line, index) => {
+              const lead = index === 0
+                ? (on ? ui.c.green(stateLabel) : ui.c.dim(stateLabel)) + "  " + ui.c.emerald(f.key.padEnd(9)) + " "
+                : continuation;
+              ui.line("  " + lead + ui.c.dim(line));
+            });
           }
-          ui.line("  " + ui.c.faint(ui.t("config.usage")));
+          printWrapped(ui.t("config.usage"), { indent: 2, paint: ui.c.faint });
         };
         const [cfgKey, cfgVal] = arg.trim().split(/\s+/);
         if (!cfgKey) return showConfig(), true;
         const flag = ENGINE_FLAGS.find((f) => f.key === cfgKey.toLowerCase());
         if (!flag || !/^(on|off)$/i.test(cfgVal || "")) return ui.warn(ui.t("config.usage")), true;
-        prefs[flag.pref] = /^on$/i.test(cfgVal);
-        if (opts.savePrefs) opts.savePrefs(prefs);
+        persistPrefs({ [flag.pref]: /^on$/i.test(cfgVal) });
         ui.ok(ui.t("config.set", flag.key, prefs[flag.pref] ? "on" : "off"));
         return showConfig(), true;
       }
       case "storm": {
-        if (!arg) return ui.warn("usage: /storm <goal>  [--research]"), true;
+        if (!arg) return ui.warn(ui.t("stormUsage")), true;
         let goal = arg;
         let research = false;
         if (/\s--research(-evidence)?\b/.test(" " + goal)) {
@@ -1003,7 +1438,7 @@ function startRepl(opts) {
         return true;
       }
       case "build": {
-        if (!arg) return ui.warn("usage: /build <만들고 싶은 에이전트/팀 설명>"), true;
+        if (!arg) return ui.warn(ui.t("buildUsage")), true;
         ui.line("");
         if (typeof H.terminalBuild !== "function") throw new Error("Terminal MCP build preflight is unavailable");
         if (H.ensureProjectForExecution) {
@@ -1020,19 +1455,31 @@ function startRepl(opts) {
         return true;
       }
       case "route": {
-        if (!arg) return ui.warn("usage: /route <요청>"), true;
+        if (!arg) return ui.warn(ui.t("routeUsage")), true;
+        const raw = /(?:^|\s)--json(?:\s|$)/.test(arg);
+        const query = arg.replace(/(?:^|\s)--json(?=\s|$)/g, " ").trim();
+        if (!query) return ui.warn(ui.t("routeUsage")), true;
         ui.line("");
-        await H.hepRun(["route", arg, "--project", state.cwd, "--runtime", "terminal"], { cwd: state.cwd });
+        await H.hepRun(
+          ["route", query, "--project", state.cwd, "--runtime", "terminal", ...(raw ? ["--json"] : [])],
+          { cwd: state.cwd, ui },
+        );
         return true;
       }
       case "research": {
-        if (!arg) return ui.warn("usage: /research status|gather|search|read … (예: /research search \"쿼리\")"), true;
+        if (!arg) return ui.warn(ui.t("researchUsage")), true;
+        let researchArgs;
+        try {
+          researchArgs = input.tokenizeCommandLine(arg);
+        } catch {
+          return ui.warn(ui.t("commandQuoteError")), true;
+        }
         ui.line("");
-        await H.hepRun(["research", ...arg.split(/\s+/)], { cwd: state.cwd });
+        await H.hepRun(["research", ...researchArgs], { cwd: state.cwd, ui });
         return true;
       }
       case "search": {
-        if (!arg) return ui.warn("usage: /search <할 일>"), true;
+        if (!arg) return ui.warn(ui.t("searchUsage")), true;
         if (H.cloudSearch) await H.cloudSearch(db, [arg]);
         else await H.hepRun(["hep-search", arg], { cwd: state.cwd });
         return true;
@@ -1040,7 +1487,7 @@ function startRepl(opts) {
       case "workforce":
       case "network":
       case "taskforce": {
-        if (!arg) return ui.warn("usage: /network <요청> [--benchmark]  (Agent Workforce Ontology)"), true;
+        if (!arg) return ui.warn(ui.t("networkUsage")), true;
         let goal = arg;
         const benchmark = /(?:^|\s)--benchmark(?:\s|$)/.test(goal);
         goal = goal.replace(/(?:^|\s)--benchmark(?=\s|$)/g, " ").trim();
@@ -1054,7 +1501,7 @@ function startRepl(opts) {
           state.projectPath = H.ensureProjectForExecution(db, state.cwd, state.permission, "terminal-workforce");
         }
         ui.line("");
-        await H.workforceRun(db, goal, {
+        const result = await runWorkforceTurn(goal, {
           ui,
           cwd: state.cwd,
           permission: state.permission,
@@ -1064,27 +1511,39 @@ function startRepl(opts) {
           effortPin: state.effortPinned ? (state.effort || "none") : undefined,
           concurrency,
           benchmark,
+          surface: "terminal-workforce-explicit",
         });
+        if (result?.localOnly) await runTurn(expandMentions(goal));
+        return true;
+      }
+      case "network-complete": {
+        if (!H.workforceGoalComplete) return ui.warn("Workforce goal completion is unavailable."), true;
+        const status = arg.trim().toLowerCase() === "cancel" ? "cancelled" : "completed";
+        const completed = await H.workforceGoalComplete(state.cwd, null, status);
+        const goalId = completed?.goalId || completed?.goals?.[0]?.goalId || "active goal";
+        ui.ok(status === "cancelled" ? `Workforce goal cancelled: ${goalId}` : `Workforce goal completed: ${goalId}`);
         return true;
       }
       case "legacy-network": {
-        if (!arg) return ui.warn("usage: /legacy-network <요청>"), true;
+        if (!arg) return ui.warn(ui.t("legacyNetworkUsage")), true;
         ui.line("");
         await H.hepRun(["hep-network", arg, "--project", state.cwd, "--runtime", "terminal"], { cwd: state.cwd });
         return true;
       }
       case "browser": {
+        if (!arg) return ui.warn(ui.t("browserUsage")), true;
         ui.line("");
-        await H.hepRun(["hep-browser", ...(arg ? arg.split(/\s+/) : [])], { cwd: state.cwd });
+        await H.hepRun(["hep-browser", ...arg.split(/\s+/)], { cwd: state.cwd });
         return true;
       }
       case "connect": {
+        if (!arg) return ui.warn(ui.t("connectUsage")), true;
         ui.line("");
-        await H.hepRun(["hep-connect", ...(arg ? arg.split(/\s+/) : [])], { cwd: state.cwd });
+        await H.hepRun(["hep-connect", ...arg.split(/\s+/)], { cwd: state.cwd });
         return true;
       }
       case "swarm": {
-        if (!arg) return ui.warn("usage: /swarm <goal>  [--parallel N]"), true;
+        if (!arg) return ui.warn(ui.t("swarmUsage")), true;
         let goal = arg;
         let concurrency;
         const m = goal.match(/\s--parallel\s+(\d+)\b/);
@@ -1111,7 +1570,11 @@ function startRepl(opts) {
       case "model": {
         // CLI(claude/codex/gemini)와 BYOK/Ollama 모두 지원 — 각 런타임의 모델 플래그로 전달.
         const requested = (arg || "").trim();
-        state.runtime.model = !requested || requested.toLowerCase() === "auto" ? null : requested;
+        if (!requested) {
+          ui.info(ui.t("modelCurrent", state.modelPinned ? (state.runtime.model || "unknown") : "auto"));
+          return true;
+        }
+        state.runtime.model = requested.toLowerCase() === "auto" ? null : requested;
         state.modelPinned = Boolean(state.runtime.model);
         state.native = {}; // 새 모델로 세션 리셋
         ui.ok(ui.t("modelSet", state.runtime.model || "auto"));
@@ -1128,9 +1591,7 @@ function startRepl(opts) {
         }
         state.effort = lv === "auto" || lv === "off" ? null : lv;
         state.effortPinned = lv !== "auto";
-        prefs.effort = state.effort;
-        prefs.effortPinned = state.effortPinned;
-        if (opts.savePrefs) opts.savePrefs(prefs);
+        persistPrefs({ effort: state.effort, effortPinned: state.effortPinned });
         state.native = {};
         ui.ok(ui.t("effortSet", state.effortPinned ? (state.effort || "off") : "auto"));
         return true;
@@ -1143,6 +1604,19 @@ function startRepl(opts) {
           return true;
         }
         if (!["read", "write", "full"].includes(p)) return ui.warn(ui.t("permUsage")), true;
+        if (p === "full" && state.permission !== "full") {
+          const now = Date.now();
+          if (now >= commandFullPermissionArmedUntil) {
+            commandFullPermissionArmedUntil = now + 5_000;
+            ui.warn(ui.t("permFullCommandArm"));
+            return true;
+          }
+          commandFullPermissionArmedUntil = 0;
+          setPermission(p, { notify: false });
+          ui.warn(ui.t("permFullConfirm"));
+          return true;
+        }
+        commandFullPermissionArmedUntil = 0;
         setPermission(p);
         return true;
       }
@@ -1150,6 +1624,19 @@ function startRepl(opts) {
         if (arg) {
           const p = (arg || "").toLowerCase();
           if (!["read", "write", "full"].includes(p)) return ui.warn(ui.t("permUsage")), true;
+          if (p === "full" && state.permission !== "full") {
+            const now = Date.now();
+            if (now >= commandFullPermissionArmedUntil) {
+              commandFullPermissionArmedUntil = now + 5_000;
+              ui.warn(ui.t("permFullCommandArm"));
+              return true;
+            }
+            commandFullPermissionArmedUntil = 0;
+            setPermission(p, { notify: false });
+            ui.warn(ui.t("permFullConfirm"));
+            return true;
+          }
+          commandFullPermissionArmedUntil = 0;
           setPermission(p);
         } else {
           printPermissions();
@@ -1166,10 +1653,11 @@ function startRepl(opts) {
           if (!fs.existsSync(next)) return ui.error(ui.t("cwdNoPath", next)), true;
           state.cwd = next;
           state.native = {};
+          if (!composer && Array.isArray(rl.history)) rl.history = input.loadHistory(state.cwd);
           if (H.projectPathFor) state.projectPath = H.projectPathFor(db, next);
           ui.ok(ui.t("cwdSet", banner.shorten(next)));
         } else {
-          ui.info(state.cwd);
+          ui.info(banner.shorten(state.cwd));
         }
         return true;
       case "memory": {
@@ -1181,9 +1669,12 @@ function startRepl(opts) {
       case "ontology": {
         if (!H.ontologyCommand) return ui.warn("ontology command unavailable"), true;
         try {
-          const lines = H.ontologyCommand(arg, { cwd: state.cwd, projectPath: state.projectPath });
+          const lines = H.ontologyCommand(arg, { cwd: state.cwd, projectPath: state.projectPath, lang: ui.lang });
           ui.line("");
-          for (const item of lines || []) ui.line("  " + ui.c.text(String(item)));
+          const shortCwd = banner.shorten(state.cwd);
+          for (const item of lines || []) {
+            printWrapped(String(item).split(state.cwd).join(shortCwd), { indent: 2 });
+          }
         } catch (e) {
           ui.error((e && e.message) || String(e));
         }
@@ -1193,9 +1684,12 @@ function startRepl(opts) {
       case "graph": {
         if (!H.careerGraphCommand) return ui.warn("career graph command unavailable"), true;
         try {
-          const lines = H.careerGraphCommand(arg, { cwd: state.cwd, projectPath: state.projectPath });
+          const lines = H.careerGraphCommand(arg, { cwd: state.cwd, projectPath: state.projectPath, lang: ui.lang });
           ui.line("");
-          for (const item of lines || []) ui.line("  " + ui.c.text(String(item)));
+          const shortCwd = banner.shorten(state.cwd);
+          for (const item of lines || []) {
+            printWrapped(String(item).split(state.cwd).join(shortCwd), { indent: 2 });
+          }
         } catch (e) {
           ui.error((e && e.message) || String(e));
         }
@@ -1206,8 +1700,12 @@ function startRepl(opts) {
         if (!arg) return ui.warn(ui.t("sideUsage")), true;
         if (!state.subject) return ui.warn(ui.t("sideNeedsSubject")), true;
         ui.info(ui.t("sideStart"));
-        await runTurn(expandMentions(arg), { side: true });
-        ui.info(ui.t("sideDone"));
+        {
+          const result = await runTurn(expandMentions(arg), { side: true });
+          if (result?.ok) ui.info(ui.t("sideDone"));
+          else if (result?.cancelled) ui.warn(ui.t("sideCancelled"));
+          else ui.warn(ui.t("sideFailed"));
+        }
         return true;
       case "clear":
         state.history = [];
@@ -1240,16 +1738,31 @@ function startRepl(opts) {
       }
       case "marketplace":
       case "market": {
+        const { visWidth, wrapWidth } = require("./agentlas-composer.cjs");
+        const room = Math.max(28, (ui.out.columns || 80) - 2);
+        const printWrapped = (value, color) => {
+          for (const line of wrapWidth(value, room)) ui.line("  " + color(line));
+        };
+        const printCommand = (command, hint) => {
+          const prefix = command + " ".repeat(Math.max(2, 18 - visWidth(command)));
+          const continuation = " ".repeat(visWidth(prefix));
+          const lines = wrapWidth(hint, Math.max(2, room - visWidth(prefix)));
+          lines.forEach((line, lineIndex) => {
+            const left = lineIndex === 0 ? ui.c.emerald(prefix) : continuation;
+            ui.line("  " + left + ui.c.dim(line));
+          });
+        };
         ui.line("");
         ui.rule(ui.t("market.title"));
-        ui.line("  " + ui.c.dim(ui.t("market.help")));
-        ui.line("  " + ui.c.emerald("/install <slug>".padEnd(18)) + ui.c.dim(ui.t("market.installHint")));
-        ui.line("  " + ui.c.emerald("/import <path>".padEnd(18)) + ui.c.dim(ui.t("market.importHint")));
+        printWrapped(ui.t("market.help"), ui.c.dim);
+        printCommand("/install <slug>", ui.t("market.installHint"));
+        printCommand("/import <path>", ui.t("market.importHint"));
         const logged = H.hasCloudSession ? await H.hasCloudSession() : false;
-        ui.line("  " + ui.c.faint(ui.t(logged ? "market.loggedIn" : "market.loggedOut")));
+        printWrapped(ui.t(logged ? "market.loggedIn" : "market.loggedOut"), ui.c.faint);
         return true;
       }
       case "mcp": {
+        if (arg) return ui.warn(ui.t("mcp.commandUsage")), true;
         const servers = H.mcpServers ? H.mcpServers(db) : [];
         ui.line("");
         ui.rule("MCP");
@@ -1257,13 +1770,12 @@ function startRepl(opts) {
           let envKeys = [];
           try { envKeys = JSON.parse(s.env_keys_json || "[]"); } catch { /* ignore */ }
           const name = ui.lang === "en" ? (s.name_en || s.name) : s.name;
-          const on = s.enabled && s.runtimeConsented ? ui.c.green("on ") : s.enabled ? ui.c.faint("consent") : ui.c.faint("off");
           const envStr = envKeys.length ? envKeys.join(", ") : "no key";
-          ui.line("   " + ui.c.emerald(String(name).padEnd(22)) + ui.c.blue(String(s.transport || "").padEnd(7)) + on + ui.c.dim("  " + envStr));
+          printWrapped(`${name}  ${s.transport || ""}  ${s.enabled && s.runtimeConsented ? "on" : s.enabled ? "consent" : "off"}  ${envStr}`, { indent: 3 });
         }
         const wired = servers.filter((s) => s.enabled && s.transport === "stdio" && s.runtimeEligible === true && s.runtimeConsented === true).length;
-        ui.line("   " + ui.c.faint(ui.t("mcp.wired", String(wired))));
-        ui.line("   " + ui.c.faint(ui.t("mcp.usage")));
+        printWrapped(ui.t("mcp.wired", String(wired)), { indent: 3, paint: ui.c.faint });
+        printWrapped(ui.t("mcp.usage"), { indent: 3, paint: ui.c.faint });
         return true;
       }
       case "resume": {
@@ -1275,14 +1787,13 @@ function startRepl(opts) {
             ui.info(ui.t("resume.none"));
             return true;
           }
-          list.slice(0, 10).forEach((s, i) =>
-            ui.line(
-              "   " + ui.c.faint(String(i + 1).padStart(2)) + "  " +
-                ui.c.emerald(String(s.agentLabel || s.agentSlug || "?").padEnd(20)) +
-                ui.c.blue(String(s.kind || "").padEnd(12)) + ui.c.dim(s.title || ""),
-            ),
-          );
-          ui.line("   " + ui.c.faint(ui.t("resume.usage")));
+          list.slice(0, 10).forEach((s, i) => {
+            printWrapped(
+              `${String(i + 1).padStart(2)}  ${s.agentLabel || s.agentSlug || "?"}  ${s.kind || ""}  ${s.title || ""}`,
+              { indent: 3 },
+            );
+          });
+          printWrapped(ui.t("resume.usage"), { indent: 3, paint: ui.c.faint });
           return true;
         }
         const n = parseInt(arg, 10);
@@ -1316,10 +1827,18 @@ function startRepl(opts) {
         return true;
       }
       case "doctor":
-        await H.doctor(db, ui);
+        await H.doctor(db, ui, { runtime: state.runtime });
         return true;
       case "status":
-        banner.renderStatus({ ui, runtimeLabel: runtimeLabel(state.runtime), subjectLabel: state.subject && state.subject.label, permission: state.permission, cwd: state.cwd });
+        banner.renderStatus({
+          ui,
+          runtimeLabel: runtimeLabel(state.runtime),
+          modelLabel: state.modelPinned ? (state.runtime.model || "unknown") : "auto",
+          effortLabel: state.effortPinned ? (state.effort || "off") : "auto",
+          subjectLabel: state.subject && state.subject.label,
+          permission: state.permission,
+          cwd: state.cwd,
+        });
         return true;
       case "cost":
         printCost();
@@ -1343,9 +1862,9 @@ function startRepl(opts) {
             const env = row.env.length
               ? row.env.map((e) => `${e.key}:${e.hasValue ? "set" : "missing"}`).join(" ")
               : "no key";
-            ui.line("   " + ui.c.blue(row.modality.padEnd(7)) + ui.c.text(row.provider.id.padEnd(22)) + ui.c.dim(env));
+            printWrapped(`${row.modality}  ${row.provider.id}  ${env}`, { indent: 3 });
           }
-          ui.line("   " + ui.c.faint(ui.t("multimodal.usage")));
+          printWrapped(ui.t("multimodal.usage"), { indent: 3, paint: ui.c.faint });
         }
         return true;
       }
@@ -1353,10 +1872,12 @@ function startRepl(opts) {
         showDiff();
         return true;
       case "history": {
-        const items = input.loadHistory().slice(0, 30);
+        const items = input.loadHistory(state.cwd).slice(0, 30);
         ui.line("");
         if (!items.length) { ui.info(ui.t("noHistory")); return true; }
-        for (let i = 0; i < items.length; i++) ui.line("   " + ui.c.faint(String(i + 1).padStart(3)) + "  " + ui.c.text(items[i]));
+        for (let i = 0; i < items.length; i++) {
+          printWrapped(`${String(i + 1).padStart(3)}  ${items[i]}`, { indent: 3 });
+        }
         return true;
       }
       case "compact":
@@ -1420,7 +1941,9 @@ function startRepl(opts) {
       if (f) return chooseAndStart(setSubjectFirm, f);
       if (H.autoRouteAgent || H.resolveAutoRoute) {
         // 연결 모델이 라우트를 최종 판정한다(resolveAutoRoute) — 없으면 어휘 폴백.
-        const choice = H.resolveAutoRoute ? await H.resolveAutoRoute(db, t, ui.lang) : H.autoRouteAgent(db, t, ui.lang);
+        const choice = H.resolveAutoRoute
+          ? await H.resolveAutoRoute(db, t, ui.lang, undefined, state.runtime)
+          : H.autoRouteAgent(db, t, ui.lang);
         if (choice) {
           if (choice.direct) {
             setSubjectDirect();
@@ -1442,14 +1965,24 @@ function startRepl(opts) {
 
   // 한 줄 입력 처리(공용): ! 셸 · / 명령 · 미선택 시 번호/이름/자동라우팅 · 그 외 턴 실행. readline·composer 양쪽이 호출.
   async function processLine(t) {
+    if (!/^\/(?:permission|permissions|perm)\s+full\s*$/i.test(t)) commandFullPermissionArmedUntil = 0;
+    syncSharedEnginePrefs(true);
     if (t.startsWith("!")) {
-      runShell(t.slice(1).trim());
+      await runShell(t.slice(1).trim());
       return;
     }
     if (t.startsWith("/") && !input.isAbsolutePathTask(t)) {
       await handleSlash(t); // /exit 는 내부에서 process.exit
       return;
     }
+    const submissionAbort = new AbortController();
+    let submissionCancellationVerified = true;
+    busy = true;
+    currentAbort = submissionAbort;
+    const routingStatus = ui.lang === "ko" ? "요청 라우팅 중…" : "Routing request…";
+    beginInteractiveTurn(routingStatus);
+    ui.status(routingStatus);
+    try {
     // 직답 모드는 대상 고정이 아니라 "자동 라우팅 유지" — 매 메시지 재라우팅해,
     // 나중에 전문 요청이 오면 해당 에이전트로 자연스럽게 넘어간다.
     const directMode = !!(state.subject && state.subject.kind === "direct");
@@ -1476,7 +2009,10 @@ function startRepl(opts) {
       }
       if (H.autoRouteAgent || H.resolveAutoRoute) {
         // 연결 모델이 라우트를 최종 판정한다(resolveAutoRoute) — 없으면 어휘 폴백.
-        const choice = H.resolveAutoRoute ? await H.resolveAutoRoute(db, t, ui.lang) : H.autoRouteAgent(db, t, ui.lang);
+        const choice = H.resolveAutoRoute
+          ? await H.resolveAutoRoute(db, t, ui.lang, submissionAbort.signal, state.runtime)
+          : H.autoRouteAgent(db, t, ui.lang);
+        if (submissionAbort.signal.aborted) return;
         if (choice) {
           if (choice.direct) {
             setSubjectDirect();
@@ -1494,21 +2030,38 @@ function startRepl(opts) {
           }
         }
       }
-      // Workforce is the default for direct, goal-like work. An explicit
-      // `/config network off` remains a durable opt-out; Storm stays opt-in.
-      if (state.subject && state.subject.kind === "direct" && goalLikePrompt(t)) {
+      // Once a Workforce goal is bound, every later direct turn consults that
+      // incumbent roster even when the user never typed the word "goal".
+      let hasActiveWorkforceGoal = false;
+      if (
+        state.subject
+        && state.subject.kind === "direct"
+        && H.workforceGoalRuntime
+      ) {
+        try {
+          const context = await H.workforceGoalRuntime(state.cwd);
+          hasActiveWorkforceGoal = Array.isArray(context?.goals) && context.goals.length > 0;
+        } catch {
+          // A missing login/Core does not hijack an ordinary local turn. An
+          // explicit /network invocation still fails closed with the real error.
+        }
+      }
+      // Workforce is the default for new goal-like work, and mandatory for any
+      // active bound goal. `/config network off` prevents new automatic goals;
+      // it cannot silently release or bypass an already hired roster.
+      if (state.subject && state.subject.kind === "direct" && (hasActiveWorkforceGoal || goalLikePrompt(t))) {
         if (prefs.autoStorm && H.stormRun) {
           ui.info(ui.t("config.autoEngage", "stormbreaker", "storm"));
-          await H.stormRun(db, t, { ui, cwd: state.cwd, research: false });
+          await H.stormRun(db, t, { ui, cwd: state.cwd, research: false, signal: submissionAbort.signal });
           return;
         }
-        if (prefs.autoNetwork && H.workforceRun) {
+        if ((hasActiveWorkforceGoal || prefs.autoNetwork) && H.workforceRun) {
           ui.info(ui.t("config.autoEngage", "workforce ontology", "network"));
           if (H.ensureProjectForExecution) {
             state.projectPath = H.ensureProjectForExecution(db, state.cwd, state.permission, "terminal-workforce-auto");
           }
           ui.line("");
-          await H.workforceRun(db, t, {
+          const result = await runWorkforceTurn(t, {
             ui,
             cwd: state.cwd,
             permission: state.permission,
@@ -1516,12 +2069,33 @@ function startRepl(opts) {
             projectPath: state.projectPath,
             modelPin: state.modelPinned ? state.runtime.model : null,
             effortPin: state.effortPinned ? (state.effort || "none") : undefined,
+            surface: "terminal-workforce-auto",
+            signal: submissionAbort.signal,
           });
+          if (submissionAbort.signal.aborted) return;
+          if (result?.localOnly) {
+            const localResult = await runTurn(expandMentions(t), { abortController: submissionAbort, turnStarted: true });
+            submissionCancellationVerified = localResult?.cancellationVerified !== false;
+          }
           return;
         }
       }
     }
-    await runTurn(expandMentions(t));
+    if (!submissionAbort.signal.aborted) {
+      const result = await runTurn(expandMentions(t), { abortController: submissionAbort, turnStarted: true });
+      submissionCancellationVerified = result?.cancellationVerified !== false;
+    }
+    } finally {
+      ui.endTurn();
+      if (submissionAbort.signal.aborted) {
+        if (submissionCancellationVerified) ui.warn(ui.t("interrupted"));
+        else ui.error(ui.t("cancellationUnverified"));
+      }
+      if (currentAbort === submissionAbort) {
+        busy = false;
+        currentAbort = null;
+      }
+    }
   }
 
   // 실작업(goal)형 프롬프트 감지 — 질문/잡담에는 자동 엔진(storm/network)을 절대 걸지 않는다.
@@ -1544,12 +2118,11 @@ function startRepl(opts) {
     const shortLabel = (label) => (label === "claude-code" ? "claude" : label);
     const labels = [];
     const push = (label) => { if (label && label !== "(none)" && !labels.includes(label)) labels.push(label); };
-    for (const kind of installedKinds()) push(kind); // 연결(설치)된 CLI 런타임 — 미사용이어도 표시
-    push(runtimeLabel(state.runtime)); // 현재 런타임 (BYOK/Ollama 포함)
-    for (const label of Object.keys(state.cost)) push(label); // 세션 중 사용한 나머지
+    push(runtimeLabel(state.runtime)); // current runtime, even before its first turn
+    for (const label of Object.keys(state.cost)) push(label); // other runtimes actually used this session
     const parts = labels.map((label) => {
       const e = state.cost[label];
-      if (!e) return `${shortLabel(label)} 0`;
+      if (!e) return `${shortLabel(label)} 0t`;
       if (e.in || e.out) return `${shortLabel(label)} ${fmtTok(e.in)}→${fmtTok(e.out)}`;
       return `${shortLabel(label)} ${e.turns}${ui.lang === "ko" ? "턴" : "t"}`;
     });
@@ -1600,6 +2173,7 @@ function startRepl(opts) {
         const meta = composerMeta();
         r = await composer.read({
           glyph: buffer ? "…" : "›",
+          continuation: Boolean(buffer),
           ...meta,
           suggest: (l) => input.slashCommandSuggestions(l, 12, ui.lang),
           complete: completer,
@@ -1611,6 +2185,10 @@ function startRepl(opts) {
       if (r.exit || r.eof) {
         ui.line(ui.c.dim(ui.t("bye")));
         return process.exit(0);
+      }
+      if (r.cancel) {
+        buffer = "";
+        continue;
       }
       const line = r.value || "";
       if (input.isContinuation(line)) {
@@ -1645,7 +2223,7 @@ function startRepl(opts) {
       if (!t) return ask();
       slashPalette.clear();
       if (rl.terminal && rl.history && rl.history[0] !== t) rl.history.unshift(t);
-      input.persistHistory(rl);
+      input.persistHistory(rl, state.cwd);
       await processLine(t);
       if (!closed) ask();
     });
@@ -1663,7 +2241,7 @@ function startRepl(opts) {
         if (prefs.runtime && prefs.runtime !== "auto" && H.RUNTIME_BIN[prefs.runtime] && H.which(H.RUNTIME_BIN[prefs.runtime])) {
           state.runtime = { mode: "cli", kind: prefs.runtime };
         }
-        if (opts.savePrefs) opts.savePrefs(prefs);
+        persistPrefs(result);
         ui.line("");
       } catch (e) {
         ui.error((e && e.message) || String(e));
@@ -1680,10 +2258,18 @@ function startRepl(opts) {
       routingNote(state.subject);
     } else {
       // Claude Code처럼 번호 픽커 없이 바로 입력. 할 일을 입력하면 자동 라우팅된다.
-      ui.line("  " + ui.c.dim(ui.t("picker.hint")));
+      const { wrapWidth } = require("./agentlas-composer.cjs");
+      const room = Math.max(28, (ui.out.columns || 80) - 2);
+      for (const line of wrapWidth(ui.t("picker.hint"), room)) ui.line("  " + ui.c.dim(line));
     }
     if (composer) {
       handoff = true;
+      // The classic readline slash palette owns a prepended `keypress`
+      // listener. Closing readline clears its visible palette but does not
+      // detach that input listener; leaving it alive makes the closed
+      // readline and the raw composer edit the same bytes. Arrow/Escape/Ctrl-C
+      // sequences can then strip or duplicate the next slash command.
+      slashPalette.detach();
       try { rl.close(); } catch { /* ignore */ } // hand stdin to the raw-mode composer
       composerLoop();
     } else {
@@ -1694,35 +2280,46 @@ function startRepl(opts) {
 }
 
 function applyPreferenceDefaults(prefs) {
-  if (!Object.prototype.hasOwnProperty.call(prefs, "autoNetwork")) prefs.autoNetwork = true;
+  if (!Object.prototype.hasOwnProperty.call(prefs, "autoNetwork")) prefs.autoNetwork = false;
   return prefs;
 }
 
 function printHelp(ui) {
   const c = ui.c;
+  const ko = ui.lang === "ko";
+  const { visWidth, wrapWidth } = require("./agentlas-composer.cjs");
+  const room = Math.max(28, (ui.out.columns || 80) - 2);
+  const helpLine = (key, description) => {
+    const prefix = `${key} — `;
+    const descriptionLines = wrapWidth(String(description), Math.max(8, room - visWidth(prefix)));
+    ui.line("  " + c.text(prefix + (descriptionLines[0] || "")));
+    const continuation = " ".repeat(visWidth(prefix));
+    for (const line of descriptionLines.slice(1)) ui.line("  " + c.text(continuation + line));
+  };
   ui.line("");
   ui.rule(ui.t("help.title"));
-  ui.line("  " + c.bold(c.text(ui.t("help.intro"))));
+  for (const line of wrapWidth(ui.t("help.intro"), room)) ui.line("  " + c.bold(c.text(line)));
   ui.line("");
   ui.line("  " + c.faint(ui.t("help.commands")));
   const rows = [
     [ui.t("help.talkKey"), ui.t("help.talk")],
     ["/skills", ui.t("help.skills")],
     ["/agents", ui.t("help.agents")],
-    ["/team [agent rt]", ui.t("help.team")],
-    ["/agent <name>", ui.t("help.agent")],
-    ["/firms · /firm <name>", ui.t("help.firms")],
-    ["/runtime <kind>", ui.t("help.runtime")],
-    ["/model <id>", ui.t("help.model")],
-    ["/effort <lvl>", ui.t("help.effort")],
-    ["/permission <lvl>", ui.t("help.permission")],
+    [ko ? "/team [에이전트 런타임]" : "/team [agent runtime]", ui.t("help.team")],
+    [ko ? "/agent <이름>" : "/agent <name>", ui.t("help.agent")],
+    [ko ? "/firms · /firm <이름>" : "/firms · /firm <name>", ui.t("help.firms")],
+    [ko ? "/runtime <종류>" : "/runtime <kind>", ui.t("help.runtime")],
+    [ko ? "/model <식별자>" : "/model <id>", ui.t("help.model")],
+    [ko ? "/effort <단계>" : "/effort <level>", ui.t("help.effort")],
+    [ko ? "/permission <단계>" : "/permission <level>", ui.t("help.permission")],
     ["/permissions", ui.t("help.permissions")],
     ["/setup", ui.t("help.setup")],
-    ["/cwd [path]", ui.t("help.cwd")],
+    ["/project status|init", ui.lang === "ko" ? "로컬 프로젝트 상태 확인/명시적 초기화" : "inspect or explicitly initialize local project state"],
+    [ko ? "/cwd [경로]" : "/cwd [path]", ui.t("help.cwd")],
     ["/memory", ui.t("help.memory")],
-    ["/career-graph [text]", ui.t("help.careerGraph")],
-    ["/ontology [text]", ui.t("help.ontology")],
-    ["/side <question>", ui.t("help.side")],
+    [ko ? "/career-graph [문구]" : "/career-graph [text]", ui.t("help.careerGraph")],
+    [ko ? "/ontology [문구]" : "/ontology [text]", ui.t("help.ontology")],
+    [ko ? "/side <질문>" : "/side <question>", ui.t("help.side")],
     ["/status", ui.t("help.status")],
     ["/cost", ui.t("help.cost")],
     ["/multimodal", ui.t("help.multimodal")],
@@ -1731,15 +2328,16 @@ function printHelp(ui) {
     ["/history", ui.t("help.history")],
     ["/resume [n]", ui.t("help.resume")],
     ["/compact", ui.t("help.compact")],
-    ["/import <path>", ui.t("help.import")],
-    ["/storm <goal>", ui.t("help.storm")],
-    ["/swarm <goal>", ui.t("help.swarm")],
-    ["/build <request>", ui.t("help.build")],
-    ["/route <request>", ui.t("help.route")],
-    ["/research <sub>", ui.t("help.research")],
-    ["/search <task>", ui.t("help.search")],
-    ["/install <slug>", ui.t("help.install")],
-    ["/network <req>", ui.t("help.network")],
+    [ko ? "/import <경로>" : "/import <path>", ui.t("help.import")],
+    [ko ? "/storm <목표>" : "/storm <goal>", ui.t("help.storm")],
+    [ko ? "/swarm <목표>" : "/swarm <goal>", ui.t("help.swarm")],
+    [ko ? "/build <요청>" : "/build <request>", ui.t("help.build")],
+    [ko ? "/route <요청>" : "/route <request>", ui.t("help.route")],
+    [ko ? "/research <하위 명령>" : "/research <subcommand>", ui.t("help.research")],
+    [ko ? "/search <작업>" : "/search <task>", ui.t("help.search")],
+    [ko ? "/install <식별자>" : "/install <slug>", ui.t("help.install")],
+    [ko ? "/network <요청>" : "/network <request>", ui.t("help.network")],
+    ["/network-complete", ui.lang === "ko" ? "현재 장기 Workforce 작업을 명시적으로 완료" : "explicitly complete the active durable Workforce goal"],
     ["/browser", ui.t("help.browser")],
     ["/connect", ui.t("help.connect")],
     ["/marketplace", ui.t("help.market")],
@@ -1748,13 +2346,18 @@ function printHelp(ui) {
     ["/keybindings", ui.t("help.keybindings")],
     ["/exit", ui.t("help.exit")],
   ];
-  for (const [k, v] of rows) ui.line("  " + c.emerald(k.padEnd(24)) + c.dim(v));
+  for (const [k, v] of rows) helpLine(k, v);
+  ui.info(ko
+    ? "전체 도움말입니다. 이전 항목은 터미널 스크롤로 확인하세요."
+    : "This is the full help. Use terminal scrollback to review earlier entries.");
   ui.line("");
   printKeybindings(ui);
 }
 
 function printKeybindings(ui) {
   const c = ui.c;
+  const { visWidth, wrapWidth } = require("./agentlas-composer.cjs");
+  const room = Math.max(28, (ui.out.columns || 80) - 2);
   ui.line("  " + c.faint(ui.t("help.tipsTitle")));
   const tips = [
     ["/", ui.t("help.slash")],
@@ -1767,7 +2370,13 @@ function printKeybindings(ui) {
     ["Up / Down", ui.t("help.arrows")],
     ["Ctrl-C", ui.t("help.ctrlc")],
   ];
-  for (const [k, v] of tips) ui.line("  " + c.emerald(k.padEnd(24)) + c.dim(v));
+  for (const [key, description] of tips) {
+    const prefix = `${key} — `;
+    const lines = wrapWidth(String(description), Math.max(8, room - visWidth(prefix)));
+    ui.line("  " + c.text(prefix + (lines[0] || "")));
+    const continuation = " ".repeat(visWidth(prefix));
+    for (const line of lines.slice(1)) ui.line("  " + c.text(continuation + line));
+  }
 }
 
 module.exports = {
@@ -1776,5 +2385,6 @@ module.exports = {
   runtimePromptForSession,
   makeMemoryGuard,
   makeStyleGuard,
+  sanitizeShellDisplay,
   applyPreferenceDefaults,
 };

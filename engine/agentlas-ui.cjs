@@ -201,21 +201,23 @@ class Ui {
     this._turnChrome = null;
     this._footerDrawn = false;
     this._footerDrawnRows = 0;
+    this._footerDrawnWidths = [];
+    this._footerViewportRows = 0;
+    this._footerScrollBottom = 0;
     this._footerSuspended = false;
     this._resumeSpinnerAfterStream = false;
     this._streamKeepsFooter = false;
     this._turnTasks = [];
-    this._tasksExpanded = true;
+    this._tasksExpanded = false;
     this._turnKeyHandler = null;
     this._turnInputWasRaw = false;
+    this._turnResizeHandler = null;
+    this._turnStatusShown = false;
   }
 
   write(s) {
-    const redrawFooter = !!(this._turnChrome && !this._footerSuspended);
-    if (redrawFooter) this._eraseFooter();
     this.out.write(s);
     if (s.length) this._atLineStart = s.endsWith("\n");
-    if (redrawFooter) this._drawFooter();
   }
   line(s = "") {
     if (!this._turnChrome) this.stopSpinner();
@@ -255,7 +257,7 @@ class Ui {
     const plain = truncateCells(`${status}  ${meta}`, available);
     const statusLine = this.c.emerald(frame + " ") + this.c.text(plain);
     const taskLines = [];
-    if (this._turnTasks.length) {
+    if (this._turnTasks.length || this._tasksExpanded) {
       const completed = this._turnTasks.filter((task) => task.status === "completed").length;
       const toggle = this._tasksExpanded ? this.t("tasks.hide") : this.t("tasks.show");
       taskLines.push(this.c.bold(this.c.text(`${this.t("tasks.title")} ${completed}/${this._turnTasks.length}`)) + this.c.faint(`  ·  ${toggle}`));
@@ -288,45 +290,41 @@ class Ui {
   }
 
   _eraseFooter() {
-    if (!this._footerDrawn) return;
-    const rows = this._footerDrawnRows;
-    let seq = "\r";
-    if (rows > 1) seq += `\x1b[${rows - 1}A`;
-    seq += "\x1b[0J";
-    this.out.write(seq);
     this._footerDrawn = false;
     this._footerDrawnRows = 0;
+    this._footerDrawnWidths = [];
+    this._footerViewportRows = 0;
+  }
+
+  _setFooterScrollRegion(footerRows) {
+    void footerRows;
+  }
+
+  _resetFooterScrollRegion() {
+    this._footerScrollBottom = 0;
   }
 
   _drawFooter() {
-    if (!this._turnChrome || this._footerSuspended || this._footerDrawn || !this.out.isTTY) return;
-    const lines = this._footerLines();
-    if (!lines.length) return;
-    if (!this._atLineStart) this.out.write("\n");
-    this.out.write(lines.join("\n"));
-    this._footerDrawn = true;
-    this._footerDrawnRows = lines.length;
+    // Deliberately append-only during active turns. Multi-row live footers are
+    // not scrollback-safe across tmux/macOS resize reflow: saved cursors,
+    // relative erasure, absolute rows, and scroll regions can all either leave
+    // ghosts or discard real output. The composer returns after the turn.
   }
 
   _redrawFooter() {
-    if (!this._turnChrome || this._footerSuspended) return;
-    this._eraseFooter();
-    this._drawFooter();
+    // Active-turn output is append-only; resize requires no repaint.
   }
 
   // ── 스피너 (stderr가 아닌 메인 스트림에, 같은 줄을 갱신) ──
   startSpinner(text) {
     if (this._turnChrome) {
       this._spinText = text || this._spinText || "";
-      if (this._spinTimer) return;
-      this._spinStart = Date.now();
-      const tick = () => {
-        this._spinFrame++;
-        this._redrawFooter();
-      };
-      tick();
-      this._spinTimer = setInterval(tick, 120);
-      if (this._spinTimer.unref) this._spinTimer.unref();
+      if (!this._turnStatusShown && this._spinText) {
+        this._turnStatusShown = true;
+        this._spinStart = Date.now();
+        const stop = this.lang === "ko" ? "Ctrl-C로 중단" : "Ctrl-C to interrupt";
+        this.info(`${this._spinText}  ·  ${stop}`);
+      }
       return;
     }
     if (!this.enabled || !this.out.isTTY) {
@@ -360,21 +358,28 @@ class Ui {
     this._turnFailures = 0;
     this._lastTool = null;
     this._turnTasks = [];
-    this._tasksExpanded = true;
+    this._tasksExpanded = false;
+    this._spinText = chrome && typeof chrome === "object" && typeof chrome.activity === "string"
+      ? chrome.activity
+      : "";
+    this._spinFrame = 0;
+    this._turnStatusShown = false;
     if (chrome && this.out.isTTY) {
       this._turnChrome = typeof chrome === "string" ? { status: chrome } : { ...chrome };
-      this._drawFooter();
       this._attachTurnKeys();
     }
   }
   endTurn() {
     this.stopSpinner(true);
     this._eraseFooter();
+    this._resetFooterScrollRegion();
     this._detachTurnKeys();
+    this._detachTurnResize();
     this._turnChrome = null;
     this._footerSuspended = false;
     this._turnStart = null;
     this._turnTasks = [];
+    this._turnStatusShown = false;
   }
 
   _attachTurnKeys() {
@@ -386,7 +391,7 @@ class Ui {
     const handler = (_str, key = {}) => {
       if (key.ctrl && String(key.name || "").toLowerCase() === "t") {
         this._tasksExpanded = !this._tasksExpanded;
-        this._redrawFooter();
+        this._printTaskSnapshot();
         return;
       }
       if (key.ctrl && String(key.name || "").toLowerCase() === "c" && this._turnChrome?.onInterrupt) {
@@ -405,25 +410,58 @@ class Ui {
     try { if (input?.setRawMode) input.setRawMode(this._turnInputWasRaw); } catch { /* ignore */ }
   }
 
+  _attachTurnResize() {
+    const out = this.out;
+    if (this._turnResizeHandler || !out || typeof out.on !== "function") return;
+    this._turnResizeHandler = () => this._redrawFooter();
+    out.on("resize", this._turnResizeHandler);
+  }
+
+  _detachTurnResize() {
+    const out = this.out;
+    if (this._turnResizeHandler && out && typeof out.removeListener === "function") {
+      out.removeListener("resize", this._turnResizeHandler);
+    }
+    this._turnResizeHandler = null;
+  }
+
+  _printTaskSnapshot() {
+    if (!this._tasksExpanded) {
+      this.info(this.lang === "ko" ? "작업 상세를 숨겼습니다." : "Task details hidden.");
+      return;
+    }
+    const completed = this._turnTasks.filter((task) => task.status === "completed").length;
+    this.line("");
+    this.info(`${this.t("tasks.title")} ${completed}/${this._turnTasks.length}`);
+    for (const task of this._turnTasks.slice(-8)) {
+      const icon = task.status === "completed" ? "✓" : task.status === "failed" ? "!" : task.status === "in_progress" ? "■" : "□";
+      const statusKey = task.status === "completed"
+        ? "tasks.done"
+        : task.status === "failed"
+          ? "tasks.failed"
+          : task.status === "in_progress"
+            ? "tasks.progress"
+            : "tasks.pending";
+      this.info(`${icon} ${task.label}  ·  ${this.t(statusKey)}`);
+    }
+  }
+
   replaceTasks(payload, source) {
     const normalized = taskEvents.normalizeTaskList(payload, source);
     if (!normalized.length && !Array.isArray(payload) && !Array.isArray(payload?.todos) && !Array.isArray(payload?.items) && !Array.isArray(payload?.tasks)) return;
     this._turnTasks = normalized;
-    this._redrawFooter();
   }
 
   applyTaskTool(name, payload, toolId) {
     const next = taskEvents.applyTaskTool(this._turnTasks, name, payload, toolId);
     if (next === this._turnTasks) return;
     this._turnTasks = next;
-    this._redrawFooter();
   }
 
   applyTaskResult(name, payload, toolId) {
     const next = taskEvents.applyTaskResult(this._turnTasks, name, payload, toolId);
     if (next === this._turnTasks) return;
     this._turnTasks = next;
-    this._redrawFooter();
   }
   updateSpinner(text) {
     this._spinText = text || "";
@@ -462,7 +500,6 @@ class Ui {
     this._resumeSpinnerAfterStream = !!this._spinTimer;
     this.stopSpinner(true);
     if (this._turnChrome) {
-      this._eraseFooter();
       this._footerSuspended = true;
     }
     this.ensureNl();
@@ -485,7 +522,6 @@ class Ui {
     }
     if (this._turnChrome) {
       this._footerSuspended = false;
-      this._drawFooter();
       if (this._resumeSpinnerAfterStream) this.startSpinner(this._spinText);
     }
     this._resumeSpinnerAfterStream = false;
@@ -535,20 +571,30 @@ class Ui {
   status(msg) {
     this.updateSpinner(msg);
   }
+  _message(prefix, prefixPaint, messagePaint, msg) {
+    const { wrapWidth } = require("./agentlas-composer.cjs");
+    const columns = Math.max(8, Number(this.out.columns) || 80);
+    const prefixWidth = visibleWidth(prefix);
+    const lines = wrapWidth(stripAnsi(String(msg ?? "")), Math.max(2, columns - prefixWidth));
+    lines.forEach((line, index) => {
+      const lead = index === 0 ? prefixPaint(prefix) : " ".repeat(prefixWidth);
+      this.line(lead + messagePaint(line));
+    });
+  }
   info(msg) {
-    this.line(this.c.dim("  " + msg));
+    this._message("  ", this.c.dim, this.c.dim, msg);
   }
   ok(msg) {
     this.stopSpinner();
-    this.line(this.c.green("✓ ") + this.c.text(msg));
+    this._message("✓ ", this.c.green, this.c.text, msg);
   }
   warn(msg) {
     this.stopSpinner();
-    this.line(this.c.amber("! ") + this.c.text(msg));
+    this._message("! ", this.c.amber, this.c.text, msg);
   }
   error(msg) {
     this.stopSpinner();
-    this.line(this.c.paw("✗ ") + this.c.text(msg));
+    this._message("✗ ", this.c.paw, this.c.text, msg);
   }
 
   // 최종 텍스트(비스트리밍 경로)에 가벼운 마크다운 강조 적용 후 출력.
@@ -577,6 +623,11 @@ class Ui {
   cost(usage) {
     this._lastUsage = usage || null;
     if (!usage) return;
+    // During an active turn, usage remains available to the composer/session
+    // ledger. Printing it into the transcript would look like model output.
+    if (this._turnChrome) {
+      return;
+    }
     const bits = [];
     if (usage.input_tokens != null || usage.output_tokens != null) {
       bits.push(`${usage.input_tokens ?? "?"}→${usage.output_tokens ?? "?"} tok`);
