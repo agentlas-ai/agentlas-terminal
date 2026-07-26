@@ -87,7 +87,12 @@ for optional in \
   session-orchestrator-contract timeout-regression update-semver-contract \
   login-loopback-security plugin-add-contract hub-install-contract \
   automation-contract workforce-runtime-contract capture-runtime-guard \
-  mcp-config-isolation mcp-probe-concurrency mcp-consent-allowlist mcp-child-env-isolation
+  mcp-config-isolation mcp-probe-concurrency mcp-consent-allowlist mcp-child-env-isolation \
+  experience-p6-cli-contract experience-exchange-contract experience-auto-intake-contract \
+  desktop-ontology-loadout-contract cloud-runtime-paths cloud-save-publish \
+  cloud-asset-restore cloud-owner-restore cloud-cas-client \
+  stormbreaker-core-contract workload-routing-contract swarm-protocol-contract \
+  hephaestus-passthrough-contract oberon-contract project-bootstrap-contract
 do
   if [ -f "$SCRIPT_DIR/$optional.cjs" ]; then
     check "$optional" node "$SCRIPT_DIR/$optional.cjs"

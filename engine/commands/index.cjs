@@ -60,6 +60,11 @@ const COMMANDS = {
   upload: () => require("./upload.cjs"),
   storm: () => require("./storm.cjs"),
   swarm: () => require("./swarm.cjs"),
+  project: () => require("./project.cjs"),
+  context: () => require("./context.cjs"),
+  ontology: () => require("./ontology.cjs"),
+  "career-graph": () => require("./career-graph.cjs"),
+  creds: () => require("./creds.cjs"),
 };
 
 // v1에 존재했으나 아직 v2로 재구축되지 않은 명령 — 정직 정지 목록.
@@ -67,11 +72,7 @@ const COMMANDS = {
 const NOT_YET_PORTED = [
   
       
-  "creds",
-  "ontology", "career-graph",
-  "project",
-  "context",
-];
+        ];
 
 // 무인자 호출이 프롬프트로 오라우팅되면 안 되는 명령 (smoke 가드 대상)
 const GUARDED_NO_ARG = new Set(["search", "install", "upload"]);

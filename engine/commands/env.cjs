@@ -8,28 +8,10 @@
  */
 const os = require("node:os");
 const path = require("node:path");
-const fs = require("node:fs");
 const { userDataDir } = require("../core/paths.cjs");
-
-/** .env 파싱 — 값 보존 없이 키만 필요할 때도 같은 파서를 쓴다 (KEY=VALUE, # 주석). */
-function readDotEnvFile(file) {
-  const result = {};
-  let raw;
-  try {
-    raw = fs.readFileSync(file, "utf8");
-  } catch {
-    return result;
-  }
-  for (const line of raw.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eq = trimmed.indexOf("=");
-    if (eq <= 0) continue;
-    const key = trimmed.slice(0, eq).trim();
-    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) result[key] = trimmed.slice(eq + 1);
-  }
-  return result;
-}
+// readDotEnvFile 본체는 engine/project/env-file.cjs 로 이관 (creds 명령과 공유 —
+// 명령 파일끼리 import 금지 규칙 때문에 기능 모듈로 내려갔다). 여기서는 re-export.
+const { readDotEnvFile } = require("../project/env-file.cjs");
 
 function sharedEnvKeys() {
   const fromFiles = {
