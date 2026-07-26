@@ -694,6 +694,7 @@ module.exports = {
   buildChildEnv,
   isProtectedChildEnvKeyCli,
   parseDotEnv,
+  mergeChildEnvValues,
   readDotEnvFile,
   readDotEnvDir,
   projectScopedEnvValues,

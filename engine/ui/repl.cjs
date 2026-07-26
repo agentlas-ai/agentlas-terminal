@@ -167,9 +167,7 @@ async function startRepl(ctx, opts = {}) {
       }
 
       if (input.startsWith("!")) {
-        // 셸 실행은 v2에서 아직 미배선 — 조용히 프롬프트로 삼키지 않는다.
-        ui.line(ui.c.dim(en ? "!shell is not wired in v2 yet" : "!셸 실행은 v2에서 아직 미배선입니다"));
-        prompt();
+        runShell(ctx, input.slice(1).trim(), permission).then(prompt, (e) => { ui.error(String((e && e.message) || e)); prompt(); });
         return;
       }
 
@@ -205,6 +203,71 @@ async function startRepl(ctx, opts = {}) {
     });
 
     prompt();
+  });
+}
+
+/*
+ * !셸 실행 (v1 runShell의 v2 이식 — 핵심 계약 보존):
+ *  - full 권한에서만 실행 (셸은 작업 공간 경계를 강제할 수 없다).
+ *  - env는 턴 한정: buildChildEnv 결과를 spawn에만 전달하고 호스트 프로세스의
+ *    env 객체는 절대 변형하지 않는다 (credential-env-regression 계약).
+ *  - 출력 8MB 캡, 표시 전 시크릿 마스킹, 프로세스 그룹 종료.
+ */
+async function runShell(ctx, cmd, permission) {
+  const ui = ctx.uiInstance;
+  const en = ctx.lang === "en";
+  if (!cmd) return;
+  if (permission !== "full") {
+    ui.warn(en
+      ? "Shell commands require full permission because they cannot enforce the workspace boundary."
+      : "셸 명령은 작업 공간 경계를 강제할 수 없어 무제한 권한에서만 실행됩니다.");
+    return;
+  }
+  const { spawn } = require("node:child_process");
+  const { buildChildEnv } = require("../workforce/capture.cjs");
+  const { redactCommandSecrets } = (() => {
+    try { return require("../agentlas-ui.cjs"); } catch { return { redactCommandSecrets: (s) => s }; }
+  })();
+  let turnEnv;
+  try {
+    turnEnv = await buildChildEnv(ctx.db(), { cwd: process.cwd() });
+  } catch {
+    turnEnv = { ...process.env };
+  }
+  ui.tool("$", typeof redactCommandSecrets === "function" ? redactCommandSecrets(cmd) : cmd);
+  const maxBytes = 8 * 1024 * 1024;
+  await new Promise((resolve) => {
+    const grouped = process.platform !== "win32";
+    const child = spawn(cmd, {
+      shell: true,
+      cwd: process.cwd(),
+      env: turnEnv,
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: grouped,
+    });
+    let bytes = 0;
+    let capped = false;
+    const onData = (d) => {
+      bytes += d.length;
+      if (bytes > maxBytes) {
+        if (!capped) {
+          capped = true;
+          ui.warn(en ? "(output capped at 8MB — command stopped)" : "(출력 8MB 초과 — 명령 중단)");
+          try { grouped ? process.kill(-child.pid, "SIGTERM") : child.kill("SIGTERM"); } catch { /* dead */ }
+        }
+        return;
+      }
+      ui.streamDelta(d.toString("utf8"));
+    };
+    ui.streamStart(true);
+    child.stdout.on("data", onData);
+    child.stderr.on("data", onData);
+    child.on("error", (e) => { ui.streamEnd(); ui.error(e.message); resolve(); });
+    child.on("close", (code) => {
+      ui.streamEnd();
+      if (code !== 0 && !capped) ui.line(ui.c.dim(`exit ${code}`));
+      resolve();
+    });
   });
 }
 

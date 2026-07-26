@@ -119,13 +119,31 @@ class Session extends EventEmitter {
     this._record({ type: "turn-start", at: Date.now(), prompt });
     store.appendMessage(this.db, this.chatId, "user", prompt);
 
+    // 데스크탑 러너 동형 프롬프트 조립: 언어지시 + 에이전트 프롬프트 + 연결 스킬 +
+    // 거버넌스 메모리 컨텍스트 + 메모리 이미터 코어(+의도 시 전체 스키마/자격증명 리마인더).
+    // projectPath는 명시 초기화(.agentlas 존재) 프로젝트만 — project init 경계 유지.
+    let systemPrompt = this.agent.systemPrompt || "";
+    try {
+      const { augmentSystem } = require("./prompt.cjs");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const projectPath = fs.existsSync(path.join(this.cwd, ".agentlas")) ? this.cwd : null;
+      systemPrompt = augmentSystem(this.db, systemPrompt, {
+        lang: this.lang,
+        projectPath,
+        agentId: this.agent.id,
+        turnId: `${this.chatId}:${Date.now()}`,
+        permission: this.permission,
+      }, true, prompt);
+    } catch { /* 프롬프트 증강 실패는 턴을 막지 않는다 — 원 프롬프트로 진행 */ }
+
     const req = {
       kind: this.runtime.kind,
       bin: this.runtime.bin,
       ui: this._sink,
       cwd: this.cwd,
       prompt,
-      systemPrompt: this.agent.systemPrompt || "",
+      systemPrompt,
       permission: this.permission,
       session: { ...this.runtimeSession },
       model: this.runtime.model,

@@ -200,4 +200,4 @@ async function run(ctx, args) {
   return 0;
 }
 
-module.exports = { run };
+module.exports = { run, resolveCredentialSourcePath };
