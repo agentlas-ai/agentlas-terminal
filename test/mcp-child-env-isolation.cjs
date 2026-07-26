@@ -22,10 +22,9 @@ process.env.AGENTLAS_USER_DATA_DIR = userData;
 process.env.PROCESS_PROVIDER_TOKEN = "process-provider-sentinel-value";
 process.env.PROCESS_UNRELATED_SECRET = "process-unrelated-sentinel-value";
 
-const runtime = require("../engine/agentlas.cjs");
 const host = require("../engine/agentlas-native-host.cjs");
 const mcpEnv = require("../engine/agentlas-mcp-env.cjs");
-const terminalMcp = require("../engine/agentlas-experience-mcp.cjs");
+const terminalMcp = require("../engine/mcp/probe.cjs");
 
 const secretValues = [
   "process-provider-sentinel-value",
@@ -45,13 +44,20 @@ const unrelatedNames = [
   "AGENT_UNRELATED_SECRET",
 ];
 
-function fakeDb() {
-  return {
-    prepare(sql) {
-      if (/env_requirements_json/.test(sql)) return { get: () => ({ env_requirements_json: "[]" }) };
-      return { get: () => null, all: () => [] };
-    },
-  };
+// v1의 buildChildEnvCli(모놀리스)가 만들던 "4소스 병합 provider env"를 픽스처로
+// 재현한다: 프로세스 env + 전역 credentials.env + 프로젝트 .env + 에이전트 .env.
+// v2에는 아직 provider env 빌더가 포팅되지 않았지만, 이 테스트의 계약(MCP 자식
+// env 격리가 그 병합본에서 허용 키만 통과시킨다)은 병합 방식과 무관하게 동일하다.
+function readDotEnvFixture(file) {
+  const values = {};
+  for (const line of fs.readFileSync(file, "utf8").split(/\r?\n/)) {
+    const match = line.match(/^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=\s*(.*?)\s*$/);
+    if (!match) continue;
+    let value = match[2];
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1);
+    if (value) values[match[1]] = value;
+  }
+  return values;
 }
 
 function runWrappedProbe(descriptor, inheritedEnv) {
@@ -118,14 +124,12 @@ function runWrappedProbe(descriptor, inheritedEnv) {
       "AGENT_ALPHA_TOKEN=agent-alpha-sentinel-value",
       "AGENT_UNRELATED_SECRET=agent-unrelated-sentinel-value",
     ].join("\n") + "\n", { mode: 0o600 });
-    fs.writeFileSync(path.join(userData, "agent-routes.json"), JSON.stringify({ "agent-fixture": { path: agent } }), { mode: 0o600 });
-
-    const mergedProviderEnv = await runtime.buildChildEnvCli(fakeDb(), {
-      cwd: project,
-      projectPath: project,
-      agentId: "agent-fixture",
-      permission: "full",
-    });
+    const mergedProviderEnv = {
+      ...process.env,
+      ...readDotEnvFixture(path.join(userData, "credentials.env")),
+      ...readDotEnvFixture(path.join(project, ".env")),
+      ...readDotEnvFixture(path.join(agent, ".env")),
+    };
     for (const key of [
       "PROCESS_PROVIDER_TOKEN", "PROCESS_UNRELATED_SECRET", "GLOBAL_ALPHA_TOKEN", "GLOBAL_UNRELATED_SECRET",
       "PROJECT_BETA_TOKEN", "PROJECT_UNRELATED_SECRET", "AGENT_ALPHA_TOKEN", "AGENT_UNRELATED_SECRET",
