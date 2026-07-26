@@ -107,6 +107,11 @@ function agentMcpServerIds(db, agentId) {
   }
 }
 
+/** invoke 시스템 프롬프트: 저장 프롬프트가 없으면 이름 기반 최소 프롬프트 (v1 agentSystemPromptCli 동형). */
+function agentSystemPrompt(row) {
+  return row && row.system_prompt ? row.system_prompt : `You are ${row?.name || "an Agentlas agent"}.`;
+}
+
 module.exports = {
   findAgent,
   listAgents,
@@ -114,6 +119,7 @@ module.exports = {
   listRoutableAgents,
   rowToAgent,
   agentMcpServerIds,
+  agentSystemPrompt,
   isPrivateWebOnlyAgentRow,
   isBackgroundAgentRow,
 };

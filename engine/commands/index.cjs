@@ -56,18 +56,19 @@ const COMMANDS = {
   netadmin: () => require("./netadmin.cjs"),
   journal: () => require("./journal.cjs"),
   "legacy-network": () => require("./legacy-network.cjs"),
+  cloud: () => require("./cloud.cjs"),
+  upload: () => require("./upload.cjs"),
 };
 
 // v1에 존재했으나 아직 v2로 재구축되지 않은 명령 — 정직 정지 목록.
 // 재구축이 끝나면 여기서 지우고 COMMANDS에 올린다.
 const NOT_YET_PORTED = [
   
-  "upload",
-  "storm", "swarm",
+    "storm", "swarm",
   
   "creds",
   "ontology", "career-graph",
-  "cloud", "project",
+  "project",
   "context",
 ];
 

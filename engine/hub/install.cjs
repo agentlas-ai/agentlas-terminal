@@ -20,7 +20,10 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { userDataDir } = require("../core/paths.cjs");
-const { columnExists, runWriteTransaction } = require("../core/db.cjs");
+const { columnExists } = require("../core/db.cjs");
+// v1 계약: persist의 트랜잭션은 sqlite-policy의 관용형(runWriteTransaction)이다 —
+// .transaction이 없는 드라이버/주입 DB에서는 트랜잭션 없이 fn을 실행한다(v1 테스트 계약).
+const { runWriteTransaction } = require("../agentlas-sqlite-policy.cjs");
 const { callHubTool } = require("../cloud/hub-client.cjs");
 
 // ── 패키지 상한/식별 상수 (서버 package-contract와 동일) ──
@@ -780,6 +783,15 @@ module.exports = {
   CLOUD_PACKAGE_HASH_V1,
   CLOUD_PACKAGE_HASH_V2,
   CLOUD_RESTORE_MARKER_PATH,
+  // cloud-assets(패키징/CAS/상태 저널)가 같은 원시 규칙을 공유한다 — 복제 금지 계약.
+  // 특히 cloudIsLocalExperienceLineagePath는 cloudHashPackage의 제외 규칙과
+  // 바이트 단위로 같아야 한다(복제본이 드리프트하면 해시 계약이 갈라진다).
+  CLOUD_ASSET_SCOPES,
+  cloudRevisionEtag,
+  cloudCodePointPathOrder,
+  cloudIsLocalExperienceLineagePath,
+  cloudApplyPortableFileMode,
+  cloudFsyncDirectory,
   cloudSlug,
   detectKind,
   sha,
