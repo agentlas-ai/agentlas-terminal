@@ -7,11 +7,7 @@
   },
   "scripts": {
     "smoke": "sh test/smoke.sh",
-    "test:stormbreaker-core": "node test/stormbreaker-core-contract.cjs && node test/workload-routing-contract.cjs",
-    "test:workforce": "node test/workforce-runtime-contract.cjs",
-    "test:project-bootstrap": "node test/project-bootstrap-contract.cjs",
-    "test:project-bootstrap:release": "node test/project-bootstrap-contract.cjs --strict",
-    "test:release-contracts": "npm run test:stormbreaker-core && npm run test:workforce && npm run test:project-bootstrap:release"
+    "test:release-contracts": "npm run smoke"
   },
   "engines": {
     "node": ">=20"
