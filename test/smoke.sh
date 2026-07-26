@@ -82,7 +82,7 @@ for optional in \
   stormbreaker-core-contract workload-routing-contract swarm-protocol-contract \
   hephaestus-passthrough-contract oberon-contract project-bootstrap-contract \
   memory-prompt-budget credential-env-regression runtime-env-protection permission-mapping \
-  session-fences-contract
+  session-fences-contract auto-route-contract firm-orchestrate-contract
 do
   if [ -f "$SCRIPT_DIR/$optional.cjs" ]; then
     check "$optional" node "$SCRIPT_DIR/$optional.cjs"

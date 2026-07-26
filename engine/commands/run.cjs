@@ -5,12 +5,17 @@
  *   --runtime <kind>      claude-code | codex | gemini
  *   --permission <level>  read | write | full
  * 프롬프트가 없고 stdin이 TTY가 아니면 stdin을 읽는다.
- * 자동 라우팅(최적 에이전트 판정)은 v2 판정 배선 전까지 없다 — 첫 토큰이
- * 에이전트로 해석되지 않으면 기본 에이전트로 실행한다(조용한 오라우팅 금지,
- * 어떤 에이전트로 실행하는지 stderr에 명시).
+ *
+ * 자동 라우팅(agents/router.cjs): 첫 토큰이 에이전트로 해석되지 않으면 호스트 LLM
+ * 판정(resolveAutoRoute)이 최적 에이전트를 고른다 — 어휘 점수는 후보 모집 전용이다.
+ * 판정 런타임이 없으면 기본 에이전트로 정직 폴백하되 note를 stderr에 반드시 출력한다
+ * (조용한 오라우팅/폴백 금지 — 오너 결정).
+ * 런타임 사다리: 명시(--runtime) > 에이전트별 오버라이드(agent_runtime_overrides) >
+ * prefs > active_runtime > detected (runtimes/overrides.cjs).
  */
 const { findAgent, listAgents } = require("../agents/registry.cjs");
 const { resolveRuntime } = require("../runtimes/resolve.cjs");
+const { resolveRuntimeForAgent, unavailableOverrideNote } = require("../runtimes/overrides.cjs");
 const { Orchestrator } = require("../sessions/orchestrator.cjs");
 const { Renderer } = require("../ui/renderer.cjs");
 const permissions = require("../agentlas-permissions.cjs");
@@ -49,20 +54,6 @@ async function runOnce(ctx, args) {
       promptParts = parsed.rest.slice(1);
     }
   }
-  if (!agent) {
-    const visible = listAgents(db);
-    agent = visible[0] || findAgent(db, "agentlas-orchestrator");
-    if (!agent) {
-      ctx.err(ctx.lang === "en" ? "no installed agent (agentlas search/install first)" : "설치된 에이전트가 없습니다 (agentlas search/install 먼저)");
-      return 1;
-    }
-    if (parsed.rest.length) {
-      ctx.err(ctx.lang === "en"
-        ? `(no agent match for '${parsed.rest[0]}' — running with ${agent.slug})`
-        : `('${parsed.rest[0]}' 에 맞는 에이전트 없음 — ${agent.slug} 로 실행)`);
-    }
-  }
-
   let prompt = promptParts.join(" ").trim();
   if (!prompt && !process.stdin.isTTY) prompt = await readStdin();
   if (!prompt) {
@@ -70,12 +61,49 @@ async function runOnce(ctx, args) {
     return 1;
   }
 
+  // 기본 런타임을 먼저 확정한다 — 판정 러너(자동 라우팅)도 이 런타임을 쓴다.
   let runtime;
   try {
     runtime = resolveRuntime({ db, prefs: ctx.prefs, explicit: parsed.runtime });
   } catch (e) {
     ctx.err(String((e && e.message) || e));
     return 1;
+  }
+
+  if (!agent) {
+    // 자동 라우팅 — 최종 픽은 호스트 LLM 판정. 판정 불가 시 기본 에이전트 정직 폴백 + note.
+    const router = require("../agents/router.cjs");
+    let choice = null;
+    try {
+      choice = await router.resolveAutoRoute(db, prompt, { lang: ctx.lang, runtime });
+    } catch (e) {
+      ctx.err(ctx.lang === "ko"
+        ? `자동 라우팅 실패(${(e && e.message) || e}) — 기본 에이전트로 실행합니다`
+        : `auto-routing failed (${(e && e.message) || e}) — running with the default agent`);
+    }
+    if (choice && choice.agent) {
+      agent = choice.agent;
+    } else {
+      const visible = listAgents(db);
+      agent = visible[0] || findAgent(db, "agentlas-orchestrator");
+      if (!agent) {
+        ctx.err(ctx.lang === "en" ? "no installed agent (agentlas search/install first)" : "설치된 에이전트가 없습니다 (agentlas search/install 먼저)");
+        return 1;
+      }
+      // 직답 판정 — 페르소나 오염 없이 기본 에이전트 챗으로, 플레인 프롬프트로 답한다.
+      if (choice && choice.direct) agent = { ...agent, systemPrompt: router.directSystemPrompt(ctx.lang) };
+    }
+    // 조용한 라우팅 금지 — 누가 왜 선택됐는지(또는 왜 판정을 못 했는지) 반드시 출력.
+    if (choice && choice.note) ctx.err(ctx.uiInstance.c.dim(choice.note));
+  }
+
+  // 에이전트가 확정된 뒤 에이전트별 런타임 오버라이드를 얹는다(명시 --runtime이 항상 우선).
+  if (!parsed.runtime && agent && agent.id) {
+    try {
+      const layered = resolveRuntimeForAgent({ db, prefs: ctx.prefs, explicit: null, agentId: agent.id });
+      if (layered.unavailableOverride) ctx.err(ctx.uiInstance.c.dim(unavailableOverrideNote(layered, ctx.lang)));
+      runtime = layered;
+    } catch { /* 오버라이드 층 실패 → 이미 확정된 기본 런타임 유지 */ }
   }
 
   const orch = new Orchestrator({ db, lang: ctx.lang });

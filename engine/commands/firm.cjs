@@ -1,8 +1,11 @@
 "use strict";
 /*
  * firm — 회사(CEO) 위임: agentlas firm <slug> [task…]
- * 실행 경로는 세션 계층 하나다: 회사의 CEO 에이전트로 세션을 만든다.
- * 무인자: 회사 목록. task 없이 slug만: 그 CEO와 REPL.
+ * 실행 경로는 세션 계층 하나다(제2 spawn 경로 금지).
+ * 무인자: 회사 목록. task 없이 slug만: 그 CEO와 REPL(기존 동작 유지).
+ * task가 있으면 데스크탑 firm-orchestrator 동형의 3-tier 위임을 돈다:
+ *   CEO PLAN(## Delegate 펜스) → 본부 병렬 실행(division 서브세션) → CEO SYNTHESIZE.
+ *   (firms/orchestrate.cjs runFirmTurn — 단순 CEO 챗 1턴이 아니다.)
  */
 const { rowToAgent } = require("../agents/registry.cjs");
 
@@ -47,10 +50,63 @@ async function run(ctx, args) {
   }
   const ceo = rowToAgent(ceoRow);
 
-  const task = args.slice(1).join(" ").trim();
+  // 간단 플래그 파싱(--runtime/--permission) — 명령끼리 참조 금지 규칙상 run.cjs 미차용.
+  const rest = args.slice(1);
+  const flags = { runtime: null, permission: null, task: [] };
+  for (let i = 0; i < rest.length; i++) {
+    if (rest[i] === "--runtime") flags.runtime = rest[++i];
+    else if (rest[i] === "--permission") flags.permission = rest[++i];
+    else flags.task.push(rest[i]);
+  }
+  const task = flags.task.join(" ").trim();
   if (task) {
-    // 원샷: run 명령과 동일 경로 (CEO 에이전트 지정)
-    return require("./run.cjs").run(ctx, [ceo.slug, task]);
+    // 3-tier 위임 실행 — PLAN → DELEGATE → SYNTHESIZE (firms/orchestrate.cjs).
+    const { runFirmTurn } = require("../firms/orchestrate.cjs");
+    const { resolveRuntimeForAgent, unavailableOverrideNote } = require("../runtimes/overrides.cjs");
+    const { Orchestrator } = require("../sessions/orchestrator.cjs");
+    const permissions = require("../agentlas-permissions.cjs");
+    let runtime;
+    try {
+      // 사다리: 명시 > (agent CEO > firm) 오버라이드 > prefs > active > detected.
+      runtime = resolveRuntimeForAgent({
+        db,
+        prefs: ctx.prefs,
+        explicit: flags.runtime,
+        targets: [
+          { scope: "agent", targetId: ceo.id },
+          { scope: "firm", targetId: firm.id },
+        ],
+      });
+    } catch (e) {
+      ctx.err(String((e && e.message) || e));
+      return 1;
+    }
+    if (runtime.unavailableOverride) ctx.err(ctx.ui.dim(unavailableOverrideNote(runtime, ctx.lang)));
+    const orch = new Orchestrator({ db, lang: ctx.lang });
+    const dim = ctx.ui.dim;
+    const result = await runFirmTurn({
+      db,
+      orch,
+      firm,
+      ceoAgent: ceo,
+      task,
+      runtime,
+      permission: permissions.normalize(flags.permission || (ctx.prefs && ctx.prefs.permission) || "write"),
+      cwd: process.cwd(),
+      onEvent: (ev) => {
+        if (ev.phase === "plan") ctx.err(dim(ko ? `${firm.name} · CEO가 작업을 분배하는 중…` : `${firm.name} · CEO is planning the work…`));
+        else if (ev.phase === "delegate") ctx.err(dim((ko ? "위임 → " : "delegating → ") + ev.targets.map((t) => t.name || t.role).join(", ")));
+        else if (ev.phase === "division-done") ctx.err(dim(`  ${ev.role}: ${ev.ok ? "ok" : "failed"}`));
+        else if (ev.phase === "synthesize") ctx.err(dim(ko ? "팀 결과를 종합하는 중…" : "Synthesizing team results…"));
+      },
+    });
+    orch.shutdown();
+    if (result.text) ctx.out(result.text.trimEnd());
+    if (!result.ok) {
+      ctx.err(ko ? "일부 본부/종합 턴이 실패했습니다 (위 status 참조)." : "Some division or synthesis turns failed (see status above).");
+      return 1;
+    }
+    return 0;
   }
   const { startRepl } = require("../ui/repl.cjs");
   return startRepl(ctx, { agent: ceo.slug });
