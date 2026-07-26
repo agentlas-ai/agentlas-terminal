@@ -1,0 +1,700 @@
+"use strict";
+/*
+ * workforce/capture — 헤드리스 러너 2종: CLI 캡처(captureRuntime) + BYOK 원샷(runApi),
+ * 그리고 워크포스 워커의 자식 env 빌더(buildChildEnv).
+ *
+ * v1 모놀리스(engine/agentlas.cjs, legacy-v1-engine-snapshot)의 captureRuntime /
+ * runApi / buildChildEnvCli 를 계약 그대로 포팅했다. 계약 자체는
+ * test/capture-runtime-guard.cjs 가 고정한다 — 아래 속성을 약화시키면 안 된다:
+ *
+ *  - idle/total 타임아웃 + SIGTERM→SIGKILL 승격 + kill-grace 강제 해제
+ *    (child가 close를 영영 안 줘도 캡처 슬롯은 반드시 풀린다)
+ *  - 출력 상한(AGENTLAS_CAPTURE_MAX_OUTPUT_BYTES, 64KB..32MB) 초과 즉시 중단 —
+ *    무한 출력 버퍼링 금지
+ *  - AbortSignal 전파(운영자 취소)
+ *  - no-authority 캡처: 프롬프트를 argv로만 전달(stdin 에코 없음), MCP는
+ *    정확-공백 격리(claudeMcpIsolationArgs/geminiMcpIsolationArgs), 툴 전면 차단
+ *  - 자식 env는 native-host.runtimeEnvForKind 로 신원 격리(CODEX_HOME 등),
+ *    프로젝트 .env가 보호 키(타임아웃/캡처 상한 포함)를 덮지 못한다
+ */
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { spawn } = require("node:child_process");
+const { dbPath, userDataDir } = require("../core/paths.cjs");
+
+// 캡처 드라이버가 검증된 런타임만. v2 detect.cjs의 RUNTIME_BIN에는 kimi/grok/cursor도
+// 있지만 buildArgs/텍스트 추출 계약이 없으므로 여기 목록에 절대 조용히 추가하지 않는다.
+const RUNTIME_BIN = {
+  "claude-code": "claude",
+  codex: "codex",
+  gemini: "gemini",
+};
+
+const SERVICE = "com.agentlas.desktop";
+
+function readKeytar() {
+  try {
+    return require("keytar");
+  } catch {
+    return null;
+  }
+}
+
+// v1 which 포팅: PATH + 알려진 설치 위치. detect.whichSync(spawn `which`)와 달리
+// 캡처 경로는 프로세스 spawn 없이 결정론적으로 실행 파일을 찾는다.
+function which(cmd) {
+  const paths = (process.env.PATH || "").split(path.delimiter);
+  const exts = process.platform === "win32" ? [".cmd", ".exe", ""] : [""];
+  const extra = [
+    path.join(os.homedir(), ".claude/local"),
+    path.join(os.homedir(), ".codex/bin"),
+    path.join(os.homedir(), ".gemini/bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+  ];
+  for (const dir of [...paths, ...extra]) {
+    for (const ext of exts) {
+      const full = path.join(dir, cmd + ext);
+      try {
+        fs.accessSync(full, fs.constants.X_OK);
+        return full;
+      } catch {
+        /* next */
+      }
+    }
+  }
+  return null;
+}
+
+function finiteTimeoutMs(value, fallback, min, max) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(parsed)));
+}
+
+const CAPTURE_OUTPUT_DEFAULT_BYTES = 4 * 1024 * 1024;
+function captureOutputLimit(env = process.env) {
+  return finiteTimeoutMs(env.AGENTLAS_CAPTURE_MAX_OUTPUT_BYTES, CAPTURE_OUTPUT_DEFAULT_BYTES, 64 * 1024, 32 * 1024 * 1024);
+}
+function directCaptureOutputLimit(value) {
+  return finiteTimeoutMs(value, CAPTURE_OUTPUT_DEFAULT_BYTES, 128, 32 * 1024 * 1024);
+}
+
+// ── 캡처 인자 빌드 (v1 buildArgs 포팅) ──────────────────────────────────
+// 보안 매핑은 native-host/permissions가 단일 정본이다. 여기서는 조립만 한다.
+function buildArgs(kind, systemPrompt, prompt, permission, runtimeOptions = {}) {
+  const native = require("../agentlas-native-host.cjs");
+  const level = require("../agentlas-permissions.cjs").normalize(permission);
+  const model = runtimeOptions.model ? String(runtimeOptions.model) : null;
+  const effort = runtimeOptions.effort ? String(runtimeOptions.effort) : null;
+  const noAuthority = runtimeOptions.authorityMode === "no-authority";
+  if (kind === "claude-code") {
+    const perm = native.claudePermissionArgs(noAuthority ? "read" : level);
+    // 백그라운드/캡처 경로에는 검토된 MCP 서버 목록이 없다. full 권한은 툴 권한이지
+    // MCP 동의가 아니므로 이 경로는 항상 정확-공백 MCP 격리를 유지한다.
+    const mcp = native.claudeMcpIsolationArgs();
+    const thinking = effort === "max" || effort === "xhigh" ? "Ultrathink. " : effort === "high" ? "Think hard. " : effort === "medium" ? "Think. " : "";
+    const claudeEffort = effort === "minimal" ? "low" : effort === "xhigh" ? "max" : effort;
+    const effortArgs = claudeEffort && claudeEffort !== "none" ? ["--effort", claudeEffort] : [];
+    return [
+      "-p", thinking + prompt,
+      "--append-system-prompt", systemPrompt,
+      ...(model ? ["--model", model] : []),
+      ...effortArgs,
+      ...perm,
+      ...(noAuthority ? ["--tools", ""] : []),
+      ...mcp,
+    ];
+  }
+  if (kind === "codex") {
+    const perm = native.codexPermissionArgs(noAuthority ? "read" : level);
+    const mcp = [];
+    const modelArgs = model ? ["-m", model] : [];
+    const effortArgs = effort ? ["-c", `model_reasoning_effort="${effort}"`] : [];
+    const noAuthorityArgs = noAuthority ? [
+      "--ephemeral",
+      "--ignore-user-config",
+      "--ignore-rules",
+      "--disable", "shell_tool",
+      "--disable", "unified_exec",
+      "--disable", "apps",
+      "--disable", "browser_use",
+      "--disable", "computer_use",
+      "--disable", "image_generation",
+      "--disable", "workspace_dependencies",
+      "--disable", "goals",
+      "--disable", "memories",
+      "--disable", "plugins",
+      "--disable", "hooks",
+      "--disable", "multi_agent",
+      "--disable", "tool_suggest",
+      "--json",
+    ] : [];
+    return ["exec", "--skip-git-repo-check", ...noAuthorityArgs, ...modelArgs, ...effortArgs, ...perm, ...mcp, `[SYSTEM]\n${systemPrompt}\n\n${prompt}`];
+  }
+  if (kind === "gemini") {
+    const perm = native.geminiPermissionArgs(noAuthority ? "read" : level);
+    if (noAuthority && !runtimeOptions.noToolsPolicyPath) {
+      // Gemini는 툴 공백을 증명할 명시적 deny-all 정책 파일 없이는 no-authority 실행 금지.
+      throw new Error("Gemini no-authority capture requires an explicit deny-all policy");
+    }
+    const noAuthorityArgs = noAuthority
+      ? ["--admin-policy", String(runtimeOptions.noToolsPolicyPath)]
+      : [];
+    // full 권한이어도 사용자의 전역 Gemini MCP 정의(자격증명 env 동반)를 상속하지 않는다.
+    const mcp = native.geminiMcpIsolationArgs();
+    return ["--prompt", `[SYSTEM]\n${systemPrompt}\n\n${prompt}`, ...(model ? ["-m", model] : []), ...perm, ...noAuthorityArgs, ...mcp];
+  }
+  return [prompt];
+}
+
+// codex --json 이벤트 스트림에서 최종 에이전트 텍스트만 추출.
+function codexCaptureAgentText(jsonl) {
+  const completed = [];
+  const latest = new Map();
+  for (const line of String(jsonl || "").split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    let event;
+    try { event = JSON.parse(line); } catch { continue; }
+    const item = event?.item;
+    if (!item || item.type !== "agent_message" || typeof item.text !== "string") continue;
+    if (event.type === "item.completed") completed.push(item.text);
+    else if (event.type === "item.started" || event.type === "item.updated") latest.set(String(item.id || latest.size), item.text);
+  }
+  if (completed.length) return completed.join("");
+  return [...latest.values()].join("");
+}
+
+function capturedRuntimeAgentText(kind, raw) {
+  const text = String(raw || "");
+  const events = [];
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      events.push(JSON.parse(line));
+    } catch {
+      // 네이티브 CLI는 캡처 모드에서 보통 평문을 준다. 한 줄이라도 JSON이 아니면
+      // 추측하지 말고 전체 결과를 보존한다.
+      return text.trim();
+    }
+  }
+  if (!events.length) return "";
+
+  if (kind === "claude-code") {
+    const isProtocol = events.some((event) =>
+      ["system", "stream_event", "result", "rate_limit_event"].includes(event?.type),
+    );
+    if (!isProtocol) return text.trim();
+    const final = [...events].reverse().find(
+      (event) => event?.type === "result" && typeof event.result === "string",
+    );
+    if (final) return final.result;
+    return events.map((event) => {
+      const delta = event?.type === "stream_event" ? event.event?.delta : null;
+      return delta?.type === "text_delta" && typeof delta.text === "string" ? delta.text : "";
+    }).join("");
+  }
+
+  if (kind === "gemini") {
+    const isProtocol = events.some((event) =>
+      ["init", "message", "tool_use", "tool_result", "result", "error"].includes(event?.type),
+    );
+    if (!isProtocol) return text.trim();
+    const assistant = events
+      .filter((event) => event?.type === "message" && event.role === "assistant")
+      .map((event) => typeof event.content === "string" ? event.content : "")
+      .join("");
+    if (assistant) return assistant;
+    const final = [...events].reverse().find((event) =>
+      event?.type === "result" &&
+      (typeof event.result === "string" || typeof event.response === "string"),
+    );
+    return final ? String(final.result ?? final.response) : "";
+  }
+
+  return text.trim();
+}
+
+/**
+ * 네이티브 CLI 헤드리스 1턴 캡처 — 최종 텍스트를 resolve한다.
+ * opts: { cwd, env, permission, model, effort, authorityMode, noToolsPolicyPath,
+ *         timeoutConfig, outputLimitBytes, signal, spawn(테스트 주입) }
+ */
+function captureRuntime(kind, systemPrompt, prompt, opts) {
+  opts = opts || {};
+  const cwd = opts.cwd || runCwd();
+  const nativeHost = require("../agentlas-native-host.cjs");
+  const timeout = opts.timeoutConfig
+    ? nativeHost.directNativeTimeoutConfig(opts.timeoutConfig)
+    : nativeHost.nativeTimeoutConfig(opts.env || process.env);
+  const outputLimit = opts.outputLimitBytes == null
+    ? captureOutputLimit(opts.env || process.env)
+    : directCaptureOutputLimit(opts.outputLimitBytes);
+  return new Promise((resolve, reject) => {
+    const bin = which(RUNTIME_BIN[kind]) || RUNTIME_BIN[kind];
+    let child;
+    try {
+      const spawnImpl = opts.spawn || spawn;
+      const env = nativeHost.runtimeEnvForKind(kind, opts.env || process.env, {
+        permission: opts.permission,
+        mcpServers: [],
+        mcpAllowlistMode: kind === "gemini" ? "exact" : undefined,
+      });
+      const groupedChild = process.platform !== "win32" && spawnImpl === spawn;
+      child = spawnImpl(bin, buildArgs(kind, systemPrompt, prompt, opts.permission, {
+        model: opts.model,
+        effort: opts.effort,
+        authorityMode: opts.authorityMode,
+        noToolsPolicyPath: opts.noToolsPolicyPath,
+      }), {
+        cwd,
+        stdio: ["ignore", "pipe", "pipe"],
+        env,
+        detached: groupedChild,
+        windowsHide: true,
+      });
+      child.__agentlasGroupedChild = groupedChild;
+    } catch (error) {
+      reject(error);
+      return;
+    }
+
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    let capturedBytes = 0;
+    let settled = false;
+    let terminationError = null;
+    let idleTimer = null;
+    let totalTimer = null;
+    let killTimer = null;
+    let forceTimer = null;
+    let onStdout = () => {};
+    let onStderr = () => {};
+    let onError = () => {};
+    let onClose = () => {};
+    let onAbort = () => {};
+
+    const clearTimers = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      if (totalTimer) clearTimeout(totalTimer);
+      if (killTimer) clearTimeout(killTimer);
+      if (forceTimer) clearTimeout(forceTimer);
+      idleTimer = totalTimer = killTimer = forceTimer = null;
+    };
+    const cleanup = () => {
+      clearTimers();
+      child.stdout?.removeListener("data", onStdout);
+      child.stderr?.removeListener("data", onStderr);
+      child.removeListener("error", onError);
+      child.removeListener("close", onClose);
+      if (opts.signal) opts.signal.removeEventListener?.("abort", onAbort);
+    };
+    const finishReject = (error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const finishResolve = (value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(value);
+    };
+    const requestStop = (error) => {
+      if (settled || terminationError) return;
+      terminationError = error;
+      if (idleTimer) clearTimeout(idleTimer);
+      if (totalTimer) clearTimeout(totalTimer);
+      idleTimer = totalTimer = null;
+      nativeHost.terminateNativeChild(child, "SIGTERM");
+      if (settled) return;
+      killTimer = setTimeout(() => {
+        if (settled) return;
+        nativeHost.terminateNativeChild(child, "SIGKILL");
+        if (settled) return;
+        // child가 close를 영영 안 줘도 캡처 슬롯을 강제로 해제한다 (v1 계약).
+        forceTimer = setTimeout(() => finishReject(terminationError), Math.max(250, Math.min(1_000, timeout.killGraceMs)));
+      }, timeout.killGraceMs);
+    };
+    const timeoutError = (phase, ms) => {
+      const error = new Error(
+        phase === "idle"
+          ? `${kind} capture idle timeout: ${ms}ms 동안 출력이 없습니다.`
+          : `${kind} capture total timeout: 전체 실행 시간이 ${ms}ms를 초과했습니다.`,
+      );
+      error.code = `AGENTLAS_CAPTURE_${phase.toUpperCase()}_TIMEOUT`;
+      return error;
+    };
+    const armIdle = () => {
+      if (settled || terminationError) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => requestStop(timeoutError("idle", timeout.idleMs)), timeout.idleMs);
+    };
+    const append = (target, chunk) => {
+      armIdle();
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const remaining = Math.max(0, outputLimit - capturedBytes);
+      if (remaining > 0) {
+        const kept = bytes.length > remaining ? bytes.subarray(0, remaining) : bytes;
+        target.push(kept);
+        capturedBytes += kept.length;
+      }
+      if (bytes.length > remaining) {
+        const error = new Error(`${kind} capture output limit: ${outputLimit} bytes를 초과했습니다.`);
+        error.code = "AGENTLAS_CAPTURE_OUTPUT_LIMIT";
+        requestStop(error);
+      }
+    };
+
+    onStdout = (chunk) => append(stdoutChunks, chunk);
+    onStderr = (chunk) => append(stderrChunks, chunk);
+    onError = (error) => finishReject(terminationError || error);
+    onClose = (code) => {
+      if (terminationError) {
+        finishReject(terminationError);
+        return;
+      }
+      const stdout = Buffer.concat(stdoutChunks).toString("utf8");
+      const stderr = Buffer.concat(stderrChunks).toString("utf8");
+      if (code && code !== 0) {
+        finishReject(new Error(`${kind} exited ${code}: ${stderr.slice(-500)}`));
+        return;
+      }
+      const raw = stdout.trim() || stderr.trim();
+      if (kind === "codex" && opts.authorityMode === "no-authority") {
+        finishResolve(codexCaptureAgentText(raw));
+        return;
+      }
+      if (kind === "claude-code" || kind === "gemini") {
+        finishResolve(capturedRuntimeAgentText(kind, raw));
+        return;
+      }
+      finishResolve(raw);
+    };
+    onAbort = () => {
+      const reason = opts.signal && opts.signal.reason;
+      const error = reason instanceof Error ? reason : new Error(`${kind} capture aborted`);
+      if (!error.code) error.code = "ABORT_ERR";
+      requestStop(error);
+    };
+
+    child.stdout.on("data", onStdout);
+    child.stderr.on("data", onStderr);
+    child.on("error", onError);
+    child.on("close", onClose);
+    armIdle();
+    totalTimer = setTimeout(() => requestStop(timeoutError("total", timeout.totalMs)), timeout.totalMs);
+    if (opts.signal) {
+      if (opts.signal.aborted) onAbort();
+      else opts.signal.addEventListener("abort", onAbort, { once: true });
+    }
+  });
+}
+
+// ── API 러너 (BYOK / Ollama) — 비스트리밍, 최종 텍스트 반환 (v1 runApi 포팅) ──
+// engine/agentlas-api-agent.cjs 는 스트리밍+툴 루프(대화형)용이다. 워크포스 워커는
+// zero-tools 원샷이 계약이므로 v1의 비스트리밍 원샷 경로를 그대로 쓴다.
+const DEFAULT_API_MODEL = {
+  anthropic: "claude-sonnet-4-6",
+  openai: "gpt-4o-mini",
+  google: "gemini-1.5-flash",
+  ollama: "llama3.1",
+  upstage: "solar-pro2",
+  custom: "deepseek-chat",
+  glm: "glm-4.6",
+  kimi: "kimi-k2-0711-preview",
+  deepseek: "deepseek-chat",
+};
+const ANTHROPIC_COMPAT_API = {
+  glm: { label: "GLM", baseUrl: "https://api.z.ai/api/anthropic" },
+  kimi: { label: "Kimi", baseUrl: "https://api.moonshot.ai/anthropic" },
+  deepseek: { label: "DeepSeek", baseUrl: "https://api.deepseek.com/anthropic" },
+};
+const DEFAULT_CUSTOM_API_BASE_URL = "https://api.openai.com/v1";
+
+async function apiKey(backend) {
+  const keytar = readKeytar();
+  if (!keytar) return null;
+  // 키체인 접근 거부(서명 안 된 standalone Node)는 "키 없음"으로 조용히 처리.
+  return keytar.getPassword(SERVICE, "byok:" + backend).catch(() => null);
+}
+
+// Custom BYOK 키가 전송될 origin 재검증: 공개 주소는 HTTPS만, HTTP는 localhost/LAN만.
+function normalizeCustomApiBaseUrl(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return DEFAULT_CUSTOM_API_BASE_URL;
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error("Custom API base URL is invalid.");
+  }
+  const host = parsed.hostname.toLowerCase();
+  const isLoopback = host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]";
+  const isPrivateLan =
+    /^10\./.test(host) || /^192\.168\./.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host);
+  if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && (isLoopback || isPrivateLan))) {
+    throw new Error("Custom API base URL must use HTTPS or HTTP on localhost/LAN.");
+  }
+  return value.replace(/\/+$/, "");
+}
+
+/** Desktop과 공유하는 SQLite meta에서 Custom OpenAI base URL을 읽는다(읽기 전용). */
+function readCustomApiBaseUrl() {
+  const p = dbPath();
+  if (!fs.existsSync(p)) return DEFAULT_CUSTOM_API_BASE_URL;
+  let db = null;
+  let raw = "";
+  try {
+    try {
+      const Database = require("better-sqlite3");
+      db = new Database(p, { readonly: true, fileMustExist: true });
+    } catch {
+      const { DatabaseSync } = require("node:sqlite");
+      db = new DatabaseSync(p, { readOnly: true });
+    }
+    try {
+      const row = db.prepare("SELECT value FROM meta WHERE key = 'custom_base_url'").get();
+      raw = row && row.value ? row.value : "";
+    } catch {
+      // 구버전 DB에 meta 테이블/키가 없으면 Desktop과 동일하게 OpenAI 기본 URL.
+      raw = "";
+    }
+  } catch (e) {
+    throw new Error(`Could not read the Custom API base URL from the shared database: ${(e && e.message) || e}`);
+  } finally {
+    try { if (db && typeof db.close === "function") db.close(); } catch { /* ignore close failure */ }
+  }
+  return normalizeCustomApiBaseUrl(raw);
+}
+
+/**
+ * BYOK/Ollama 한 턴. 재사용 경로이므로 절대 process.exit하지 않고 오류를 throw해
+ * 호출자의 catch/finally가 부분 실패를 처리하게 한다.
+ * options는 회귀 테스트의 fetch/키 주입용이며 상용 호출자는 사용하지 않는다.
+ */
+async function runApi(backend, model, system, prompt, options) {
+  options = options || {};
+  model = model || DEFAULT_API_MODEL[backend];
+  const fetchImpl = options.fetch || globalThis.fetch;
+  if (typeof fetchImpl !== "function") throw new Error("fetch is unavailable in this runtime (run through the app runtime).");
+  if (backend === "ollama") {
+    const resp = await fetchImpl("http://127.0.0.1:11434/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model, stream: false, messages: [{ role: "system", content: system }, { role: "user", content: prompt }] }),
+    });
+    if (!resp.ok) throw new Error(`Ollama ${resp.status} — run 'ollama serve' and check the model`);
+    const j = await resp.json();
+    return (j.message && j.message.content) || "";
+  }
+  const supported = backend === "anthropic" || backend === "openai" || backend === "google" ||
+    backend === "upstage" || backend === "custom" || !!ANTHROPIC_COMPAT_API[backend];
+  if (!supported) throw new Error("Unsupported backend: " + backend);
+  const key = Object.prototype.hasOwnProperty.call(options, "apiKey") ? options.apiKey : await apiKey(backend);
+  if (!key) throw new Error(`${backend} API key is missing. Register it in App settings → BYOK.`);
+
+  const anthropicCompat = ANTHROPIC_COMPAT_API[backend];
+  if (backend === "anthropic" || anthropicCompat) {
+    const label = anthropicCompat ? anthropicCompat.label : "Anthropic";
+    const base = anthropicCompat ? anthropicCompat.baseUrl : "https://api.anthropic.com";
+    const authHeaders = anthropicCompat
+      ? { "x-api-key": key, authorization: "Bearer " + key }
+      : { "x-api-key": key };
+    const resp = await fetchImpl(`${base}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model, max_tokens: 4096, system, messages: [{ role: "user", content: prompt }] }),
+    });
+    if (!resp.ok) throw new Error(`${label} ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 200)}`);
+    const j = await resp.json();
+    return (j.content && j.content[0] && j.content[0].text) || "";
+  }
+  if (backend === "openai" || backend === "upstage" || backend === "custom") {
+    const base = backend === "upstage"
+      ? "https://api.upstage.ai/v1"
+      : backend === "custom"
+        ? normalizeCustomApiBaseUrl(Object.prototype.hasOwnProperty.call(options, "customBaseUrl")
+          ? options.customBaseUrl
+          : readCustomApiBaseUrl())
+        : "https://api.openai.com/v1";
+    const label = backend === "custom" ? "Custom API" : backend === "upstage" ? "Upstage" : "OpenAI";
+    const resp = await fetchImpl(`${base}/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer " + key },
+      body: JSON.stringify({ model, messages: [{ role: "system", content: system }, { role: "user", content: prompt }] }),
+    });
+    if (!resp.ok) throw new Error(`${label} ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 200)}`);
+    const j = await resp.json();
+    return (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || "";
+  }
+  if (backend === "google") {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`;
+    const resp = await fetchImpl(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: [{ role: "user", parts: [{ text: prompt }] }] }),
+    });
+    if (!resp.ok) throw new Error(`Google ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 200)}`);
+    const j = await resp.json();
+    const c = j.candidates && j.candidates[0];
+    return (c && c.content && c.content.parts && c.content.parts[0] && c.content.parts[0].text) || "";
+  }
+  throw new Error("Unsupported backend: " + backend);
+}
+
+// ── 작업 폴더 규칙 (v1 runCwd/projectCwd 포팅) ─────────────────────────
+function runCwd() {
+  const dir = path.join(userDataDir(), "agent-cwd");
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  } catch {
+    return os.homedir();
+  }
+}
+
+// 에이전트가 실행될 작업 폴더 = 사용자가 명령을 친 현재 디렉터리(= 대상 프로젝트).
+// 단, home/userData/agent-cwd 같은 "프로젝트 아님" 위치면 안전한 전용 폴더로 폴백.
+function projectCwd() {
+  try {
+    const cwd = process.cwd();
+    if (!cwd || cwd === os.homedir() || cwd === userDataDir() || cwd === runCwd()) return runCwd();
+    return cwd;
+  } catch {
+    return runCwd();
+  }
+}
+
+// ── 자식 env 빌더 (v1 buildChildEnvCli 포팅) ───────────────────────────
+function parseDotEnv(text) {
+  const out = {};
+  for (const raw of String(text || "").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const m = line.match(/^(?:export\s+)?([A-Z][A-Z0-9_]{2,})\s*=\s*(.*)$/);
+    if (!m) continue;
+    let value = m[2].trim();
+    const q = value[0];
+    if ((q === '"' || q === "'") && value.endsWith(q)) value = value.slice(1, -1);
+    out[m[1]] = value;
+  }
+  return out;
+}
+function readDotEnvFile(file) {
+  try {
+    const st = fs.statSync(file);
+    if (!st.isFile() || st.size > 512 * 1024) return {};
+    return parseDotEnv(fs.readFileSync(file, "utf8"));
+  } catch {
+    return {};
+  }
+}
+function readDotEnvDir(dir) {
+  return { ...readDotEnvFile(path.join(dir, ".env")), ...readDotEnvFile(path.join(dir, ".env.local")) };
+}
+function projectEnvId(projectPath) {
+  const raw = path.basename(projectPath || runCwd() || "project") || "project";
+  return raw.toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "PROJECT";
+}
+function projectScopedEnvValues(values, projectPath) {
+  const prefix = `AGENTLAS_PROJECT_${projectEnvId(projectPath)}_`;
+  const result = {};
+  for (const [key, value] of Object.entries(values || {})) {
+    if (!key.startsWith(prefix)) continue;
+    const actualKey = key.slice(prefix.length);
+    if (/^[A-Z][A-Z0-9_]*$/.test(actualKey)) result[actualKey] = value;
+  }
+  return result;
+}
+
+// 프로젝트/에이전트 dotenv는 일반 API 키 우선순위를 유지하되, 호스트 CLI의 신원·설치·
+// 플러그인 탐색 루트는 바꾸지 못한다. Windows env도 대소문자 무관 비교(v1 계약).
+const PROTECTED_CHILD_ENV_KEYS_CLI = new Set([
+  "HOME", "PATH", "PATHEXT", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+  "XDG_CONFIG_HOME", "XDG_DATA_HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_SAFE_MODE",
+  "AGENTLAS_CODEX_HOME", "AGENTLAS_USER_DATA_DIR",
+  "CLAUDE_CODE_SIMPLE", "CLAUDE_PLUGIN_ROOT", "CLAUDE_PLUGIN_DATA", "CLAUDE_PROJECT_DIR",
+  "GEMINI_CLI_HOME", "GEMINI_CLI_SYSTEM_SETTINGS_PATH", "GEMINI_CLI_USER_SETTINGS",
+  "GEMINI_CLI_TRUSTED_FOLDERS_PATH", "GEMINI_CLI_TRUST_WORKSPACE", "GEMINI_CLI_EXTENSION_REGISTRY_URI",
+  "HEPHAESTUS_RUNTIME_ROOT", "HEPHAESTUS_RUNTIME_BASE", "HEPHAESTUS_PYTHON", "HEPHAESTUS_AUTO_UPDATE",
+  "HEPHAESTUS_UPDATE_CHECK", "NPM_CONFIG_PREFIX", "NODE_OPTIONS", "NODE_PATH",
+  "PYTHONHOME", "PYTHONPATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
+  "AGENTLAS_HUB_CONNECT_TIMEOUT_MS", "AGENTLAS_HUB_IDLE_TIMEOUT_MS", "AGENTLAS_HUB_TOTAL_TIMEOUT_MS",
+  "AGENTLAS_NATIVE_IDLE_TIMEOUT_MS", "AGENTLAS_NATIVE_TOTAL_TIMEOUT_MS", "AGENTLAS_NATIVE_KILL_GRACE_MS",
+  "AGENTLAS_CAPTURE_MAX_OUTPUT_BYTES",
+]);
+// 네트워크 무결성 키 — TLS 검증·프록시·CA·엔드포인트·세션. 비신뢰 출처(클론 레포의
+// 프로젝트/에이전트 dotenv)로 주입되면 MITM/SSRF/세션 하이재킹. 사용자 본인의 전역
+// credentials.env와 호스트 셸 env는 신뢰하므로 허용.
+const UNTRUSTED_PROTECTED_ENV_KEYS_CLI = new Set([
+  "NODE_TLS_REJECT_UNAUTHORIZED", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+  "OPENSSL_CONF", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+  "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "GRPC_PROXY", "NPM_CONFIG_PROXY",
+  "AGENTLAS_SESSION", "AGENTLAS_MCP_BASE_URL", "AGENTLAS_WEB_BASE_URL", "AGENTLAS_API_BASE_URL",
+  "AGENTLAS_HUB_BASE_URL", "AGENTLAS_CLOUD_BASE_URL", "OLLAMA_HOST",
+]);
+function isProtectedChildEnvKeyCli(key, trusted) {
+  const k = String(key || "").trim().toUpperCase();
+  if (PROTECTED_CHILD_ENV_KEYS_CLI.has(k)) return true; // 호스트 신원/플러그인 루트 — 모든 출처 차단
+  if (!trusted && UNTRUSTED_PROTECTED_ENV_KEYS_CLI.has(k)) return true; // 네트워크 무결성 — 비신뢰 출처만 차단
+  return false;
+}
+function mergeChildEnvValues(target, values, overwrite, trusted) {
+  const injected = [];
+  for (const [key, value] of Object.entries(values || {})) {
+    if (!value || isProtectedChildEnvKeyCli(key, trusted)) continue;
+    if (!overwrite && target[key]) continue;
+    target[key] = value;
+    injected.push(key);
+  }
+  return injected;
+}
+
+/**
+ * 워크포스 자식 env 빌더 (v1 buildChildEnvCli의 v2 포팅).
+ * v1의 멀티모달 카탈로그/키체인 볼트/에이전트 폴더 dotenv 소스는 그 서브시스템이
+ * 아직 v2로 이식되지 않아 여기 없다 — 워크포스 경로는 ctx.agentId를 절대 넘기지
+ * 않으므로(no-authority 원샷) 계약상 영향이 없고, 필요해지면 그 모듈 포팅과 함께
+ * 여기에 소스를 추가한다(조용한 근사 금지).
+ */
+async function buildChildEnv(db, ctx) {
+  const env = { ...process.env };
+  const apply = (values, overwrite, trusted) => {
+    mergeChildEnvValues(env, values, overwrite, trusted);
+  };
+  const globalCredentials = {
+    ...readDotEnvFile(path.join(userDataDir(), "credentials.env")),
+    ...readDotEnvFile(path.join(os.homedir(), ".agentlas", "credentials.env")),
+  };
+  apply(globalCredentials, false, true); // 사용자 본인의 전역 자격 — 신뢰
+  if (ctx && ctx.projectPath) apply(projectScopedEnvValues(globalCredentials, ctx.projectPath), true, true);
+  if (ctx && ctx.cwd) apply(readDotEnvDir(ctx.cwd), true, false); // 프로젝트 dotenv — 비신뢰
+  if (ctx && ctx.projectPath && ctx.projectPath !== ctx.cwd) apply(readDotEnvDir(ctx.projectPath), true, false);
+  return env;
+}
+
+module.exports = {
+  RUNTIME_BIN,
+  which,
+  runCwd,
+  projectCwd,
+  buildArgs,
+  codexCaptureAgentText,
+  capturedRuntimeAgentText,
+  captureOutputLimit,
+  directCaptureOutputLimit,
+  captureRuntime,
+  apiKey,
+  normalizeCustomApiBaseUrl,
+  readCustomApiBaseUrl,
+  runApi,
+  buildChildEnv,
+  isProtectedChildEnvKeyCli,
+  parseDotEnv,
+  readDotEnvFile,
+  readDotEnvDir,
+  projectScopedEnvValues,
+};

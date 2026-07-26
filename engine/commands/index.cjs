@@ -37,6 +37,9 @@ const COMMANDS = {
   native: () => require("./native.cjs"),
   chat: () => require("./chat.cjs"),
   multimodal: () => require("./multimodal.cjs"),
+  workforce: () => require("./workforce.cjs"),
+  network: () => require("./workforce.cjs"),
+  taskforce: () => require("./workforce.cjs"),
 };
 
 // v1에 존재했으나 아직 v2로 재구축되지 않은 명령 — 정직 정지 목록.
@@ -44,7 +47,7 @@ const COMMANDS = {
 const NOT_YET_PORTED = [
   
   "build", "upload", "connect",
-  "storm", "swarm", "network", "workforce", "taskforce", "legacy-network",
+  "storm", "swarm", "legacy-network",
   "call", "browser", "route", "research", "netadmin", "journal",
   "creds", "memory",
   "evolve", "oberon", "film", "ontology", "career-graph",
