@@ -33,6 +33,7 @@ const COMMANDS = {
   plugin: () => require("./plugin.cjs"),
   plugins: () => require("./plugin.cjs"),
   open: () => require("./open.cjs"),
+  automation: () => require("./automation.cjs"),
 };
 
 // v1에 존재했으나 아직 v2로 재구축되지 않은 명령 — 정직 정지 목록.
@@ -42,7 +43,7 @@ const NOT_YET_PORTED = [
   "build", "upload", "connect",
   "storm", "swarm", "network", "workforce", "taskforce", "legacy-network",
   "call", "browser", "route", "research", "netadmin", "journal",
-  "automation", "creds", "memory",
+  "creds", "memory",
   "evolve", "multimodal", "oberon", "film", "ontology", "career-graph",
   "cloud", "experience", "variant", "project",
   "context", "hep",
