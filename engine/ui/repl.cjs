@@ -68,6 +68,7 @@ async function startRepl(ctx, opts = {}) {
 
   const resolveRt = () => resolveRuntime({ db, prefs: ctx.prefs, explicit: runtimeOverride });
 
+  let resumeChatId = opts.chatId || null;
   const ensureMainSession = (agentToken) => {
     const agent = agentToken ? findAgent(db, agentToken) : (orch.active() ? orch.active().agent : pickDefaultAgent(db));
     if (!agent) {
@@ -77,7 +78,8 @@ async function startRepl(ctx, opts = {}) {
     }
     const active = orch.active();
     if (active && active.agent.id === agent.id) return active;
-    const session = orch.spawn({ agent, runtime: resolveRt(), permission, cwd: process.cwd(), activate: true });
+    const session = orch.spawn({ agent, runtime: resolveRt(), permission, cwd: process.cwd(), activate: true, chatId: resumeChatId });
+    resumeChatId = null; // 재개는 첫 세션에만 적용
     renderer.attach(session, { replay: false });
     return session;
   };

@@ -32,12 +32,13 @@ const COMMANDS = {
   install: () => require("./install.cjs"),
   plugin: () => require("./plugin.cjs"),
   plugins: () => require("./plugin.cjs"),
+  open: () => require("./open.cjs"),
 };
 
 // v1에 존재했으나 아직 v2로 재구축되지 않은 명령 — 정직 정지 목록.
 // 재구축이 끝나면 여기서 지우고 COMMANDS에 올린다.
 const NOT_YET_PORTED = [
-  "chat", "open", "native",
+  "chat", "native",
   "build", "upload", "connect",
   "storm", "swarm", "network", "workforce", "taskforce", "legacy-network",
   "call", "browser", "route", "research", "netadmin", "journal",
