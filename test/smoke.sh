@@ -72,8 +72,8 @@ guard "guard-search"  node "$BIN" search
 guard "guard-install" node "$BIN" install
 guard "guard-upload"  node "$BIN" upload
 
-# 미포팅 v1 명령은 정직 정지 (exit 1, 조용한 성공 금지)
-guard "guard-not-ported" node "$BIN" storm "goal"
+# 프롬프트 없는 run은 usage + exit 1 (모델 호출 없이 정직 실패해야 함).
+guard "guard-run-no-prompt" sh -c "node '$BIN' run < /dev/null"
 
 # 살아있는 계약 테스트
 check "bootstrap-race" node "$SCRIPT_DIR/bootstrap-race.cjs"

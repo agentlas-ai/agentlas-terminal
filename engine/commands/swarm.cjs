@@ -1,0 +1,69 @@
+"use strict";
+/*
+ * commands/swarm — `agentlas swarm <goal> [--parallel N] [--runtime <kind>]`.
+ *
+ * v1 모놀리스 디스패치(legacy-v1-engine-snapshot, engine/agentlas.cjs 13079행)의 포팅:
+ *   case "swarm" → parity().cmdSwarm(db, rest, runtimeOverride,
+ *     { cwd, projectPath, permission })
+ *
+ * 워커 실행은 storm/swarm.cjs 를 통해 engine/workforce/capture.cjs 의 headless
+ * 캡처로만 이뤄진다(제2의 스폰 경로 금지). 워커의 workload allocation은
+ * agentlas-workload-routing 이 검증만 하고, 거부 시 fail-closed 다.
+ * 런타임 부재는 resolveRuntime의 code="no_runtime" throw가 그대로 전파돼 exit 1.
+ *
+ * projectPath: v1 ensureTerminalProjectForExecutionCli 미포팅 —
+ * commands/storm.cjs 파일 머리 주석과 동일한 결정·동일한 근거로 cwd 를 넘긴다.
+ */
+const { buildStormDeps } = require("../storm/deps.cjs");
+const { projectCwd } = require("../workforce/capture.cjs");
+
+function resolvePermission(ctx) {
+  // v1 resolveTerminalPermission 포팅: 저장된 `full` 은 세션 한정 계약이라
+  // persistent()가 fail-closed 로 강등한다.
+  try {
+    const policy = require("../agentlas-permissions.cjs");
+    return policy.persistent(ctx && ctx.prefs && ctx.prefs.permission, "write");
+  } catch {
+    return "write";
+  }
+}
+
+/** `--runtime <kind>` 만 명령 자체 플래그로 벗겨낸다. 나머지는 cmdSwarm 이 파싱. */
+function splitRuntimeOverride(args) {
+  const rest = [];
+  let runtimeOverride = null;
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] === "--runtime" && args[i + 1]) {
+      runtimeOverride = String(args[++i]);
+      continue;
+    }
+    rest.push(args[i]);
+  }
+  return { rest, runtimeOverride };
+}
+
+async function run(ctx, args) {
+  const { rest, runtimeOverride } = splitRuntimeOverride(args);
+  // usage 경로(목표 텍스트 없음)는 SQLite를 열 이유가 없다 — cmdSwarm 의 플래그
+  // (--parallel/-n <N>)만 있는 호출은 빈 목표다.
+  const hasGoal = rest.some((token, i) =>
+    !["--parallel", "-n"].includes(String(token))
+    && !(i > 0 && ["--parallel", "-n"].includes(String(rest[i - 1]))));
+  if (!hasGoal) {
+    ctx.err("usage: agentlas swarm <goal>  [--parallel N] [--runtime <kind>]");
+    return 1;
+  }
+  const db = ctx.db();
+  const cwd = projectCwd();
+  const permission = resolvePermission(ctx);
+  const swarm = require("../storm/swarm.cjs").create(buildStormDeps(ctx));
+  const r = await swarm.cmdSwarm(db, rest, runtimeOverride, {
+    cwd,
+    // v1 ensureTerminalProjectForExecutionCli 미포팅 — commands/storm.cjs 주석 참조.
+    projectPath: cwd,
+    permission,
+  });
+  return r && r.ok ? 0 : 1;
+}
+
+module.exports = { run, splitRuntimeOverride };
