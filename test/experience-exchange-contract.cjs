@@ -7,9 +7,9 @@ const os = require("node:os");
 const path = require("node:path");
 
 const exchange = require("../engine/agentlas-experience-exchange.cjs");
-const terminalAssets = require("../engine/agentlas-experience-mcp.cjs");
+const terminalAssets = require("../engine/experience/build.cjs");
 const desktopLoadout = require("../engine/agentlas-desktop-loadout.cjs");
-const { parseRunExperienceArgs, resolveRuntimeExperienceCli } = require("../engine/agentlas.cjs");
+const { parseRunExperienceArgs, resolveRuntimeExperienceCli } = require("../engine/experience/runtime.cjs");
 
 const fixture = JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures", "portable-experience-bundle-v1-golden.json"), "utf8"));
 const activationContract = JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures", "experience-activation-contract-v1.json"), "utf8"));

@@ -42,6 +42,10 @@ const COMMANDS = {
   taskforce: () => require("./workforce.cjs"),
   oberon: () => require("./oberon.cjs"),
   film: () => require("./film.cjs"),
+  experience: () => require("./experience.cjs"),
+  memory: () => require("./memory.cjs"),
+  evolve: () => require("./evolve.cjs"),
+  variant: () => require("./variant.cjs"),
 };
 
 // v1에 존재했으나 아직 v2로 재구축되지 않은 명령 — 정직 정지 목록.
@@ -51,9 +55,9 @@ const NOT_YET_PORTED = [
   "build", "upload", "connect",
   "storm", "swarm", "legacy-network",
   "call", "browser", "route", "research", "netadmin", "journal",
-  "creds", "memory",
-  "evolve", "ontology", "career-graph",
-  "cloud", "experience", "variant", "project",
+  "creds",
+  "ontology", "career-graph",
+  "cloud", "project",
   "context", "hep",
 ];
 

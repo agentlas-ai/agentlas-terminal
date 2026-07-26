@@ -7,7 +7,8 @@ const os = require("node:os");
 const path = require("node:path");
 
 const loadout = require("../engine/agentlas-desktop-loadout.cjs");
-const { parseRunExperienceArgs } = require("../engine/agentlas.cjs");
+// v1 모놀리스의 parseRunExperienceArgs 는 v2 experience/runtime 모듈로 이식됐다.
+const { parseRunExperienceArgs } = require("../engine/experience/runtime.cjs");
 const experienceExchange = require("../engine/agentlas-experience-exchange.cjs");
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "agentlas-desktop-loadout-contract-"));

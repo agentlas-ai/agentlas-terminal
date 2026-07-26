@@ -5,7 +5,12 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const core = require("../engine/agentlas.cjs");
+// v1 모놀리스의 curateCliReply/finalizeExperienceExecutionCli 는 v2에서
+// memory-cli/experience 모듈로 분리 이식됐다 — 계약(어서션)은 동일하다.
+const core = {
+  ...require("../engine/memory-cli/curate.cjs"),
+  ...require("../engine/experience/runtime.cjs"),
+};
 const exchange = require("../engine/agentlas-experience-exchange.cjs");
 const intake = require("../engine/agentlas-experience-intake.cjs");
 

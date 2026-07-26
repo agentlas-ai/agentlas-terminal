@@ -1,0 +1,196 @@
+"use strict";
+
+/*
+ * experience/variant — `agentlas variant resolve` 로컬 자문 해소기.
+ *
+ * v1 engine/agentlas-experience-mcp.cjs의 cmdVariant 슬라이스 이식.
+ * 결정 어휘는 계약이라 절대 변경 금지: selected | fallback | base-only | error.
+ *
+ * 권위 경계(v1 그대로):
+ *  - authority는 항상 "local-advisory"다. executionAuthorized/reputationAccepted/
+ *    serverResolutionReceiptPresent 는 로컬에서 절대 true가 될 수 없다 —
+ *    Hub 렌탈은 Web 서버 해소 영수증을 요구한다.
+ *  - required MCP 부족은 해당 variant만 제외한다(에이전트 전체 부족으로
+ *    승격 금지, requiredMcpFailureScope: "variant-only").
+ */
+
+const path = require("node:path");
+const { collectSystemMcpInventory } = require("../mcp/inventory.cjs");
+const { indexInventory, resolveMcpRequirement } = require("../mcp/plan.cjs");
+const {
+  assertObject,
+  assertExactKeys,
+  assertId,
+  validateMcpRequirement,
+  readJsonFile,
+  parseSimpleFlags,
+} = require("./intents.cjs");
+
+function validateVariantCandidate(candidate, index) {
+  const allowed = new Set(["variantId", "baseAgentReleaseId", "experiencePackReleaseId", "status", "compatibilityStatus", "score", "mcpRequirements"]);
+  assertExactKeys(candidate, allowed, ["variantId", "baseAgentReleaseId", "experiencePackReleaseId", "status", "compatibilityStatus", "score", "mcpRequirements"], `candidate[${index}]`);
+  for (const key of ["variantId", "baseAgentReleaseId", "experiencePackReleaseId"]) assertId(candidate[key], `candidate[${index}].${key}`);
+  const requirements = candidate.mcpRequirements == null ? [] : candidate.mcpRequirements;
+  if (!Array.isArray(requirements) || requirements.length > 64) throw new Error(`candidate[${index}].mcpRequirements is invalid`);
+  requirements.forEach((requirement, requirementIndex) => validateMcpRequirement(requirement, `candidate[${index}].mcpRequirements[${requirementIndex}]`));
+  const score = Number(candidate.score);
+  if (!Number.isFinite(score) || score < 0 || score > 1_000_000) throw new Error(`candidate[${index}].score is outside the local-preview range`);
+  return {
+    variantId: candidate.variantId,
+    baseAgentReleaseId: candidate.baseAgentReleaseId,
+    experiencePackReleaseId: candidate.experiencePackReleaseId,
+    status: String(candidate.status || "draft"),
+    compatibilityStatus: String(candidate.compatibilityStatus || "unverified"),
+    score,
+    mcpRequirements: requirements,
+  };
+}
+
+function resolveVariantCandidates(options) {
+  const candidates = (options.candidates || []).map(validateVariantCandidate);
+  const inventoryById = indexInventory(options.inventory || []);
+  if (!options.baseAgentReleaseId) {
+    return {
+      schemaVersion: "agentlas.terminal-variant-resolution.v1",
+      authority: "local-advisory",
+      executionAuthorized: false,
+      reputationAccepted: false,
+      serverResolutionReceiptPresent: false,
+      decision: "error",
+      code: "EXACT_BASE_RELEASE_REQUIRED",
+      selectedVariantId: null,
+      baseAgentReleaseId: null,
+      experiencePackReleaseId: null,
+      fallbackOrder: [],
+      degradedMcpIds: [],
+      excluded: [],
+      requiredMcpFailureScope: "variant-only",
+    };
+  }
+  const excluded = [];
+  const eligible = [];
+  for (const candidate of candidates) {
+    const reasons = [];
+    if (candidate.status !== "active") reasons.push(`variant-status:${candidate.status}`);
+    if (candidate.compatibilityStatus !== "verified") reasons.push(`compatibility:${candidate.compatibilityStatus}`);
+    if (options.baseAgentReleaseId && candidate.baseAgentReleaseId !== options.baseAgentReleaseId) reasons.push("base-release-mismatch");
+    const degradedMcpIds = [];
+    for (const requirement of candidate.mcpRequirements) {
+      const resolution = resolveMcpRequirement(requirement, inventoryById);
+      if (resolution.status !== "available" && requirement.required) reasons.push(`required-mcp-${resolution.status}:${requirement.catalogId}`);
+      else if (resolution.status !== "available") degradedMcpIds.push(requirement.catalogId);
+    }
+    if (reasons.length) excluded.push({ variantId: candidate.variantId, reasons });
+    else eligible.push({ ...candidate, degradedMcpIds });
+  }
+  eligible.sort((a, b) => b.score - a.score || a.variantId.localeCompare(b.variantId));
+  const selected = eligible[0] || null;
+  const baseRelease = options.baseAgentReleaseId;
+  if (selected) {
+    const decision = options.preferredVariantId && options.preferredVariantId !== selected.variantId ? "fallback" : "selected";
+    return {
+      schemaVersion: "agentlas.terminal-variant-resolution.v1",
+      authority: "local-advisory",
+      executionAuthorized: false,
+      reputationAccepted: false,
+      serverResolutionReceiptPresent: false,
+      decision,
+      selectedVariantId: selected.variantId,
+      baseAgentReleaseId: selected.baseAgentReleaseId,
+      experiencePackReleaseId: selected.experiencePackReleaseId,
+      fallbackOrder: eligible.slice(1).map((candidate) => candidate.variantId),
+      degradedMcpIds: selected.degradedMcpIds,
+      excluded,
+      requiredMcpFailureScope: "variant-only",
+    };
+  }
+  if (options.allowBaseOnly !== false && baseRelease) {
+    return {
+      schemaVersion: "agentlas.terminal-variant-resolution.v1",
+      authority: "local-advisory",
+      executionAuthorized: false,
+      reputationAccepted: false,
+      serverResolutionReceiptPresent: false,
+      decision: "base-only",
+      selectedVariantId: null,
+      baseAgentReleaseId: baseRelease,
+      experiencePackReleaseId: null,
+      fallbackOrder: [],
+      degradedMcpIds: [],
+      excluded,
+      requiredMcpFailureScope: "variant-only",
+    };
+  }
+  return {
+    schemaVersion: "agentlas.terminal-variant-resolution.v1",
+    authority: "local-advisory",
+    executionAuthorized: false,
+    reputationAccepted: false,
+    serverResolutionReceiptPresent: false,
+    decision: "error",
+    code: "NO_ELIGIBLE_VARIANT_AND_NO_BASE_FALLBACK",
+    selectedVariantId: null,
+    baseAgentReleaseId: baseRelease,
+    experiencePackReleaseId: null,
+    fallbackOrder: [],
+    degradedMcpIds: [],
+    excluded,
+    requiredMcpFailureScope: "variant-only",
+  };
+}
+
+function renderVariantResolution(result) {
+  const lines = [
+    `VARIANT RESOLUTION: ${result.decision}`,
+    "Local compatibility preview only; Hub rental requires a Web server resolution receipt.",
+    "Candidate score/verified claims are not accepted as reputation, payment, rental, or execution authority.",
+  ];
+  if (result.decision === "selected") lines.push(`selected: ${result.selectedVariantId}`);
+  else if (result.decision === "fallback") lines.push(`fallback selected: ${result.selectedVariantId}`);
+  else if (result.decision === "base-only") lines.push(`base-only: ${result.baseAgentReleaseId} (no Experience Pack attached)`);
+  else lines.push(`error: ${result.code}`);
+  if (result.fallbackOrder.length) lines.push(`next fallbacks: ${result.fallbackOrder.join(", ")}`);
+  for (const excluded of result.excluded) lines.push(`excluded only ${excluded.variantId}: ${excluded.reasons.join(", ")}`);
+  lines.push("Required MCP shortages exclude only the affected variant; they never create an agent-wide shortage.");
+  return lines.join("\n");
+}
+
+function cmdVariant(options) {
+  const args = options.args || [];
+  const sub = args[0] || "resolve";
+  if (sub !== "resolve") throw new Error(`unknown variant subcommand: ${sub} (resolve)`);
+  const flags = parseSimpleFlags(args.slice(1));
+  let candidates = [];
+  let baseAgentReleaseId = flags["base-release"] || null;
+  const candidateFile = flags.candidates || flags._[0];
+  if (candidateFile) {
+    const { value } = readJsonFile(path.resolve(options.cwd || process.cwd(), candidateFile), "variant candidates");
+    if (Array.isArray(value)) candidates = value;
+    else {
+      assertObject(value, "variant candidate document");
+      if (!Array.isArray(value.candidates)) throw new Error("variant candidate document must contain candidates[]");
+      candidates = value.candidates;
+      if (!baseAgentReleaseId && value.baseAgentReleaseId) baseAgentReleaseId = value.baseAgentReleaseId;
+    }
+  }
+  if (baseAgentReleaseId) assertId(baseAgentReleaseId, "--base-release");
+  const inventory = collectSystemMcpInventory(options.db, { userDataDir: options.userDataDir, env: options.env || process.env });
+  const result = resolveVariantCandidates({
+    candidates,
+    inventory,
+    baseAgentReleaseId,
+    preferredVariantId: flags.prefer || null,
+    allowBaseOnly: flags["no-base-only"] !== true,
+  });
+  const emit = options.out || console.log;
+  emit(flags.json ? JSON.stringify(result, null, 2) : renderVariantResolution(result));
+  if (result.decision === "error") (options.setExitCode || ((code) => { process.exitCode = code; }))(2);
+  return result;
+}
+
+module.exports = {
+  validateVariantCandidate,
+  resolveVariantCandidates,
+  renderVariantResolution,
+  cmdVariant,
+};
