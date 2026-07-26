@@ -46,19 +46,29 @@ const COMMANDS = {
   memory: () => require("./memory.cjs"),
   evolve: () => require("./evolve.cjs"),
   variant: () => require("./variant.cjs"),
+  hep: () => require("./hep.cjs"),
+  build: () => require("./build.cjs"),
+  connect: () => require("./connect.cjs"),
+  call: () => require("./call.cjs"),
+  browser: () => require("./browser.cjs"),
+  route: () => require("./route.cjs"),
+  research: () => require("./research.cjs"),
+  netadmin: () => require("./netadmin.cjs"),
+  journal: () => require("./journal.cjs"),
+  "legacy-network": () => require("./legacy-network.cjs"),
 };
 
 // v1에 존재했으나 아직 v2로 재구축되지 않은 명령 — 정직 정지 목록.
 // 재구축이 끝나면 여기서 지우고 COMMANDS에 올린다.
 const NOT_YET_PORTED = [
   
-  "build", "upload", "connect",
-  "storm", "swarm", "legacy-network",
-  "call", "browser", "route", "research", "netadmin", "journal",
+  "upload",
+  "storm", "swarm",
+  
   "creds",
   "ontology", "career-graph",
   "cloud", "project",
-  "context", "hep",
+  "context",
 ];
 
 // 무인자 호출이 프롬프트로 오라우팅되면 안 되는 명령 (smoke 가드 대상)
