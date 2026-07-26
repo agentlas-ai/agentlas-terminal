@@ -3233,7 +3233,14 @@ function create(deps = {}) {
           receipt.failure.benchmarkPersistenceError = String((persistError && persistError.message) || persistError).slice(0, 500);
         }
       }
-      if (!ctx.silent) ui.error(`${receipt.failure.code}: ${receipt.failure.message}`);
+      if (!ctx.silent) {
+        // 서버/검증 거절 사유(details)는 영수증에만 남고 화면에서 누락되던 표시 결함 —
+        // 정직 중계 원칙상 사유를 원문 그대로 병기한다(실사용 network 테스트에서 실증).
+        const detailText = receipt.failure.details
+          ? ` — ${JSON.stringify(receipt.failure.details).slice(0, 600)}`
+          : "";
+        ui.error(`${receipt.failure.code}: ${receipt.failure.message}${detailText}`);
+      }
       return { ok: false, error: receipt.failure, receipt, benchmarkArtifactPath };
     }
   }
