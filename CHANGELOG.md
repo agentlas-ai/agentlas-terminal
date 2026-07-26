@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.9.9 — 2026-07-26
+
+- In an explicitly initialized project, ordinary runs, firms, Stormbreaker, and
+  Workforce now receive the same local Context Slice from Agentlas OS v1.1.66
+  after the task is concrete. The slice carries inherited goals and constraints
+  plus exact definitions, backlinks, and structurally related files without
+  sending the project map to Hub or Cloud.
+- Read, write, and full task permission no longer doubles as consent to create
+  `.agentlas/` or edit `.gitignore`. `agentlas project status` is passive, and
+  only the explicit `agentlas project init` boundary creates private project
+  state after announcing the side effects.
+- Workload-routing receipts now conform to the public v1 nested schema, treat a
+  missing model/runtime pair as unresolved, and fail closed on unknown required
+  metadata or ambiguous duplicate model identifiers.
+- The shared architecture seeder is monotonic: it preserves newer or
+  unparseable shared state, upgrades older state atomically, and repairs only
+  missing built-ins at an equal version instead of flipping the Desktop-shared
+  database back to an older Terminal bundle.
+- Interactive output is append-only while a task runs, preserves long streamed
+  output and scrollback through resize/cancellation, wraps command meaning at
+  narrow widths, and keeps saved runtime, permission, lifecycle, and Korean/
+  English status text truthful.
+- Release validation targets the exact Agentlas OS v1.1.66 contract commit
+  `3f6f9ac3929b9238330de18c758ba200fb371017`.
+
 ## 0.9.8 — 2026-07-25
 
 - No more silent keyword fallback. When the connected model can't judge a route

@@ -116,6 +116,25 @@ agentlas import <폴더>             # 로컬 에이전트/팀 임포트
 agentlas list                      # 설치된 에이전트/회사 + 활성 런타임
 ```
 
+**프로젝트 의존관계 지도**
+```sh
+agentlas project status
+agentlas project init
+agentlas context refresh
+agentlas context refs resolveHubEntityKind
+agentlas context slice --task "entity kind 라우팅 수정" \
+  --target src/package-kind.ts --render
+agentlas context impact --changed src/package-kind.ts
+agentlas context verify --changed src/package-kind.ts \
+  --reviewed src/register/route.ts
+```
+
+`agentlas project init`으로 명시적으로 초기화한 프로젝트에서만 일반
+실행, 팀, Stormbreaker, Workforce가 작업이 구체화된 뒤 같은 로컬 Context
+Slice를 자동으로 받는다. 읽기·쓰기·전체 권한만으로는 `.agentlas/`나
+`.gitignore`를 만들거나 수정하지 않는다. Hub/Cloud 검색에는 코드맵,
+소스 경로, 프로젝트 파일 내용이 전송되지 않는다.
+
 **Portable Experience Bundle과 Variant**
 ```sh
 agentlas experience list

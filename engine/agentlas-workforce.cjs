@@ -1643,7 +1643,13 @@ function create(deps = {}) {
   }
 
   async function runModel(runtime, system, prompt, context) {
-    if (typeof D.runModel === "function") return normalizeModelText(await D.runModel({ runtime, system, prompt, context }));
+    const localContextSlice = typeof D.projectContextSlice === "function"
+      ? D.projectContextSlice(context.cwd, context.task || "")
+      : "";
+    const effectiveSystem = localContextSlice
+      ? `${system}\n\n${localContextSlice}`
+      : system;
+    if (typeof D.runModel === "function") return normalizeModelText(await D.runModel({ runtime, system: effectiveSystem, prompt, context }));
     if (runtime.mode === "cli") {
       const authorityMode = context.authorityMode || "no-authority";
       if (runtime.kind === "codex" && authorityMode === "no-authority") {
@@ -1658,7 +1664,7 @@ function create(deps = {}) {
           "Gemini CLI workforce execution is blocked until this host proves an empty built-in and MCP tool inventory",
         );
       }
-      return normalizeModelText(await D.captureRuntime(runtime.kind, system, prompt, {
+      return normalizeModelText(await D.captureRuntime(runtime.kind, effectiveSystem, prompt, {
         cwd: context.cwd,
         env: context.env,
         permission: context.permission,
@@ -1667,7 +1673,7 @@ function create(deps = {}) {
         authorityMode,
       }));
     }
-    return normalizeModelText(await D.runApi(runtime.backend, context.modelPin || runtime.model, system, prompt));
+    return normalizeModelText(await D.runApi(runtime.backend, context.modelPin || runtime.model, effectiveSystem, prompt));
   }
 
   async function callHubTool(name, args) {
@@ -1888,7 +1894,15 @@ function create(deps = {}) {
     const env = typeof D.buildChildEnv === "function" ? await D.buildChildEnv(db, {
       projectPath: ctx.projectPath || null, permission, cwd, lang: ui.lang,
     }) : process.env;
-    const modelContext = { cwd, permission, env, modelPin: ctx.modelPin || null, effortPin: ctx.effortPin, authorityMode: "no-authority" };
+    const modelContext = {
+      cwd,
+      permission,
+      env,
+      modelPin: ctx.modelPin || null,
+      effortPin: ctx.effortPin,
+      authorityMode: "no-authority",
+      task,
+    };
     const prompts = buildPrompts(task, identity);
     const runId = `workforce-run:${crypto.randomUUID()}`;
     const provider = runtime.mode === "cli" ? runtime.kind : runtime.backend;

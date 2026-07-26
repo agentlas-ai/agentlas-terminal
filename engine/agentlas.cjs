@@ -8334,7 +8334,39 @@ function ensureTerminalProjectForExecutionCli(db, projectPath, permission = PERM
   if (permission === "read") return activeProjectPath(db, { projectPath: root });
   return activeProjectPath(db, { projectPath: root, activate: true, reason });
 }
-function cliMemoryContext(db, projectPath, agentId = null) {
+
+function cliProjectContextSlice(projectPath, task) {
+  if (!projectPath || !String(task || "").trim()) return "";
+  try {
+    const coreRoot = resolveCoreRuntimeRoot();
+    if (!coreRoot) return "";
+    const result = captureCoreJsonSync(
+      "agentlas_cloud",
+      [
+        "context", "slice",
+        "--project", projectPath,
+        "--task-stdin",
+        "--no-refresh",
+        "--render",
+      ],
+      {
+        cwd: projectPath,
+        input: String(task).slice(0, 12_000),
+        timeout: 4_000,
+      },
+      coreRoot,
+    );
+    return result
+      && result.schemaVersion === "agentlas.context-slice.v1"
+      && typeof result.rendered === "string"
+      ? result.rendered.trim()
+      : "";
+  } catch {
+    return "";
+  }
+}
+
+function cliMemoryContext(db, projectPath, agentId = null, task = "") {
   const sections = [];
   const arch = loadArch();
   ensureMemoryContextColumn(db);
@@ -8347,6 +8379,8 @@ function cliMemoryContext(db, projectPath, agentId = null) {
         if (s.trim()) sections.push(`### Project memory (${projectPath})\n${s.trim()}`);
       }
     } catch { /* ignore */ }
+    const contextSlice = cliProjectContextSlice(projectPath, task);
+    if (contextSlice) sections.push(contextSlice);
   }
   if (tableExists(db, "memory_entries")) {
     try {
@@ -8514,7 +8548,7 @@ function augmentSystem(db, baseSystem, ctx, withEmitter, request = "") {
   sys = langDirective(lang) + (sys ? "\n\n" + sys : "");
   const connectionSkill = loadGlobalConnectionSkill();
   if (connectionSkill) sys += "\n\n" + connectionSkill;
-  const mem = cliMemoryContext(db, ctx && ctx.projectPath, ctx && ctx.agentId);
+  const mem = cliMemoryContext(db, ctx && ctx.projectPath, ctx && ctx.agentId, request);
   if (mem) sys += "\n\n" + mem;
   if (withEmitter) {
     sys += "\n\n" + memoryEmitterPromptFor(request, arch, ctx && ctx.turnId, ctx && ctx.permission);
@@ -9803,7 +9837,7 @@ function buildHelpers(db) {
     autoRouteNote: (choice, lang) => autoRouteNote(choice, lang),
     autoRoutePreamble: (choice, lang) => autoRoutePreamble(choice, lang),
     directSystemPrompt: (lang) => directSystemPrompt(lang),
-    cliMemoryContext: (db_, pp, agentId) => cliMemoryContext(db_, pp, agentId),
+    cliMemoryContext: (db_, pp, agentId, task) => cliMemoryContext(db_, pp, agentId, task),
     importLocal: (db_, p) => importLocalFolderCli(db_, p),
     // REPL-safe public Hub install: fail()(process.exit) 대신 Error를 throw 해 REPL이 직접 렌더하게 한다.
     cloudInstall: async (db_, slug) => {
@@ -10285,6 +10319,7 @@ function workforce() {
       fetchHub: (url, init) => fetchHubCli(url, init),
       listWorkforceTools: listWorkforceToolsCli,
       supportsWorkforceToolAuthority: async () => false,
+      projectContextSlice: cliProjectContextSlice,
       prefsLang,
       out,
     });
@@ -11949,6 +11984,7 @@ function cmdHelp() {
       "  research <sub>           Research Engine: status|gather|search|read|plan",
       "  career-graph <sub>       source routing index: status|list|add",
       "  ontology <sub>           project knowledge: status|list|add   (REPL: /ontology)",
+      "  context <sub>            project map: refresh|locate|refs|slice|impact|verify",
       "  journal <sub>            Stormbreaker run journal: status|verify|repair|gate",
       "",
       hdr("ACCOUNT & OPS"),
@@ -12063,6 +12099,17 @@ async function main() {
     case "memory":
       // Phase 1b: 기존 마크다운 메모리 → 공유 agentlas.sqlite 이관(dry-run 기본, --apply).
       return require("./agentlas-memory-import.cjs").cmdMemory({ db, args: rest.slice(1), out, fail });
+    case "context": {
+      if (!rest[1]) return fail("usage: agentlas context refresh|locate|refs|slice|impact|verify [options]");
+      const cwd = projectCwd();
+      ensureTerminalProjectForExecutionCli(db, cwd, PERMISSION, "terminal-context");
+      const contextArgs = rest.slice(1);
+      const hasProject = contextArgs.includes("--project");
+      return parity().cmdHep(
+        db,
+        ["context", ...contextArgs, ...(hasProject ? [] : ["--project", cwd])],
+      );
+    }
     case "evolve":
       // Phase 2/2+: 데스크탑 트리거가 만든 성장 제안 검토·적용·되돌리기(공유 DB).
       return require("./agentlas-evolution.cjs").cmdEvolve({ db, args: rest.slice(1), out, fail, agentFolder });
