@@ -55,6 +55,16 @@ class Session extends EventEmitter {
       parentChatId: opts.parent ? opts.parent.chatId : null,
       workingFolder: this.cwd,
     });
+    // 이 세션이 붙은 챗의 kind — apply-fences의 division 재귀 가드가 parent 없는
+    // 기존 division 챗(자동화 marker 세션 등)에도 걸리게 한다.
+    // 데스크탑은 chat.kind !== 'division' 조건으로 같은 가드를 건다(client.ts:3493).
+    this.chatKind = opts.parent ? "division" : "user";
+    if (opts.chatId) {
+      try {
+        const chatRow = this.db.prepare("SELECT kind FROM chats WHERE id=?").get(opts.chatId);
+        if (chatRow && chatRow.kind === "division") this.chatKind = "division";
+      } catch { /* kind 열이 없는 구형 DB — user 취급(레거시 NULL=user 계약) */ }
+    }
 
     this.fingerprint = crypto.createHash("sha256")
       .update(`${this.runtime.kind}\n${this.agent.id}\n${this.agent.systemPrompt || ""}`)

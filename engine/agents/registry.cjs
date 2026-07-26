@@ -22,6 +22,25 @@ const BACKGROUND_AGENT_FINGERPRINTS = new Set([
   "0331d654916d648797d31598e3e18eb7fd49166e91783ab9d731648b6e855b90",
 ]);
 const BACKGROUND_ROLES = new Set(["orchestrator", "pm", "curator", "governance"]);
+// 데스크탑 electron/agents/policy.ts:35 REMOVED_MARKETPLACE_SEED_SLUGS 동형 —
+// 마켓에서 회수된 시드 에이전트는 publicAgentVisibility가 무조건 'private'으로
+// 강등한다(electron/agents/policy.ts:96). 데스크탑은 db.ts:1499에서 이 값을
+// visibility 열에 백필하지만, 데스크탑 마이그레이션이 안 돈 DB에서 터미널이
+// 이 목록 없이 읽으면 회수된 시드가 목록/해석에 다시 새어 나온다.
+const REMOVED_MARKETPLACE_SEED_SLUGS = new Set([
+  "shop-product-writer",
+  "shop-cs-responder",
+  "shop-review-monitor",
+  "shop-pricing-scout",
+  "shop-keyword-finder",
+  "marketer-content-writer",
+  "marketer-seo-researcher",
+  "marketer-schedule-secretary",
+  "marketer-ad-copywriter",
+  "marketer-analytics-reader",
+  "firm-ceo-shop",
+  "firm-ceo-marketer",
+]);
 
 function policyNormalize(value) {
   return String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
@@ -47,6 +66,19 @@ function isBackgroundAgentRow(row) {
   return agentRowFingerprints(row).some((value) => BACKGROUND_AGENT_FINGERPRINTS.has(value));
 }
 
+/**
+ * 데스크탑 publicAgentVisibility 동형 (electron/agents/policy.ts:95-100):
+ * 회수된 마켓 시드 슬러그 → private (지문/역할 검사보다 먼저),
+ * 웹 전용 → private, 백그라운드 → background, 그 외 → 열 값(없으면 visible).
+ */
+function publicAgentVisibilityRow(row) {
+  if (REMOVED_MARKETPLACE_SEED_SLUGS.has(policyNormalize(row.slug))) return "private";
+  if (isPrivateWebOnlyAgentRow(row)) return "private";
+  if (isBackgroundAgentRow(row)) return "background";
+  const declared = policyNormalize(row.visibility);
+  return declared === "visible" || declared === "background" || declared === "private" ? declared : "visible";
+}
+
 function rowToAgent(row) {
   if (!row) return null;
   return {
@@ -65,10 +97,10 @@ function rowToAgent(row) {
   };
 }
 
-/** 웹 전용(private) 제외 전체 목록 — 백그라운드 인프라는 visibility='background'로 정규화. */
+/** 웹 전용(private)·회수 시드 제외 전체 목록 — 백그라운드 인프라는 visibility='background'로 정규화. */
 function listPublicAgents(db) {
   return db.prepare("SELECT * FROM installed_agents ORDER BY installed_at DESC").all()
-    .filter((row) => !isPrivateWebOnlyAgentRow(row))
+    .filter((row) => publicAgentVisibilityRow(row) !== "private")
     .map((row) => rowToAgent({ ...row, visibility: isBackgroundAgentRow(row) ? "background" : "visible" }));
 }
 
@@ -122,4 +154,5 @@ module.exports = {
   agentSystemPrompt,
   isPrivateWebOnlyAgentRow,
   isBackgroundAgentRow,
+  publicAgentVisibilityRow,
 };

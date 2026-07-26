@@ -33,6 +33,16 @@ function writePublicAgent(root, title = "CAS Public Agent") {
     capabilities: ["cloud_cas_testing"],
     routing_status: "routing_ready",
   }, null, 2) + "\n");
+  // 공개 발행 이중 언어 메타데이터 게이트(데스크탑 package.ts:435-449 동형) 충족.
+  fs.writeFileSync(path.join(root, ".agentlas", "agent-card.json"), JSON.stringify({
+    name: title,
+    localized: {
+      titleEn: title,
+      titleKo: "CAS 공개 에이전트",
+      descriptionEn: "Exercises conditional multi-host Cloud writes.",
+      descriptionKo: "조건부 멀티호스트 Cloud 쓰기를 검증합니다.",
+    },
+  }, null, 2) + "\n");
 }
 
 function listen(server) {

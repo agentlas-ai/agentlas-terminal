@@ -93,10 +93,10 @@ for (const url of [
     },
   };
   const first = installPluginMcpRowsCli(db, [result.row]);
-  assert.deepEqual(first, { installed: 1, reused: 0 });
+  assert.deepEqual(first, { installed: 1, reused: 0, needsApproval: ["stripe"] });
   const again = installPluginMcpRowsCli(db, [result.row]);
-  assert.deepEqual(again, { installed: 0, reused: 1 }, "re-install must be idempotent");
-  const [, catalogId, name, nameEn, transport, command, argsJson, url] = inserts[0];
+  assert.deepEqual(again, { installed: 0, reused: 1, needsApproval: [] }, "re-install must be idempotent");
+  const [, catalogId, name, nameEn, transport, command, argsJson, url, , enabled] = inserts[0];
   assert.equal(catalogId, "hub:stripe:stripe");
   assert.equal(name, "stripe");
   assert.equal(nameEn, "stripe");
@@ -104,6 +104,41 @@ for (const url of [
   assert.equal(command, "npx");
   assert.deepEqual(JSON.parse(argsJson), ["-y", "@stripe/mcp", "--tools=all"]);
   assert.equal(url, null);
+  // 데스크탑 hub-plugin-bridge.ts:209-228 동형: stdio(원격 메타데이터발 로컬 실행)는
+  // 절대 자동 활성화되지 않는다 — enabled=0 + needs-approval 표면화.
+  assert.equal(enabled, 0, "hub stdio plugin rows must be registered disabled pending approval");
+}
+
+// ── 4b. http/sse 원격 행은 자동 연결(enabled=1) — 로컬 실행이 없다 ──
+{
+  const remote = pluginMcpRowCli("vercel", { name: "vercel", transport: "http", url: "https://mcp.vercel.com" }, 0);
+  assert.ok(remote.row, "https remote row must install");
+  const inserts = [];
+  const db = {
+    prepare(sql) {
+      if (/^SELECT id FROM mcp_servers/.test(sql)) return { get: () => undefined };
+      return { run: (...params) => inserts.push(params) };
+    },
+  };
+  const result = installPluginMcpRowsCli(db, [remote.row]);
+  assert.deepEqual(result, { installed: 1, reused: 0, needsApproval: [] });
+  assert.equal(inserts[0][9], 1, "remote http rows auto-connect (enabled=1) like the desktop bridge");
+}
+
+// ── 4c. 데스크탑 isLikelyRemoteMcpEndpoint 동형: https 필수 + 저장소/패키지 페이지 거부 ──
+{
+  const plaintext = pluginMcpRowCli("insecure", { name: "insecure", transport: "http", url: "http://mcp.example.com/mcp" }, 0);
+  assert.ok(plaintext.refused, "plaintext http remote endpoints must be refused (desktop requires https)");
+  const npmPage = pluginMcpRowCli("npmpage", { name: "npmpage", transport: "http", url: "https://www.npmjs.com/package/some-mcp" }, 0);
+  assert.ok(npmPage.refused, "npm package pages are docs, not MCP endpoints");
+  const pypiPage = pluginMcpRowCli("pypipage", { name: "pypipage", source: "https://pypi.org/project/some-mcp/" }, 0);
+  assert.ok(pypiPage.refused, "pypi pages are docs, not MCP endpoints");
+  // 레거시 행: mcp.* 호스트만으로는 신뢰하지 않는다 — 경로가 /mcp|/sse 를 가리켜야 한다
+  // (데스크탑 hub-plugin-bridge.ts:94 동형).
+  const hostOnly = pluginMcpRowCli("hostonly", { name: "hostonly", source: "https://mcp.example.com/" }, 0);
+  assert.ok(hostOnly.refused, "legacy rows need an explicit /mcp or /sse path, not just an mcp.* host");
+  const pathOk = pluginMcpRowCli("pathok", { name: "pathok", source: "https://mcp.linear.app/sse" }, 0);
+  assert.ok(pathOk.row, "https endpoint with /sse path stays accepted");
 }
 
 // ── 5. 레거시 비-URL source는 기존대로 stdio 커맨드로 해석 (하위호환) ──

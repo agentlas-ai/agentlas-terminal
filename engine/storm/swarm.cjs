@@ -170,12 +170,19 @@ function create(deps) {
       lang: ui.lang,
     });
 
-    async function runBaseWorker(system, prompt) {
+    async function runBaseWorker(system, prompt, options = {}) {
+      // 플래너/판정성 턴은 텍스트(JSON)만 내면 된다 — 실행 권한을 주면 모델이
+      // 계획 대신 goal을 그 자리에서 실행해버린다(실사용 storm 테스트에서 실증:
+      // 플래너 턴이 hello.txt를 직접 생성). options.permission으로 read 강등 허용.
+      const turnPermission = options.permission || permission;
       if (runtime.mode === "cli") {
         return await D.captureRuntime(runtime.kind, system, prompt, {
           cwd,
           env,
-          permission,
+          permission: turnPermission,
+          // no-authority: 도구 자체를 비운다 — read(plan 모드)만으로는 claude가
+          // "계획 파일 작성 후 승인 대기" UX로 납치되어 JSON을 내지 않는다(실측).
+          authorityMode: options.authorityMode,
           model: ctx.modelPin || runtime.model || null,
           effort: ctx.effortPin === undefined ? null : ctx.effortPin,
         });
@@ -251,27 +258,42 @@ function create(deps) {
 
     ui.startSpinner(ui.lang === "ko" ? "상위 AI가 작업별 모델 비용을 배정 중…" : "Higher-level AI is allocating task models…");
     let planned = null;
-    try {
-      const plannerText = await runBaseWorker(
-        [
-          coreHarnessPrompt,
-          workloadRouting.plannerSystemPrompt({
-            language: ui.lang === "ko" ? "Korean" : "English",
-            maxTasks: Math.min(SWARM_SPAWN_PER_TURN, SWARM_MAX_TASKS),
-            mode: stormbreaker ? "stormbreaker-goal-ultracode" : "swarm",
-            liveRuntimeInventory,
-          }),
-        ].filter(Boolean).join("\n\n"),
-        ctx.routeContext
-          ? `${goal}\n\nHEPHAESTUS ROUTE EVIDENCE (advisory; the Agentlas parent owns the final plan):\n${ctx.routeContext}`
-          : goal,
-      );
-      planned = workloadRouting.normalizePlan(plannerText, { maxTasks: SWARM_SPAWN_PER_TURN });
-    } catch (error) {
-      ui.warn(`workload planner failed: ${String((error && error.message) || error).slice(0, 160)}`);
+    // 플래너는 읽기 전용 + 무효 JSON 1회 재시도. v1의 "현재 모델로 투명 폴백" 경로는
+    // 이후의 폴백 제거·정직정지 강화로 죽은 길이 됐는데 메시지와 유령 작업만 남아
+    // "폴백한다"고 말하고 fail-closed로 죽는 모순을 냈다(실사용 storm 테스트 실증).
+    // 방침대로: 재시도 후에도 무효면 정직 정지.
+    for (let attempt = 0; attempt < 2 && !planned; attempt++) {
+      try {
+        const plannerText = await runBaseWorker(
+          [
+            coreHarnessPrompt,
+            workloadRouting.plannerSystemPrompt({
+              language: ui.lang === "ko" ? "Korean" : "English",
+              maxTasks: Math.min(SWARM_SPAWN_PER_TURN, SWARM_MAX_TASKS),
+              mode: stormbreaker ? "stormbreaker-goal-ultracode" : "swarm",
+              liveRuntimeInventory,
+            }),
+            attempt > 0
+              ? "PREVIOUS ATTEMPT WAS NOT VALID PLAN JSON. Reply with ONLY the plan JSON object — no prose, no tool use."
+              : "",
+          ].filter(Boolean).join("\n\n"),
+          ctx.routeContext
+            ? `${goal}\n\nHEPHAESTUS ROUTE EVIDENCE (advisory; the Agentlas parent owns the final plan):\n${ctx.routeContext}`
+            : goal,
+          { permission: "read", authorityMode: "no-authority" },
+        );
+        planned = workloadRouting.normalizePlan(plannerText, { maxTasks: SWARM_SPAWN_PER_TURN });
+      } catch (error) {
+        ui.warn(`workload planner failed: ${String((error && error.message) || error).slice(0, 160)}`);
+      }
     }
     ui.stopSpinner();
-    if (!planned) ui.warn(ui.lang === "ko" ? "모델 배정 JSON이 유효하지 않아 현재 모델로 투명하게 폴백합니다." : "Invalid allocation JSON; transparently falling back to the current model.");
+    if (!planned) {
+      ui.error(ui.lang === "ko"
+        ? "플래너가 유효한 실행 계획(JSON)을 내지 못했습니다 — 정지합니다 (조용한 폴백 금지)."
+        : "The planner did not produce a valid plan JSON — stopping (no silent fallback).");
+      return { ok: false, reason: "invalid_plan_json" };
+    }
     if (planned) {
       ui.line("");
       ui.info(stormbreaker
@@ -285,9 +307,7 @@ function create(deps) {
     }
 
     let seq = 0;
-    const initialTasks = planned
-      ? planned.tasks
-      : [{ title: goal.slice(0, 80), brief: goal, role: undefined, allocation: null }];
+    const initialTasks = planned.tasks; // 정직 정지 이후 planned는 항상 유효 — 유령 폴백 작업 경로 제거
     const tasks = initialTasks.map((task) => ({ id: ++seq, ...task, status: "pending", result: "", parentTaskId: null }));
     const seen = new Set(tasks.map((task) => task.title.toLowerCase()));
     let active = 0;

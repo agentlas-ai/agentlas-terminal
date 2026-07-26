@@ -781,7 +781,22 @@ async function installHubAgent(db, slug, options = {}) {
  * (실사용 테스트에서 실증된 모델 드리프트 — 데스크탑과 토씨까지 맞춘다).
  */
 function assertHubInstallAllowed(listing, slug) {
-  const { isPrivateWebOnlyAgentRow } = require("../agents/registry.cjs");
+  const { isPrivateWebOnlyAgentRow, publicAgentVisibilityRow } = require("../agents/registry.cjs");
+  // 회수된 마켓 시드는 데스크탑 marketplace가 리스팅 자체를 숨긴다
+  // (electron/marketplace/index.ts:180 isPublicDesktopAgent → null = not found).
+  // 터미널도 같은 관측 결과를 낸다 — 설치 불가, 존재하지 않는 상품으로 취급.
+  const rowLike = {
+    slug: listing.slug || slug,
+    name: listing.name,
+    name_en: listing.nameEn,
+    tagline: listing.tagline,
+    tagline_en: listing.taglineEn,
+    visibility: listing.visibility,
+    role: listing.role,
+  };
+  if (publicAgentVisibilityRow(rowLike) === "private" && !isPrivateWebOnlyAgentRow(rowLike)) {
+    throw new Error(`Hub agent not found: ${slug}`);
+  }
   if (isPrivateWebOnlyAgentRow({
     slug: listing.slug || slug,
     name: listing.name,

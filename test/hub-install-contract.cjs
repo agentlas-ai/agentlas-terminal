@@ -131,6 +131,19 @@ async function main() {
     );
   }
 
+  // ── 1c. 회수된 마켓 시드 슬러그 → not found (데스크탑 marketplace/index.ts:180 동형) ──
+  await assert.rejects(
+    () => installHubAgent(db, "shop-product-writer", {
+      callTool: fakeCallTool({ "shop-product-writer": { slug: "shop-product-writer", name: "Shop Writer", systemPrompt: "brain", trustGrade: "A" } }),
+    }),
+    /Hub agent not found: shop-product-writer/,
+    "removed marketplace seed slugs are hidden products — install must observe not-found",
+  );
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS n FROM installed_agents WHERE slug='shop-product-writer'").get().n, 0,
+    "removed seed refusal must not insert a row",
+  );
+
   // ── 2. 신규 설치: 행 + entity_kind + materialize ──
   const v1 = makeListing("contract-agent", { entryText: "# v1\nfirst version body" });
   const installed = await installHubAgent(db, "contract-agent", {

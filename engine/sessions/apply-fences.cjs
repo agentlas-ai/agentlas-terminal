@@ -82,8 +82,10 @@ function applyReplyFences(session, parsed, opts = {}) {
       receipts.refused.push(refusal);
       continue;
     }
-    if (session.parent) {
-      // division 서브세션의 자동화 등록 금지 — 자동화가 자동화를 만드는 재귀 방지.
+    if (session.parent || session.chatKind === "division") {
+      // division 서브세션(자동화 marker 세션 포함)의 자동화 등록 금지 — 자동화가
+      // 자동화를 만드는 재귀 방지. 데스크탑 client.ts:3493(chat.kind !== 'division')과 동형:
+      // parent 없는 자동화 실행 세션도 division 챗이므로 반드시 이 가드에 걸려야 한다.
       const refusal = { type: "automation-refused", name: a.name, reason: "division session may not register automations" };
       record(refusal);
       receipts.refused.push(refusal);

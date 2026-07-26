@@ -21,6 +21,37 @@ const { callHubTool, fetchHub, parseHubJson, webBaseUrl } = require("../cloud/hu
 // 등록하면 "절대 연결될 수 없는 MCP 서버"가 생긴다(2026-07-23 근본수리 계열).
 const PLUGIN_CODE_HOSTING_HTML_RE = /^https?:\/\/(www\.)?(github\.com|gitlab\.com|bitbucket\.org)\//i;
 
+// 데스크탑 hub-plugin-bridge.ts:38 REPO_PAGE_HOSTS 동형 — 저장소/패키지 HTML 페이지
+// 호스트. 데스크탑은 npm/pypi 패키지 페이지도 엔드포인트가 아니라고 본다.
+const PLUGIN_REPO_PAGE_HOSTS = new Set([
+  "github.com",
+  "www.github.com",
+  "gitlab.com",
+  "www.gitlab.com",
+  "bitbucket.org",
+  "www.bitbucket.org",
+  "npmjs.com",
+  "www.npmjs.com",
+  "pypi.org",
+]);
+
+/**
+ * 데스크탑 isLikelyRemoteMcpEndpoint 동형 (electron/mcp-tools/hub-plugin-bridge.ts:61):
+ * https 필수, 저장소/패키지 HTML 페이지 호스트는 거부. v1 터미널은 http://도 원격
+ * 엔드포인트로 수용했지만 현 데스크탑 모델은 평문 원격 MCP 등록을 허용하지 않는다.
+ */
+function pluginIsLikelyRemoteMcpEndpoint(rawUrl) {
+  let url;
+  try {
+    url = new URL(String(rawUrl || ""));
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "https:") return false;
+  if (PLUGIN_REPO_PAGE_HOSTS.has(url.hostname.toLowerCase())) return false;
+  return true;
+}
+
 /** Hub 플러그인 매니페스트 조회. 404 → null, 스키마 불일치/HTTP 오류 → throw. */
 async function fetchPluginManifest(slug, { fetch: fetchImpl } = {}) {
   const resp = await fetchHub(`${webBaseUrl()}/api/plugins/${encodeURIComponent(slug)}`, {
@@ -35,20 +66,15 @@ async function fetchPluginManifest(slug, { fetch: fetchImpl } = {}) {
   return manifest;
 }
 
-/** 휴리스틱: 명시적 transport 선언이 없는 레거시 source URL이 진짜 MCP 엔드포인트로 보이는가. */
+/**
+ * 휴리스틱: 명시적 transport 선언이 없는 레거시 source URL이 진짜 MCP 엔드포인트로 보이는가.
+ * 데스크탑 hub-plugin-bridge.ts:94 동형 — https 엔드포인트이면서 경로가 명시적으로
+ * MCP(/mcp, /sse)를 가리킬 때만 신뢰한다. v1의 "mcp.* 호스트면 경로 없이 수용" 완화는
+ * 데스크탑 모델에 없다(호스트명만으로 엔드포인트를 추정하지 않는다).
+ */
 function pluginLooksLikeMcpEndpoint(rawUrl) {
-  let parsed;
-  try {
-    parsed = new URL(String(rawUrl || ""));
-  } catch {
-    return false;
-  }
-  if (!/^https?:$/.test(parsed.protocol)) return false;
-  if (PLUGIN_CODE_HOSTING_HTML_RE.test(parsed.href)) return false;
-  const pathname = parsed.pathname.replace(/\/+$/, "");
-  if (/\/(mcp|sse)$/i.test(pathname)) return true; // …/mcp, …/sse 관례
-  if (/^mcp\./i.test(parsed.hostname)) return true; // mcp.linear.app 류 전용 호스트
-  return false;
+  if (!pluginIsLikelyRemoteMcpEndpoint(rawUrl)) return false;
+  return /\/(mcp|sse)(?:$|[/?#])/.test(String(rawUrl));
 }
 
 /**
@@ -93,7 +119,11 @@ function pluginMcpRow(slug, entry, index) {
     if (PLUGIN_CODE_HOSTING_HTML_RE.test(url)) {
       return refuse("URL is a code-hosting HTML page (docs), not an MCP endpoint");
     }
-    // 명시적 transport 선언은 서버가 검증한 연결정보로 신뢰한다 (레포 페이지만 방어).
+    // 명시 선언이어도 데스크탑과 동일하게 isLikelyRemoteMcpEndpoint를 통과해야 한다
+    // (hub-plugin-bridge.ts:90) — https 필수, 저장소/패키지 페이지 호스트 거부.
+    if (!pluginIsLikelyRemoteMcpEndpoint(url)) {
+      return refuse("URL is not a usable remote MCP endpoint (https required; repo/package pages are docs)");
+    }
     return makeRow({ transport: "http", command: null, argsJson: "[]", url });
   }
   if (transport) return refuse(`unsupported transport "${transport}"`);
@@ -130,23 +160,37 @@ function planPluginMcpInstall(slug, manifest) {
   return { rows, refused };
 }
 
-/** 정규화된 행들을 로컬 mcp_servers 스키마에 멱등 삽입. { installed, reused } 반환. */
+/**
+ * 정규화된 행들을 로컬 mcp_servers 스키마에 멱등 삽입.
+ * { installed, reused, needsApproval } 반환.
+ *
+ * 데스크탑 hub-plugin-bridge.ts:209-228 동형(자율 경계, 2026-07-23 재설계):
+ * stdio(로컬 프로세스 실행 = 원격 메타데이터발 코드 실행)는 절대 자동 활성화하지
+ * 않는다 — enabled=0으로 등록하고 승인 필요로 정직하게 표면화한다. 이 테이블은
+ * 데스크탑과 공유되므로, 터미널이 enabled=1로 넣으면 데스크탑 런타임 구성이
+ * 승인 게이트 없이 그 로컬 프로세스를 실행하게 된다. http/sse 원격 연결만
+ * 자동 활성화한다(네트워크 연결일 뿐 로컬 실행이 없다).
+ */
 function installPluginMcpRows(db, rows) {
   let installed = 0;
   let reused = 0;
+  const needsApproval = [];
   for (const row of rows) {
+    const stdioNeedsApproval = row.transport === "stdio";
     const existing = db.prepare("SELECT id FROM mcp_servers WHERE catalog_id = ? LIMIT 1").get(row.catalogId);
     if (existing) { reused += 1; continue; } // 멱등: 재설치가 중복 행을 만들지 않는다
     db.prepare(
       `INSERT INTO mcp_servers (id, catalog_id, name, name_en, transport, command, args_json, url, env_keys_json, enabled, installed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       row.id, row.catalogId, row.name, row.name, row.transport,
-      row.command, row.argsJson, row.url, row.envKeysJson, new Date().toISOString(),
+      row.command, row.argsJson, row.url, row.envKeysJson,
+      stdioNeedsApproval ? 0 : 1, new Date().toISOString(),
     );
     installed += 1;
+    if (stdioNeedsApproval) needsApproval.push(row.name);
   }
-  return { installed, reused };
+  return { installed, reused, needsApproval };
 }
 
 /** Hub 플러그인 카탈로그 목록 (marketplace.list_plugins). 실패는 그대로 throw — 폴백 카탈로그 금지. */
@@ -158,7 +202,9 @@ async function listHubPlugins({ callTool } = {}) {
 
 module.exports = {
   PLUGIN_CODE_HOSTING_HTML_RE,
+  PLUGIN_REPO_PAGE_HOSTS,
   fetchPluginManifest,
+  pluginIsLikelyRemoteMcpEndpoint,
   pluginLooksLikeMcpEndpoint,
   pluginMcpRow,
   planPluginMcpInstall,

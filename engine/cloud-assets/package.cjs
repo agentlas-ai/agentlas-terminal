@@ -238,6 +238,60 @@ function cloudReadTagline(snapshot) {
   return "Portable Agentlas cloud agent package.";
 }
 
+/*
+ * 공개 Hub 발행 이중 언어 메타데이터 게이트 — 데스크탑 package.ts:435-449 동형.
+ * 데스크탑은 게이트 전에 연결된 모델로 자동 번역을 시도하지만(package.ts:428-434),
+ * v2 터미널은 로컬 런타임 리뷰 계층이 아직 미배선이라(--llm-review 정직 정지와
+ * 동일 계열) 번역 없이 게이트만 적용한다 — 조용한 무검증 발행보다 정직한 차단.
+ */
+function cloudCleanLocalizedField(value, max) {
+  return typeof value === "string"
+    ? value.normalize("NFKC").replace(/\s+/g, " ").trim().slice(0, max).trim()
+    : "";
+}
+
+function cloudNormalizeLocalizedListing(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const localized = {
+    titleEn: cloudCleanLocalizedField(value.titleEn, 96),
+    titleKo: cloudCleanLocalizedField(value.titleKo, 96),
+    descriptionEn: cloudCleanLocalizedField(value.descriptionEn, 640),
+    descriptionKo: cloudCleanLocalizedField(value.descriptionKo, 640),
+  };
+  return Object.values(localized).some(Boolean) ? localized : undefined;
+}
+
+function cloudReadLocalizedListing(snapshot) {
+  const manifest = cloudReadPackageJson(snapshot);
+  for (const source of [manifest.agentCard, manifest.agentlas, manifest.manifest, manifest.routingCard]) {
+    const nested = cloudNormalizeLocalizedListing(source && source.localized);
+    if (nested) return nested;
+    const flat = cloudNormalizeLocalizedListing(source);
+    if (flat) return flat;
+  }
+  return undefined;
+}
+
+// 데스크탑 localizedListingProblems(package.ts:1777-1794) 토씨 동일.
+function cloudLocalizedListingProblems(value) {
+  if (!value) return ["localized object missing"];
+  const issues = [];
+  if (!value.titleEn) issues.push("titleEn missing");
+  if (!value.titleKo) issues.push("titleKo missing");
+  if (!value.descriptionEn) issues.push("descriptionEn missing");
+  if (!value.descriptionKo) issues.push("descriptionKo missing");
+  if (/[가-힣]/.test(value.titleEn)) issues.push("titleEn contains Hangul");
+  if (/[가-힣]/.test(value.descriptionEn)) issues.push("descriptionEn contains Hangul");
+  if (
+    value.descriptionEn
+    && value.descriptionEn === value.descriptionKo
+    && /[가-힣]/.test(value.descriptionKo)
+  ) {
+    issues.push("English description is not translated");
+  }
+  return issues;
+}
+
 function cloudReadStableSlug(snapshot) {
   const manifest = cloudReadPackageJson(snapshot);
   return stringFirst(
@@ -723,6 +777,21 @@ async function packageCloudAgent(db, root, opts = {}) {
   }
   const routingCard = isPublicHubPublish ? readCloudRoutingCard(snapshot) : {};
   if (routingCard.finding) scan.findings.push(routingCard.finding);
+  if (isPublicHubPublish) {
+    // 데스크탑 package.ts:435-449 동형: 공개 Hub 리스팅은 검증된 EN/KO 메타데이터 필수.
+    const localizedProblems = cloudLocalizedListingProblems(cloudReadLocalizedListing(snapshot));
+    if (localizedProblems.length > 0) {
+      scan.findings.push({
+        id: "localized-metadata-required",
+        severity: "blocker",
+        category: "structure",
+        file: ".agentlas/agent-card.json",
+        message: `Public Hub metadata needs verified English and Korean fields: ${localizedProblems.join(", ")}.`,
+        remediation:
+          "Add localized.titleEn, titleKo, descriptionEn, and descriptionKo to .agentlas/agent-card.json, or use local-runtime review so Agentlas can translate them with your connected model.",
+      });
+    }
+  }
   const packageFindings = isPublicHubPublish ? scan.findings : privateCloudSafetyFindings(scan.findings);
   const name = cloudReadName(snapshot, path.basename(rootPath));
   const slug = cloudSlug(opts.slug || cloudReadStableSlug(snapshot) || name || path.basename(rootPath));
@@ -846,6 +915,8 @@ module.exports = {
   cloudPackageSnapshot,
   cloudReadName,
   cloudReadTagline,
+  cloudReadLocalizedListing,
+  cloudLocalizedListingProblems,
   cloudReadStableSlug,
   cloudInferKind,
   cloudDetectRuntimeLabels,

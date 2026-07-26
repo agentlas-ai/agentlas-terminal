@@ -316,9 +316,16 @@ const timeoutConfig = { idleMs: 5000, totalMs: 10000, killGraceMs: 100 };
 
   // 세션 계층 경유 증명: 자동화 실행이 chats/chat_messages 에 영속됐다
   const autoChat = db.prepare(
-    "SELECT c.id FROM chats c JOIN chat_messages m ON m.chat_id=c.id WHERE m.role='user' AND m.text='Automation prompt goes to the session.'",
+    "SELECT c.id, c.kind, c.title FROM chats c JOIN chat_messages m ON m.chat_id=c.id WHERE m.role='user' AND m.text='Automation prompt goes to the session.'",
   ).get();
   assert.ok(autoChat, "automation turn persisted through the v2 session layer");
+  // 데스크탑 getOrCreateAutomationSession 동형(chats.ts:334-375): 자동화 실행은
+  // 숨김 division marker 세션이다 — 사용자 챗 목록(kind='user')을 오염시키지 않는다.
+  assert.equal(autoChat.kind, "division", "automation runs must use a hidden division session");
+  assert.match(String(autoChat.title), /^⟦automation⟧.*::target:agent:[0-9a-f]{16}$/, "division session must carry the desktop-parity marker title");
+  // 두 번째 실행이 같은 marker 세션을 재사용한다 (매 실행 새 챗 금지).
+  const markerChats = db.prepare("SELECT COUNT(*) AS n FROM chats WHERE kind='division' AND title=?").get(autoChat.title);
+  assert.equal(markerChats.n, 1, "one persistent division session per automation target");
 
   // 실패 실행: error 기록 + run_count 미증가 + next_run_at 는 그래도 전진
   db.prepare("UPDATE automations SET next_run_at=? WHERE id=?")
@@ -343,6 +350,73 @@ const timeoutConfig = { idleMs: 5000, totalMs: 10000, killGraceMs: 100 };
   assert.equal(code, 0);
   assert.match(outLines.join("\n"), /Due automation/);
   console.log("daemon tick execution: OK");
+
+  // ── 6. 데스크탑 동형 실행 게이트 (hub 타깃 / tool_mode / 실행 계약) ──
+  // 6a. hub 타깃: 리스/스케줄을 소비하지 않는 정직 스킵 (Desktop 스케줄러 몫).
+  const hubId = store.addAutomation(db, {
+    name: "Hub target", targetType: "hub", targetId: "some-hub-agent",
+    cron: "*/5 * * * *", prompt: "noop", tz: null, disabled: false,
+  }, schedule.nextCronRun("*/5 * * * *", new Date(), null));
+  const hubRow = db.prepare("SELECT * FROM automations WHERE id=?").get(hubId);
+  const hubResult = await daemon.runAutomationOnce(ctx, db, hubRow,
+    { runtime: fakeRuntime, spawnImpl: fakeClaudeSpawn("must not run"), timeoutConfig });
+  assert.equal(hubResult.skipped, true);
+  assert.equal(hubResult.reason, "hub-target-unsupported");
+  const hubAfter = db.prepare("SELECT next_run_at, claimed_at FROM automations WHERE id=?").get(hubId);
+  assert.equal(hubAfter.next_run_at, hubRow.next_run_at, "hub-target skip must not consume the occurrence");
+  assert.equal(hubAfter.claimed_at, null, "hub-target skip must not claim the lease");
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM run_history WHERE automation_id=?").get(hubId).n, 0);
+  db.prepare("DELETE FROM automations WHERE id=?").run(hubId);
+
+  // 6b. tool_mode 'computer-use': 터미널엔 CUA/브라우저 러너가 없다 — 위장 실행 금지.
+  const cuaId = store.addAutomation(db, {
+    name: "CUA target", targetType: "agent", targetId: agentRow.id,
+    cron: "*/5 * * * *", prompt: "noop", tz: null, disabled: false,
+  }, schedule.nextCronRun("*/5 * * * *", new Date(), null));
+  db.prepare("UPDATE automations SET tool_mode='computer-use' WHERE id=?").run(cuaId);
+  const cuaResult = await daemon.runAutomationOnce(ctx, db,
+    db.prepare("SELECT * FROM automations WHERE id=?").get(cuaId),
+    { runtime: fakeRuntime, spawnImpl: fakeClaudeSpawn("must not run"), timeoutConfig });
+  assert.equal(cuaResult.skipped, true);
+  assert.equal(cuaResult.reason, "tool-mode-unsupported");
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM run_history WHERE automation_id=?").get(cuaId).n, 0);
+  db.prepare("DELETE FROM automations WHERE id=?").run(cuaId);
+
+  // 6c. raw-row 실행 계약 게이트 — 데스크탑 automation-scheduler.ts:538-549 문구 동일.
+  const contractId = store.addAutomation(db, {
+    name: "Contract gate", targetType: "agent", targetId: agentRow.id,
+    cron: "*/5 * * * *", prompt: "noop", tz: null, disabled: false,
+  }, schedule.nextCronRun("*/5 * * * *", new Date(), null));
+  db.prepare("UPDATE automations SET hub_mode='weird-future-mode' WHERE id=?").run(contractId);
+  const hubModeResult = await daemon.runAutomationOnce(ctx, db,
+    db.prepare("SELECT * FROM automations WHERE id=?").get(contractId),
+    { runtime: fakeRuntime, spawnImpl: fakeClaudeSpawn("must not run"), timeoutConfig });
+  assert.equal(hubModeResult.ok, false);
+  assert.match(String(hubModeResult.error), /automation_hub_mode_contract_invalid: the saved Hub routing policy is unknown and requires an explicit selection\./);
+  let contractHist = db.prepare("SELECT * FROM run_history WHERE automation_id=? ORDER BY ran_at DESC").all(contractId);
+  assert.equal(contractHist[0].status, "needs_input", "contract violation is needs_input, never a silent run");
+
+  // runtime_selection_json 은 데스크탑이 나중에 추가한 열 — 부트스트랩 스키마에 없으면
+  // 추가해 계약 게이트를 검증한다 (daemon 은 columnExists 로 방어하므로 없는 DB에선 missing 취급).
+  try { db.prepare("ALTER TABLE automations ADD COLUMN runtime_selection_json TEXT").run(); } catch { /* already present */ }
+  db.prepare("UPDATE automations SET hub_mode='hub-allowed', runtime_selection_json='not-json{' WHERE id=?").run(contractId);
+  const pinInvalidResult = await daemon.runAutomationOnce(ctx, db,
+    db.prepare("SELECT * FROM automations WHERE id=?").get(contractId),
+    { runtime: fakeRuntime, spawnImpl: fakeClaudeSpawn("must not run"), timeoutConfig });
+  assert.equal(pinInvalidResult.ok, false);
+  assert.match(String(pinInvalidResult.error), /pinned_runtime_contract_invalid: the saved runtime pin is malformed and requires an explicit runtime selection\./);
+
+  // 6d. 유효한 핀인데 이 터미널이 실행 못 하는 종류 → 조용한 대체 없이 정직 정지
+  //     (데스크탑 client.ts:1828-1830 pinned-runtime-unavailable 동형 문구).
+  db.prepare("UPDATE automations SET runtime_selection_json=? WHERE id=?")
+    .run(JSON.stringify({ kind: "byok", backend: "anthropic", model: "claude-sonnet-4-6" }), contractId);
+  const pinUnavailable = await daemon.runAutomationOnce(ctx, db,
+    db.prepare("SELECT * FROM automations WHERE id=?").get(contractId),
+    { spawnImpl: fakeClaudeSpawn("must not run"), timeoutConfig });
+  assert.equal(pinUnavailable.ok, false);
+  assert.match(String(pinUnavailable.error), /Pinned automation runtime is unavailable: byok · claude-sonnet-4-6/);
+  db.prepare("DELETE FROM automations WHERE id=?").run(contractId);
+  console.log("desktop-parity execution gates: OK");
 
   // 정리
   fs.rmSync(tmp, { recursive: true, force: true });

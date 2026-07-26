@@ -52,6 +52,20 @@ function writePublicAgent(root) {
     }, null, 2) + "\n",
     "utf8",
   );
+  // 데스크탑 package.ts:435-449 동형 게이트: 공개 Hub 발행은 검증된 EN/KO 메타데이터 필수.
+  fs.writeFileSync(
+    path.join(root, ".agentlas", "agent-card.json"),
+    JSON.stringify({
+      name: "Public Test Agent",
+      localized: {
+        titleEn: "Public Test Agent",
+        titleKo: "공개 테스트 에이전트",
+        descriptionEn: "Runs the public test task.",
+        descriptionKo: "공개 테스트 작업을 실행합니다.",
+      },
+    }, null, 2) + "\n",
+    "utf8",
+  );
 }
 
 function listen(server) {
@@ -393,6 +407,10 @@ function close(server) {
     });
     assert.equal(publicBlocked.status, "blocked");
     assert.ok(publicBlocked.review.findings.some((finding) => finding.id === "routing-card-required"));
+    // 데스크탑 package.ts:435-449 동형: EN/KO 메타데이터 없는 공개 발행은 blocker.
+    const localizedFinding = publicBlocked.review.findings.find((finding) => finding.id === "localized-metadata-required");
+    assert.ok(localizedFinding, "public publish without bilingual metadata must be blocked");
+    assert.match(localizedFinding.message, /Public Hub metadata needs verified English and Korean fields/);
 
     const publicRoot = path.join(tempDir, "public-agent");
     writePublicAgent(publicRoot);

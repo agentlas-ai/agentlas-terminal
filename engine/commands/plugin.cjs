@@ -43,9 +43,9 @@ async function pluginAdd(ctx, slug) {
     );
     return 1;
   }
-  let installed, reused;
+  let installed, reused, needsApproval;
   try {
-    ({ installed, reused } = installPluginMcpRows(ctx.db(), rows));
+    ({ installed, reused, needsApproval } = installPluginMcpRows(ctx.db(), rows));
   } catch (e) {
     ctx.err(String((e && e.message) || e));
     return 1;
@@ -55,6 +55,10 @@ async function pluginAdd(ctx, slug) {
     ctx.out(`  ⚠ skipped ${item.name}: ${item.reason}${item.source ? ` (${item.source})` : ""}`);
   }
   ctx.out(`  MCP servers: ${installed} added${reused ? `, ${reused} already present` : ""}`);
+  // 데스크탑 hub-plugin-bridge.ts:219-227 동형: stdio는 비활성 등록 + 승인 필요 표면화.
+  for (const name of needsApproval || []) {
+    ctx.out(`  ⚠ needs-approval ${name}: local execution requires one-click approval in MCP settings`);
+  }
   const authKind = manifest.auth?.kind;
   if (authKind && authKind !== "none") {
     ctx.out(`  ⚠ Requires ${authKind} — set credentials before use (agentlas creds).`);

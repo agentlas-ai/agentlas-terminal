@@ -10,13 +10,82 @@
  * Desktop 스케줄러가 같은 행을 동시에 돌리는 것을 막는 유일한 방어선.
  * 리스를 못 잡으면 실행하지 않는다(skip, 정직 보고).
  */
+const crypto = require("node:crypto");
 const { findAgent, rowToAgent } = require("../agents/registry.cjs");
 const { resolveRuntime } = require("../runtimes/resolve.cjs");
 const { Orchestrator } = require("../sessions/orchestrator.cjs");
+const sessionStore = require("../sessions/store.cjs");
 const permissions = require("../agentlas-permissions.cjs");
 const { columnExists } = require("../core/db.cjs");
 const schedule = require("./schedule.cjs");
 const store = require("./store.cjs");
+
+// ── 실행 계약 상태 (데스크탑 automations.ts:115-176 decodeRuntimeSelection /
+//    getAutomationExecutionContractState 동형) ──────────────────────────────
+// 손상된/미래 계약 값은 절대 조용히 넓혀 실행하지 않는다 — raw-row 게이트로
+// 무인 실행 직전에 검사한다(데스크탑 automation-scheduler.ts:538-549).
+const RUNTIME_KINDS = new Set([
+  "claude-code", "codex", "gemini", "kimi", "grok", "cursor", "byok", "ollama", "lmstudio", "mlx",
+]);
+const RUNTIME_BACKENDS = new Set([
+  "anthropic", "openai", "google", "ollama", "lmstudio", "mlx", "upstage", "custom", "glm",
+  "kimi", "deepseek", "minimax", "xai", "openrouter", "cursor",
+]);
+const RUNTIME_SELECTION_KEYS = new Set(["kind", "backend", "source", "model", "longContext", "effort"]);
+
+function decodeRuntimeSelection(raw) {
+  if (raw == null) return { state: "missing" };
+  try {
+    const value = JSON.parse(raw);
+    if (
+      value && typeof value === "object" && !Array.isArray(value) &&
+      Object.keys(value).every((key) => RUNTIME_SELECTION_KEYS.has(key)) &&
+      typeof value.kind === "string" && RUNTIME_KINDS.has(value.kind) &&
+      (value.backend === undefined || (typeof value.backend === "string" && RUNTIME_BACKENDS.has(value.backend))) &&
+      (value.source === undefined || (typeof value.source === "string" && value.source.length > 0 && value.source.length <= 2048)) &&
+      (value.model === undefined || (typeof value.model === "string" && value.model.length > 0 && value.model.length <= 512)) &&
+      (value.longContext === undefined || typeof value.longContext === "boolean") &&
+      (value.effort === undefined || (typeof value.effort === "string" && value.effort.length <= 128))
+    ) {
+      return { state: "valid", value };
+    }
+  } catch { /* 손상 데이터는 아래에서 invalid — 진짜 없는 레거시 핀과 구분한다 */ }
+  return { state: "invalid" };
+}
+
+function automationContractState(db, row) {
+  const runtimeSelection = columnExists(db, "automations", "runtime_selection_json")
+    ? decodeRuntimeSelection(row.runtime_selection_json)
+    : { state: "missing" };
+  const hubMode = !columnExists(db, "automations", "hub_mode") || row.hub_mode == null
+    ? "missing"
+    : row.hub_mode === "hub-first" || row.hub_mode === "local-only" || row.hub_mode === "hub-allowed"
+      ? "valid"
+      : "invalid";
+  return { runtimeSelection: runtimeSelection.state, runtimePin: runtimeSelection.value || null, hubMode };
+}
+
+/**
+ * 자동화별 숨김 지속 세션 — 데스크탑 getOrCreateAutomationSession 동형
+ * (electron/store/chats.ts:334-375). marker 제목이 바이트 단위로 같아 데스크탑
+ * 스케줄러와 같은 division 챗을 공유한다: recurring work가 매 실행마다 새 사용자
+ * 챗을 만들지 않고(kind='user' 목록 오염 금지), 이전 결과/차단 상태를 이어받는다.
+ */
+function automationSessionChatId(db, row, agent) {
+  const targetKind = row.target_type === "firm" ? "firm" : "agent";
+  const targetHash = crypto.createHash("sha256")
+    .update(targetKind).update("\0").update(String(row.target_id))
+    .digest("hex").slice(0, 16);
+  const marker = `⟦automation⟧${row.id}::target:${targetKind}:${targetHash}`;
+  try {
+    const existing = db.prepare("SELECT id FROM chats WHERE kind = 'division' AND title = ? LIMIT 1").get(marker);
+    if (existing) return existing.id;
+    return sessionStore.createChat(db, { agentId: agent.id, title: marker, kind: "division" });
+  } catch {
+    // chats 스키마가 아직 없으면(비정상 DB) 세션 계층의 기본 챗 생성에 맡긴다.
+    return null;
+  }
+}
 
 /**
  * 자동화 타깃(agent/firm) → 세션에 태울 agent 객체.
@@ -61,6 +130,28 @@ async function runAutomationOnce(ctx, db, row, opts = {}) {
       : `This automation is disabled and was not run: ${row.name}`);
     return { ok: false, skipped: true, reason: "disabled" };
   }
+  // ── 터미널이 충실히 실행할 수 없는 계열은 리스를 잡지 않고 스킵한다 ──
+  // 리스/스케줄을 소비하면 데스크탑 스케줄러가 그 회차를 영영 실행하지 못한다.
+  // Hub 타깃: 데스크탑은 정확 릴리스 핀 + Hub 런타임으로 실행한다
+  // (automation-scheduler.ts:573-630 hub_version_pin 게이트) — 터미널에는 그
+  // 실행 계층이 없으므로 위장 실행 금지, 정직 스킵.
+  if (row.target_type === "hub") {
+    ctx.err(ko
+      ? `Hub 타깃 자동화는 터미널 데몬이 실행하지 않습니다(정확 릴리스 핀 실행은 Desktop 스케줄러 몫): ${row.name}`
+      : `Hub-target automations are not run by the terminal daemon (exact-release Hub execution belongs to the Desktop scheduler): ${row.name}`);
+    return { ok: false, skipped: true, reason: "hub-target-unsupported" };
+  }
+  // tool_mode 'browser'/'computer-use': 데스크탑은 Agentlas Browser/컴퓨터유즈
+  // 러너를 배선하고 권한 프리플라이트까지 건다(automation-scheduler.ts:619-625).
+  // 터미널 세션 계층에는 그 러너가 없다 — 평문 세션으로 돌리는 조용한 다운그레이드
+  // (위장 실행) 대신 정직 스킵으로 Desktop 실행분을 남겨 둔다.
+  const rowToolMode = columnExists(db, "automations", "tool_mode") ? row.tool_mode : null;
+  if (rowToolMode === "browser" || rowToolMode === "computer-use") {
+    ctx.err(ko
+      ? `tool_mode '${rowToolMode}' 자동화는 터미널 데몬이 실행하지 않습니다(브라우저/컴퓨터유즈 러너는 Desktop 몫): ${row.name}`
+      : `tool_mode '${rowToolMode}' automations are not run by the terminal daemon (the browser/computer-use runner belongs to Desktop): ${row.name}`);
+    return { ok: false, skipped: true, reason: "tool-mode-unsupported" };
+  }
   if (!store.leaseSupported(db)) {
     // 리스 열이 없는 DB에서는 Desktop 과의 배타성을 증명할 수 없다 — fail-closed.
     ctx.err(ko
@@ -77,8 +168,39 @@ async function runAutomationOnce(ctx, db, row, opts = {}) {
   }
 
   try {
+    // ── raw-row 실행 계약 게이트 (데스크탑 automation-scheduler.ts:538-549 동형) ──
+    // 손상된 계약 값으로는 무인 실행하지 않는다 — 문구까지 데스크탑과 동일.
+    const contract = automationContractState(db, row);
+    if (contract.runtimeSelection === "invalid") {
+      const msg = "pinned_runtime_contract_invalid: the saved runtime pin is malformed and requires an explicit runtime selection.";
+      ctx.err(msg);
+      store.recordRun(db, row.id, "needs_input", msg, opts.scheduledFor);
+      store.advanceAfterRun(db, row, { ok: false, advanceSchedule: !!opts.advanceSchedule });
+      return { ok: false, error: msg };
+    }
+    if (contract.hubMode === "invalid") {
+      const msg = "automation_hub_mode_contract_invalid: the saved Hub routing policy is unknown and requires an explicit selection.";
+      ctx.err(msg);
+      store.recordRun(db, row.id, "needs_input", msg, opts.scheduledFor);
+      store.advanceAfterRun(db, row, { ok: false, advanceSchedule: !!opts.advanceSchedule });
+      return { ok: false, error: msg };
+    }
+
     const agent = resolveTargetAgent(db, row);
-    const runtime = opts.runtime || resolveRuntime({ db, prefs: ctx.prefs, explicit: opts.runtimeOverride || null });
+    // 런타임 사다리: 명시 --runtime > 유효한 자동화 핀(runtime_selection_json) > 기본 사다리.
+    // 핀이 있는데 이 터미널이 그 종류를 실행할 수 없으면 조용한 대체 없이 정직 정지
+    // (데스크탑 client.ts:1828-1830 pinned-runtime-unavailable 문구 동형).
+    let runtime = opts.runtime || null;
+    if (!runtime && !opts.runtimeOverride && contract.runtimePin) {
+      const pin = contract.runtimePin;
+      try {
+        runtime = resolveRuntime({ db, prefs: ctx.prefs, explicit: pin.kind });
+        if (pin.model) runtime.model = pin.model;
+      } catch {
+        throw new Error(`Pinned automation runtime is unavailable: ${pin.kind}${pin.model ? ` · ${pin.model}` : ""}`);
+      }
+    }
+    if (!runtime) runtime = resolveRuntime({ db, prefs: ctx.prefs, explicit: opts.runtimeOverride || null });
     // 권한: 자동화 행에 permission 열이 있으면 그 값, 없으면 write (v1 기본과 동일).
     const rowPermission = columnExists(db, "automations", "permission") ? row.permission : null;
     const permission = permissions.normalize(rowPermission || "write", "write");
@@ -86,6 +208,9 @@ async function runAutomationOnce(ctx, db, row, opts = {}) {
     ctx.err(ctx.ui.dim(`${agent.slug} · ${runtime.kind} · ${permission} · ${ko ? "자동화" : "automation"} ${String(row.id).slice(0, 8)}`));
 
     const orch = opts.orchestrator || new Orchestrator({ db, lang: ctx.lang });
+    // 자동화 실행 = 숨김 division marker 세션 (데스크탑 chats.ts:334-375 동형).
+    // 사용자 챗 목록을 오염시키지 않고, Desktop 스케줄러와 같은 세션을 이어 쓴다.
+    const markerChatId = automationSessionChatId(db, row, agent);
     const session = orch.spawn({
       agent,
       runtime,
@@ -94,6 +219,7 @@ async function runAutomationOnce(ctx, db, row, opts = {}) {
       title: `automation: ${row.name}`.slice(0, 60),
       spawnImpl: opts.spawnImpl,
       timeoutConfig: opts.timeoutConfig,
+      ...(markerChatId ? { chatId: markerChatId } : {}),
     });
     if (typeof opts.onSession === "function") opts.onSession(session);
 
@@ -141,8 +267,11 @@ async function daemonTick(ctx, db, opts = {}) {
   let ran = 0;
   for (const row of due) {
     if (opts.shouldStop && opts.shouldStop()) break;
+    // 터미널 미지원 계열(hub 타깃/browser/computer-use)은 due 로 계속 남는다 —
+    // Desktop 몫으로 남겨둔 것이므로 틱마다 같은 안내를 반복하지 않는다.
+    if (opts.skipAnnounced && opts.skipAnnounced.has(row.id)) continue;
     ran += 1;
-    await runAutomationOnce(ctx, db, row, {
+    const result = await runAutomationOnce(ctx, db, row, {
       advanceSchedule: true,
       scheduledFor: row.next_run_at,
       runtimeOverride: opts.runtimeOverride,
@@ -150,6 +279,13 @@ async function daemonTick(ctx, db, opts = {}) {
       spawnImpl: opts.spawnImpl,
       timeoutConfig: opts.timeoutConfig,
     });
+    if (
+      opts.skipAnnounced && result && result.skipped &&
+      (result.reason === "hub-target-unsupported" || result.reason === "tool-mode-unsupported")
+    ) {
+      opts.skipAnnounced.add(row.id);
+      continue; // 스케줄/1회성 비활성화도 건드리지 않는다 — Desktop 이 실행해야 할 회차다.
+    }
     // 스케줄이 없는(1회성) 행이 남으면 재발화 방지 (v1과 동일).
     if (!row.schedule || !schedule.nextAutomationRun(row)) {
       db.prepare("UPDATE automations SET enabled = 0 WHERE id = ? AND (schedule IS NULL OR schedule = '')").run(row.id);
@@ -172,10 +308,12 @@ async function automationDaemon(ctx, db, opts = {}) {
     ? "Ctrl-C로 종료. (데스크탑 앱 스케줄러와 리스를 공유해 중복 실행되지 않습니다.)"
     : "Ctrl-C to stop. (Shares the SQLite lease with the Desktop scheduler; no duplicate runs.)"));
 
+  const skipAnnounced = new Set(); // 미지원 계열 안내는 데몬 수명당 1회
   while (!stopping) {
     await daemonTick(ctx, db, {
       runtimeOverride: opts.runtimeOverride,
       shouldStop: () => stopping,
+      skipAnnounced,
     });
     // interval 대기 (1초 단위로 stop 체크 — SIGINT 후 최대 1초 안에 내려온다)
     for (let i = 0; i < intervalSec && !stopping; i++) {
@@ -186,4 +324,12 @@ async function automationDaemon(ctx, db, opts = {}) {
   return 0;
 }
 
-module.exports = { runAutomationOnce, daemonTick, automationDaemon, resolveTargetAgent };
+module.exports = {
+  runAutomationOnce,
+  daemonTick,
+  automationDaemon,
+  resolveTargetAgent,
+  automationContractState,
+  automationSessionChatId,
+  decodeRuntimeSelection,
+};
