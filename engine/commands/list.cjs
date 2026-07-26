@@ -5,15 +5,14 @@
  * 데스크탑과 동일하게 목록에서 숨긴다.
  */
 const { activeRuntimeRow, listAvailableCliRuntimes } = require("../runtimes/detect.cjs");
+const { listAgents } = require("../agents/registry.cjs");
 
 function run(ctx) {
   const db = ctx.db();
-  const hasVisibility = ctx.columnExists(db, "installed_agents", "visibility");
-  const agents = db.prepare(
-    hasVisibility
-      ? "SELECT slug, name, name_en, tagline, tagline_en, builtin FROM installed_agents WHERE visibility='visible' ORDER BY builtin DESC, slug"
-      : "SELECT slug, name, name_en, tagline, tagline_en, builtin FROM installed_agents ORDER BY builtin DESC, slug",
-  ).all();
+  // 프라이버시 정책(웹 전용/백그라운드 제외)은 registry가 소유한다 — 직접 SQL 금지.
+  const agents = listAgents(db).map((a) => ({
+    slug: a.slug, name: a.name, name_en: a.nameEn, tagline: a.tagline, tagline_en: a.taglineEn, builtin: a.builtin,
+  }));
   const firms = ctx.tableExists(db, "firms")
     ? db.prepare("SELECT id, name FROM firms ORDER BY name").all()
     : [];

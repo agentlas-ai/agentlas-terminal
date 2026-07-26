@@ -36,6 +36,7 @@ const COMMANDS = {
   automation: () => require("./automation.cjs"),
   native: () => require("./native.cjs"),
   chat: () => require("./chat.cjs"),
+  multimodal: () => require("./multimodal.cjs"),
 };
 
 // v1에 존재했으나 아직 v2로 재구축되지 않은 명령 — 정직 정지 목록.
@@ -46,7 +47,7 @@ const NOT_YET_PORTED = [
   "storm", "swarm", "network", "workforce", "taskforce", "legacy-network",
   "call", "browser", "route", "research", "netadmin", "journal",
   "creds", "memory",
-  "evolve", "multimodal", "oberon", "film", "ontology", "career-graph",
+  "evolve", "oberon", "film", "ontology", "career-graph",
   "cloud", "experience", "variant", "project",
   "context", "hep",
 ];
