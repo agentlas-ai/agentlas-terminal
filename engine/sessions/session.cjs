@@ -161,7 +161,26 @@ class Session extends EventEmitter {
     this._child = null;
 
     const finalText = (res && (res.finalText || res.text)) || "";
-    if (finalText) store.appendMessage(this.db, this.chatId, "assistant", finalText);
+    /*
+     * 펜스 프로토콜(Desktop runner 패리티): 성공 턴의 최종 텍스트에서 숨은 제어
+     * 블록(## Memory Events / ## Delegate / ## Automation / <<agentlas-ask>>)을
+     * 파싱하고, 영속·표시에는 cleanText 만 남긴다. 실패/킬 턴은 파싱하지 않는다 —
+     * 반쯤 죽은 응답의 위임/자동화를 실행하지 않기 위해. 파서 예외 시 원문 보존
+     * (데이터 유실이 오폭보다 낫다). require 는 lazy — orchestrator 와의 로드
+     * 사이클 방지.
+     */
+    let persistText = finalText;
+    let parsedFences = null;
+    if (finalText && !(res && res.error) && this.status !== "killed") {
+      try {
+        parsedFences = require("./fences.cjs").parseReplyFences(finalText);
+        persistText = parsedFences.cleanText;
+      } catch {
+        parsedFences = null;
+        persistText = finalText;
+      }
+    }
+    if (persistText) store.appendMessage(this.db, this.chatId, "assistant", persistText);
     if (res && res.session && res.session.id) {
       this.runtimeSession = { id: res.session.id };
       store.saveRuntimeSession(this.db, this.chatId, this.runtime.kind, this.runtimeSession, this.fingerprint);
@@ -179,7 +198,17 @@ class Session extends EventEmitter {
       this._record({ type: "turn-end", at: Date.now(), ok: false, error: res.error });
     } else {
       this.status = "done";
-      this._record({ type: "turn-end", at: Date.now(), ok: true, text: finalText });
+      // 링버퍼 표시 이벤트에도 raw 대신 cleanText — 제어 블록이 패널/lastLine 에 새지 않게.
+      this._record({ type: "turn-end", at: Date.now(), ok: true, text: persistText });
+    }
+    // 적용은 상태 확정 후 — 이 세션이 더 이상 running 으로 집계되지 않아 위임 스폰이
+    // 동시 상한을 자기 자신으로 소모하지 않는다. 적용 실패는 이벤트로 표면화.
+    if (parsedFences) {
+      try {
+        require("./apply-fences.cjs").applyReplyFences(this, parsedFences, { orch: this.orchestrator });
+      } catch (e) {
+        this._record({ type: "error", at: Date.now(), text: `fence apply failed: ${(e && e.message) || String(e)}` });
+      }
     }
     return res;
   }

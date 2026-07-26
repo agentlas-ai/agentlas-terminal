@@ -60,6 +60,7 @@ class Orchestrator extends EventEmitter {
     });
     const key = this._nextKey();
     session.key = key;
+    session.orchestrator = this; // apply-fences 가 ## Delegate 스폰 시 쓰는 오르카 역참조
     this.sessions.set(key, session);
     if (parent) parent.children.push(key);
 
