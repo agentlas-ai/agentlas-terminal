@@ -769,11 +769,54 @@ async function installHubAgent(db, slug, options = {}) {
   if (!slug) throw new Error("usage: agentlas install <slug>");
   const listing = await fetchHubAgentManifest(slug, options);
   if (!listing) throw new Error(`Hub agent not found: ${slug}`);
-  if (listing.delivery && listing.delivery.mode === "call_only") {
-    // call-only 자산은 소스가 오지 않는다 — 로컬 설치로 위장하지 않고 정직 거절(오너 결정).
-    throw new Error(`This Hub agent is call-only and cannot be installed from source. Run: agentlas call ${slug}`);
-  }
+  assertHubInstallAllowed(listing, slug);
   return persistCloudListing(db, listing);
+}
+
+/*
+ * 데스크탑 registry.installAgent와 동일한 설치 게이트 (electron/mcp/registry.ts:178).
+ * 제품 모델: Hub는 기본이 "빌림"(call-only → 북마크 또는 agentlas call)이고,
+ * 로컬 설치는 소스가 공개된 install-only 패키지 중 신뢰등급 A/B만 허용된다.
+ * v1 터미널은 delivery.mode 검사 하나뿐이라 이 게이트들이 전부 빠져 있었다
+ * (실사용 테스트에서 실증된 모델 드리프트 — 데스크탑과 토씨까지 맞춘다).
+ */
+function assertHubInstallAllowed(listing, slug) {
+  const { isPrivateWebOnlyAgentRow } = require("../agents/registry.cjs");
+  if (isPrivateWebOnlyAgentRow({
+    slug: listing.slug || slug,
+    name: listing.name,
+    name_en: listing.nameEn,
+    tagline: listing.tagline,
+    tagline_en: listing.taglineEn,
+    visibility: listing.visibility,
+    role: listing.role,
+  })) {
+    throw new Error("This web-only agent is not available in the Agentlas terminal.");
+  }
+  const callOnly = (listing.delivery && listing.delivery.mode === "call_only")
+    || listing.callable === true
+    || listing.kind === "cloud-callable"
+    || listing.entityKind === "cloud-callable";
+  const packagePrompt = cloudSystemPromptFromPackage(listing, listing.slug || slug);
+  const hasPrompt = (typeof listing.systemPrompt === "string" && listing.systemPrompt.trim())
+    || (typeof packagePrompt === "string" && packagePrompt.trim());
+  if (!hasPrompt) {
+    if (callOnly) {
+      throw new Error(
+        "This Hub agent is call-only and cannot be installed locally. Bookmark it or run `agentlas call " + slug + "`; owners can restore their Agent Cloud package with `agentlas cloud restore`.",
+      );
+    }
+    throw new Error("This Hub package is missing the instructions required for a safe local install.");
+  }
+  if (callOnly) {
+    throw new Error(
+      "This Hub agent is call-only and cannot be installed locally. Bookmark it or run `agentlas call " + slug + "`.",
+    );
+  }
+  const trust = String(listing.trustGrade || "").toUpperCase();
+  if (trust !== "A" && trust !== "B") {
+    throw new Error(`Trust grade ${listing.trustGrade || "unknown"} blocked. Sideloading requires explicit approval (V1+).`);
+  }
 }
 
 module.exports = {

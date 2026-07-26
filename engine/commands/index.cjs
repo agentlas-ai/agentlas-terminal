@@ -66,6 +66,7 @@ const COMMANDS = {
   "career-graph": () => require("./career-graph.cjs"),
   creds: () => require("./creds.cjs"),
   billing: () => require("./billing.cjs"),
+  uninstall: () => require("./uninstall.cjs"),
 };
 
 // v1에 존재했으나 아직 v2로 재구축되지 않은 명령 — 정직 정지 목록.

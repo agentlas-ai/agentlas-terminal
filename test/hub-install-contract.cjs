@@ -94,12 +94,42 @@ async function main() {
     () => installHubAgent(db, "call-only-agent", {
       callTool: fakeCallTool({ "call-only-agent": { slug: "call-only-agent", name: "Call Only", delivery: { mode: "call_only" } } }),
     }),
-    /call-only and cannot be installed from source.*agentlas call call-only-agent/s,
+    // 데스크탑 registry.installAgent 게이트 문구 동형 (모델: 빌림이 기본, 설치는 예외).
+    /call-only and cannot be installed locally.*agentlas call call-only-agent/s,
   );
   assert.equal(
     db.prepare("SELECT COUNT(*) AS n FROM installed_agents WHERE slug='call-only-agent'").get().n, 0,
     "call_only refusal must not insert a row",
   );
+
+  // ── 1b. 데스크탑 동형 설치 게이트: cloud-callable kind / 빈 프롬프트 / 신뢰등급 ──
+  await assert.rejects(
+    () => installHubAgent(db, "callable-kind", {
+      callTool: fakeCallTool({ "callable-kind": { slug: "callable-kind", name: "Callable", kind: "cloud-callable", systemPrompt: "brain", trustGrade: "A" } }),
+    }),
+    /call-only and cannot be installed locally/,
+    "kind cloud-callable must refuse even with a prompt (borrow model)",
+  );
+  await assert.rejects(
+    () => installHubAgent(db, "no-prompt", {
+      callTool: fakeCallTool({ "no-prompt": { slug: "no-prompt", name: "NoPrompt", trustGrade: "A" } }),
+    }),
+    /missing the instructions required for a safe local install/,
+    "empty systemPrompt must refuse (the SQLite NOT NULL era bug class)",
+  );
+  await assert.rejects(
+    () => installHubAgent(db, "low-trust", {
+      callTool: fakeCallTool({ "low-trust": { slug: "low-trust", name: "LowTrust", systemPrompt: "brain", trustGrade: "C" } }),
+    }),
+    /Trust grade C blocked\. Sideloading requires explicit approval/,
+    "trust grade below B must be blocked exactly like Desktop",
+  );
+  for (const blocked of ["callable-kind", "no-prompt", "low-trust"]) {
+    assert.equal(
+      db.prepare("SELECT COUNT(*) AS n FROM installed_agents WHERE slug=?").get(blocked).n, 0,
+      `gate refusal must not insert a row (${blocked})`,
+    );
+  }
 
   // ── 2. 신규 설치: 행 + entity_kind + materialize ──
   const v1 = makeListing("contract-agent", { entryText: "# v1\nfirst version body" });
