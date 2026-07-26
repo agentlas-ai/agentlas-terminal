@@ -80,6 +80,7 @@ check "bootstrap-race" node "$SCRIPT_DIR/bootstrap-race.cjs"
 check "sqlite-driver-probe" node "$SCRIPT_DIR/sqlite-driver-probe.cjs"
 check "experience-taxonomy-parity" node "$SCRIPT_DIR/experience-taxonomy-parity.cjs"
 check "tool-workspace-boundary" node "$SCRIPT_DIR/tool-workspace-boundary.cjs"
+check "session-orchestrator-contract" node "$SCRIPT_DIR/session-orchestrator-contract.cjs"
 
 # 신선 환경 첫 실행
 FRESH="$(mktemp -d "${TMPDIR:-/tmp}/agentlas-smoke-XXXXXX")"

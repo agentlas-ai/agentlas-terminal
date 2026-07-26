@@ -834,6 +834,11 @@ function runNativeTurn(req) {
       });
       child.__agentlasNativeChild = spawnImpl === spawn;
       child.__agentlasGroupedChild = groupedChild;
+      // 세션 계층(오르카)이 실행 중 중단(kill)을 하려면 child 핸들이 필요하다.
+      // 커스텀 spawn 주입 방식은 위 트리킬 플래그를 깨므로 훅으로 노출한다.
+      if (typeof req.onSpawn === "function") {
+        try { req.onSpawn(child); } catch { /* observer 실패가 턴을 죽이면 안 됨 */ }
+      }
     } catch (e) {
       ui.error(uiText(ui, "runtime.failed", kind, e.message));
       return resolve({ text: "", session: st.session, error: e.message });

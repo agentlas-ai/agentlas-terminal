@@ -17,12 +17,13 @@ const COMMANDS = {
   mcp: () => require("./mcp.cjs"),
   help: () => require("./help.cjs"),
   usage: () => require("./help.cjs"),
+  run: () => require("./run.cjs"),
 };
 
 // v1에 존재했으나 아직 v2로 재구축되지 않은 명령 — 정직 정지 목록.
 // 재구축이 끝나면 여기서 지우고 COMMANDS에 올린다.
 const NOT_YET_PORTED = [
-  "run", "chat", "open", "firm", "import", "cd", "native",
+  "chat", "open", "firm", "import", "cd", "native",
   "search", "install", "plugin", "build", "upload", "connect",
   "storm", "swarm", "network", "workforce", "taskforce", "legacy-network",
   "call", "browser", "route", "research", "netadmin", "journal",

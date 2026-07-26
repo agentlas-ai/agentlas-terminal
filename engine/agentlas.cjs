@@ -86,16 +86,25 @@ function main() {
   }
 
   if (code === undefined) {
-    // 알 수 없는 토큰: v2에서는 아직 에이전트 점프/원샷 자동 라우팅이 배선되지 않았다.
-    // 조용히 프롬프트로 삼켜 오라우팅하는 대신 정직하게 안내한다.
-    ctx.err(
-      `'${normalized[0]}' is not a v2 command yet (agent jump / one-shot routing lands with the v2 runner).\n` +
-      `See: agentlas help`,
-    );
-    process.exit(1);
+    // 알 수 없는 토큰: 에이전트 이름이면 그 에이전트와의 REPL로 점프,
+    // 아니면 전체를 하나의 작업으로 보고 원샷 실행(run) — v1과 동일한 UX.
+    const { findAgent } = require("./agents/registry.cjs");
+    let agent = null;
+    try { agent = findAgent(ctx.db(), normalized[0]); } catch { /* db unavailable → run이 진단 */ }
+    if (agent && normalized.length === 1) {
+      const { startRepl } = require("./ui/repl.cjs");
+      return startRepl(ctx, { agent: agent.slug }).then(
+        (replCode) => process.exit(replCode || 0),
+        (e) => { ctx.err(String((e && e.message) || e)); process.exit(1); },
+      );
+    }
+    code = commands.COMMANDS.run().run(ctx, normalized);
   }
 
-  process.exit(code);
+  Promise.resolve(code).then(
+    (n) => process.exit(typeof n === "number" ? n : 0),
+    (e) => { ctx.err(String((e && e.message) || e)); process.exit(1); },
+  );
 }
 
 if (require.main === module) main();
