@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.0.4 — 2026-07-27
+
+**The hub boundary stops guessing.** Owner decision after live runs: rules
+that infer private data from shape were removed rather than tuned, because
+each one refused work orders whose flagged phrase *was* the task — a slash
+between Korean words read as a file path, "멱등키 설계" read as a credential
+assignment, "고객 ID를 조회하는 API" read as a labeled identifier. No repair
+was possible, so the request simply died.
+
+- Gone: path inference from a slash, labeled-identifier inference, UUID/IP/
+  phone shape matching, keyword-adjacency credential matching.
+- Kept: forms that can only be one thing — issuer-prefixed provider tokens,
+  PEM headers, JWTs, credentials embedded in a URL, email addresses.
+- Those are now **redacted from the outgoing text instead of refusing the
+  run**, and the redaction is printed, so a pasted secret never leaves the
+  machine and the task still proceeds. `AGENTLAS_HUB_BOUNDARY=off` sends
+  text verbatim.
+- Upload and packaging are unchanged: they already block by file identity
+  (`.env*`, `*.pem/key/p12`, `credentials*`, `id_rsa`), which is fact rather
+  than inference.
+
+Shared fixtures (`privacy-guard-fixtures/`) and `scripts/sync-privacy-guard.sh`
+now pin this contract across the terminal engine and the server.
+
 ## 1.0.3 — 2026-07-27
 
 Live `workforce` runs surfaced four defects that no unit gate could reach.

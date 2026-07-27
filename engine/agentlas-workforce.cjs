@@ -806,49 +806,79 @@ function decodedHubText(value) {
   return text;
 }
 
-function hubTextFindingKinds(value) {
-  const text = decodedHubText(value);
-  const findings = [];
-  if (HUB_EMAIL_RE.test(text)) findings.push("email");
-  HUB_UUID_RE.lastIndex = 0;
-  const hasUuid = HUB_UUID_RE.test(text);
-  HUB_UUID_RE.lastIndex = 0;
-  const phoneText = text.replace(HUB_UUID_RE, " ");
-  HUB_PHONE_RE.lastIndex = 0;
-  for (const match of phoneText.matchAll(HUB_PHONE_RE)) {
-    const digits = (match[0].match(/\d/g) || []).length;
-    if (digits >= 10 && digits <= 15) { findings.push("phone"); break; }
-  }
-  if (HUB_LABELED_ID_RE.test(text)) findings.push("labeled_identifier");
-  if (hasUuid) findings.push("uuid");
-  HUB_IP_RE.lastIndex = 0;
-  for (const match of text.matchAll(HUB_IP_RE)) {
-    if (net.isIP(match[0].replace(/^\[|\]$/g, ""))) { findings.push("ip_address"); break; }
-  }
-  const masked = text.replace(HUB_HTTPS_RE, " ").replace(HUB_PLACEHOLDER_RE, " ");
-  if (HUB_PATH_PATTERNS.some((pattern) => pattern.test(masked))) findings.push("local_path");
-  for (const [kind, pattern] of HUB_SECRET_PATTERNS) if (pattern.test(text)) findings.push(`secret_${kind}`);
-  return [...new Set(findings)];
+/*
+ * Hub-bound text hygiene — SELF-PROVING FORMS ONLY, and it masks instead of killing.
+ *
+ * Owner decision 2026-07-27, after live runs: every GUESSING rule (a slash after
+ * a word = a path, "key"/"secret" near a value = a credential, digit runs =
+ * a phone, hex groups = a UUID/IP) produced false positives that killed real
+ * requests with no repair available — the flagged phrase WAS the task
+ * ("진단/멱등키", "멱등키 설계"). Guessing is removed, not tuned.
+ *
+ * What remains is a narrow certainty: strings whose form can only be one thing
+ * (provider token with its issuer prefix, PEM header, JWT, credentials in a
+ * URL, an email address). Those are redacted from the outgoing text rather than
+ * refused, so a paste accident never leaves the machine and the run continues.
+ * Set AGENTLAS_HUB_BOUNDARY=off to send text verbatim.
+ */
+const HUB_REDACTION_PATTERNS = [
+  ["secret_provider_token", /\b(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,})\b/g],
+  ["secret_private_key", /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/gi],
+  ["secret_bearer_token", /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}/gi],
+  ["secret_jwt", /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g],
+  ["secret_credential_url", /\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s/:@]+:[^\s/@]+@[^\s/]+/gi],
+  ["email", /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi],
+];
+
+function hubBoundaryEnabled(env = process.env) {
+  return String(env.AGENTLAS_HUB_BOUNDARY || "").trim().toLowerCase() !== "off";
 }
 
-function assertHubWorkOrderBoundary(order) {
-  const issues = [];
-  const fields = [["taskBrief", order.taskBrief]];
-  order.roleSlots.forEach((slot, index) => {
-    fields.push([`roleSlots[${index}].title`, slot.title], [`roleSlots[${index}].task`, slot.task]);
-  });
-  for (const [fieldPath, value] of fields) {
-    for (const kind of hubTextFindingKinds(value)) {
-      issues.push({ path: fieldPath, code: kind.startsWith("secret_") ? `hub_${kind}` : `hub_private_${kind}` });
+/** Redact self-proving secrets/identifiers. Returns { text, redacted: [kinds] }. */
+function redactHubText(value) {
+  if (!hubBoundaryEnabled()) return { text: value, redacted: [] };
+  let text = String(value);
+  const redacted = [];
+  for (const [kind, pattern] of HUB_REDACTION_PATTERNS) {
+    pattern.lastIndex = 0;
+    if (pattern.test(text)) {
+      pattern.lastIndex = 0;
+      text = text.replace(pattern, "<redacted>");
+      redacted.push(kind);
     }
   }
-  if (issues.length) {
-    fail(
-      "work_order_hub_boundary_rejected",
-      "Hub-bound WorkOrder free text failed the deterministic privacy boundary",
-      { issues },
-    );
-  }
+  return { text, redacted };
+}
+
+function hubTextFindingKinds(value) {
+  // 인코딩 우회로 숨긴 자격증명도 같은 기준으로 본다(판정만, 치환은 원문 기준).
+  return redactHubText(decodedHubText(value)).redacted;
+}
+
+/**
+ * Redact self-proving secrets from the Hub-bound WorkOrder in place.
+ *
+ * This replaced a reject-and-ask-the-model-to-rewrite gate. Refusing was the
+ * wrong shape twice over: the model cannot remove a phrase that IS the task, and
+ * a real pasted credential should never depend on a model choosing to drop it.
+ * Redaction is deterministic, keeps the run alive, and the caller reports what
+ * was masked so nothing is hidden from the user.
+ */
+function redactHubWorkOrder(order) {
+  const redactions = [];
+  const applyField = (fieldPath, value, assign) => {
+    if (typeof value !== "string" || !value) return;
+    const { text, redacted } = redactHubText(value);
+    if (!redacted.length) return;
+    assign(text);
+    for (const kind of redacted) redactions.push({ path: fieldPath, kind });
+  };
+  applyField("taskBrief", order.taskBrief, (next) => { order.taskBrief = next; });
+  order.roleSlots.forEach((slot, index) => {
+    applyField(`roleSlots[${index}].title`, slot.title, (next) => { slot.title = next; });
+    applyField(`roleSlots[${index}].task`, slot.task, (next) => { slot.task = next; });
+  });
+  return redactions;
 }
 
 function validateWorkOrder(value) {
@@ -923,7 +953,12 @@ function validateWorkOrder(value) {
   if (!Number.isInteger(policy.minimumCandidatesPerSlot) || policy.minimumCandidatesPerSlot < 2 || policy.minimumCandidatesPerSlot > 30) fail("work_order_invalid", "selectionPolicy.minimumCandidatesPerSlot is invalid");
   if (!Number.isInteger(policy.maximumCandidatesPerSlot) || policy.maximumCandidatesPerSlot < 2 || policy.maximumCandidatesPerSlot > 100) fail("work_order_invalid", "selectionPolicy.maximumCandidatesPerSlot is invalid");
   if (policy.minimumCandidatesPerSlot > policy.maximumCandidatesPerSlot) fail("work_order_invalid", "candidate window minimum exceeds maximum");
-  assertHubWorkOrderBoundary(order);
+  // 자기증명 자격증명만 결정적으로 마스킹한다(거절 아님) — 마스킹 내역은
+  // 비파괴 필드로 달아 호출자가 화면에 정직히 표시한다.
+  const hubRedactions = redactHubWorkOrder(order);
+  if (hubRedactions.length) {
+    Object.defineProperty(order, "__hubRedactions", { value: hubRedactions, enumerable: false });
+  }
   return order;
 }
 
@@ -2712,6 +2747,12 @@ function create(deps = {}) {
       // 실황 내레이션: 사용자는 "누가 소집됐고 지금 뭘 하는지"를 보면서 신뢰를
       // 형성한다(2026-07-27 오너 요구). 결과에 영향 없는 표시 전용 — silent 존중.
       if (!ctx.silent) {
+        const redactions = workOrder.__hubRedactions || [];
+        if (redactions.length) {
+          ui.info(ui.lang === "ko"
+            ? `허브 전송 전 ${redactions.length}건 마스킹: ${[...new Set(redactions.map((row) => row.kind))].join(", ")}`
+            : `redacted before leaving this machine (${redactions.length}): ${[...new Set(redactions.map((row) => row.kind))].join(", ")}`);
+        }
         const nameByRelease = new Map();
         for (const slotRow of candidateSet.slots) {
           for (const cand of slotRow.candidates) nameByRelease.set(cand.agentReleaseId, cand.name || cand.agentReleaseId);

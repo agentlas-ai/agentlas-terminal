@@ -1970,18 +1970,37 @@ function workforceMemoryContinuityWiring() {
   process.stderr.write("workforce-runtime-contract: SKIP workforceMemoryContinuityWiring (v2 REPL workforce wiring not landed)\n");
 }
 
-async function privateWorkOrderRepairsLocallyAndNeverCallsHubOnExhaustion() {
+async function selfProvingSecretsAreRedactedBeforeLeavingTheMachine() {
   const f = fixture();
-  const privateOrder = structuredClone(f.workOrder);
-  privateOrder.taskBrief = "Inspect /Users/example/private/.env for customer id=acct_12345678";
-  const h = harness({ modelOutputs: [JSON.stringify(privateOrder), JSON.stringify(privateOrder)] });
-  const result = await h.runtime.workforceRun({}, "private boundary test", { silent: true, benchmark: true });
-  assert.equal(result.ok, false);
-  assert.equal(result.error.code, "work_order_hub_boundary_rejected");
-  assert.equal(h.modelCalls.length, 2, "the same leader receives exactly one bounded local repair attempt");
-  assert.deepEqual(h.hubCalls, [], "rejected private text must produce zero Hub calls");
-  assert.match(h.modelCalls[1].prompt, /hub_private_local_path/);
-  assert.match(h.modelCalls[1].prompt, /hub_private_labeled_identifier/);
+  const leaky = structuredClone(f.workOrder);
+  leaky.taskBrief = "Design the payment retry path. Owner mason@example.com, token sk-abcdefghijklmnopqrstuvwx.";
+  leaky.roleSlots[0].task = "웹훅 이중청구 진단/멱등키 설계 — 한국어/영어 문서를 남긴다";
+  const h = harness({
+    modelOutputs: [
+      JSON.stringify(leaky),
+      JSON.stringify(f.selection),
+      JSON.stringify(f.plan),
+      "Backend handoff: idempotency key state machine and serializable transaction boundary.",
+      "Verifier handoff: replay, partial-failure, forged-key, and concurrent-commit adversarial cases.",
+      "Integrated deliverable with transaction design, adversarial tests, and explicit limitations.",
+      JSON.stringify({
+        schemaVersion: "agentlas.workforce-verification.v1",
+        status: "passed",
+        checks: [{ checkId: "check:redaction", status: "passed", evidence: "no credential reached the Hub" }],
+        issues: [],
+      }),
+    ],
+  });
+  const result = await h.runtime.workforceRun({}, "redaction boundary test", { silent: true, benchmark: true, concurrency: 1 });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  const searchCall = h.hubCalls.find((row) => row.name === "workforce.search_candidates");
+  const sent = JSON.stringify(searchCall.args.workOrder);
+  assert.doesNotMatch(sent, /sk-abcdefghijklmnopqrstuvwx/, "a provider token must never reach the Hub");
+  assert.doesNotMatch(sent, /mason@example\.com/, "an email address must never reach the Hub");
+  assert.match(sent, /<redacted>/, "the redaction must be visible in the outgoing text");
+  // 추측 규칙 제거의 핵심: 한국어 슬래시 표기는 손대지 않고 그대로 나간다.
+  assert.match(sent, /진단\/멱등키/, "non-Latin separator slashes are ordinary task text");
+  assert.match(sent, /한국어\/영어/);
 }
 
 async function workersAreToldTheirExactExecutionAuthority() {
@@ -2173,7 +2192,7 @@ async function main() {
   cardinalityShortfallTriggersRefinementButPolicyMinimumDoesNot();
   selectionExpansionSummaryIsRedactedAndSlotBounded();
   await structuredRepairExhaustionFailsBeforeHubAndPersistsArtifact();
-  await privateWorkOrderRepairsLocallyAndNeverCallsHubOnExhaustion();
+  await selfProvingSecretsAreRedactedBeforeLeavingTheMachine();
   await digestMismatchFailsClosed();
   runtimeBundleDigestUsesExactCanonicalProjection();
   await tamperedDirectiveBundleDigestFailsBeforePlanner();
