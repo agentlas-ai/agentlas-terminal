@@ -509,31 +509,56 @@ function renderSlashPalette(rows, selectedIndex, opts = {}) {
   );
   const descWidth = Math.max(0, lineWidth - commandWidth - 1);
   const selected = rows[Math.max(0, Math.min(selectedIndex, rows.length - 1))] || rows[0];
-  const out = [
+  const head = [
     c.faint(truncateVisible(`${i18n.t(lang, "palette.title")}  ${i18n.t(lang, "palette.search")}`, lineWidth)),
     c.faint("─".repeat(lineWidth)),
   ];
-  rows.forEach((row, index) => {
-    const command = padVisible(truncateVisible(row.command, commandWidth), commandWidth);
-    const desc = truncateVisible(row.description, descWidth);
-    const body = " " + c.blue(command) + c.text(desc);
-    out.push(index === selectedIndex ? c.inverse(padVisible(body, lineWidth)) : body);
-  });
-  out.push(c.faint("─".repeat(lineWidth)));
+  /*
+   * 꼬리(구분선·선택 상세·조작 안내)를 먼저 만든다 — 목록만 예산에 맞춰 줄이고
+   * 머리와 꼬리는 어떤 높이에서도 지키기 위해서다.
+   */
+  const tail = [c.faint("─".repeat(lineWidth))];
+  const tailStart = tail.length; // 이 뒤는 자리가 모자라면 접는다 (상세 → 예시 순으로 버림)
+  const out = head;
   if (selected) {
     const usage = truncateVisible(selected.usage || selected.command, lineWidth - 2);
     const detail = truncateVisible(selected.detail || selected.description || "", lineWidth - 2);
     const category = selected.category ? i18n.t(lang, "palette.category", selected.category) : "";
     const categoryRoom = Math.max(0, lineWidth - visibleWidthLite(usage) - 3);
     const categoryText = categoryRoom > 0 ? truncateVisible(category, categoryRoom) : "";
-    out.push(" " + c.text(usage) + (categoryText ? c.dim("  " + categoryText) : ""));
-    if (detail) out.push(" " + c.dim(detail));
+    tail.push(" " + c.text(usage) + (categoryText ? c.dim("  " + categoryText) : ""));
+    if (detail) tail.push(" " + c.dim(detail));
     if (selected.examples && selected.examples.length) {
-      out.push(c.dim(truncateVisible(" " + i18n.t(lang, "palette.examples", selected.examples.slice(0, 2).join("  |  ")), lineWidth)));
+      tail.push(c.dim(truncateVisible(" " + i18n.t(lang, "palette.examples", selected.examples.slice(0, 2).join("  |  ")), lineWidth)));
     }
   }
-  out.push(c.dim(truncateVisible(" " + i18n.t(lang, "palette.controls"), lineWidth)));
-  return out.join("\n");
+  /*
+   * 화면 높이 예산. 터미널보다 긴 프레임을 쏟으면 그리는 도중 스크롤이 나고, 그 순간
+   * 오버레이가 제자리를 잃어 이전 프레임이 화면에 남는다(실측: 24행에서 18행짜리
+   * 프레임 → 블록이 겹겹이 쌓이고 프롬프트가 화면 밖으로 밀려남).
+   * 선택 항목이 잘려 나가지 않도록 강조 위치를 중심으로 창을 잡는다.
+   */
+  const controls = c.dim(truncateVisible(" " + i18n.t(lang, "palette.controls"), lineWidth));
+  const budget = Math.max(1, Math.floor(Number(opts.maxRows) || (rows.length + head.length + tail.length + 1)));
+  /*
+   * 자리가 모자라면 선택 상세부터 접는다. 목록 한 줄과 조작 안내는 마지막까지 지킨다 —
+   * 아무것도 못 고르는 팔레트나 나가는 법을 모르는 팔레트는 없느니만 못하다.
+   * 최소 프레임은 5줄(제목·구분선·목록 1줄·구분선·조작 안내)이며, 그보다 좁은 예산도 5줄이다.
+   */
+  while (tail.length > tailStart && budget - head.length - tail.length - 1 < 1) tail.pop();
+  const listBudget = Math.max(1, budget - head.length - tail.length - 1);
+  const start = Math.min(
+    Math.max(0, selectedIndex - listBudget + 1),
+    Math.max(0, rows.length - listBudget),
+  );
+  rows.slice(start, start + listBudget).forEach((row, offset) => {
+    const index = start + offset;
+    const command = padVisible(truncateVisible(row.command, commandWidth), commandWidth);
+    const desc = truncateVisible(row.description, descWidth);
+    const body = " " + c.blue(command) + c.text(desc);
+    out.push(index === selectedIndex ? c.inverse(padVisible(body, lineWidth)) : body);
+  });
+  return out.concat(tail, [controls]).join("\n");
 }
 
 function attachSlashPalette(rl, opts = {}) {
@@ -574,9 +599,25 @@ function attachSlashPalette(rl, opts = {}) {
     rl.write(null, { ctrl: true, name: "u" });
     rl.write(value);
   }
+  /*
+   * 커서 복원은 상대 이동으로만 한다.
+   *
+   * 예전 구현은 DECSC/DECRC(`\x1b7`/`\x1b8`)로 절대 위치를 저장·복원했다. 그런데 REPL은
+   * 프롬프트가 화면 맨 아래에 있는 게 보통이라, 그 아래로 프레임을 그리면 반드시 스크롤이
+   * 난다. 스크롤 뒤 저장된 절대 행은 다른 내용을 가리키므로 복원이 어긋나고, 다음 렌더의
+   * "커서 아래 전부 지우기"가 이전 프레임을 못 지운다 — 화면에 팔레트가 겹겹이 쌓였다.
+   * (pyte 에뮬레이션 실측: 24행에서 ↓ 3회 → 잔상 블록 + 프롬프트 유실.)
+   * `\x1b[nA` 같은 상대 이동은 내용과 함께 밀리므로 스크롤이 나도 어긋나지 않는다.
+   */
+  function promptColumn() {
+    const prompt = typeof rl.getPrompt === "function" ? rl.getPrompt() : "";
+    const typed = String(rl.line || "").slice(0, rl.cursor);
+    return visibleWidthLite(String(prompt)) + visibleWidthLite(typed) + 1;
+  }
   function clear() {
     if (!state.visible) return;
-    stream.write("\x1b7\x1b[E\x1b[0J\x1b8");
+    // 그린 뒤에는 프롬프트 아래에 자리가 있으므로 커서 아래로 이동은 스크롤을 만들지 않는다.
+    stream.write(`\x1b[1B\r\x1b[0J\x1b[1A\x1b[${promptColumn()}G`);
     state.visible = false;
   }
   function render() {
@@ -596,10 +637,16 @@ function attachSlashPalette(rl, opts = {}) {
     if (state.selected < 0 || state.selected >= list.length) state.selected = 0;
     const body = renderSlashPalette(list, state.selected, {
       columns: stream.columns || process.stdout.columns || 88,
+      // 프롬프트 줄과 여유 한 줄을 남긴다 — 프레임이 화면을 다 먹으면 제자리 갱신이 불가능하다.
+      maxRows: Math.max(5, (stream.rows || process.stdout.rows || 24) - 2),
       colors,
       lang: opts.lang || (opts.ui && opts.ui.lang) || "en",
     });
-    stream.write("\x1b7\x1b[E\x1b[0J" + body + "\x1b8");
+    if (!body) { clear(); return; }
+    const lines = body.split("\n");
+    // 첫 줄바꿈은 프롬프트 아래로 내려가며, 자리가 없으면 여기서 화면이 한 번 밀린다.
+    // 그린 만큼 그대로 되올라오므로 이후 갱신은 제자리에서 일어난다.
+    stream.write(`\r\n\x1b[0J${lines.join("\r\n")}\x1b[${lines.length}A\x1b[${promptColumn()}G`);
     state.visible = true;
   }
   /*

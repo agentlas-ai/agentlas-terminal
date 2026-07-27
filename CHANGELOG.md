@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.0.11 — 2026-07-27
+
+- **The slash palette repaints in place instead of stacking copies of
+  itself.** Every keystroke left the previous frame on screen, so a few
+  arrow presses filled the terminal with duplicate palettes and pushed the
+  prompt out of view. Two causes, both measured on an emulated terminal:
+  the frame was drawn with the cursor saved and restored by absolute
+  position, and the frame was 18 lines tall with no regard for the window.
+  In a REPL the prompt sits at the bottom of the screen, so drawing below
+  it always scrolls — and after a scroll the saved absolute row points at
+  different content, so the next repaint erased the wrong region and left
+  the old frame behind. The palette now returns to the prompt with a
+  relative cursor move, which survives scrolling, and never draws a frame
+  taller than the window: the list shrinks around the highlighted entry,
+  and the selection detail folds away before the list does, so the
+  highlighted row and the controls hint survive at any height. Verified at
+  14, 18, 24 and 50 rows — one palette on screen, prompt intact.
+- Quitting no longer announces a wait for commands that finish in
+  milliseconds; the notice now appears only after 400ms.
+
 ## 1.0.10 — 2026-07-27
 
 Four defects in the REPL's slash surface, all found by sweeping for the shape
