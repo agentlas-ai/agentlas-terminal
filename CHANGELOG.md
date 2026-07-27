@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.0.12 — 2026-07-28
+
+- **Orchestrator/worker model roles now resolve from ordered candidate
+  pools.** The shared `model_role_members` table (Desktop schema v80) holds
+  n candidates per role in priority order; the terminal picks the first
+  member that is actually executable here, records every skipped member
+  with its reason, and never silently substitutes a lower-priority runtime
+  when all members are unavailable — the head member is used and the skip
+  list is preserved. An empty worker pool inherits the orchestrator pool,
+  matching the single-row inherit contract, and databases without pools
+  keep resolving through the v79 single-row and legacy `active_runtime`
+  ladders unchanged.
+- **Workforce escalation is bounded and receipted end to end.** A worker
+  that violates the handoff output contract twice — or is named in two
+  consecutive verifier failures — gets exactly one orchestrator-role
+  retry, stamped with `escalated-after-failure`, the failure count, and
+  the attempt number; a failing escalation stops honestly instead of
+  looping or downgrading.
+- **BYOK Anthropic calls mark the system prefix as a prompt-cache
+  breakpoint.** Real Anthropic endpoints receive the system prompt as one
+  `cache_control: ephemeral` block (~90% cheaper cached input on hits;
+  a silent no-op below the per-model minimum). Anthropic-compatible
+  endpoints (GLM/Kimi/DeepSeek) keep the plain string form they expect.
+- Model-allocation receipts split "no allocation was provided"
+  (`allocation_not_provided`) from "the allocation was malformed"
+  (`invalid_ai_allocation`), and real invocations now retain the
+  provider-reported token usage per role instead of discarding it.
+
 ## 1.0.11 — 2026-07-27
 
 - **The slash palette repaints in place instead of stacking copies of

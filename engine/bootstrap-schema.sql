@@ -17,6 +17,18 @@ CREATE TABLE model_roles (
         updated_at TEXT NOT NULL,
         CHECK(role = 'worker' OR inherit = 0)
       );
+CREATE TABLE model_role_members (
+        role TEXT NOT NULL CHECK(role IN ('orchestrator','worker')),
+        position INTEGER NOT NULL CHECK(position >= 1),
+        kind TEXT NOT NULL,
+        backend TEXT,
+        source TEXT,
+        model TEXT,
+        effort TEXT,
+        long_context INTEGER NOT NULL DEFAULT 0 CHECK(long_context IN (0,1)),
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(role, position)
+      );
 CREATE TABLE installed_agents (
         id TEXT PRIMARY KEY,
         slug TEXT UNIQUE NOT NULL,

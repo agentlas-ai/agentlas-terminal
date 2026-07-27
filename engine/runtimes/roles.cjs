@@ -80,6 +80,55 @@ function normalizedRow(row, role) {
   };
 }
 
+const MODEL_ROLE_MEMBER_TABLE = "model_role_members";
+
+/** Desktop v80 역할 풀(순서=우선순위). 테이블이 없거나 비면 []. */
+function roleMembers(db, role) {
+  if (!db || !VALID_ROLES.has(role) || !tableExists(db, MODEL_ROLE_MEMBER_TABLE)) return [];
+  for (const column of ["role", "position", "kind"]) {
+    if (!columnExists(db, MODEL_ROLE_MEMBER_TABLE, column)) return [];
+  }
+  try {
+    return db
+      .prepare("SELECT * FROM model_role_members WHERE role=? ORDER BY position ASC")
+      .all(role)
+      .map((row) => ({
+        ...normalizedRow({ ...row, inherit: 0 }, role),
+        position: row.position,
+        sourceLayer: "model-role-pool",
+      }))
+      .filter((row) => row && row.kind);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 풀에서 첫 가용 멤버를 고른다. isAvailable(member)가 없으면 순서 1위.
+ * 전원 불가면 조용한 대체 없이 1위를 그대로 쓰고 skipped를 남긴다.
+ * worker 풀이 비면 오케스트레이터 풀을 상속하며, 풀 자체가 없으면
+ * 기존 단일 행 해석(resolvedModelRole)으로 내려간다.
+ */
+function pickRoleFromPool(db, role = "orchestrator", isAvailable = null) {
+  if (!VALID_ROLES.has(role)) throw new TypeError(`unknown model role: ${role}`);
+  const own = roleMembers(db, role);
+  const inherited = role === "worker" && own.length === 0;
+  const members = inherited ? roleMembers(db, "orchestrator") : own;
+  const skipped = [];
+  for (const member of members) {
+    if (typeof isAvailable === "function" && !isAvailable(member)) {
+      skipped.push({ position: member.position, kind: member.kind, reason: "runtime-unavailable" });
+      continue;
+    }
+    return { ...member, role, inherit: inherited, skipped };
+  }
+  if (members.length > 0) {
+    return { ...members[0], role, inherit: inherited, skipped };
+  }
+  const single = resolvedModelRole(db, role);
+  return single ? { ...single, position: null, skipped } : null;
+}
+
 function resolvedModelRole(db, role = "orchestrator") {
   if (!VALID_ROLES.has(role)) throw new TypeError(`unknown model role: ${role}`);
   if (role === "orchestrator") {
@@ -103,8 +152,11 @@ function resolvedModelRole(db, role = "orchestrator") {
 
 module.exports = {
   MODEL_ROLE_TABLE,
+  MODEL_ROLE_MEMBER_TABLE,
   VALID_ROLES,
   roleRow,
+  roleMembers,
+  pickRoleFromPool,
   legacyOrchestrator,
   resolvedModelRole,
 };

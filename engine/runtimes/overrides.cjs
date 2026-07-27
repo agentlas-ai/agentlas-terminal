@@ -19,7 +19,7 @@ const {
   CLI_EXECUTABLE_KINDS,
   API_EXECUTABLE_KINDS,
 } = require("./resolve.cjs");
-const { resolvedModelRole } = require("./roles.cjs");
+const { pickRoleFromPool } = require("./roles.cjs");
 
 const OVERRIDE_TABLE = "agent_runtime_overrides";
 // 데스크탑 VALID_SCOPES 동형. v2 터미널 호출자는 주로 'agent'지만 firm/division도 읽을 수 있다.
@@ -153,12 +153,24 @@ function resolveRuntimeForAgent({
   }
 
   // Role defaults sit above active_runtime/detected but below exact per-call
-  // pins and agent/firm/division overrides.
-  const roleSelection = resolvedModelRole(db, role);
+  // pins and agent/firm/division overrides. v80 풀(순서=우선순위)이 있으면
+  // 이 Terminal에서 실행 가능한 첫 멤버를 쓰고, 스킵 내역은 결과에 남긴다.
+  // 풀이 없으면 pickRoleFromPool이 단일 행/레거시 해석으로 내려간다.
+  const roleSelection = pickRoleFromPool(db, role, (member) => {
+    if (!EXECUTABLE_KINDS.has(member.kind)) return false;
+    return Boolean(selectedRuntime(member, member.sourceLayer));
+  });
   if (roleSelection && EXECUTABLE_KINDS.has(roleSelection.kind)) {
     const selected = selectedRuntime(roleSelection, roleSelection.sourceLayer);
     if (selected) {
-      return { ...selected, role, inheritedRole: roleSelection.inherit };
+      return {
+        ...selected,
+        role,
+        inheritedRole: roleSelection.inherit,
+        ...(roleSelection.skipped?.length
+          ? { rolePoolSkipped: roleSelection.skipped }
+          : {}),
+      };
     }
   }
   const resolved = withPins(resolveImpl({ db, prefs, explicit: null }));
