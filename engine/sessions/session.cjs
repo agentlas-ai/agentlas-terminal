@@ -21,7 +21,7 @@ const RING_LIMIT = 2000;
 class Session extends EventEmitter {
   /**
    * @param {object} opts
-   *   db, agent {id,slug,name,systemPrompt}, runtime {kind,bin,model?},
+   *   db, agent {id,slug,name,systemPrompt}, runtime {kind,bin,model?,effort?},
    *   permission, cwd, lang, parent (Session|null), title, chatId?(재개)
    */
   constructor(opts) {
@@ -46,7 +46,9 @@ class Session extends EventEmitter {
     this._turnPromise = null;
     // 계약 테스트용 spawn 주입(runNativeTurn의 req.spawn). 프로덕션 경로에선 null.
     this._spawnImpl = opts.spawnImpl || null;
+    this._apiTurnImpl = opts.apiTurnImpl || null;
     this._timeoutConfig = opts.timeoutConfig || null;
+    this._apiAbort = null;
 
     this.chatId = opts.chatId || store.createChat(this.db, {
       agentId: this.agent.id,
@@ -154,26 +156,55 @@ class Session extends EventEmitter {
       }, true, prompt);
     } catch { /* 프롬프트 증강 실패는 턴을 막지 않는다 — 원 프롬프트로 진행 */ }
 
-    const req = {
-      kind: this.runtime.kind,
-      bin: this.runtime.bin,
-      ui: this._sink,
-      cwd: this.cwd,
-      prompt,
-      systemPrompt,
-      permission: this.permission,
-      session: { ...this.runtimeSession },
-      model: this.runtime.model,
-      onSpawn: (child) => { this._child = child; },
-    };
-    if (this._spawnImpl) req.spawn = this._spawnImpl;
-    if (this._timeoutConfig) req.timeoutConfig = this._timeoutConfig;
-
     let res;
-    try {
-      res = await nativeHost.runNativeTurn(req);
-    } catch (e) {
-      res = { text: "", session: req.session, error: (e && e.message) || String(e) };
+    if (this.runtime.kind === "ollama") {
+      const ctrl = new AbortController();
+      this._apiAbort = ctrl;
+      const apiTurn = this._apiTurnImpl || require("../agentlas-api-agent.cjs").runApiTurn;
+      try {
+        const history = store.chatHistory(this.db, this.chatId).map((row) => ({
+          role: row.role,
+          content: row.text,
+        }));
+        res = await apiTurn({
+          backend: "ollama",
+          model: this.runtime.model || "llama3.1",
+          system: systemPrompt,
+          messages: history,
+          ctx: {
+            cwd: this.cwd,
+            permission: this.permission,
+            env: process.env,
+          },
+          ui: this._sink,
+          signal: ctrl.signal,
+        });
+      } catch (e) {
+        res = { text: "", error: (e && e.message) || String(e) };
+      } finally {
+        this._apiAbort = null;
+      }
+    } else {
+      const req = {
+        kind: this.runtime.kind,
+        bin: this.runtime.bin,
+        ui: this._sink,
+        cwd: this.cwd,
+        prompt,
+        systemPrompt,
+        permission: this.permission,
+        session: { ...this.runtimeSession },
+        model: this.runtime.model,
+        effort: this.runtime.effort,
+        onSpawn: (child) => { this._child = child; },
+      };
+      if (this._spawnImpl) req.spawn = this._spawnImpl;
+      if (this._timeoutConfig) req.timeoutConfig = this._timeoutConfig;
+      try {
+        res = await nativeHost.runNativeTurn(req);
+      } catch (e) {
+        res = { text: "", session: req.session, error: (e && e.message) || String(e) };
+      }
     }
     this._child = null;
 
@@ -233,6 +264,11 @@ class Session extends EventEmitter {
   /** 실행 중 턴을 중단한다. 큐는 비운다. */
   kill() {
     this.queue.length = 0;
+    if (this._apiAbort) {
+      this.status = "killed";
+      try { this._apiAbort.abort(new Error("session killed")); } catch { /* already aborted */ }
+      return;
+    }
     if (this._child) {
       this.status = "killed";
       try { nativeHost.terminateNativeChild(this._child); } catch { /* already dead */ }

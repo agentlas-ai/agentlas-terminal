@@ -29,6 +29,8 @@ const SLASH_COMMANDS = [
   { command: "/mcp", args: "", ko: "MCP 서버 목록", en: "MCP servers" },
   { command: "/doctor", args: "", ko: "런타임·데이터 점검", en: "Health check" },
   { command: "/runtime", args: "<kind>", ko: "새 세션 런타임 지정", en: "Set runtime for new sessions" },
+  { command: "/model", args: "<id|default>", ko: "새 세션 모델 지정", en: "Set model for new sessions" },
+  { command: "/effort", args: "<level|none>", ko: "새 세션 추론 강도 지정", en: "Set effort for new sessions" },
   { command: "/permission", args: "<level>", ko: "새 세션 권한 지정", en: "Set permission for new sessions" },
   { command: "/login", args: "", ko: "Agentlas Cloud 로그인", en: "Sign in to Agentlas Cloud" },
   { command: "/whoami", args: "", ko: "로그인 상태", en: "Signed-in account" },
@@ -82,6 +84,7 @@ const SLASH_COMMANDS = [
 
 const SLASH_NAMES = SLASH_COMMANDS.map((c) => c.command);
 const RUNTIME_KINDS = ["claude-code", "codex", "gemini"];
+const EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 const PERM_LEVELS = ["read", "write", "full"];
 // 세션 인자를 받는 명령 — 완성 후보를 살아있는 세션 키(s1, s2…)로 채운다.
 const SESSION_ARG_COMMANDS = new Set(["/s", "/switch", "/steer", "/kill", "/rm"]);
@@ -119,6 +122,7 @@ function makeCompleter(ctx = {}) {
 
     const cmd = tokens[0];
     if (cmd === "/runtime") return [uniqStartsWith(RUNTIME_KINDS, last), last];
+    if (cmd === "/effort") return [uniqStartsWith(EFFORT_LEVELS, last), last];
     if (cmd === "/permission") return [uniqStartsWith(PERM_LEVELS, last), last];
     if (SESSION_ARG_COMMANDS.has(cmd) && tokens.length === 2) return [uniqStartsWith(getSessions(), last), last];
     if (AGENT_ARG_COMMANDS.has(cmd) && tokens.length === 2) {

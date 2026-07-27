@@ -4,7 +4,13 @@
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const { PassThrough } = require("node:stream");
-const { captureRuntime, captureOutputLimit, isProtectedChildEnvKeyCli } = require("../engine/workforce/capture.cjs");
+const {
+  captureRuntime,
+  capturedRuntimeUsage,
+  captureOutputLimit,
+  isProtectedChildEnvKeyCli,
+  runApi,
+} = require("../engine/workforce/capture.cjs");
 
 class FakeChild extends EventEmitter {
   constructor(options = {}) {
@@ -42,6 +48,7 @@ function capture(child, options = {}) {
     timeoutConfig: options.timeoutConfig || { idleMs: 40, totalMs: 300, killGraceMs: 15 },
     outputLimitBytes: options.outputLimitBytes || 1_024,
     signal: options.signal,
+    envelope: options.envelope,
     spawn: () => child,
   });
 }
@@ -67,6 +74,83 @@ async function main() {
   setTimeout(() => streaming.finish(0), 110);
   assert.equal(await streamingRun, "onetwothreefour", "regular output must keep the capture idle timer alive");
   assert.deepEqual(streaming.signals, []);
+
+  assert.deepEqual(capturedRuntimeUsage("claude-code", JSON.stringify({
+    type: "result",
+    result: "ok",
+    usage: {
+      input_tokens: 10,
+      cache_creation_input_tokens: 3,
+      cache_read_input_tokens: 4,
+      output_tokens: 5,
+    },
+  })), { inputTokens: 17, outputTokens: 5 });
+  assert.deepEqual(capturedRuntimeUsage("codex", JSON.stringify({
+    type: "turn.completed",
+    usage: { input_tokens: 20, cached_input_tokens: 8, output_tokens: 7 },
+  })), { inputTokens: 20, outputTokens: 7 });
+  assert.deepEqual(capturedRuntimeUsage("gemini", JSON.stringify({
+    type: "result",
+    usageMetadata: { promptTokenCount: 12, candidatesTokenCount: 6 },
+  })), { inputTokens: 12, outputTokens: 6 });
+  assert.equal(capturedRuntimeUsage("codex", JSON.stringify({
+    type: "turn.completed",
+    usage: { output_tokens: 7 },
+  })), null, "one-sided provider usage must remain unobserved");
+
+  const metered = new FakeChild();
+  const meteredRun = capture(metered, { envelope: true });
+  metered.stdout.write(JSON.stringify({
+    type: "result",
+    response: "metered",
+    usageMetadata: { promptTokenCount: 9, candidatesTokenCount: 4 },
+  }));
+  metered.finish(0);
+  assert.deepEqual(await meteredRun, {
+    text: "metered",
+    usage: { inputTokens: 9, outputTokens: 4 },
+  });
+
+  const ollama = await runApi("ollama", "qwen", "system", "prompt", {
+    envelope: true,
+    fetch: async () => ({
+      ok: true,
+      json: async () => ({
+        message: { content: "local" },
+        prompt_eval_count: 11,
+        eval_count: 3,
+      }),
+    }),
+  });
+  assert.deepEqual(ollama, {
+    text: "local",
+    usage: { inputTokens: 11, outputTokens: 3 },
+  });
+
+  // BYOK 프롬프트 캐시 계약: 진짜 Anthropic만 system을 cache_control 블록 배열로
+  // 보낸다. 호환 엔드포인트(GLM 등)는 문자열 유지 — 추가 필드를 거부할 수 있다.
+  const anthropicBodies = [];
+  await runApi("anthropic", "claude-haiku-4-5", "stable system prefix", "prompt", {
+    apiKey: "key-test",
+    fetch: async (_url, init) => {
+      anthropicBodies.push(JSON.parse(init.body));
+      return { ok: true, json: async () => ({ content: [{ text: "cached" }], usage: { input_tokens: 5, output_tokens: 2 } }) };
+    },
+  });
+  assert.deepEqual(anthropicBodies[0].system, [
+    { type: "text", text: "stable system prefix", cache_control: { type: "ephemeral" } },
+  ], "real Anthropic must receive the system prefix as one ephemeral cache breakpoint");
+
+  const compatBodies = [];
+  await runApi("glm", "glm-4.6", "stable system prefix", "prompt", {
+    apiKey: "key-test",
+    fetch: async (_url, init) => {
+      compatBodies.push(JSON.parse(init.body));
+      return { ok: true, json: async () => ({ content: [{ text: "compat" }], usage: { input_tokens: 5, output_tokens: 2 } }) };
+    },
+  });
+  assert.strictEqual(compatBodies[0].system, "stable system prefix",
+    "Anthropic-compatible endpoints must keep the plain string system field");
 
   const silent = new FakeChild({ ignoreTerm: true });
   await assert.rejects(

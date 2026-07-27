@@ -20,7 +20,8 @@ const { renderBanner, readVersion } = require("../agentlas-banner.cjs");
 const { Orchestrator, maxParallel } = require("../sessions/orchestrator.cjs");
 const { Renderer } = require("./renderer.cjs");
 const { findAgent, listAgents } = require("../agents/registry.cjs");
-const { resolveRuntime, NoRuntimeError } = require("../runtimes/resolve.cjs");
+const { resolveRuntimeForAgent } = require("../runtimes/overrides.cjs");
+const { EFFORTS } = require("../agentlas-workload-routing.cjs");
 const permissions = require("../agentlas-permissions.cjs");
 const i18n = require("../agentlas-i18n.cjs");
 const { tokenizeCommandLine } = require("../agentlas-input.cjs");
@@ -133,8 +134,18 @@ async function startRepl(ctx, opts = {}) {
   const renderer = new Renderer(ui);
   let permission = permissions.normalize(opts.permission || (ctx.prefs && ctx.prefs.permission) || "write");
   let runtimeOverride = opts.runtime || null;
+  let modelOverride = opts.model || null;
+  let effortOverride = opts.effort || null;
 
-  const resolveRt = () => resolveRuntime({ db, prefs: ctx.prefs, explicit: runtimeOverride });
+  const resolveRt = (agentId = null) => resolveRuntimeForAgent({
+    db,
+    prefs: ctx.prefs,
+    explicit: runtimeOverride,
+    model: modelOverride,
+    effort: effortOverride,
+    role: "orchestrator",
+    agentId,
+  });
 
   let resumeChatId = opts.chatId || null;
   const ensureMainSession = (agentToken) => {
@@ -146,7 +157,14 @@ async function startRepl(ctx, opts = {}) {
     }
     const active = orch.active();
     if (active && active.agent.id === agent.id) return active;
-    const session = orch.spawn({ agent, runtime: resolveRt(), permission, cwd: process.cwd(), activate: true, chatId: resumeChatId });
+    const session = orch.spawn({
+      agent,
+      runtime: resolveRt(agent.id),
+      permission,
+      cwd: process.cwd(),
+      activate: true,
+      chatId: resumeChatId,
+    });
     resumeChatId = null; // 재개는 첫 세션에만 적용
     renderer.attach(session, { replay: false });
     return session;
@@ -318,7 +336,18 @@ async function startRepl(ctx, opts = {}) {
 
       if (input.startsWith("/")) {
         try {
-          const quit = handleSlash(ctx, input.slice(1), { orch, renderer, ensureMainSession, resolveRt, track: trackCommand, setPermission: (p) => { permission = p; }, getPermission: () => permission, setRuntime: (r) => { runtimeOverride = r; } });
+          const quit = handleSlash(ctx, input.slice(1), {
+            orch,
+            renderer,
+            ensureMainSession,
+            resolveRt,
+            track: trackCommand,
+            setPermission: (p) => { permission = p; },
+            getPermission: () => permission,
+            setRuntime: (r) => { runtimeOverride = r; },
+            setModel: (model) => { modelOverride = model; },
+            setEffort: (effort) => { effortOverride = effort; },
+          });
           if (quit === "quit") { rl.close(); return; }
         } catch (e) {
           ui.error(String((e && e.message) || e));
@@ -604,6 +633,27 @@ function handleSlash(ctx, cmdline, api) {
       if (!rest[0]) throw new Error("Usage: /runtime claude-code|codex|gemini");
       api.setRuntime(rest[0]);
       ctx.out(ui.c.dim(`runtime: ${rest[0]} (${en ? "applies to new sessions" : "새 세션부터 적용"})`));
+      return;
+    }
+    case "model": {
+      const model = String(rest[0] || "").trim();
+      if (!model) throw new Error("Usage: /model <provider-model-id|default>");
+      const next = ["default", "inherit"].includes(model.toLowerCase()) ? null : model;
+      api.setModel(next);
+      ctx.out(ui.c.dim(
+        `model: ${next || "default"} (${en ? "applies to new sessions" : "새 세션부터 적용"})`,
+      ));
+      return;
+    }
+    case "effort": {
+      const effort = String(rest[0] || "").trim().toLowerCase();
+      if (!EFFORTS.includes(effort)) {
+        throw new Error(`Usage: /effort ${EFFORTS.join("|")}`);
+      }
+      api.setEffort(effort === "none" ? null : effort);
+      ctx.out(ui.c.dim(
+        `effort: ${effort} (${en ? "applies to new sessions" : "새 세션부터 적용"})`,
+      ));
       return;
     }
     case "permission": {

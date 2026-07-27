@@ -7,9 +7,25 @@
  */
 const { RUNTIME_BIN, whichSync, listAvailableCliRuntimes, activeRuntimeRow } = require("./detect.cjs");
 
-// native-host가 스트리밍 드라이버를 갖춘 런타임만 실행 대상으로 삼는다.
-// kimi/grok/cursor 드라이버가 포팅되면 여기에 추가한다 (조용한 오폭 방지).
-const EXECUTABLE_KINDS = new Set(["claude-code", "codex", "gemini"]);
+// Session이 실제 드라이버를 갖춘 런타임만 실행 대상으로 삼는다.
+// CLI는 native-host, Ollama는 로컬 API loop를 쓴다. 다른 드라이버가 포팅되면
+// 해당 집합에 추가한다(조용한 오폭 방지).
+const CLI_EXECUTABLE_KINDS = new Set(["claude-code", "codex", "gemini"]);
+const API_EXECUTABLE_KINDS = new Set(["ollama"]);
+const EXECUTABLE_KINDS = new Set([
+  ...CLI_EXECUTABLE_KINDS,
+  ...API_EXECUTABLE_KINDS,
+]);
+
+function apiRuntime(kind, model, source) {
+  if (!API_EXECUTABLE_KINDS.has(kind)) return null;
+  return {
+    kind,
+    backend: kind,
+    ...(model ? { model } : {}),
+    source,
+  };
+}
 
 class NoRuntimeError extends Error {
   constructor(message) {
@@ -24,9 +40,11 @@ class NoRuntimeError extends Error {
  */
 function resolveRuntime({ db, prefs, explicit }) {
   if (explicit) {
+    const api = apiRuntime(explicit, null, "explicit");
+    if (api) return api;
     const bin = RUNTIME_BIN[explicit];
     if (!bin) throw new NoRuntimeError(`unknown runtime: ${explicit}`);
-    if (!EXECUTABLE_KINDS.has(explicit)) {
+    if (!CLI_EXECUTABLE_KINDS.has(explicit)) {
       throw new NoRuntimeError(`runtime '${explicit}' has no v2 streaming driver yet (available: ${[...EXECUTABLE_KINDS].join(", ")})`);
     }
     const p = whichSync(bin);
@@ -34,18 +52,24 @@ function resolveRuntime({ db, prefs, explicit }) {
     return { kind: explicit, bin: p, source: "explicit" };
   }
   const pref = prefs && prefs.runtime;
-  if (pref && EXECUTABLE_KINDS.has(pref)) {
+  if (pref && API_EXECUTABLE_KINDS.has(pref)) {
+    return apiRuntime(pref, null, "prefs");
+  }
+  if (pref && CLI_EXECUTABLE_KINDS.has(pref)) {
     const p = whichSync(RUNTIME_BIN[pref]);
     if (p) return { kind: pref, bin: p, source: "prefs" };
   }
   if (db) {
     const active = activeRuntimeRow(db);
-    if (active && EXECUTABLE_KINDS.has(active.kind)) {
+    if (active && API_EXECUTABLE_KINDS.has(active.kind)) {
+      return apiRuntime(active.kind, active.model || undefined, "active");
+    }
+    if (active && CLI_EXECUTABLE_KINDS.has(active.kind)) {
       const p = whichSync(RUNTIME_BIN[active.kind]);
       if (p) return { kind: active.kind, bin: p, model: active.model || undefined, source: "active" };
     }
   }
-  const found = listAvailableCliRuntimes().filter((r) => EXECUTABLE_KINDS.has(r.kind));
+  const found = listAvailableCliRuntimes().filter((r) => CLI_EXECUTABLE_KINDS.has(r.kind));
   if (found.length) return { kind: found[0].kind, bin: found[0].path, source: "detected" };
   // 신규 사용자의 최빈 막다른 길: "설치하라"만 있고 방법이 없으면 여기서 이탈한다.
   // 실제 설치 명령을 그대로 준다(데스크탑 온보딩의 "Claude Code 무료로 설치하기"와 동형).
@@ -61,4 +85,10 @@ function resolveRuntime({ db, prefs, explicit }) {
   ].join("\n"));
 }
 
-module.exports = { resolveRuntime, NoRuntimeError, EXECUTABLE_KINDS };
+module.exports = {
+  resolveRuntime,
+  NoRuntimeError,
+  EXECUTABLE_KINDS,
+  CLI_EXECUTABLE_KINDS,
+  API_EXECUTABLE_KINDS,
+};

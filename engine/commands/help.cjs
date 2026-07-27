@@ -9,8 +9,8 @@ const HELP = `agentlas — the operating system for agents, in your terminal
 
 TALK & RUN
   <agent> · chat <agent>   jump into a chat with one agent
-  run [agent] [prompt]     one-shot (-p print · --runtime · --permission; stdin ok)
-  firm <firm> [task]       delegate to a company's CEO
+  run [agent] [prompt]     one-shot (-p · --runtime · --model · --effort · --permission)
+  firm <firm> [task]       delegate to a CEO (--runtime · --model · --effort)
   chats [n] · open <id>    recent conversations · resume one
 
 AGENTS & HUB
@@ -20,7 +20,7 @@ AGENTS & HUB
   build "<request>"        build/repair/package an agent or team
   upload <path>            save owner-private in Agent Cloud (--visibility marketplace to publish)
   import <path> · cd · native prepare  local folder agents
-  list                     installed agents/companies + active runtime
+  list                     installed agents/companies + orchestrator/worker runtimes
   experience <sub>         portable Experience: list|inspect|validate|save|publish|status|export|unpublish
   variant resolve          local variant selection
 
@@ -51,10 +51,13 @@ ACCOUNT & OPS
 
 IN-REPL (agentlas → interactive, Orca multi-session)
   /spawn <agent> [task] · /sessions · /tree · /s <n> · /steer <n> <msg> ·
-  /kill <n> · /rm <n> · /broadcast <msg> · /use · /runtime · /permission
+  /kill <n> · /rm <n> · /broadcast <msg> · /use · /runtime · /model · /effort · /permission
   typing during a running turn queues steering; ctrl-c interrupts the turn
 
-Options: -p|--print · --runtime claude-code|codex|gemini · --permission read|write|full
+Options: -p|--print · --runtime claude-code|codex|gemini · --model <exact-id> ·
+         --effort none|minimal|low|medium|high|xhigh|max ·
+         --tier economy|balanced|frontier (requires --model) ·
+         --permission read|write|full
 `;
 
 function run(ctx) {

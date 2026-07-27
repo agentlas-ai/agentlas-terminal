@@ -5,7 +5,24 @@
  * 데스크탑과 동일하게 목록에서 숨긴다.
  */
 const { activeRuntimeRow, listAvailableCliRuntimes } = require("../runtimes/detect.cjs");
+const { resolvedModelRole } = require("../runtimes/roles.cjs");
 const { listAgents } = require("../agents/registry.cjs");
+
+function roleRuntimeLabel(selection, role, en) {
+  if (!selection) return en ? "(not set)" : "(미설정)";
+  const provider = selection.kind === "byok"
+    ? selection.backend || "byok"
+    : selection.kind;
+  const bits = [
+    provider,
+    selection.model ? `(${selection.model})` : "",
+    selection.effort ? `· effort ${selection.effort}` : "",
+  ].filter(Boolean);
+  if (role === "worker" && selection.inherit) {
+    bits.push(en ? "· inherits orchestrator" : "· 오케스트레이터 상속");
+  }
+  return bits.join(" ");
+}
 
 function run(ctx) {
   const db = ctx.db();
@@ -36,7 +53,14 @@ function run(ctx) {
   const active = activeRuntimeRow(db);
   const clis = listAvailableCliRuntimes();
   ctx.out("");
-  ctx.out(ctx.ui.bold(en ? "Runtime" : "런타임"));
+  ctx.out(ctx.ui.bold(en ? "Model roles" : "모델 역할"));
+  const orchestrator = resolvedModelRole(db, "orchestrator");
+  const worker = resolvedModelRole(db, "worker");
+  ctx.out(`  orchestrator: ${roleRuntimeLabel(orchestrator, "orchestrator", en)}`);
+  ctx.out(`  worker:       ${roleRuntimeLabel(worker, "worker", en)}`);
+
+  ctx.out("");
+  ctx.out(ctx.ui.bold(en ? "Legacy runtime compatibility" : "레거시 런타임 호환"));
   if (active) {
     ctx.out(`  active: ${active.kind}${active.model ? ` (${active.model})` : ""}${active.backend ? ` via ${active.backend}` : ""}`);
   } else {

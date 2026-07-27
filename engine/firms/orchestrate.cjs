@@ -204,13 +204,15 @@ function turnText(res) {
  * 회사 1태스크 실행: PLAN → DELEGATE → SYNTHESIZE.
  * @param {object} p
  *   db, orch(Orchestrator), firm(firms 행), ceoAgent(rowToAgent 결과),
- *   task, runtime, permission, cwd, onEvent?({phase,...}),
+ *   task, runtime(orchestrator), workerRuntime?, resolveWorkerRuntime?(division),
+ *   permission, cwd, onEvent?({phase,...}),
  *   spawnImplFor?({kind:'ceo'|'division', role?}) — 계약 테스트 전용 fake spawn 주입,
  *   timeoutConfig? — 테스트 전용.
  * @returns {ok, text, chatId, plan:{text,delegations}, divisions:[{role,name,ok,text,chatId}]}
  */
 async function runFirmTurn(p) {
   const { db, orch, firm, ceoAgent, task, runtime, permission, cwd } = p;
+  const workerRuntime = p.workerRuntime || runtime;
   const onEvent = typeof p.onEvent === "function" ? p.onEvent : () => {};
   const parseDelegations = loadDelegateParser();
   const divisions = resolveDivisions(db, firm, ceoAgent);
@@ -269,15 +271,20 @@ async function runFirmTurn(p) {
   // kind='division' + parent_chat_id(CEO 챗)로 영속된다. 한 본부의 실패는 격리한다.
   onEvent({ phase: "delegate", targets: matched.map((m) => ({ role: m.node.role, name: m.node.name, brief: m.brief })) });
   const divisionResults = await parallelCap(matched, maxParallel(), async (m) => {
+    const divisionRuntime = typeof p.resolveWorkerRuntime === "function"
+      ? p.resolveWorkerRuntime(m.node)
+      : workerRuntime;
     const session = orch.spawn({
       agent: m.node.agent,
-      runtime,
+      runtime: divisionRuntime,
       permission,
       cwd,
       title: `division: ${m.node.role}`,
       parentKey: ceoSession.key,
       activate: false,
-      spawnImpl: p.spawnImplFor ? p.spawnImplFor({ kind: "division", role: m.node.role }) : undefined,
+      spawnImpl: p.spawnImplFor
+        ? p.spawnImplFor({ kind: "division", role: m.node.role, runtime: divisionRuntime })
+        : undefined,
       timeoutConfig: p.timeoutConfig,
     });
     // 본부 세션도 generic 자동 위임을 끈다 — 터미널 firm 은 아직 tier-3(전문가) 배선이

@@ -32,47 +32,114 @@ const path = require("node:path");
 const { userDataDir } = require("../core/paths.cjs");
 const hubClient = require("../cloud/hub-client.cjs");
 const detect = require("../runtimes/detect.cjs");
+const { resolvedModelRole } = require("../runtimes/roles.cjs");
 const capture = require("./capture.cjs");
 
 // ── 런타임 해석 (v1 resolveRuntime의 워크포스 어댑터) ─────────────────────
-// 워크포스 모듈이 기대하는 형태: {mode:"cli", kind, model?} | {mode:"api", backend, model}.
-// v2 runtimes/resolve.cjs는 {kind, bin, source}만 주고 BYOK/Ollama를 모르므로,
-// v1의 사다리(명시 override > prefs 저장값 > 공유 DB active_runtime(byok/ollama 포함)
-// > PATH 탐지)를 여기서 복원한다. 아무것도 없으면 no_runtime 정직 정지 — 폴백 금지.
-function resolveWorkforceRuntime(db, override) {
-  if (!override) {
+// 워크포스 모듈이 기대하는 형태:
+//   {mode:"cli", kind, model?, effort?} | {mode:"api", backend, model, effort?}
+// 반환 정본은 orchestrator 런타임이며 roleRuntimes에 두 역할의 실제 실행 런타임을
+// 동봉한다. stage별 선택은 agentlas-workforce.cjs가 수행한다.
+function runtimeFromSelection(selection) {
+  if (!selection || !selection.kind) return null;
+  const common = {
+    model: selection.model || null,
+    effort: selection.effort || null,
+    capabilities: ["code", "tools", ...(selection.longContext ? ["long-context"] : [])],
+    efforts: [],
+    source: selection.sourceLayer || selection.source || null,
+    role: selection.role || null,
+  };
+  if (capture.RUNTIME_BIN[selection.kind]) {
+    return { mode: "cli", kind: selection.kind, ...common };
+  }
+  if (selection.kind === "byok" && selection.backend) {
+    return { mode: "api", backend: selection.backend, ...common };
+  }
+  if (selection.kind === "ollama") {
+    return { mode: "api", backend: "ollama", ...common };
+  }
+  return null;
+}
+
+function legacyWorkforceRuntime(db, override) {
+  let selectedOverride = override;
+  if (!selectedOverride) {
     try {
       const saved = require("../agentlas-config.cjs").loadPrefs(userDataDir()).runtime;
-      if (saved && saved !== "auto" && capture.RUNTIME_BIN[saved] && capture.which(capture.RUNTIME_BIN[saved])) override = saved;
+      if (
+        saved &&
+        saved !== "auto" &&
+        capture.RUNTIME_BIN[saved] &&
+        capture.which(capture.RUNTIME_BIN[saved])
+      ) {
+        selectedOverride = saved;
+      }
     } catch { /* prefs 없음 — 사다리 계속 */ }
   }
   const ar = db ? detect.activeRuntimeRow(db) : null;
-  const activeCli = ar && capture.RUNTIME_BIN[ar.kind]
-    ? {
-        mode: "cli",
+  const active = ar
+    ? runtimeFromSelection({
+        role: "orchestrator",
         kind: ar.kind,
-        model: ar.model || null,
-        capabilities: ["code", "tools", ...(ar.long_context ? ["long-context"] : [])],
-        efforts: [],
-      }
+        backend: ar.backend,
+        source: ar.source,
+        model: ar.model,
+        effort: null,
+        longContext: Boolean(ar.long_context),
+        sourceLayer: "active-runtime",
+      })
     : null;
-  if (override) {
-    if (!capture.RUNTIME_BIN[override]) {
-      const error = new Error(`unknown workforce runtime: ${override} (capture drivers: ${Object.keys(capture.RUNTIME_BIN).join(", ")})`);
+  if (selectedOverride) {
+    if (!capture.RUNTIME_BIN[selectedOverride]) {
+      const error = new Error(
+        `unknown workforce runtime: ${selectedOverride} (capture drivers: ${Object.keys(capture.RUNTIME_BIN).join(", ")})`,
+      );
       error.code = "no_runtime";
       throw error;
     }
-    return activeCli && activeCli.kind === override ? activeCli : { mode: "cli", kind: override };
+    return active && active.mode === "cli" && active.kind === selectedOverride
+      ? active
+      : { mode: "cli", kind: selectedOverride, model: null, effort: null };
   }
-  if (activeCli) return activeCli;
-  if (ar && ar.kind === "byok" && ar.backend) return { mode: "api", backend: ar.backend, model: ar.model };
-  if (ar && ar.kind === "ollama") return { mode: "api", backend: "ollama", model: ar.model };
+  if (active) return active;
   for (const kind of Object.keys(capture.RUNTIME_BIN)) {
-    if (capture.which(capture.RUNTIME_BIN[kind])) return { mode: "cli", kind };
+    if (capture.which(capture.RUNTIME_BIN[kind])) {
+      return { mode: "cli", kind, model: null, effort: null, source: "detected" };
+    }
   }
-  const error = new Error("no_runtime: no agent CLI or connected API runtime found (claude / codex / gemini / BYOK / Ollama).");
+  const error = new Error(
+    "no_runtime: no agent CLI or connected API runtime found (claude / codex / gemini / BYOK / Ollama).",
+  );
   error.code = "no_runtime";
   throw error;
+}
+
+// 사다리: 명시 override > model_roles[role] > 레거시 prefs/active/PATH.
+// worker가 비어 있거나 inherit=1이면 roles.cjs가 orchestrator로만 승격한다.
+function resolveWorkforceRuntime(db, override) {
+  if (override) {
+    const exact = legacyWorkforceRuntime(db, override);
+    return {
+      ...exact,
+      role: "orchestrator",
+      roleRuntimes: {
+        orchestrator: { ...exact, role: "orchestrator" },
+        worker: { ...exact, role: "worker" },
+      },
+    };
+  }
+  const fallback = legacyWorkforceRuntime(db, null);
+  const orchestrator = runtimeFromSelection(resolvedModelRole(db, "orchestrator")) || fallback;
+  const worker = runtimeFromSelection(resolvedModelRole(db, "worker")) || orchestrator;
+  return {
+    ...orchestrator,
+    role: "orchestrator",
+    roleRuntimes: {
+      orchestrator: { ...orchestrator, role: "orchestrator" },
+      worker: { ...worker, role: "worker" },
+    },
+  };
 }
 
 // ── 영수증 (v1 모놀리스의 JSONL 계약 포팅: userData 하위, 0700/0600) ──────
@@ -112,13 +179,49 @@ function persistBenchmarkArtifact(artifact, executionIdHint) {
 // 보존하되 runtimeIds=[] / status="observed-not-executable"로 광고한다 —
 // 필요 capability에 대해 워크포스 모듈이 플래너 전에 fail-closed 하게 된다.
 // 권한을 제조하는 것보다 정직 정지가 계약이다.
-async function listWorkforceTools({ db, roster, cwd, env, timeoutMs, signal }) {
+// 워커가 실제로 부여받을 수 있는 유일한 네이티브 도구 집합 — 읽기 전용.
+// claude-code는 plan 모드(쓰기·실행 거부) + --allowedTools 로 이 경계를 강제할 수 있어
+// "정확 per-tool 부착"이 증명된다. 쓰기·셸·네트워크·MCP는 여전히 증명 불가라 잠긴 채다.
+const READ_ONLY_NATIVE_TOOLS = ["Read", "Grep", "Glob"];
+const READ_ONLY_BUILTIN_TOOL_ID = "builtin:file-read";
+const READ_ONLY_CAPABILITY_IDS = ["tool:file-read"];
+const READ_ONLY_RUNTIME_IDS = ["runtime:claude-code"];
+
+function readOnlyBuiltinToolRows(roster, runtimeId) {
+  if (!READ_ONLY_RUNTIME_IDS.includes(String(runtimeId || ""))) return [];
+  const rows = [];
+  for (const pinned of roster || []) {
+    // 허브가 이 릴리스에 파일 읽기를 허용했을 때만. deny면 존중하고 부여하지 않는다.
+    if (pinned?.permissionPolicy?.fileRead?.mode !== "manifest-allowlist") continue;
+    rows.push({
+      slotId: pinned.slotId,
+      agentReleaseId: pinned.agentReleaseId,
+      permissionPolicyDigest: pinned.permissionPolicyDigest,
+      provider: "builtin",
+      toolId: READ_ONLY_BUILTIN_TOOL_ID,
+      // 내장 도구는 MCP 서버가 없다. validateToolInventory는 serverId가 정확히 null이
+      // 아니면 거절한다(2026-07-27 라이브: "builtin" 문자열을 넣어 prepare 직후 전량 폐기).
+      serverId: null,
+      description: "Read-only project file access (Read/Grep/Glob, no write, no shell)",
+      inputSchemaDigest: null,
+      runtimeIds: [...READ_ONLY_RUNTIME_IDS],
+      selectiveEnforcement: "exact-tool-allowlist",
+      capabilityIds: [...READ_ONLY_CAPABILITY_IDS],
+      status: "ready",
+    });
+  }
+  return rows;
+}
+
+async function listWorkforceTools({ db, roster, cwd, env, timeoutMs, signal, runtimeId }) {
   const mcp = require("../mcp/index.cjs");
+  // 읽기 전용 내장 도구는 MCP 서버 유무와 무관하게 항상 제공한다.
+  const builtinRows = readOnlyBuiltinToolRows(roster, runtimeId);
   const servers = mcp.readConsentedSystemMcpServers(db, {
     userDataDir: userDataDir(),
     createRuntimeHome: false,
   }).slice(0, 8);
-  if (!servers.length) return [];
+  if (!servers.length) return builtinRows;
   const deadline = Date.now() + Math.max(50, Math.min(12_000, Number(timeoutMs) || 12_000));
   const outcomes = new Array(servers.length);
   let cursor = 0;
@@ -140,7 +243,7 @@ async function listWorkforceTools({ db, roster, cwd, env, timeoutMs, signal }) {
   await Promise.all(Array.from({ length: Math.min(3, servers.length) }, () => worker()));
 
   const safeId = /^[A-Za-z0-9][A-Za-z0-9_.$:/@+~-]{0,127}$/;
-  const rows = [];
+  const rows = [...builtinRows];
   for (let index = 0; index < servers.length; index += 1) {
     const server = servers[index];
     const listed = outcomes[index];
@@ -444,9 +547,19 @@ function buildWorkforceDeps(ctx = {}) {
     appendAuditReceipt,
     persistBenchmarkArtifact,
     listWorkforceTools,
-    // Terminal 원샷 러너는 네이티브 per-tool 권한 부여 경계를 아직 증명하지 못했다.
-    // 증명 없이 true를 돌려주면 권한 제조가 된다 — v1과 동일하게 항상 false.
-    supportsWorkforceToolAuthority: async () => false,
+    // 호스트가 자기 도구를 빌려주는 결정은 허브 후보 자격과 무관하다.
+    // requiredToolCapabilities는 "이 허브 에이전트가 그 도구를 선언했는가"라는
+    // 후보 필터라서, 선언한 에이전트가 사실상 0이라 그걸 쓰면 후보가 0건이 된다
+    // (2026-07-27 실측: 그래서 리더가 절대 선언하지 않았고 부여가 영영 발동 안 됨).
+    // 읽기 권한 대여는 허브가 그 릴리스에 파일 읽기를 허용했는지만 보면 된다.
+    hostReadOnlyGrants: (roster, runtimeId) => readOnlyBuiltinToolRows(roster, runtimeId),
+    // 읽기 전용 내장 도구는 claude-code plan 모드 + --allowedTools/--disallowedTools로
+    // 정확 경계가 증명된다 → 부여 허용. 그 밖(쓰기·셸·네트워크·MCP)은 여전히 증명
+    // 불가라 거부한다. 증명 없이 true를 돌려주면 권한 제조가 된다.
+    supportsWorkforceToolAuthority: async ({ grantedToolIds }) =>
+      Array.isArray(grantedToolIds)
+      && grantedToolIds.length > 0
+      && grantedToolIds.every((id) => id === READ_ONLY_BUILTIN_TOOL_ID),
     bindWorkforceGoal,
     loadWorkforceGoalRuntime,
     recordWorkforceGoalTurn,
@@ -472,6 +585,9 @@ module.exports = {
   appendAuditReceipt,
   persistBenchmarkArtifact,
   listWorkforceTools,
+  readOnlyBuiltinToolRows,
+  READ_ONLY_NATIVE_TOOLS,
+  READ_ONLY_BUILTIN_TOOL_ID,
   bindWorkforceGoal,
   loadWorkforceGoalRuntime,
   completeWorkforceGoal,

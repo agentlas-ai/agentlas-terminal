@@ -5,6 +5,18 @@ CREATE TABLE active_runtime (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         kind TEXT NOT NULL
       , backend TEXT, source TEXT, model TEXT, long_context INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE model_roles (
+        role TEXT PRIMARY KEY CHECK(role IN ('orchestrator','worker')),
+        kind TEXT NOT NULL,
+        backend TEXT,
+        source TEXT,
+        model TEXT,
+        effort TEXT,
+        long_context INTEGER NOT NULL DEFAULT 0 CHECK(long_context IN (0,1)),
+        inherit INTEGER NOT NULL DEFAULT 0 CHECK(inherit IN (0,1)),
+        updated_at TEXT NOT NULL,
+        CHECK(role = 'worker' OR inherit = 0)
+      );
 CREATE TABLE installed_agents (
         id TEXT PRIMARY KEY,
         slug TEXT UNIQUE NOT NULL,

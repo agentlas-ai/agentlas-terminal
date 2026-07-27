@@ -89,7 +89,48 @@ function buildArgs(kind, systemPrompt, prompt, permission, runtimeOptions = {}) 
   const model = runtimeOptions.model ? String(runtimeOptions.model) : null;
   const effort = runtimeOptions.effort ? String(runtimeOptions.effort) : null;
   const noAuthority = runtimeOptions.authorityMode === "no-authority";
+  // read-only 권한: 워크포스가 tool:file-read 능력만 부여했을 때. plan 모드(쓰기 불가)에
+  // 정확-도구 allowlist를 겹쳐 읽기 3종으로 고정한다. 이것이 "증명 가능한 경계"의 실체다 —
+  // 예전에는 이 모드가 없어서 도구를 주면 곧바로 acceptEdits(쓰기)+기본 도구 전체가 됐고,
+  // 그래서 권한 부여 자체를 항상 거부할 수밖에 없었다(2026-07-27 코드 감사 불가의 근본).
+  const readOnlyAuthority = runtimeOptions.authorityMode === "read-only";
+  const readOnlyTools = Array.isArray(runtimeOptions.allowedNativeTools) && runtimeOptions.allowedNativeTools.length
+    ? [...new Set(runtimeOptions.allowedNativeTools.map((t) => String(t)))].sort()
+    : [];
+  if (readOnlyAuthority && !readOnlyTools.length) {
+    throw new Error("read-only capture requires an explicit native tool allowlist");
+  }
+  // read-only 분기를 가진 런타임은 claude-code뿐이다. 다른 kind로 들어오면 아래에서
+  // 일반 권한 분기로 떨어져 조용히 쓰기/셸까지 열린다 — 권한 승격이므로 정직 정지.
+  // (역할별 모델 배정으로 워커가 codex/gemini에서 돌 수 있게 되며 실재 경로가 됐다.)
+  if (readOnlyAuthority && kind !== "claude-code") {
+    throw new Error(`read-only capture is not provable on ${kind}`);
+  }
   if (kind === "claude-code") {
+    if (readOnlyAuthority) {
+      const thinkingRo = effort === "max" || effort === "xhigh" ? "Ultrathink. " : effort === "high" ? "Think hard. " : effort === "medium" ? "Think. " : "";
+      const claudeEffortRo = effort === "minimal" ? "low" : effort === "xhigh" ? "max" : effort;
+      return [
+        "-p", thinkingRo + prompt,
+        "--append-system-prompt", systemPrompt,
+        ...(model ? ["--model", model] : []),
+        ...(claudeEffortRo && claudeEffortRo !== "none" ? ["--effort", claudeEffortRo] : []),
+        // 도구를 쓰는 워커는 최종 답까지 stdout에 한 글자도 내지 않는다 — 무도구
+        // 워커에는 없던 문제다. 유휴 타이머는 그 침묵을 "죽었다"로 읽고 10분에
+        // 처형한다(2026-07-27 라이브 실측 AGENTLAS_CAPTURE_IDLE_TIMEOUT). 이벤트
+        // 스트림으로 받아 도구 호출마다 진행 신호가 흐르게 하면 유휴 판정이 비로소
+        // 진짜 정지 신호가 된다. 최종 텍스트는 capturedRuntimeAgentText가 result
+        // 이벤트에서 뽑는다(이미 이 프로토콜을 파싱한다). 부분 토큰 델타는 켜지
+        // 않는다 — 진행 신호는 도구 호출 단위로 충분하고 출력량이 폭증한다.
+        "--output-format", "stream-json",
+        "--verbose",
+        // plan 모드는 쓰기/실행을 거부한다. allowedTools로 읽기 3종만 남긴다.
+        "--permission-mode", "plan",
+        "--allowedTools", readOnlyTools.join(","),
+        "--disallowedTools", "Write,Edit,MultiEdit,NotebookEdit,Bash,BashOutput,KillShell,WebFetch,WebSearch,Task",
+        ...native.claudeMcpIsolationArgs(),
+      ];
+    }
     const perm = native.claudePermissionArgs(noAuthority ? "read" : level);
     // 백그라운드/캡처 경로에는 검토된 MCP 서버 목록이 없다. full 권한은 툴 권한이지
     // MCP 동의가 아니므로 이 경로는 항상 정확-공백 MCP 격리를 유지한다.
@@ -102,6 +143,16 @@ function buildArgs(kind, systemPrompt, prompt, permission, runtimeOptions = {}) 
       "--append-system-prompt", systemPrompt,
       ...(model ? ["--model", model] : []),
       ...effortArgs,
+      // 이 분기도 read-only 분기와 같은 이유로 이벤트 스트림이 필요하다. 위 주석은
+      // 침묵 문제를 "도구를 쓰는 워커"의 것으로 한정했지만, 그건 도구 유무가 아니라
+      // "최종 답 전에는 stdout에 아무것도 없다"는 성질이고 이 분기도 똑같다.
+      // effort가 높으면 "Ultrathink."가 앞에 붙어 사고만 10분을 넘길 수 있고,
+      // 유휴 타이머는 그 침묵을 죽음으로 읽는다 — 2026-07-28 라이브에서 무도구
+      // 워커 3개가 전부 600초 유휴로 처형됐다. 진행 신호가 흐르는 채널로 재야
+      // 유휴 판정이 실제 정지를 뜻한다. 최종 텍스트는
+      // capturedRuntimeAgentText가 result 이벤트에서 그대로 뽑는다.
+      "--output-format", "stream-json",
+      "--verbose",
       ...perm,
       ...(noAuthority ? ["--tools", ""] : []),
       ...mcp,
@@ -166,6 +217,98 @@ function codexCaptureAgentText(jsonl) {
   return [...latest.values()].join("");
 }
 
+function nonNegativeTokenCount(value) {
+  return Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+function usageFromObject(value, inputKeys, outputKeys, inputAdditiveKeys = []) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const firstCount = (keys) => {
+    for (const key of keys) {
+      const count = nonNegativeTokenCount(value[key]);
+      if (count != null) return count;
+    }
+    return null;
+  };
+  let inputTokens = firstCount(inputKeys);
+  const outputTokens = firstCount(outputKeys);
+  if (inputTokens != null) {
+    for (const key of inputAdditiveKeys) {
+      const count = nonNegativeTokenCount(value[key]);
+      if (count != null) inputTokens += count;
+    }
+  }
+  // Do not manufacture a zero for providers that expose only one side.
+  return inputTokens == null || outputTokens == null
+    ? null
+    : { inputTokens, outputTokens };
+}
+
+function capturedRuntimeUsage(kind, raw) {
+  const events = [];
+  for (const line of String(raw || "").split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      events.push(JSON.parse(line));
+    } catch {
+      return null;
+    }
+  }
+  const genericUsage = (value) =>
+    usageFromObject(
+      value,
+      ["inputTokens", "input_tokens", "promptTokens", "prompt_tokens", "promptTokenCount"],
+      ["outputTokens", "output_tokens", "completionTokens", "completion_tokens", "candidatesTokenCount"],
+    );
+  for (const event of [...events].reverse()) {
+    if (kind === "claude-code") {
+      const claudeUsage = usageFromObject(
+        event?.usage,
+        ["input_tokens"],
+        ["output_tokens"],
+        ["cache_creation_input_tokens", "cache_read_input_tokens"],
+      );
+      if (claudeUsage) return claudeUsage;
+      const modelUsage = event?.modelUsage;
+      if (modelUsage && typeof modelUsage === "object" && !Array.isArray(modelUsage)) {
+        let inputTokens = 0;
+        let outputTokens = 0;
+        let observed = false;
+        for (const row of Object.values(modelUsage)) {
+          const usage = genericUsage(row);
+          if (!usage) continue;
+          inputTokens += usage.inputTokens;
+          outputTokens += usage.outputTokens;
+          observed = true;
+        }
+        if (observed) return { inputTokens, outputTokens };
+      }
+    }
+    const direct =
+      genericUsage(event?.usage) ||
+      genericUsage(event?.usageMetadata) ||
+      genericUsage(event?.stats);
+    if (direct) return direct;
+    if (kind === "gemini") {
+      const models = event?.stats?.models;
+      if (models && typeof models === "object" && !Array.isArray(models)) {
+        let inputTokens = 0;
+        let outputTokens = 0;
+        let observed = false;
+        for (const row of Object.values(models)) {
+          const usage = genericUsage(row);
+          if (!usage) continue;
+          inputTokens += usage.inputTokens;
+          outputTokens += usage.outputTokens;
+          observed = true;
+        }
+        if (observed) return { inputTokens, outputTokens };
+      }
+    }
+  }
+  return null;
+}
+
 function capturedRuntimeAgentText(kind, raw) {
   const text = String(raw || "");
   const events = [];
@@ -219,7 +362,9 @@ function capturedRuntimeAgentText(kind, raw) {
 /**
  * 네이티브 CLI 헤드리스 1턴 캡처 — 최종 텍스트를 resolve한다.
  * opts: { cwd, env, permission, model, effort, authorityMode, noToolsPolicyPath,
- *         timeoutConfig, outputLimitBytes, signal, spawn(테스트 주입) }
+ *         envelope, timeoutConfig, outputLimitBytes, signal, spawn(테스트 주입) }
+ * envelope=true면 { text, usage }를 반환한다. usage는 양쪽 토큰을 실제로 관측한
+ * 경우만 채우고, 불완전한 provider 이벤트를 0으로 위조하지 않는다.
  */
 function captureRuntime(kind, systemPrompt, prompt, opts) {
   opts = opts || {};
@@ -247,6 +392,7 @@ function captureRuntime(kind, systemPrompt, prompt, opts) {
         effort: opts.effort,
         authorityMode: opts.authorityMode,
         noToolsPolicyPath: opts.noToolsPolicyPath,
+        allowedNativeTools: opts.allowedNativeTools,
       }), {
         cwd,
         stdio: ["ignore", "pipe", "pipe"],
@@ -369,15 +515,17 @@ function captureRuntime(kind, systemPrompt, prompt, opts) {
         return;
       }
       const raw = stdout.trim() || stderr.trim();
+      let text;
       if (kind === "codex" && opts.authorityMode === "no-authority") {
-        finishResolve(codexCaptureAgentText(raw));
-        return;
+        text = codexCaptureAgentText(raw);
+      } else if (kind === "claude-code" || kind === "gemini") {
+        text = capturedRuntimeAgentText(kind, raw);
+      } else {
+        text = raw;
       }
-      if (kind === "claude-code" || kind === "gemini") {
-        finishResolve(capturedRuntimeAgentText(kind, raw));
-        return;
-      }
-      finishResolve(raw);
+      finishResolve(opts.envelope
+        ? { text, usage: capturedRuntimeUsage(kind, raw) }
+        : text);
     };
     onAbort = () => {
       const reason = opts.signal && opts.signal.reason;
@@ -399,7 +547,7 @@ function captureRuntime(kind, systemPrompt, prompt, opts) {
   });
 }
 
-// ── API 러너 (BYOK / Ollama) — 비스트리밍, 최종 텍스트 반환 (v1 runApi 포팅) ──
+// ── API 러너 (BYOK / Ollama) — 비스트리밍, 최종 텍스트/usage 반환 (v1 runApi 포팅) ──
 // engine/agentlas-api-agent.cjs 는 스트리밍+툴 루프(대화형)용이다. 워크포스 워커는
 // zero-tools 원샷이 계약이므로 v1의 비스트리밍 원샷 경로를 그대로 쓴다.
 const DEFAULT_API_MODEL = {
@@ -483,6 +631,9 @@ function readCustomApiBaseUrl() {
  */
 async function runApi(backend, model, system, prompt, options) {
   options = options || {};
+  const finish = (text, usage) => options.envelope
+    ? { text: String(text || ""), usage: usage || null }
+    : String(text || "");
   model = model || DEFAULT_API_MODEL[backend];
   const fetchImpl = options.fetch || globalThis.fetch;
   if (typeof fetchImpl !== "function") throw new Error("fetch is unavailable in this runtime (run through the app runtime).");
@@ -494,7 +645,10 @@ async function runApi(backend, model, system, prompt, options) {
     });
     if (!resp.ok) throw new Error(`Ollama ${resp.status} — run 'ollama serve' and check the model`);
     const j = await resp.json();
-    return (j.message && j.message.content) || "";
+    return finish(
+      (j.message && j.message.content) || "",
+      usageFromObject(j, ["prompt_eval_count"], ["eval_count"]),
+    );
   }
   const supported = backend === "anthropic" || backend === "openai" || backend === "google" ||
     backend === "upstage" || backend === "custom" || !!ANTHROPIC_COMPAT_API[backend];
@@ -509,14 +663,25 @@ async function runApi(backend, model, system, prompt, options) {
     const authHeaders = anthropicCompat
       ? { "x-api-key": key, authorization: "Bearer " + key }
       : { "x-api-key": key };
+    // Prompt caching: 진짜 Anthropic만 cache_control을 존중한다. 크고 안정된
+    // system 프리픽스를 캐시 경계로 표시하면 적중 시 입력이 ~90% 싸게 과금되고,
+    // 모델별 최소치(~1024 토큰) 미만이면 서버가 조용히 무시하므로 무해하다.
+    // 호환 엔드포인트(GLM/Kimi/DeepSeek)는 문자열 형태를 유지한다 — 서버측
+    // 자동 캐시가 있고 추가 필드를 거부할 수 있다(데스크탑 byok.ts와 동일 계약).
+    const systemField = backend === "anthropic"
+      ? [{ type: "text", text: system, cache_control: { type: "ephemeral" } }]
+      : system;
     const resp = await fetchImpl(`${base}/v1/messages`, {
       method: "POST",
       headers: { "content-type": "application/json", ...authHeaders, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({ model, max_tokens: 4096, system, messages: [{ role: "user", content: prompt }] }),
+      body: JSON.stringify({ model, max_tokens: 4096, system: systemField, messages: [{ role: "user", content: prompt }] }),
     });
     if (!resp.ok) throw new Error(`${label} ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 200)}`);
     const j = await resp.json();
-    return (j.content && j.content[0] && j.content[0].text) || "";
+    return finish(
+      (j.content && j.content[0] && j.content[0].text) || "",
+      usageFromObject(j.usage, ["input_tokens"], ["output_tokens"]),
+    );
   }
   if (backend === "openai" || backend === "upstage" || backend === "custom") {
     const base = backend === "upstage"
@@ -534,7 +699,10 @@ async function runApi(backend, model, system, prompt, options) {
     });
     if (!resp.ok) throw new Error(`${label} ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 200)}`);
     const j = await resp.json();
-    return (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || "";
+    return finish(
+      (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || "",
+      usageFromObject(j.usage, ["prompt_tokens"], ["completion_tokens"]),
+    );
   }
   if (backend === "google") {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`;
@@ -546,7 +714,10 @@ async function runApi(backend, model, system, prompt, options) {
     if (!resp.ok) throw new Error(`Google ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 200)}`);
     const j = await resp.json();
     const c = j.candidates && j.candidates[0];
-    return (c && c.content && c.content.parts && c.content.parts[0] && c.content.parts[0].text) || "";
+    return finish(
+      (c && c.content && c.content.parts && c.content.parts[0] && c.content.parts[0].text) || "",
+      usageFromObject(j.usageMetadata, ["promptTokenCount"], ["candidatesTokenCount"]),
+    );
   }
   throw new Error("Unsupported backend: " + backend);
 }
@@ -641,6 +812,19 @@ const UNTRUSTED_PROTECTED_ENV_KEYS_CLI = new Set([
   "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "GRPC_PROXY", "NPM_CONFIG_PROXY",
   "AGENTLAS_SESSION", "AGENTLAS_MCP_BASE_URL", "AGENTLAS_WEB_BASE_URL", "AGENTLAS_API_BASE_URL",
   "AGENTLAS_HUB_BASE_URL", "AGENTLAS_CLOUD_BASE_URL", "OLLAMA_HOST",
+  // 모델 제공사 엔드포인트/게이트웨이 — Agentlas 자체 base URL과 같은 부류인데 빠져
+  // 있었다. 2026-07-27 실측: 클론 레포의 .env 한 줄이 자식 CLI의 ANTHROPIC_BASE_URL과
+  // AUTH_TOKEN을 갈아치워, 모든 워커 프롬프트가 공격자 서버로 나가고 그 서버가 쓴
+  // 답변이 핸드오프·합성으로 흘러든다. 키 자체(*_API_KEY)는 프로젝트별 BYOK 기능이라
+  // 계속 허용한다 — 막는 것은 "데이터가 어디로 가는가"뿐이다.
+  "ANTHROPIC_BASE_URL", "ANTHROPIC_API_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS",
+  "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_BASE_URL",
+  "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+  "CLAUDE_CODE_SKIP_VERTEX_AUTH", "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_BEDROCK",
+  "OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_ORGANIZATION", "AZURE_OPENAI_ENDPOINT",
+  "OPENAI_PROXY", "CODEX_BASE_URL", "CODEX_API_URL",
+  "GOOGLE_GEMINI_BASE_URL", "GOOGLE_VERTEX_BASE_URL", "GEMINI_API_BASE_URL",
+  "GOOGLE_CLOUD_PROJECT", "GOOGLE_APPLICATION_CREDENTIALS",
 ]);
 function isProtectedChildEnvKeyCli(key, trusted) {
   const k = String(key || "").trim().toUpperCase();
@@ -690,6 +874,7 @@ module.exports = {
   buildArgs,
   codexCaptureAgentText,
   capturedRuntimeAgentText,
+  capturedRuntimeUsage,
   captureOutputLimit,
   directCaptureOutputLimit,
   captureRuntime,

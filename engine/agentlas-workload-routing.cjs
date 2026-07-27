@@ -397,10 +397,32 @@ function resolveAllocationAcrossRuntimes(options = {}) {
   return { ...resolution, runtime, runtimeId, requestedRuntimeId: requestedId || null };
 }
 
-function createDecisionReceipt({ taskId, stage, decision, resolution }) {
+function modelRoleForStage(stage) {
+  return ["plan", "planner", "leader", "verify", "verifier", "synthesize", "synthesis", "route", "clarify"]
+    .includes(cleanText(stage, 80).toLowerCase())
+    ? "orchestrator"
+    : "worker";
+}
+
+function normalizeObservedUsage(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const inputTokens = value.inputTokens;
+  const outputTokens = value.outputTokens;
+  return Number.isInteger(inputTokens) && inputTokens >= 0
+    && Number.isInteger(outputTokens) && outputTokens >= 0
+    ? { inputTokens, outputTokens }
+    : null;
+}
+
+function createDecisionReceipt({ taskId, stage, decision, resolution, role, usage }) {
   const normalized = normalizeAllocation(decision);
   const validationIssues = [];
-  if (!normalized) validationIssues.push("invalid-ai-allocation");
+  const decisionProvided = decision != null;
+  if (!decisionProvided) validationIssues.push("allocation_not_provided");
+  else if (!normalized) validationIssues.push("invalid_ai_allocation");
+  const resolvedRole = role === "worker" || role === "orchestrator"
+    ? role
+    : modelRoleForStage(stage);
   const resolutionCodes = cleanText(resolution && resolution.fallbackReason, 500)
     .split(",")
     .map((code) => cleanText(code, 120))
@@ -411,12 +433,13 @@ function createDecisionReceipt({ taskId, stage, decision, resolution }) {
   ])].slice(0, 32);
   const featurePayload = JSON.stringify(normalized ? {
     phase: normalized.phase,
+    role: resolvedRole,
     tier: normalized.tier,
     effort: normalized.effort,
     reasonCodes: normalized.reasonCodes,
     requiredCapabilities: normalized.requiredCapabilities,
     estimatedContextTokens: normalized.estimatedContextTokens,
-  } : { phase: cleanText(stage, 80) || null, allocation: null });
+  } : { phase: cleanText(stage, 80) || null, role: resolvedRole, allocation: null });
   const featureHash = `sha256:${crypto.createHash("sha256").update(featurePayload, "utf8").digest("hex")}`;
   const source = resolution && resolution.source;
   const hasResolvedCurrent = Boolean(
@@ -439,6 +462,7 @@ function createDecisionReceipt({ taskId, stage, decision, resolution }) {
       ? normalized.decisionId
       : `terminal:model-allocation:${featureHash.slice("sha256:".length, "sha256:".length + 24)}`,
     packetId: cleanText(taskId, 255) || null,
+    role: resolvedRole,
     status,
     requested: {
       tier: normalized ? normalized.tier : null,
@@ -460,6 +484,7 @@ function createDecisionReceipt({ taskId, stage, decision, resolution }) {
     selectorVersion: normalized ? normalized.selectorVersion : "deterministic-host-fallback",
     independentVerificationRequired:
       riskCodes.has("high-risk") || riskCodes.has("critical-risk") || riskCodes.has("independent-verification"),
+    usage: normalizeObservedUsage(usage),
     validationIssues,
     privacy: { rawPromptIncluded: false, rawTranscriptIncluded: false },
   };
@@ -522,6 +547,7 @@ module.exports = {
   resolveAllocation,
   resolveAllocationAcrossRuntimes,
   createDecisionReceipt,
+  modelRoleForStage,
   appendDecisionReceipt,
   defaultReceiptPath,
   plannerSystemPrompt,

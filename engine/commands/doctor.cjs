@@ -9,6 +9,19 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { dbPath, userDataDir } = require("../core/paths.cjs");
 const { listAvailableCliRuntimes, activeRuntimeRow } = require("../runtimes/detect.cjs");
+const { resolvedModelRole } = require("../runtimes/roles.cjs");
+
+function roleDetail(selection, role, en) {
+  if (!selection) return en ? "not set" : "미설정";
+  const provider = selection.kind === "byok" ? selection.backend || "byok" : selection.kind;
+  return [
+    `${role}=${provider}${selection.model ? `/${selection.model}` : ""}`,
+    selection.effort ? `effort=${selection.effort}` : null,
+    role === "worker" && selection.inherit
+      ? (en ? "inherits orchestrator" : "오케스트레이터 상속")
+      : null,
+  ].filter(Boolean).join(" · ");
+}
 
 function run(ctx) {
   const en = ctx.lang === "en";
@@ -42,8 +55,17 @@ function run(ctx) {
     ctx.out(ctx.ui.dim("      npm i -g @anthropic-ai/claude-code  ·  @openai/codex  ·  @google/gemini-cli"));
   }
   try {
-    const active = activeRuntimeRow(ctx.db());
+    const db = ctx.db();
+    const active = activeRuntimeRow(db);
     if (active) ok(en ? "active runtime" : "활성 런타임", `${active.kind}${active.model ? ` (${active.model})` : ""}`);
+    const orchestrator = resolvedModelRole(db, "orchestrator");
+    const worker = resolvedModelRole(db, "worker");
+    if (orchestrator && worker) {
+      ok(
+        en ? "model roles" : "모델 역할",
+        `${roleDetail(orchestrator, "orchestrator", en)} · ${roleDetail(worker, "worker", en)}`,
+      );
+    }
   } catch { /* db issue already reported */ }
 
   // 3) 로그인 상태 (세션 파일 관측만 — 네트워크 호출 없음)

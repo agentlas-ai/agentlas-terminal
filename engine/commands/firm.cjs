@@ -50,11 +50,14 @@ async function run(ctx, args) {
   }
   const ceo = rowToAgent(ceoRow);
 
-  // 간단 플래그 파싱(--runtime/--permission) — 명령끼리 참조 금지 규칙상 run.cjs 미차용.
+  // 간단 플래그 파싱 — 명령끼리 참조 금지 규칙상 run.cjs 미차용.
   const rest = args.slice(1);
-  const flags = { runtime: null, permission: null, task: [] };
+  const flags = { runtime: null, model: null, effort: null, tier: null, permission: null, task: [] };
   for (let i = 0; i < rest.length; i++) {
     if (rest[i] === "--runtime") flags.runtime = rest[++i];
+    else if (rest[i] === "--model") flags.model = rest[++i];
+    else if (rest[i] === "--effort") flags.effort = rest[++i];
+    else if (rest[i] === "--tier") flags.tier = rest[++i];
     else if (rest[i] === "--permission") flags.permission = rest[++i];
     else flags.task.push(rest[i]);
   }
@@ -62,26 +65,64 @@ async function run(ctx, args) {
   if (task) {
     // 3-tier 위임 실행 — PLAN → DELEGATE → SYNTHESIZE (firms/orchestrate.cjs).
     const { runFirmTurn } = require("../firms/orchestrate.cjs");
-    const { resolveRuntimeForAgent, unavailableOverrideNote } = require("../runtimes/overrides.cjs");
+    const {
+      resolveRuntimeForAgent,
+      unavailableOverrideNote,
+      unavailableRoleNote,
+    } = require("../runtimes/overrides.cjs");
+    const { EFFORTS, TIERS } = require("../agentlas-workload-routing.cjs");
     const { Orchestrator } = require("../sessions/orchestrator.cjs");
     const permissions = require("../agentlas-permissions.cjs");
+    if (flags.effort && !EFFORTS.includes(String(flags.effort))) {
+      ctx.err(`unknown --effort ${flags.effort} (use: ${EFFORTS.join(" | ")})`);
+      return 1;
+    }
+    if (flags.tier && !TIERS.includes(String(flags.tier))) {
+      ctx.err(`unknown --tier ${flags.tier} (use: ${TIERS.join(" | ")})`);
+      return 1;
+    }
+    if (flags.tier && !flags.model) {
+      ctx.err("--tier requires --model: Terminal never guesses a provider model id from a cost tier");
+      return 1;
+    }
     let runtime;
+    let workerRuntime;
     try {
-      // 사다리: 명시 > (agent CEO > firm) 오버라이드 > prefs > active > detected.
+      // CEO는 orchestrator, 본부는 worker. 명시 핀은 기존 firm 호출과의 호환을 위해
+      // 두 역할 모두에 적용하고, 미지정 시 각각 model_roles 기본값을 사용한다.
       runtime = resolveRuntimeForAgent({
         db,
         prefs: ctx.prefs,
         explicit: flags.runtime,
+        model: flags.model,
+        effort: flags.effort,
+        role: "orchestrator",
         targets: [
           { scope: "agent", targetId: ceo.id },
           { scope: "firm", targetId: firm.id },
         ],
       });
+      workerRuntime = resolveRuntimeForAgent({
+        db,
+        prefs: ctx.prefs,
+        explicit: flags.runtime,
+        model: flags.model,
+        effort: flags.effort,
+        role: "worker",
+        targets: [{ scope: "firm", targetId: firm.id }],
+      });
+      if (flags.tier) {
+        runtime.modelTier = flags.tier;
+        workerRuntime.modelTier = flags.tier;
+      }
     } catch (e) {
       ctx.err(String((e && e.message) || e));
       return 1;
     }
     if (runtime.unavailableOverride) ctx.err(ctx.ui.dim(unavailableOverrideNote(runtime, ctx.lang)));
+    if (runtime.unavailableRoleSelection) ctx.err(ctx.ui.dim(unavailableRoleNote(runtime, ctx.lang)));
+    if (workerRuntime.unavailableOverride) ctx.err(ctx.ui.dim(unavailableOverrideNote(workerRuntime, ctx.lang)));
+    if (workerRuntime.unavailableRoleSelection) ctx.err(ctx.ui.dim(unavailableRoleNote(workerRuntime, ctx.lang)));
     const orch = new Orchestrator({ db, lang: ctx.lang });
     const dim = ctx.ui.dim;
     const result = await runFirmTurn({
@@ -91,6 +132,20 @@ async function run(ctx, args) {
       ceoAgent: ceo,
       task,
       runtime,
+      workerRuntime,
+      resolveWorkerRuntime: flags.runtime || flags.model || flags.effort
+        ? null
+        : (node) => resolveRuntimeForAgent({
+            db,
+            prefs: ctx.prefs,
+            explicit: null,
+            role: "worker",
+            targets: [
+              { scope: "agent", targetId: node.agent.id },
+              { scope: "division", targetId: `${firm.id}:${node.role}` },
+              { scope: "firm", targetId: firm.id },
+            ],
+          }),
       permission: permissions.normalize(flags.permission || (ctx.prefs && ctx.prefs.permission) || "write"),
       cwd: process.cwd(),
       onEvent: (ev) => {

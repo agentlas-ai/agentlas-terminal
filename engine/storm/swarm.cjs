@@ -191,7 +191,7 @@ function create(deps) {
       return typeof text === "string" ? text : (text && text.text) || "";
     }
 
-    function recordAllocation(task, stage, decision, resolution, parentTaskId = null) {
+    function recordAllocation(task, stage, decision, resolution, parentTaskId = null, usage = null) {
       const receipt = workloadRouting.createDecisionReceipt({
         taskId: `${stage}-${task.id || "synthesis"}`,
         parentTaskId,
@@ -199,6 +199,7 @@ function create(deps) {
         stage,
         decision,
         resolution,
+        usage,
       });
       try {
         workloadRouting.appendDecisionReceipt(
@@ -221,9 +222,9 @@ function create(deps) {
         availableModels: ctx.availableModels,
         maxTier: ctx.maxTier || process.env.AGENTLAS_MODEL_MAX_TIER,
       });
-      recordAllocation(task, stage, task.allocation, resolution, parentTaskId);
       // 할당 거부 후 CLI 기본 모델로 조용히 실행 금지 — fail-closed (계약 테스트 고정).
       if (!resolution.ok) {
+        recordAllocation(task, stage, task.allocation, resolution, parentTaskId);
         throw new Error(`model allocation failed closed: ${resolution.fallbackReason || "no compliant live model"}`);
       }
       if (resolution.fallbackReason) {
@@ -238,17 +239,32 @@ function create(deps) {
         source: resolution.source,
         fallbackReason: resolution.fallbackReason || null,
       };
-      if (selectedRuntime.mode === "cli") {
-        return await D.captureRuntime(selectedRuntime.kind, system, prompt, {
-          cwd,
-          env,
-          permission,
-          model: resolution.model,
-          effort: resolution.effort,
-        });
+      let observed;
+      try {
+        observed = selectedRuntime.mode === "cli"
+          ? await D.captureRuntime(selectedRuntime.kind, system, prompt, {
+            cwd,
+            env,
+            permission,
+            model: resolution.model,
+            effort: resolution.effort,
+            envelope: true,
+          })
+          : await D.runApi(
+            selectedRuntime.backend,
+            resolution.model || selectedRuntime.model,
+            system,
+            prompt,
+            { envelope: true },
+          );
+      } catch (error) {
+        recordAllocation(task, stage, task.allocation, resolution, parentTaskId);
+        throw error;
       }
-      const text = await D.runApi(selectedRuntime.backend, resolution.model || selectedRuntime.model, system, prompt);
-      return typeof text === "string" ? text : (text && text.text) || "";
+      const text = typeof observed === "string" ? observed : (observed && observed.text) || "";
+      const usage = observed && typeof observed === "object" ? observed.usage : null;
+      recordAllocation(task, stage, task.allocation, resolution, parentTaskId, usage);
+      return text;
     }
 
     const label = runtime.mode === "cli" ? runtime.kind : runtime.backend;

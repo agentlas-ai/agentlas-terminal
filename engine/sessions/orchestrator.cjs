@@ -43,7 +43,7 @@ class Orchestrator extends EventEmitter {
    * 세션 생성(+선택적 즉시 실행). parentKey를 주면 그 세션의 서브에이전트
    * (division 챗)로 붙는다.
    */
-  spawn({ agent, runtime, permission, cwd, title, parentKey, activate = true, spawnImpl, timeoutConfig, chatId }) {
+  spawn({ agent, runtime, permission, cwd, title, parentKey, activate = true, spawnImpl, apiTurnImpl, timeoutConfig, chatId }) {
     const parent = parentKey ? this.sessions.get(parentKey) || null : null;
     const session = new Session({
       db: this.db,
@@ -55,6 +55,7 @@ class Orchestrator extends EventEmitter {
       parent,
       title,
       spawnImpl,
+      apiTurnImpl,
       timeoutConfig,
       chatId,
     });

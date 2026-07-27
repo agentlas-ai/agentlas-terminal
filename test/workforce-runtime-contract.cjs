@@ -420,6 +420,7 @@ function harness(overrides = {}) {
     JSON.stringify({
       schemaVersion: "agentlas.workforce-verification.v1",
       status: "passed",
+      failedPacketIds: [],
       checks: [
         { checkId: "check:idempotency", status: "passed", evidence: "state machine present" },
         { checkId: "check:rollback", status: "passed", evidence: "atomic boundary present" },
@@ -444,6 +445,7 @@ function harness(overrides = {}) {
     runModel: async (call) => {
       modelCalls.push(call);
       if (modelIndex >= modelOutputs.length) throw new Error("unexpected model call");
+      const currentModelIndex = modelIndex;
       const match = String(call.prompt || "").match(/PLANNER_LINEAGE_DATA=(\{[^\n]+\})/);
       if (match) plannerLineage = JSON.parse(match[1]);
       let output = modelOutputs[modelIndex++];
@@ -453,7 +455,10 @@ function harness(overrides = {}) {
           .replaceAll("__EXECUTION_CONTEXT_DIGEST__", plannerLineage.executionContextDigest)
           .replaceAll("__TOOL_INVENTORY_DIGEST__", plannerLineage.toolInventoryDigest);
       }
-      return output;
+      const usage = typeof overrides.modelUsage === "function"
+        ? overrides.modelUsage({ index: currentModelIndex, call, output })
+        : null;
+      return usage ? { text: output, usage } : output;
     },
     callHubTool: async (name, args) => {
       hubCalls.push({ name, args });
@@ -512,7 +517,11 @@ function harness(overrides = {}) {
     }),
     now: () => new Date("2026-07-15T00:00:00.000Z"),
     listWorkforceTools: overrides.listWorkforceTools,
+    hostReadOnlyGrants: overrides.hostReadOnlyGrants,
     supportsWorkforceToolAuthority: overrides.supportsWorkforceToolAuthority,
+    projectCwd: overrides.projectCwd,
+    runCwd: overrides.runCwd,
+    projectContextSlice: overrides.projectContextSlice,
   });
   return {
     ...f,
@@ -578,6 +587,134 @@ async function successContract() {
   assert.equal(h.benchmarkArtifacts[0].executionReceipt.status, "passed");
   assert.equal(h.benchmarkArtifacts[0].preparedExecution.schemaVersion, "agentlas.workforce-execution-plan.v5");
   assert.equal(h.benchmarkArtifacts[0].toolInventorySnapshot.schemaVersion, "agentlas.workforce-tool-inventory.v1");
+}
+
+async function workforceReceiptCarriesObservedUsageIntoRunReceiptMetrics() {
+  const h = harness({
+    modelUsage: ({ index }) => ({
+      inputTokens: (index + 1) * 100,
+      outputTokens: (index + 1) * 10,
+    }),
+  });
+  const result = await h.runtime.workforceRun(
+    {},
+    "meter every actual workforce stage",
+    { silent: true, benchmark: true, concurrency: 1 },
+  );
+  assert.equal(result.ok, true, result.error && result.error.message);
+  assert.equal(h.modelCalls.length, 7, "work order, selection, planner, two workers, synthesis, verifier");
+  assert.equal(h.modelCalls.every((call) => call.envelope === true), true);
+  assert.deepEqual(result.executionReceipt.orchestrator.usage, {
+    inputTokens: 300,
+    outputTokens: 30,
+  });
+  assert.deepEqual(result.executionReceipt.planner.usage, {
+    inputTokens: 300,
+    outputTokens: 30,
+  });
+  assert.equal(
+    result.executionReceipt.workers.every((row) =>
+      row.directInvocation?.usage?.inputTokens > 0
+      && row.directInvocation?.usage?.outputTokens > 0),
+    true,
+  );
+  assert.deepEqual(result.executionReceipt.synthesis.usage, {
+    inputTokens: 600,
+    outputTokens: 60,
+  });
+  assert.deepEqual(result.executionReceipt.verifier.usage, {
+    inputTokens: 700,
+    outputTokens: 70,
+  });
+  assert.equal(result.receipt.runReceiptMetrics.promptTokens, 2800);
+  assert.equal(result.receipt.runReceiptMetrics.completionTokens, 280);
+  assert.equal(result.receipt.runReceiptMetrics.totalTokens, 3080);
+  assert.equal(result.receipt.runReceiptMetrics.retryCount, 0);
+  assert.equal(Number.isInteger(result.receipt.runReceiptMetrics.durationMs), true);
+  assert.equal(result.receipt.runReceiptMetrics.durationMs >= 0, true);
+
+  const missing = harness({
+    modelUsage: ({ index }) => index === 4 ? null : {
+      inputTokens: (index + 1) * 100,
+      outputTokens: (index + 1) * 10,
+    },
+  });
+  const unmetered = await missing.runtime.workforceRun(
+    {},
+    "never fabricate one missing provider usage pair",
+    { silent: true, concurrency: 1 },
+  );
+  assert.equal(unmetered.ok, true, unmetered.error && unmetered.error.message);
+  assert.equal(unmetered.receipt.runReceiptMetrics, null);
+}
+
+async function roleRuntimesSplitOrchestrationFromWorkers() {
+  const orchestrator = {
+    mode: "api",
+    backend: "ollama",
+    model: "qwen3:30b-a3b",
+    effort: "max",
+    role: "orchestrator",
+  };
+  const worker = {
+    mode: "cli",
+    kind: "claude-code",
+    model: "claude-haiku-test",
+    effort: "low",
+    role: "worker",
+  };
+  const h = harness({
+    resolveRuntime: () => ({
+      ...orchestrator,
+      roleRuntimes: { orchestrator, worker },
+    }),
+  });
+  const result = await h.runtime.workforceRun(
+    {},
+    "role runtime split benchmark",
+    { silent: true, benchmark: true, concurrency: 1 },
+  );
+  assert.equal(result.ok, true, result.error && result.error.message);
+
+  const workerCalls = h.modelCalls.filter((call) =>
+    /PINNED_RELEASE=/.test(call.system),
+  );
+  assert.equal(workerCalls.length, 2);
+  for (const call of workerCalls) {
+    assert.equal(call.runtime.kind, "claude-code");
+    assert.equal(call.runtime.model, "claude-haiku-test");
+    assert.equal(call.context.role, "worker");
+    assert.equal(call.context.modelPin, "claude-haiku-test");
+    assert.equal(call.context.effortPin, "low");
+  }
+
+  const leaderCalls = h.modelCalls.filter((call) =>
+    !/PINNED_RELEASE=/.test(call.system),
+  );
+  assert.equal(leaderCalls.length, 5, "work order, selection, planner, synthesis, verifier");
+  for (const call of leaderCalls) {
+    assert.equal(call.runtime.backend, "ollama");
+    assert.equal(call.runtime.model, "qwen3:30b-a3b");
+    assert.equal(call.context.role, "orchestrator");
+    assert.equal(call.context.modelPin, "qwen3:30b-a3b");
+    assert.equal(call.context.effortPin, "max");
+  }
+
+  assert.equal(
+    result.executionReceipt.workers.every(
+      (row) =>
+        row.directInvocation.provider === "claude-code" &&
+        row.directInvocation.role === "worker",
+    ),
+    true,
+  );
+  assert.equal(result.executionReceipt.synthesis.provider, "ollama");
+  assert.equal(result.executionReceipt.synthesis.role, "orchestrator");
+  assert.equal(result.executionReceipt.verifier.provider, "ollama");
+  assert.equal(result.executionReceipt.verifier.role, "orchestrator");
+  assert.equal(result.receipt.workers.every((row) => row.role === "worker"), true);
+  assert.equal(result.receipt.synthesis.role, "orchestrator");
+  assert.equal(result.receipt.verifier.role, "orchestrator");
 }
 
 async function codexCliFailsClosedBeforeAnyModelOrHubCall() {
@@ -674,6 +811,7 @@ async function nestedTeamGraphExecutesEveryDeclaredWorkerWithoutFlattening() {
       JSON.stringify({
         schemaVersion: "agentlas.workforce-verification.v1",
         status: "passed",
+        failedPacketIds: [],
         checks: [{ checkId: "check:nested-graph", status: "passed", evidence: "both graph workers and manager synthesis are present" }],
         issues: [],
       }),
@@ -744,6 +882,7 @@ async function terminalBufferedFetchAdapterContract() {
     JSON.stringify({
       schemaVersion: "agentlas.workforce-verification.v1",
       status: "passed",
+      failedPacketIds: [],
       checks: [{ checkId: "check:adapter", status: "passed", evidence: "buffered Hub response parsed" }],
       issues: [],
     }),
@@ -851,6 +990,7 @@ async function malformedStructuredStagesRepairOnceAndSucceed() {
       JSON.stringify({
         schemaVersion: "agentlas.workforce-verification.v1",
         status: "passed",
+        failedPacketIds: [],
         checks: [{ checkId: "check:repair", status: "passed", evidence: "all repaired stages retained exact releases" }],
         issues: [],
       }),
@@ -913,6 +1053,7 @@ async function nestedNameEnvelopeRepairsToDirectObjectsWithoutHostNormalization(
       JSON.stringify({
         schemaVersion: "agentlas.workforce-verification.v1",
         status: "passed",
+        failedPacketIds: [],
         checks: [{ checkId: "check:direct-contract", status: "passed", evidence: "direct objects reached the fixed host sequence" }],
         issues: [],
       }),
@@ -975,6 +1116,7 @@ async function terraEdgeEnumRepairUsesExactContract() {
       JSON.stringify({
         schemaVersion: "agentlas.workforce-verification.v1",
         status: "passed",
+        failedPacketIds: [],
         checks: [{ checkId: "check:edge-contract", status: "passed", evidence: "allowed relation repaired" }],
         issues: [],
       }),
@@ -1011,6 +1153,7 @@ async function candidateGapRefinementRemainsTopLlmAuthored() {
       JSON.stringify({
         schemaVersion: "agentlas.workforce-verification.v1",
         status: "passed",
+        failedPacketIds: [],
         checks: [{ checkId: "check:refinement", status: "passed", evidence: "same leader authored revised job analysis" }],
         issues: [],
       }),
@@ -1083,6 +1226,7 @@ async function twoCardinalityRefinementsCanSucceed() {
       JSON.stringify({
         schemaVersion: "agentlas.workforce-verification.v1",
         status: "passed",
+        failedPacketIds: [],
         checks: [{ checkId: "check:two-refinements", status: "passed", evidence: "the final exact roster executed" }],
         issues: [],
       }),
@@ -1546,6 +1690,7 @@ async function selectionExpansionCanUseSecondRefinementAndSucceed() {
       JSON.stringify({
         schemaVersion: "agentlas.workforce-verification.v1",
         status: "passed",
+        failedPacketIds: [],
         checks: [{ checkId: "check:selection-expansion", status: "passed", evidence: "final exact selection executed" }],
         issues: [],
       }),
@@ -1909,6 +2054,7 @@ async function incumbentRosterIsReusedWithoutAnotherNetworkCall() {
       JSON.stringify({
         schemaVersion: "agentlas.workforce-verification.v1",
         status: "passed",
+        failedPacketIds: [],
         checks: [{ checkId: "check:continuity", status: "passed", evidence: "same pinned releases executed" }],
         issues: [],
       }),
@@ -1986,6 +2132,7 @@ async function selfProvingSecretsAreRedactedBeforeLeavingTheMachine() {
       JSON.stringify({
         schemaVersion: "agentlas.workforce-verification.v1",
         status: "passed",
+        failedPacketIds: [],
         checks: [{ checkId: "check:redaction", status: "passed", evidence: "no credential reached the Hub" }],
         issues: [],
       }),
@@ -2029,6 +2176,7 @@ async function workerToolMarkupLeakRepairsOnceAndSucceeds() {
       JSON.stringify({
         schemaVersion: "agentlas.workforce-verification.v1",
         status: "passed",
+        failedPacketIds: [],
         checks: [{ checkId: "check:repair", status: "passed", evidence: "handoff is markup-free" }],
         issues: [],
       }),
@@ -2046,7 +2194,71 @@ async function workerToolMarkupLeakRepairsOnceAndSucceeds() {
   );
 }
 
-async function persistentWorkerContractViolationStopsHonestly() {
+async function persistentWorkerContractViolationEscalatesOnceAndSucceeds() {
+  const f = fixture();
+  const markup = '<invoke name="Bash">\n<parameter name="command">ls</parameter>\n</invoke>';
+  const splitRuntime = {
+    mode: "api",
+    backend: "openai",
+    model: "gpt-5.6-sol",
+    runtimeId: "runtime:codex",
+    roleRuntimes: {
+      orchestrator: {
+        mode: "api",
+        backend: "openai",
+        model: "gpt-5.6-sol",
+        runtimeId: "runtime:codex",
+      },
+      worker: {
+        mode: "api",
+        backend: "ollama",
+        model: "qwen3:30b-a3b",
+        runtimeId: "runtime:ollama",
+      },
+    },
+  };
+  f.selection.decisionAuthor = {
+    kind: "host_llm",
+    modelId: "model:openai/gpt-5.6-sol",
+    runtimeId: "runtime:openai",
+  };
+  const h = harness({
+    resolveRuntime: () => splitRuntime,
+    modelOutputs: [
+      JSON.stringify(f.workOrder),
+      JSON.stringify(f.selection),
+      JSON.stringify(f.plan),
+      markup,
+      markup,
+      "Escalated backend handoff: concrete transaction boundary and idempotency design.",
+      "Verifier handoff: replay, partial-failure, forged-key, and concurrent-commit adversarial cases.",
+      "Integrated deliverable with transaction design, adversarial tests, and explicit limitations.",
+      JSON.stringify({
+        schemaVersion: "agentlas.workforce-verification.v1",
+        status: "passed",
+        failedPacketIds: [],
+        checks: [{ checkId: "check:escalation", status: "passed", evidence: "escalated handoff is concrete" }],
+        issues: [],
+      }),
+    ],
+  });
+  const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true, concurrency: 1 });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  const escalationCalls = h.modelCalls.filter((call) => /ESCALATED HANDOFF MODE/.test(call.system));
+  assert.equal(escalationCalls.length, 1, "a task may escalate exactly once after two worker contract failures");
+  assert.equal(escalationCalls[0].context.role, "orchestrator");
+  assert.equal(escalationCalls[0].context.modelPin, "gpt-5.6-sol");
+  const backend = result.receipt.workers.find((row) => row.packetId === "packet:backend");
+  assert.equal(backend.status, "completed");
+  assert.equal(backend.role, "orchestrator");
+  assert.equal(backend.modelId, "model:openai/gpt-5.6-sol");
+  const publicBackend = h.receipts[0].workers.find((row) => row.slotId === "slot:backend");
+  assert.deepEqual(publicBackend.directInvocation.reasonCodes, ["escalated-after-failure"]);
+  assert.equal(publicBackend.directInvocation.escalationAttempt, 1);
+  assert.equal(publicBackend.directInvocation.failureCount, 2);
+}
+
+async function persistentWorkerContractViolationAfterEscalationStopsHonestly() {
   const f = fixture();
   const markup = '<invoke name="Bash">\n<parameter name="command">ls</parameter>\n</invoke>';
   const h = harness({
@@ -2056,11 +2268,20 @@ async function persistentWorkerContractViolationStopsHonestly() {
       JSON.stringify(f.plan),
       markup,
       markup,
+      markup,
     ],
   });
   const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true, concurrency: 1 });
   assert.equal(result.ok, false);
   assert.equal(result.error.code, "worker_output_contract_violation");
+  assert.equal(result.error.details.reasonCode, "escalated-after-failure");
+  assert.equal(result.error.details.escalationAttempted, true);
+  assert.equal(result.error.details.escalationCount, 1);
+  assert.equal(
+    h.modelCalls.filter((call) => /ESCALATED HANDOFF MODE/.test(call.system)).length,
+    1,
+    "a failed orchestrator escalation must never loop",
+  );
   assert.equal(result.receipt.synthesis, null, "a violating handoff must never reach synthesis");
 }
 
@@ -2077,6 +2298,7 @@ async function verifierRejectionTriggersOneCorrectiveSynthesisThenPasses() {
       JSON.stringify({
         schemaVersion: "agentlas.workforce-verification.v1",
         status: "failed",
+        failedPacketIds: ["packet:backend"],
         checks: [{ checkId: "check:rollback", status: "failed", evidence: "no atomic boundary present" }],
         issues: ["rollback design missing from the synthesis"],
       }),
@@ -2084,6 +2306,7 @@ async function verifierRejectionTriggersOneCorrectiveSynthesisThenPasses() {
       JSON.stringify({
         schemaVersion: "agentlas.workforce-verification.v1",
         status: "passed",
+        failedPacketIds: [],
         checks: [{ checkId: "check:rollback", status: "passed", evidence: "atomic boundary present" }],
         issues: [],
       }),
@@ -2102,11 +2325,92 @@ async function verifierRejectionTriggersOneCorrectiveSynthesisThenPasses() {
   assert.equal(result.receipt.correctiveHistory[0].verification.status, "failed");
 }
 
-async function verifierRejectionTwiceFailsHonestlyAfterCorrectiveRetry() {
+async function verifierRejectionTwiceEscalatesExactWorkerOnceThenPasses() {
   const f = fixture();
   const failedVerdict = JSON.stringify({
     schemaVersion: "agentlas.workforce-verification.v1",
     status: "failed",
+    failedPacketIds: ["packet:backend"],
+    checks: [{ checkId: "check:rollback", status: "failed", evidence: "still missing" }],
+    issues: ["backend packet did not establish the rollback boundary"],
+  });
+  const splitRuntime = {
+    mode: "api",
+    backend: "openai",
+    model: "gpt-5.6-sol",
+    runtimeId: "runtime:codex",
+    roleRuntimes: {
+      orchestrator: {
+        mode: "api",
+        backend: "openai",
+        model: "gpt-5.6-sol",
+        runtimeId: "runtime:codex",
+      },
+      worker: {
+        mode: "api",
+        backend: "ollama",
+        model: "qwen3:30b-a3b",
+        runtimeId: "runtime:ollama",
+      },
+    },
+  };
+  f.selection.decisionAuthor = {
+    kind: "host_llm",
+    modelId: "model:openai/gpt-5.6-sol",
+    runtimeId: "runtime:openai",
+  };
+  const h = harness({
+    resolveRuntime: () => splitRuntime,
+    modelOutputs: [
+      JSON.stringify(f.workOrder),
+      JSON.stringify(f.selection),
+      JSON.stringify(f.plan),
+      "Backend handoff that omits the rollback boundary.",
+      "Verifier handoff: replay, partial-failure, forged-key, and concurrent-commit adversarial cases.",
+      "First synthesis that still lacks a rollback boundary.",
+      failedVerdict,
+      "Second synthesis that still cannot repair the weak backend packet.",
+      failedVerdict,
+      "Escalated backend handoff with a serializable rollback boundary and idempotency state machine.",
+      "Third synthesis rebuilt from the escalated backend handoff and the verifier handoff.",
+      JSON.stringify({
+        schemaVersion: "agentlas.workforce-verification.v1",
+        status: "passed",
+        failedPacketIds: [],
+        checks: [{ checkId: "check:rollback", status: "passed", evidence: "escalated exact packet now proves the rollback boundary" }],
+        issues: [],
+      }),
+    ],
+  });
+  const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true, concurrency: 1 });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  const escalationCalls = h.modelCalls.filter((call) => /VERIFIER ESCALATION MODE/.test(call.system));
+  assert.equal(escalationCalls.length, 1, "the exact failed packet may receive only one verifier-driven escalation");
+  assert.equal(escalationCalls[0].context.role, "orchestrator");
+  assert.equal(escalationCalls[0].context.modelPin, "gpt-5.6-sol");
+  assert.match(escalationCalls[0].prompt, /packet:backend/);
+  assert.match(escalationCalls[0].prompt, /verifierFailures/);
+  assert.equal(result.receipt.verifierEscalations.length, 1);
+  assert.equal(result.receipt.verifierEscalations[0].packetId, "packet:backend");
+  assert.equal(result.receipt.synthesis.attempt, 3);
+  assert.equal(result.receipt.verifier.attempt, 3);
+  const publicBackend = h.receipts[0].workers.find((row) => row.slotId === "slot:backend");
+  assert.equal(publicBackend.priorInvocations.length, 1);
+  assert.equal(publicBackend.priorInvocations[0].role, "worker");
+  assert.equal(publicBackend.priorInvocations[0].modelId, "model:ollama/qwen3:30b-a3b");
+  assert.equal(publicBackend.directInvocation.role, "orchestrator");
+  assert.equal(publicBackend.directInvocation.modelId, "model:openai/gpt-5.6-sol");
+  assert.deepEqual(publicBackend.directInvocation.reasonCodes, ["escalated-after-failure"]);
+  assert.equal(publicBackend.directInvocation.failureCount, 2);
+  assert.equal(publicBackend.directInvocation.escalationAttempt, 1);
+}
+
+async function verifierRejectionAfterExactEscalationFailsHonestlyWithoutLoop() {
+  const f = fixture();
+  const failedVerdict = JSON.stringify({
+    schemaVersion: "agentlas.workforce-verification.v1",
+    status: "failed",
+    failedPacketIds: ["packet:backend"],
     checks: [{ checkId: "check:rollback", status: "failed", evidence: "still missing" }],
     issues: ["rollback design missing from the synthesis"],
   });
@@ -2121,6 +2425,9 @@ async function verifierRejectionTwiceFailsHonestlyAfterCorrectiveRetry() {
       failedVerdict,
       "Second synthesis that still omits the rollback design.",
       failedVerdict,
+      "Single escalated backend handoff that remains insufficient.",
+      "Third synthesis after the single exact-packet escalation.",
+      failedVerdict,
     ],
   });
   const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true, concurrency: 1 });
@@ -2128,6 +2435,527 @@ async function verifierRejectionTwiceFailsHonestlyAfterCorrectiveRetry() {
   assert.equal(result.error.code, "workforce_verification_failed");
   assert.equal(result.error.details.correctiveRetryUsed, true);
   assert.deepEqual(result.error.details.firstAttemptIssues, ["rollback design missing from the synthesis"]);
+  assert.equal(result.error.details.escalationAttempted, true);
+  assert.equal(result.error.details.escalationCount, 1);
+  assert.deepEqual(result.error.details.escalatedPacketIds, ["packet:backend"]);
+  assert.equal(
+    h.modelCalls.filter((call) => /VERIFIER ESCALATION MODE/.test(call.system)).length,
+    1,
+    "a failed verifier-driven orchestrator retry must never loop",
+  );
+}
+
+async function verifierFailuresWithoutOneRepeatedExactPacketDoNotEscalate() {
+  const f = fixture();
+  const verdict = (packetId) => JSON.stringify({
+    schemaVersion: "agentlas.workforce-verification.v1",
+    status: "failed",
+    failedPacketIds: [packetId],
+    checks: [{ checkId: "check:trace", status: "failed", evidence: `failure traced to ${packetId}` }],
+    issues: ["the two verifier rounds disagree about the failed worker packet"],
+  });
+  const h = harness({
+    modelOutputs: [
+      JSON.stringify(f.workOrder),
+      JSON.stringify(f.selection),
+      JSON.stringify(f.plan),
+      "Backend handoff.",
+      "Verifier handoff.",
+      "First synthesis.",
+      verdict("packet:backend"),
+      "Second synthesis.",
+      verdict("packet:verify"),
+    ],
+  });
+  const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true, concurrency: 1 });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "workforce_verification_failed");
+  assert.equal(result.error.details.escalationAttempted, false);
+  assert.deepEqual(result.error.details.firstFailedPacketIds, ["packet:backend"]);
+  assert.deepEqual(result.error.details.secondFailedPacketIds, ["packet:verify"]);
+  assert.equal(h.modelCalls.some((call) => /VERIFIER ESCALATION MODE/.test(call.system)), false);
+}
+
+async function emptyWorkerDeliverableReachesTheHandoffRepairGate() {
+  const f = fixture();
+  const h = harness({
+    modelOutputs: [
+      JSON.stringify(f.workOrder),
+      JSON.stringify(f.selection),
+      JSON.stringify(f.plan),
+      "   ",
+      "Backend handoff: repaired concrete idempotency design with transaction boundary.",
+      "Verifier handoff: replay, partial-failure, forged-key, and concurrent-commit adversarial cases.",
+      "Integrated deliverable with transaction design, adversarial tests, and explicit limitations.",
+      JSON.stringify({
+        schemaVersion: "agentlas.workforce-verification.v1",
+        status: "passed",
+        failedPacketIds: [],
+        checks: [{ checkId: "check:repair", status: "passed", evidence: "handoff is concrete" }],
+        issues: [],
+      }),
+    ],
+  });
+  const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true, concurrency: 1 });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  const repairCall = h.modelCalls.find((call) => /HANDOFF REPAIR MODE/.test(call.system));
+  assert.ok(repairCall, "a whitespace-only handoff must reach the empty-deliverable repair branch, not die in a length assertion");
+  assert.match(repairCall.system, /no usable deliverable/);
+  assert.equal(
+    h.receipts[0].workers.some((row) => row.directInvocation && row.directInvocation.handoffContractRetry === "empty_deliverable"),
+    true,
+  );
+}
+
+async function emptySynthesisRepairsOnceInsteadOfDiscardingEveryHandoff() {
+  const f = fixture();
+  const h = harness({
+    modelOutputs: [
+      JSON.stringify(f.workOrder),
+      JSON.stringify(f.selection),
+      JSON.stringify(f.plan),
+      "Backend handoff: idempotency key state machine and serializable transaction boundary.",
+      "Verifier handoff: replay, partial-failure, forged-key, and concurrent-commit adversarial cases.",
+      "   ",
+      "Repaired integrated deliverable with transaction design and adversarial tests.",
+      JSON.stringify({
+        schemaVersion: "agentlas.workforce-verification.v1",
+        status: "passed",
+        failedPacketIds: [],
+        checks: [{ checkId: "check:repair", status: "passed", evidence: "synthesis is concrete" }],
+        issues: [],
+      }),
+    ],
+  });
+  const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true, concurrency: 1 });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  assert.equal(result.receipt.synthesis.handoffContractRetry, "empty_deliverable");
+  assert.equal(result.receipt.synthesis.attempt, 1, "an empty synthesis is a handoff repair, not a verifier corrective round");
+  assert.equal(result.receipt.correctiveHistory.length, 0);
+}
+
+async function failedNestedTeamKeepsTheInvocationsThatActuallyRan() {
+  const f = teamFixture();
+  const markup = '<invoke name="Bash">\n<parameter name="command">ls</parameter>\n</invoke>';
+  const nestedPlan = JSON.stringify({
+    schemaVersion: "agentlas.workforce-team-delegation-plan.v1",
+    plannedWorkerIds: ["worker:builder", "worker:adversarial"],
+    packets: [
+      { id: "worker:builder", objective: "Build the exact payment transaction design", inputs: ["parent packet"], expectedOutput: "design handoff" },
+      { id: "worker:adversarial", objective: "Falsify the transaction design", inputs: ["parent packet"], expectedOutput: "adversarial handoff" },
+    ],
+    synthesisBrief: "Integrate both declared worker handoffs without omission",
+  });
+  const h = harness({
+    fixture: f,
+    modelOutputs: [
+      JSON.stringify(f.workOrder),
+      JSON.stringify(f.selection),
+      JSON.stringify(f.plan),
+      nestedPlan,
+      "Declared builder handoff.",
+      "Declared adversarial handoff.",
+      markup,
+      markup,
+    ],
+  });
+  const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, concurrency: 1 });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "worker_output_contract_violation");
+  const nested = result.receipt.nestedExecutions;
+  assert.equal(nested.length, 1, "a nested team that failed mid-flight must still appear in the audit");
+  assert.equal(nested[0].status, "failed");
+  assert.ok(nested[0].managerPlanInvocationId, "the manager plan invocation actually ran and must be recorded");
+  assert.equal(nested[0].workerInvocationIds.length, 2, "both declared worker invocations actually ran and must be recorded");
+  assert.equal(nested[0].managerSynthesisInvocationId, null, "the stage that never completed must stay null, not be invented");
+  const failed = result.receipt.workers[0];
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.nestedExecutionId, nested[0].nestedExecutionId);
+  assert.equal(failed.entityKind, "team");
+  assert.equal(failed.executionMode, "nested");
+  assert.ok(failed.runtimeId, "a failed child receipt must carry the same runtime identity as a completed one");
+  assert.equal(
+    h.modelCalls.some((call) => call.invocationId === failed.invocationId),
+    false,
+    "sanity: the harness does not expose invocation ids",
+  );
+  assert.match(String(failed.invocationId), /^workforce-invocation:/, "the failure must name a real invocation, never a freshly minted ghost id");
+}
+
+async function readOnlyFileAuthorityIsGrantableAndExactlyBounded() {
+  const capture = require("../engine/workforce/capture.cjs");
+  const deps = require("../engine/workforce/deps.cjs");
+
+  // 1) 부여 경계: 허브가 읽기를 허용한 릴리스에만, claude-code 런타임에만.
+  const roster = [
+    { slotId: "slot:a", agentReleaseId: "release:a", permissionPolicyDigest: `sha256:${"a".repeat(64)}`, permissionPolicy: { fileRead: { mode: "manifest-allowlist" } } },
+    { slotId: "slot:b", agentReleaseId: "release:b", permissionPolicyDigest: `sha256:${"b".repeat(64)}`, permissionPolicy: { fileRead: { mode: "deny" } } },
+  ];
+  const granted = deps.readOnlyBuiltinToolRows(roster, "runtime:claude-code");
+  // 0) 발행한 항목이 호스트의 실제 인벤토리 계약을 통과해야 한다. 2026-07-27 라이브:
+  // serverId에 "builtin" 문자열을 넣어 prepare 직후 tool_inventory_invalid로 전량 폐기됐다.
+  // 발행자(deps)와 검증자(workforce)를 붙여서 확인하지 않으면 같은 드리프트가 재발한다.
+  {
+    const policyDigest = `sha256:${"c".repeat(64)}`;
+    const policy = {
+      schemaVersion: "agentlas.workforce-permission-policy.v1",
+      network: "deny",
+      shell: "deny",
+      fileRead: { mode: "manifest-allowlist", allowPatterns: ["**/*"], denyPatterns: [".git/**"] },
+      mcp: { mode: "deny", allowedTools: [] },
+      unknownTools: "deny",
+    };
+    const liveRoster = [{ slotId: "slot:audit", agentReleaseId: "release:audit", permissionPolicyDigest: policyDigest, permissionPolicy: policy }];
+    const prepared = {
+      executionContextDigest: policyDigest,
+      executionRoster: liveRoster,
+      executionContext: { slots: [{ slotId: "slot:audit", requiredToolCapabilities: ["tool:file-read"] }] },
+    };
+    const validated = require("../engine/agentlas-workforce.cjs")._test.validateToolInventory({
+      schemaVersion: "agentlas.workforce-tool-inventory.v1",
+      executionContextDigest: policyDigest,
+      observedAt: "2026-07-15T00:00:00Z",
+      entries: deps.readOnlyBuiltinToolRows(liveRoster, "runtime:claude-code"),
+    }, prepared);
+    assert.equal(validated.entries.length, 1, "발행한 읽기 도구가 호스트 인벤토리 계약을 통과해야 한다");
+    assert.equal(validated.entries[0].serverId, null, "내장 도구는 serverId가 정확히 null");
+    assert.equal(validated.entries[0].provider, "builtin");
+  }
+  assert.deepEqual(granted.map((row) => row.slotId), ["slot:a"], "허브가 deny한 릴리스에는 읽기를 부여하지 않는다");
+  assert.equal(granted[0].status, "ready");
+  assert.equal(granted[0].selectiveEnforcement, "exact-tool-allowlist");
+  assert.deepEqual(granted[0].capabilityIds, ["tool:file-read"]);
+  assert.equal(deps.readOnlyBuiltinToolRows(roster, "runtime:codex").length, 0, "경계를 증명 못 하는 런타임에는 부여하지 않는다");
+
+  // 2) 권한 게이트: 읽기만 허용, 셸/쓰기/MCP는 여전히 거부.
+  const d = deps.buildWorkforceDeps({});
+  assert.equal(await d.supportsWorkforceToolAuthority({ grantedToolIds: [deps.READ_ONLY_BUILTIN_TOOL_ID] }), true);
+  assert.equal(await d.supportsWorkforceToolAuthority({ grantedToolIds: [deps.READ_ONLY_BUILTIN_TOOL_ID, "builtin:shell"] }), false);
+  assert.equal(await d.supportsWorkforceToolAuthority({ grantedToolIds: ["builtin:network"] }), false);
+  assert.equal(await d.supportsWorkforceToolAuthority({ grantedToolIds: ["mcp__db__query"] }), false);
+
+  // 3) 실제 CLI 인자: plan 모드(쓰기 거부) + 정확 allowlist + 쓰기/셸 명시 차단 + MCP 격리.
+  const args = capture.buildArgs("claude-code", "SYS", "PROMPT", "write", {
+    authorityMode: "read-only",
+    allowedNativeTools: deps.READ_ONLY_NATIVE_TOOLS,
+  });
+  assert.equal(args.includes("acceptEdits"), false, "읽기 전용 부여가 쓰기 모드로 승격되면 안 된다");
+  assert.equal(args.includes("--dangerously-skip-permissions"), false);
+  assert.deepEqual(args.slice(args.indexOf("--permission-mode"), args.indexOf("--permission-mode") + 2), ["--permission-mode", "plan"]);
+  assert.equal(args[args.indexOf("--allowedTools") + 1], "Glob,Grep,Read");
+  const disallowed = args[args.indexOf("--disallowedTools") + 1].split(",");
+  for (const blocked of ["Write", "Edit", "Bash", "WebFetch", "Task"]) {
+    assert.ok(disallowed.includes(blocked), `${blocked}는 명시적으로 차단되어야 한다`);
+  }
+  assert.ok(args.includes("--strict-mcp-config"), "MCP는 읽기 부여와 무관하게 격리 유지");
+
+  // 4) 진행 신호: 도구를 쓰는 워커는 최종 답까지 stdout이 비어 있어 유휴 타이머에
+  // 처형당했다(2026-07-27 라이브 AGENTLAS_CAPTURE_IDLE_TIMEOUT, 10분). 이벤트
+  // 스트림으로 받아야 유휴 판정이 진짜 정지 신호가 된다. 부분 토큰 델타는 끈다.
+  assert.deepEqual(
+    args.slice(args.indexOf("--output-format"), args.indexOf("--output-format") + 2),
+    ["--output-format", "stream-json"],
+    "읽기 워커는 이벤트 스트림으로 받아야 유휴 타이머가 진행을 본다",
+  );
+  assert.ok(args.includes("--verbose"), "claude는 -p + stream-json에 --verbose가 필요하다");
+  assert.equal(args.includes("--include-partial-messages"), false, "토큰 단위 델타는 출력량만 폭증시킨다");
+  assert.equal(
+    capture.capturedRuntimeAgentText("claude-code", [
+      JSON.stringify({ type: "system", subtype: "init" }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name: "Read" }] } }),
+      JSON.stringify({ type: "result", subtype: "success", result: "FINAL AUDIT TEXT" }),
+    ].join("\n")),
+    "FINAL AUDIT TEXT",
+    "스트림에서 최종 텍스트만 뽑아야 한다 — 도구 이벤트가 산출물에 새면 안 된다",
+  );
+  assert.throws(
+    () => capture.buildArgs("claude-code", "SYS", "PROMPT", "write", { authorityMode: "read-only" }),
+    /explicit native tool allowlist/,
+    "allowlist 없는 읽기 부여는 조용히 통과하면 안 된다",
+  );
+}
+
+async function declaredEdgesActuallyDeliverUpstreamHandoffs() {
+  const f = fixture();
+  // 픽스처 엣지: slot:verification 이 slot:backend 를 reviews.
+  assert.deepEqual(f.selection.edges.map((edge) => [edge.fromSlot, edge.relation, edge.toSlot]),
+    [["slot:verification", "reviews", "slot:backend"]]);
+  const h = harness({
+    fixture: f,
+    modelOutputs: [
+      JSON.stringify(f.workOrder),
+      JSON.stringify(f.selection),
+      JSON.stringify(f.plan),
+      "BACKEND_HANDOFF_MARKER: idempotency key state machine and serializable transaction boundary.",
+      "Verifier handoff: replay, partial-failure, forged-key, and concurrent-commit adversarial cases.",
+      "Integrated deliverable.",
+      JSON.stringify({
+        schemaVersion: "agentlas.workforce-verification.v1",
+        status: "passed",
+        failedPacketIds: [],
+        checks: [{ checkId: "check:edges", status: "passed", evidence: "the reviewer received the reviewed artifact" }],
+        issues: [],
+      }),
+    ],
+  });
+  const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, concurrency: 2 });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  const backendCall = h.modelCalls.find((call) => /PINNED_RELEASE=release:backend-v3/.test(call.system));
+  const verifierCall = h.modelCalls.find((call) => /PINNED_RELEASE=release:verifier-v7/.test(call.system));
+  assert.ok(backendCall && verifierCall);
+  // "A reviews B" 는 A 가 B 를 기다린다는 뜻이다 — 일괄 from→to 로 두면 정확히 뒤집힌다.
+  assert.equal(h.modelCalls.indexOf(backendCall) < h.modelCalls.indexOf(verifierCall), true,
+    "검토 대상이 검토자보다 먼저 실행되어야 한다");
+  // 2026-07-27 라이브: 검증자가 "두 아티팩트를 모두 수신하지 못해 판정 0건"이라고
+  // 보고했다. 엣지 선언만 주고 내용을 안 주면 그 엣지는 실행되지 않은 것이다.
+  const upstream = JSON.parse(verifierCall.prompt).upstreamHandoffs;
+  assert.equal(Array.isArray(upstream) && upstream.length, 1, "검토자는 상류 핸드오프를 실제로 받아야 한다");
+  assert.equal(upstream[0].slotId, "slot:backend");
+  assert.match(upstream[0].text, /BACKEND_HANDOFF_MARKER/);
+  assert.deepEqual(JSON.parse(backendCall.prompt).upstreamHandoffs, [], "상류가 없는 슬롯은 빈 배열을 받는다");
+}
+
+async function leaderStagesAreToldTheyHaveNoToolsEither() {
+  const h = harness();
+  const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, concurrency: 1 });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  // 2026-07-27 라이브: 과제문이 워커용 도구 안내를 담자 플래너가 "먼저 파일을 봐야
+  // 한다"는 산문을 내고 JSON을 주지 않아 2회 연속 실패했다. 리더 단계도 자기 권한
+  // 상태를 알아야 한다 — 도구 안내는 워커에게만 해당한다고 명시한다.
+  for (const phase of ["work-order", "selection", "planner"]) {
+    const call = h.modelCalls.find((row) => row.context && row.context.stage === "leader" && new RegExp(
+      phase === "planner" ? "orchestration-plan\\.v2" : phase === "selection" ? "workforce-selection\\.v1" : "workforce-work-order\\.v1",
+    ).test(row.system));
+    assert.ok(call, `${phase} 단계 호출이 있어야 한다`);
+    assert.match(call.system, /zero tools are granted to this planning invocation/);
+    assert.match(call.system, /applies to the separately executed workers, never to you/);
+  }
+}
+
+async function hostLendsReadAccessWithoutAnyRequiredToolCapability() {
+  const f = fixture();
+  // 실제 라이브 워크오더 그대로: 요구 도구 능력 0개. requiredToolCapabilities는
+  // "이 허브 후보가 그 도구를 선언했는가"라는 후보 자격 필터이고, 선언한 허브
+  // 에이전트가 사실상 0이라 리더는 절대 적지 않는다(적으면 후보 0건). 2026-07-27
+  // 라이브: 그 결과 읽기 부여가 영영 발동하지 않아 워커들이 "권한이 없어 소스를
+  // 볼 수 없었다"고 정직 보고했다. 대여는 허브 권한정책만 보고 결정되어야 한다.
+  assert.deepEqual(f.workOrder.roleSlots.map((slot) => slot.requiredToolCapabilities), [[], []]);
+  for (const row of f.prepared.executionRoster) {
+    row.permissionPolicy = {
+      ...row.permissionPolicy,
+      fileRead: { mode: "manifest-allowlist", allowPatterns: ["**/*"], denyPatterns: [".git/**"] },
+    };
+  }
+  refreshPreparedFixture(f);
+  const h = harness({
+    fixture: f,
+    hostReadOnlyGrants: (roster) => roster.map((row) => ({
+      slotId: row.slotId,
+      agentReleaseId: row.agentReleaseId,
+      permissionPolicyDigest: row.permissionPolicyDigest,
+      provider: "builtin",
+      toolId: "builtin:file-read",
+      serverId: null,
+      runtimeIds: ["runtime:ollama"],
+      selectiveEnforcement: "exact-tool-allowlist",
+      capabilityIds: ["tool:file-read"],
+      status: "ready",
+    })),
+    supportsWorkforceToolAuthority: async ({ grantedToolIds }) =>
+      grantedToolIds.length > 0 && grantedToolIds.every((id) => id === "builtin:file-read"),
+    modelOutputs: [
+      JSON.stringify(f.workOrder),
+      JSON.stringify(f.selection),
+      JSON.stringify(f.plan),
+      "Backend handoff citing engine/x.cjs:12 with the exact read line.",
+      "Verifier handoff citing engine/y.cjs:34 with the exact read line.",
+      "Integrated deliverable citing both read lines.",
+      JSON.stringify({
+        schemaVersion: "agentlas.workforce-verification.v1",
+        status: "passed",
+        failedPacketIds: [],
+        checks: [{ checkId: "check:cited", status: "passed", evidence: "both handoffs cite read lines" }],
+        issues: [],
+      }),
+    ],
+  });
+  const result = await h.runtime.workforceRun({}, "read grant benchmark", { silent: true, concurrency: 1 });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  const workerCalls = h.modelCalls.filter((call) => /PINNED_RELEASE=/.test(call.system));
+  assert.equal(workerCalls.length, 2);
+  for (const call of workerCalls) {
+    assert.deepEqual(call.context.grantedToolIds, ["builtin:file-read"], "요구 능력 0개여도 호스트가 읽기를 대여해야 한다");
+    assert.equal(call.context.authorityMode, "read-only");
+    assert.deepEqual(call.context.allowedNativeTools, ["Read", "Grep", "Glob"]);
+    assert.match(call.system, /read-only access to the current project working directory/);
+    assert.match(call.system, /cite exact paths with line numbers/);
+    assert.equal(call.context.cwd, h.modelCalls[0].context.cwd, "읽기 워커는 중립 폴더가 아니라 프로젝트 폴더에서 돈다");
+  }
+}
+
+async function hostNeverLendsReadAccessWhenTheHubPolicyDeniesIt() {
+  const f = fixture();
+  for (const row of f.prepared.executionRoster) {
+    assert.equal(row.permissionPolicy.fileRead.mode, "deny", "기본 픽스처는 읽기 거부 정책이어야 한다");
+  }
+  const h = harness({
+    fixture: f,
+    // deps는 fileRead deny 릴리스를 애초에 발행하지 않는다. 그 계약이 깨져 행이
+    // 새어 들어와도 워크포스가 로스터 정책으로 한 번 더 걸러야 한다.
+    hostReadOnlyGrants: (roster) => roster.map((row) => ({
+      slotId: row.slotId,
+      agentReleaseId: row.agentReleaseId,
+      permissionPolicyDigest: row.permissionPolicyDigest,
+      provider: "builtin",
+      toolId: "builtin:file-read",
+      serverId: null,
+      runtimeIds: ["runtime:ollama"],
+      selectiveEnforcement: "exact-tool-allowlist",
+      capabilityIds: ["tool:file-read"],
+      status: "ready",
+    })),
+    supportsWorkforceToolAuthority: async () => true,
+  });
+  const result = await h.runtime.workforceRun({}, "read grant benchmark", { silent: true, concurrency: 1 });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  for (const call of h.modelCalls.filter((row) => /PINNED_RELEASE=/.test(row.system))) {
+    assert.deepEqual(call.context.grantedToolIds, [], "허브가 읽기를 거부한 릴리스에는 대여하지 않는다");
+    assert.match(call.system, /zero tools are granted/);
+  }
+}
+
+async function firstFatalWorkerStopsBurningTheRemainingPackets() {
+  const f = fixture();
+  const markup = '<invoke name="Bash">\n<parameter name="command">ls</parameter>\n</invoke>';
+  const h = harness({
+    modelOutputs: [
+      JSON.stringify(f.workOrder),
+      JSON.stringify(f.selection),
+      JSON.stringify(f.plan),
+      markup,
+      markup,
+      markup,
+    ],
+  });
+  const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, concurrency: 1 });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "worker_output_contract_violation");
+  // 2026-07-27 라이브: 워커 하나가 확정 실패한 뒤에도 형제 워커들이 17분(중첩 팀
+  // 워커 18명치 호출) 더 돌고 전부 폐기됐다. 두 번째 패킷은 시작조차 하면 안 된다.
+  assert.equal(result.receipt.workers.length, 1, "the second packet must never start once the run is already doomed");
+  assert.equal(h.modelCalls.length, 6, "leader x3 plus two worker attempts and the single orchestrator escalation");
+  assert.equal(h.modelCalls.some((call) => /PINNED_RELEASE=release:verifier-v7/.test(call.system)), false);
+}
+
+async function structuredPlannersAreToldEveryBoundTheHostEnforces() {
+  const f = teamFixture();
+  const nestedPlan = {
+    schemaVersion: "agentlas.workforce-team-delegation-plan.v1",
+    plannedWorkerIds: ["worker:builder", "worker:adversarial"],
+    packets: [
+      { id: "worker:builder", objective: "Build the exact payment transaction design", inputs: ["parent packet"], expectedOutput: "design handoff" },
+      { id: "worker:adversarial", objective: "Falsify the transaction design", inputs: ["parent packet"], expectedOutput: "adversarial handoff" },
+    ],
+    synthesisBrief: "Integrate both declared worker handoffs without omission",
+  };
+  const h = harness({
+    fixture: f,
+    modelOutputs: [
+      JSON.stringify(f.workOrder),
+      JSON.stringify(f.selection),
+      JSON.stringify(f.plan),
+      JSON.stringify(nestedPlan),
+      "Declared builder handoff.",
+      "Declared adversarial handoff.",
+      "Pinned team manager synthesis with both declared handoffs.",
+      "Independent direct verifier handoff.",
+      "Top-level synthesis over team and direct-agent handoffs.",
+      JSON.stringify({
+        schemaVersion: "agentlas.workforce-verification.v1",
+        status: "passed",
+        failedPacketIds: [],
+        checks: [{ checkId: "check:bounds", status: "passed", evidence: "bounds were stated up front" }],
+        issues: [],
+      }),
+    ],
+  });
+  const result = await h.runtime.workforceRun({}, "nested team graph benchmark", { silent: true, concurrency: 1 });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  // 2026-07-27 라이브: 상한을 말해주지 않아 synthesisBrief가 2000자를 넘었고, 이미
+  // 완주한 워커 3명과 중첩 팀 2개의 결과가 통째로 폐기됐다. 상한은 반드시 선고지한다.
+  const nestedManagerCall = h.modelCalls.find((call) => /agentlas\.workforce-team-delegation-plan\.v1/.test(call.system));
+  assert.ok(nestedManagerCall, "the nested manager must receive its schema contract");
+  assert.match(nestedManagerCall.system, /synthesisBrief at most 1900 characters/);
+  assert.match(nestedManagerCall.system, /objective at most 3800/);
+  const plannerCall = h.modelCalls.find((call) => /agentlas\.workforce-orchestration-plan\.v2/.test(call.system));
+  assert.ok(plannerCall, "the top-level planner must receive its schema contract");
+  assert.match(plannerCall.system, /brief at most 1900/);
+  assert.match(plannerCall.system, /verifier criteria of at most 450 characters/);
+}
+
+async function verifierOversizedIssueRepairsOnceAndKeepsHonestVerdict() {
+  const f = fixture();
+  const oversizedRejection = JSON.stringify({
+    schemaVersion: "agentlas.workforce-verification.v1",
+    status: "failed",
+    failedPacketIds: ["packet:backend"],
+    checks: [{ checkId: "check:rollback", status: "failed", evidence: "no atomic boundary present" }],
+    issues: ["rollback design missing: ".concat("x".repeat(2400))],
+  });
+  const repairedRejection = JSON.stringify({
+    schemaVersion: "agentlas.workforce-verification.v1",
+    status: "failed",
+    failedPacketIds: ["packet:backend"],
+    checks: [{ checkId: "check:rollback", status: "failed", evidence: "no atomic boundary present" }],
+    issues: ["rollback design missing from the synthesis"],
+  });
+  const h = harness({
+    modelOutputs: [
+      JSON.stringify(f.workOrder),
+      JSON.stringify(f.selection),
+      JSON.stringify(f.plan),
+      "Backend handoff: idempotency key state machine and serializable transaction boundary.",
+      "Verifier handoff: replay, partial-failure, forged-key, and concurrent-commit adversarial cases.",
+      "First synthesis that omits the rollback design entirely.",
+      oversizedRejection,
+      repairedRejection,
+      "Corrected synthesis with the rollback design restored from the backend handoff.",
+      JSON.stringify({
+        schemaVersion: "agentlas.workforce-verification.v1",
+        status: "passed",
+        failedPacketIds: [],
+        checks: [{ checkId: "check:rollback", status: "passed", evidence: "atomic boundary present" }],
+        issues: [],
+      }),
+    ],
+  });
+  const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true, concurrency: 1 });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  const repairCall = h.modelCalls.find((call) => /STRUCTURED OUTPUT REPAIR MODE: repair the schema and field bounds only/.test(call.system));
+  assert.ok(repairCall, "an oversized honest verifier rejection must get one bounded schema repair, not an invalid_contract crash");
+  assert.match(repairCall.prompt, /PRIOR_MODEL_OUTPUT_DATA=/);
+  assert.equal(result.receipt.correctiveHistory.length, 1, "the repaired honest rejection must still drive one corrective synthesis");
+  assert.equal(result.receipt.correctiveHistory[0].verification.status, "failed");
+  assert.equal(result.receipt.verifier.verdict, "pass");
+  assert.equal(result.receipt.verifier.structuredAttemptCount, 1, "the passing verify attempt needed no schema repair");
+}
+
+async function zeroToolHandoffCallsRunInNeutralCwdWithoutProjectGrounding() {
+  const h = harness({
+    projectCwd: () => "/tmp/fixture-project",
+    runCwd: () => "/tmp/fixture-neutral-agent-cwd",
+    projectContextSlice: (cwd) => (cwd === "/tmp/fixture-project" ? "PROJECT_CONTEXT_MAP_SLICE" : ""),
+  });
+  const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true, concurrency: 1 });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  assert.match(h.modelCalls[0].system, /PROJECT_CONTEXT_MAP_SLICE/, "leader stages keep project grounding");
+  const handoffCalls = h.modelCalls.filter((call) => /PINNED_RELEASE=|host LLM synthesizer|host LLM verifier/.test(call.system));
+  assert.equal(handoffCalls.length, 4, "two pinned workers plus synthesis plus verifier");
+  for (const call of handoffCalls) {
+    assert.doesNotMatch(call.system, /PROJECT_CONTEXT_MAP_SLICE/, "handoff stages must never receive the project context map");
+    assert.equal(call.context.cwd, "/tmp/fixture-neutral-agent-cwd", "zero-tool handoff calls must run in the neutral agent cwd");
+    assert.equal(call.context.projectGrounding, false);
+  }
 }
 
 async function circularSelectionEdgesAreRepairedLocallyBeforeHubValidation() {
@@ -2149,6 +2977,7 @@ async function circularSelectionEdgesAreRepairedLocallyBeforeHubValidation() {
       JSON.stringify({
         schemaVersion: "agentlas.workforce-verification.v1",
         status: "passed",
+        failedPacketIds: [],
         checks: [{ checkId: "check:acyclic", status: "passed", evidence: "handoff graph is acyclic" }],
         issues: [],
       }),
@@ -2161,13 +2990,48 @@ async function circularSelectionEdgesAreRepairedLocallyBeforeHubValidation() {
   assert.equal(h.hubCalls.filter((row) => row.name === "workforce.validate_selection").length, 1, "the Hub must only ever see the acyclic repaired selection");
 }
 
+
+async function selectionPromptCarriesACompactMenuNotTheWholeCandidateSet() {
+  const h = harness();
+  const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true, concurrency: 2 });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  const selectionCall = h.modelCalls.find((call) => /CANDIDATE_MENU_DATA=/.test(call.prompt || ""));
+  assert.ok(selectionCall, "the selection stage must send the projected menu");
+  assert.doesNotMatch(selectionCall.prompt, /CANDIDATE_SET_DATA=/, "the full candidate set must not be shipped to the leader");
+  // 리더가 정확한 릴리스를 직접 authoring해야 하므로 releaseId는 투영에 남는다.
+  assert.match(selectionCall.prompt, /release:backend-v3/);
+  // 서버가 원본으로 재검증하는 필드는 프롬프트에서 빠진다 — 이것이 절감의 실체다.
+  assert.doesNotMatch(selectionCall.prompt.split("CANDIDATE_MENU_DATA=")[1], /packageHash|contentDigest|qualificationEvidence/);
+  // 그리고 Hub에는 여전히 완전한 CandidateSet이 간다(계약 무손상).
+  const validateCall = h.hubCalls.find((row) => row.name === "workforce.validate_selection");
+  assert.ok(JSON.stringify(validateCall.args.candidateSet).includes("packageHash"), "the Hub still validates against the complete candidate set");
+}
+
 async function main() {
   await successContract();
+  await workforceReceiptCarriesObservedUsageIntoRunReceiptMetrics();
+  await roleRuntimesSplitOrchestrationFromWorkers();
+  await selectionPromptCarriesACompactMenuNotTheWholeCandidateSet();
   await workersAreToldTheirExactExecutionAuthority();
   await workerToolMarkupLeakRepairsOnceAndSucceeds();
-  await persistentWorkerContractViolationStopsHonestly();
+  await persistentWorkerContractViolationEscalatesOnceAndSucceeds();
+  await persistentWorkerContractViolationAfterEscalationStopsHonestly();
   await verifierRejectionTriggersOneCorrectiveSynthesisThenPasses();
-  await verifierRejectionTwiceFailsHonestlyAfterCorrectiveRetry();
+  await verifierRejectionTwiceEscalatesExactWorkerOnceThenPasses();
+  await verifierRejectionAfterExactEscalationFailsHonestlyWithoutLoop();
+  await verifierFailuresWithoutOneRepeatedExactPacketDoNotEscalate();
+  await verifierOversizedIssueRepairsOnceAndKeepsHonestVerdict();
+  await emptyWorkerDeliverableReachesTheHandoffRepairGate();
+  await emptySynthesisRepairsOnceInsteadOfDiscardingEveryHandoff();
+  await failedNestedTeamKeepsTheInvocationsThatActuallyRan();
+  await structuredPlannersAreToldEveryBoundTheHostEnforces();
+  await firstFatalWorkerStopsBurningTheRemainingPackets();
+  await readOnlyFileAuthorityIsGrantableAndExactlyBounded();
+  await declaredEdgesActuallyDeliverUpstreamHandoffs();
+  await leaderStagesAreToldTheyHaveNoToolsEither();
+  await hostLendsReadAccessWithoutAnyRequiredToolCapability();
+  await hostNeverLendsReadAccessWhenTheHubPolicyDeniesIt();
+  await zeroToolHandoffCallsRunInNeutralCwdWithoutProjectGrounding();
   await circularSelectionEdgesAreRepairedLocallyBeforeHubValidation();
   await incumbentRosterIsReusedWithoutAnotherNetworkCall();
   await incumbentGoalCanChooseLocalOnlyWithoutEndingTheRoster();

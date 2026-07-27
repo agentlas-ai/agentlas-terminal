@@ -13,7 +13,13 @@
  */
 const { tableExists, columnExists } = require("../core/db.cjs");
 const { RUNTIME_BIN, whichSync } = require("./detect.cjs");
-const { resolveRuntime, EXECUTABLE_KINDS } = require("./resolve.cjs");
+const {
+  resolveRuntime,
+  EXECUTABLE_KINDS,
+  CLI_EXECUTABLE_KINDS,
+  API_EXECUTABLE_KINDS,
+} = require("./resolve.cjs");
+const { resolvedModelRole } = require("./roles.cjs");
 
 const OVERRIDE_TABLE = "agent_runtime_overrides";
 // 데스크탑 VALID_SCOPES 동형. v2 터미널 호출자는 주로 'agent'지만 firm/division도 읽을 수 있다.
@@ -78,7 +84,7 @@ function findRuntimeOverride(db, targets) {
 
 /**
  * 오버라이드를 얹은 런타임 해석.
- * @param {object} p { db, prefs, explicit, agentId, targets?, deps? }
+ * @param {object} p { db, prefs, explicit, model?, effort?, role?, agentId, targets?, deps? }
  *   targets: [{scope,targetId}] — 주면 agentId 대신 이 우선순위로 오버라이드를 찾는다
  *            (firm 경로: agent > division > firm).
  *   deps: 테스트 주입 { which, resolve } — 상용 호출자는 사용하지 않는다.
@@ -86,10 +92,48 @@ function findRuntimeOverride(db, targets) {
  *          { ..., unavailableOverride } (오버라이드가 있으나 이 머신/v2에서 실행 불가 —
  *          조용히 무시하지 않고 사유를 실어 보내며, 호출자가 note를 출력해야 한다)
  */
-function resolveRuntimeForAgent({ db, prefs, explicit, agentId, targets, deps } = {}) {
+function resolveRuntimeForAgent({
+  db,
+  prefs,
+  explicit,
+  model,
+  effort,
+  role = "orchestrator",
+  agentId,
+  targets,
+  deps,
+} = {}) {
   const resolveImpl = (deps && deps.resolve) || resolveRuntime;
+  const withPins = (runtime) => ({
+    ...runtime,
+    ...(cleanText(model) ? { model: cleanText(model) } : {}),
+    ...(cleanText(effort) ? { effort: cleanText(effort) } : {}),
+  });
+  const selectedRuntime = (selection, source) => {
+    const kind = selection && selection.kind;
+    if (API_EXECUTABLE_KINDS.has(kind)) {
+      return {
+        kind,
+        backend: selection.backend || kind,
+        model: cleanText(model) || cleanText(selection.model) || undefined,
+        effort: cleanText(effort) || cleanText(selection.effort) || undefined,
+        source,
+      };
+    }
+    if (!CLI_EXECUTABLE_KINDS.has(kind)) return null;
+    const which = (deps && deps.which) || whichSync;
+    const bin = which(RUNTIME_BIN[kind]);
+    if (!bin) return null;
+    return {
+      kind,
+      bin,
+      model: cleanText(model) || cleanText(selection.model) || undefined,
+      effort: cleanText(effort) || cleanText(selection.effort) || undefined,
+      source,
+    };
+  };
   // 명시(--runtime)가 항상 이긴다 — 오버라이드는 "사용자가 고르지 않았을 때"의 기본값이다.
-  if (explicit) return resolveImpl({ db, prefs, explicit });
+  if (explicit) return withPins(resolveImpl({ db, prefs, explicit }));
 
   const override = targets && targets.length
     ? findRuntimeOverride(db, targets)
@@ -98,27 +142,31 @@ function resolveRuntimeForAgent({ db, prefs, explicit, agentId, targets, deps } 
       : null;
   if (override) {
     const kind = override.selection.kind;
-    // v2 스트리밍 드라이버가 있는 CLI 런타임만 실제 실행 대상이다. byok/ollama/kimi
-    // 오버라이드는 데스크탑에서는 유효하지만 터미널 v2 실행 사다리에는 아직 없다 —
-    // 조용히 다른 런타임으로 둔갑시키지 않고 unavailableOverride로 정직하게 알린다.
+    // CLI 스트리밍과 로컬 API(Ollama)는 같은 Session 경로를 쓴다. 아직 연결되지
+    // 않은 BYOK/kimi 등은 조용히 다른 런타임으로 둔갑시키지 않는다.
     if (EXECUTABLE_KINDS.has(kind)) {
-      const which = (deps && deps.which) || whichSync;
-      const bin = which(RUNTIME_BIN[kind]);
-      if (bin) {
-        return {
-          kind,
-          bin,
-          model: override.selection.model,
-          effort: override.selection.effort,
-          source: "agent-override",
-          override,
-        };
-      }
+      const selected = selectedRuntime(override.selection, "agent-override");
+      if (selected) return { ...selected, override, role };
     }
-    const resolved = resolveImpl({ db, prefs, explicit: null });
-    return { ...resolved, unavailableOverride: override };
+    const resolved = withPins(resolveImpl({ db, prefs, explicit: null }));
+    return { ...resolved, unavailableOverride: override, role };
   }
-  return resolveImpl({ db, prefs, explicit: null });
+
+  // Role defaults sit above active_runtime/detected but below exact per-call
+  // pins and agent/firm/division overrides.
+  const roleSelection = resolvedModelRole(db, role);
+  if (roleSelection && EXECUTABLE_KINDS.has(roleSelection.kind)) {
+    const selected = selectedRuntime(roleSelection, roleSelection.sourceLayer);
+    if (selected) {
+      return { ...selected, role, inheritedRole: roleSelection.inherit };
+    }
+  }
+  const resolved = withPins(resolveImpl({ db, prefs, explicit: null }));
+  return {
+    ...resolved,
+    role,
+    ...(roleSelection ? { unavailableRoleSelection: roleSelection } : {}),
+  };
 }
 
 /** 오버라이드 실행 불가 시 사용자에게 출력할 한 줄 (데스크탑 문구 동형). */
@@ -130,10 +178,19 @@ function unavailableOverrideNote(runtime, lang) {
     : `Assigned runtime (${kind}) is unavailable here — using the default runtime (${runtime.kind}).`;
 }
 
+function unavailableRoleNote(runtime, lang) {
+  if (!runtime || !runtime.unavailableRoleSelection) return "";
+  const selected = runtime.unavailableRoleSelection;
+  return lang === "ko"
+    ? `${selected.role} 기본 런타임(${selected.kind})을 이 Terminal에서 실행할 수 없어 ${runtime.kind}으로 실행합니다.`
+    : `${selected.role} default runtime (${selected.kind}) is unavailable in this Terminal — using ${runtime.kind}.`;
+}
+
 module.exports = {
   readAgentRuntimeOverride,
   readRuntimeOverride,
   findRuntimeOverride,
   resolveRuntimeForAgent,
   unavailableOverrideNote,
+  unavailableRoleNote,
 };

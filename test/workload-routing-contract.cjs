@@ -70,6 +70,69 @@ async function main() {
   const storedRuntime = resolveRuntime(storedRuntimeDb);
   assert.equal(storedRuntime.model, "claude-host-current", "stored CLI active model must survive runtime resolution");
   assert.deepEqual(storedRuntime.capabilities, ["code", "tools", "long-context"]);
+  const roleRows = {
+    orchestrator: {
+      role: "orchestrator",
+      kind: "codex",
+      backend: null,
+      source: "cli",
+      model: "gpt-5.6-sol",
+      effort: "max",
+      long_context: 1,
+      inherit: 0,
+      updated_at: "2026-07-28T00:00:00.000Z",
+    },
+    worker: {
+      role: "worker",
+      kind: "ollama",
+      backend: null,
+      source: "local",
+      model: "qwen3:8b",
+      effort: "low",
+      long_context: 0,
+      inherit: 0,
+      updated_at: "2026-07-28T00:00:00.000Z",
+    },
+  };
+  const roleRuntimeDb = {
+    prepare(sql) {
+      if (/sqlite_master/.test(sql)) {
+        return { get: (name) => (name === "model_roles" ? { present: 1 } : null) };
+      }
+      if (/PRAGMA table_info\(model_roles\)/.test(sql)) {
+        return {
+          all: () => [
+            { name: "role" },
+            { name: "kind" },
+            { name: "inherit" },
+          ],
+        };
+      }
+      if (/SELECT \* FROM model_roles/.test(sql)) {
+        return { get: (role) => roleRows[role] || null };
+      }
+      if (/FROM active_runtime/.test(sql)) {
+        return {
+          get: () => ({
+            id: 1,
+            kind: "claude-code",
+            model: "legacy-fallback",
+            long_context: 0,
+          }),
+        };
+      }
+      throw new Error(`unexpected role runtime query: ${sql}`);
+    },
+  };
+  const splitRuntime = resolveRuntime(roleRuntimeDb);
+  assert.equal(splitRuntime.kind, "codex");
+  assert.equal(splitRuntime.model, "gpt-5.6-sol");
+  assert.equal(splitRuntime.effort, "max");
+  assert.equal(splitRuntime.roleRuntimes.orchestrator.kind, "codex");
+  assert.equal(splitRuntime.roleRuntimes.worker.mode, "api");
+  assert.equal(splitRuntime.roleRuntimes.worker.backend, "ollama");
+  assert.equal(splitRuntime.roleRuntimes.worker.model, "qwen3:8b");
+  assert.equal(splitRuntime.roleRuntimes.worker.role, "worker");
   const storedInventory = listAvailableRuntimes(storedRuntimeDb, storedRuntime)
     .find((runtime) => runtime.kind === "claude-code");
   assert.ok(storedInventory.availableModels.some((model) => model.id === "claude-host-current"));
@@ -288,6 +351,7 @@ async function main() {
     stage: "worker",
     decision: economy,
     resolution: routing.resolveAllocation({ runtime: codexRuntime, decision: economy }),
+    usage: { inputTokens: 120, outputTokens: 30 },
     now: new Date("2026-07-13T00:00:00.000Z"),
   });
   routing.appendDecisionReceipt(receipt, receiptFile);
@@ -296,8 +360,10 @@ async function main() {
   assert.equal(receipt.schemaVersion, "agentlas.model-allocation-receipt.v1");
   assert.deepEqual(Object.keys(receipt).sort(), [
     "decisionId", "independentVerificationRequired", "inputFeatureHash", "packetId", "privacy",
-    "reasonCodes", "requested", "resolved", "schemaVersion", "selectorVersion", "status", "validationIssues",
+    "reasonCodes", "requested", "resolved", "role", "schemaVersion", "selectorVersion", "status", "usage", "validationIssues",
   ].sort(), "Terminal receipt must have exactly the Core public schema fields");
+  assert.equal(receipt.role, "worker");
+  assert.deepEqual(receipt.usage, { inputTokens: 120, outputTokens: 30 });
   assert.equal(receipt.privacy.rawPromptIncluded, false);
   assert.equal(receipt.privacy.rawTranscriptIncluded, false);
   assert.match(receipt.inputFeatureHash, /^sha256:[0-9a-f]{64}$/);
@@ -329,6 +395,20 @@ async function main() {
     "unresolved",
     "fallback-current requires a verified current runtime/model pair",
   );
+  const missingAllocationReceipt = routing.createDecisionReceipt({
+    taskId: "worker-missing-allocation",
+    stage: "worker",
+    decision: null,
+    resolution: unresolvedFallbackReceipt.resolved,
+  });
+  assert.deepEqual(missingAllocationReceipt.validationIssues, ["allocation_not_provided"]);
+  const invalidAllocationReceipt = routing.createDecisionReceipt({
+    taskId: "worker-invalid-allocation",
+    stage: "worker",
+    decision: { tier: "not-a-tier" },
+    resolution: unresolvedFallbackReceipt.resolved,
+  });
+  assert.deepEqual(invalidAllocationReceipt.validationIssues, ["invalid_ai_allocation"]);
   const redactedReceipt = routing.createDecisionReceipt({
     taskId: "worker-private-reason",
     taskText: "another task",
@@ -399,8 +479,14 @@ async function main() {
           synthesis: { tier: "balanced", effort: "high", reason: "merge conflicting evidence", runtimeId: "runtime-1", exactModelId: "codex-live-balanced" },
         });
       }
-      if (/synthesizer of an agent swarm/.test(system)) return "integrated answer";
-      return "worker result";
+      if (/synthesizer of an agent swarm/.test(system)) {
+        return options.envelope
+          ? { text: "integrated answer", usage: { inputTokens: 80, outputTokens: 20 } }
+          : "integrated answer";
+      }
+      return options.envelope
+        ? { text: "worker result", usage: { inputTokens: 40, outputTokens: 10 } }
+        : "worker result";
     },
     runApi: async () => "",
   });
@@ -439,6 +525,8 @@ async function main() {
   assert.equal(receiptLines.length, 3);
   assert.deepEqual(new Set(receiptLines.map((item) => item.packetId)), new Set(["worker-1", "worker-2", "synthesis-final"]));
   assert.ok(receiptLines.every((item) => item.schemaVersion === "agentlas.model-allocation-receipt.v1"));
+  assert.deepEqual(receiptLines.map((item) => item.role).sort(), ["orchestrator", "worker", "worker"]);
+  assert.ok(receiptLines.every((item) => item.usage?.inputTokens > 0 && item.usage?.outputTokens > 0));
   assert.ok(receiptLines.every((item) => item.privacy.rawPromptIncluded === false && item.privacy.rawTranscriptIncluded === false));
   assert.doesNotMatch(fs.readFileSync(integratedReceiptFile, "utf8"), /audit fixtures|repair architecture|ship a safe fix/);
 

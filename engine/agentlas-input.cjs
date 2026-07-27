@@ -597,8 +597,23 @@ function attachSlashPalette(rl, opts = {}) {
     return rows().length > 0 && state.dismissedForLine !== (rl.line || "");
   }
   function replaceLine(value) {
+    const next = String(value || "");
+    /*
+     * keypress 리스너 안에서 rl.write(Ctrl-U) → rl.write(text)를 재진입시키면
+     * Node readline의 원래 Tab/Enter 핸들러가 아직 같은 키를 처리하는 중이라
+     * 기존 `/s` 뒤에 선택값을 붙였다(`/s/team`, `/s/skills` 실측). line/cursor는
+     * readline의 공개 관측 상태이고 `_refreshLine`은 그 상태를 그리는 유일한
+     * 부수효과라, 한 번에 교체해 재진입을 피한다. 구형 Node만 기존 키 시퀀스로
+     * 폴백한다.
+     */
+    if (typeof rl._refreshLine === "function") {
+      rl.line = next;
+      rl.cursor = next.length;
+      rl._refreshLine();
+      return;
+    }
     rl.write(null, { ctrl: true, name: "u" });
-    rl.write(value);
+    rl.write(next);
   }
   /*
    * 커서 복원은 상대 이동으로만 한다.
@@ -711,7 +726,17 @@ function attachSlashPalette(rl, opts = {}) {
     // Tab 은 완성이다 — 강조된 항목으로 줄을 채운다.
     // Shift-Tab 은 팔레트 확정 키가 아니다(호출자 REPL 의 권한 순환 단축키다).
     if (active() && name === "tab" && !key.shift) {
-      select();
+      if (select()) {
+        /*
+         * prependListener는 readline 자체 Tab 처리를 중단시키지 못한다. 선택을 먼저
+         * 반영한 뒤, 기본 완성기가 같은 키로 줄을 다시 바꿔도 다음 tick에 exact
+         * 선택을 한 번 재적용한다.
+         */
+        const selected = state.selectedCommand;
+        setImmediate(() => {
+          if (selected) replaceLine(selected);
+        });
+      }
       return;
     }
     /*

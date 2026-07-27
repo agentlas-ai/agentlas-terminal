@@ -3,6 +3,9 @@
  * run — 원샷 실행: agentlas run [agent] [prompt…]
  *   -p | --print          최종 답만 stdout에 (스트리밍 UI 없음)
  *   --runtime <kind>      claude-code | codex | gemini
+ *   --model <id>          exact provider model id
+ *   --effort <level>      none | minimal | low | medium | high | xhigh | max
+ *   --tier <tier>         economy | balanced | frontier (requires --model)
  *   --permission <level>  read | write | full
  * 프롬프트가 없고 stdin이 TTY가 아니면 stdin을 읽는다.
  *
@@ -10,15 +13,19 @@
  * 판정(resolveAutoRoute)이 최적 에이전트를 고른다 — 어휘 점수는 후보 모집 전용이다.
  * 판정 런타임이 없으면 기본 에이전트로 정직 폴백하되 note를 stderr에 반드시 출력한다
  * (조용한 오라우팅/폴백 금지 — 오너 결정).
- * 런타임 사다리: 명시(--runtime) > 에이전트별 오버라이드(agent_runtime_overrides) >
- * prefs > active_runtime > detected (runtimes/overrides.cjs).
+ * 런타임 사다리: 명시 핀 > 에이전트별 오버라이드(agent_runtime_overrides) >
+ * model_roles[orchestrator] > active_runtime > detected (runtimes/overrides.cjs).
  */
 const { findAgent, listAgents } = require("../agents/registry.cjs");
-const { resolveRuntime } = require("../runtimes/resolve.cjs");
-const { resolveRuntimeForAgent, unavailableOverrideNote } = require("../runtimes/overrides.cjs");
+const {
+  resolveRuntimeForAgent,
+  unavailableOverrideNote,
+  unavailableRoleNote,
+} = require("../runtimes/overrides.cjs");
 const { Orchestrator } = require("../sessions/orchestrator.cjs");
 const { Renderer } = require("../ui/renderer.cjs");
 const permissions = require("../agentlas-permissions.cjs");
+const { EFFORTS, TIERS } = require("../agentlas-workload-routing.cjs");
 
 function readStdin() {
   return new Promise((resolve) => {
@@ -30,11 +37,22 @@ function readStdin() {
 }
 
 function parseArgs(args) {
-  const out = { print: false, runtime: null, permission: null, rest: [] };
+  const out = {
+    print: false,
+    runtime: null,
+    model: null,
+    effort: null,
+    tier: null,
+    permission: null,
+    rest: [],
+  };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "-p" || a === "--print") out.print = true;
     else if (a === "--runtime") out.runtime = args[++i];
+    else if (a === "--model") out.model = args[++i];
+    else if (a === "--effort") out.effort = args[++i];
+    else if (a === "--tier") out.tier = args[++i];
     else if (a === "--permission") out.permission = args[++i];
     else out.rest.push(a);
   }
@@ -47,6 +65,18 @@ async function runOnce(ctx, args) {
   // 강등하는데, 조용히 강등하면 full을 요청한 사용자가 read로 도는 걸 모른다.
   if (parsed.permission && !["read", "write", "full"].includes(String(parsed.permission))) {
     ctx.err(`unknown --permission ${parsed.permission} (use: read | write | full)`);
+    return 1;
+  }
+  if (parsed.effort && !EFFORTS.includes(String(parsed.effort))) {
+    ctx.err(`unknown --effort ${parsed.effort} (use: ${EFFORTS.join(" | ")})`);
+    return 1;
+  }
+  if (parsed.tier && !TIERS.includes(String(parsed.tier))) {
+    ctx.err(`unknown --tier ${parsed.tier} (use: ${TIERS.join(" | ")})`);
+    return 1;
+  }
+  if (parsed.tier && !parsed.model) {
+    ctx.err("--tier requires --model: Terminal never guesses a provider model id from a cost tier");
     return 1;
   }
   const db = ctx.db();
@@ -70,7 +100,15 @@ async function runOnce(ctx, args) {
   // 기본 런타임을 먼저 확정한다 — 판정 러너(자동 라우팅)도 이 런타임을 쓴다.
   let runtime;
   try {
-    runtime = resolveRuntime({ db, prefs: ctx.prefs, explicit: parsed.runtime });
+    runtime = resolveRuntimeForAgent({
+      db,
+      prefs: ctx.prefs,
+      explicit: parsed.runtime,
+      model: parsed.model,
+      effort: parsed.effort,
+      role: "orchestrator",
+    });
+    if (parsed.tier) runtime.modelTier = parsed.tier;
   } catch (e) {
     ctx.err(String((e && e.message) || e));
     return 1;
@@ -103,13 +141,27 @@ async function runOnce(ctx, args) {
     if (choice && choice.note) ctx.err(ctx.uiInstance.c.dim(choice.note));
   }
 
-  // 에이전트가 확정된 뒤 에이전트별 런타임 오버라이드를 얹는다(명시 --runtime이 항상 우선).
-  if (!parsed.runtime && agent && agent.id) {
+  // 에이전트가 확정된 뒤 에이전트별 오버라이드를 포함한 전체 사다리를 다시 해석한다.
+  // 명시 runtime/model/effort 핀은 항상 최상단이라 에이전트 기본값보다 우선한다.
+  if (agent && agent.id) {
     try {
-      const layered = resolveRuntimeForAgent({ db, prefs: ctx.prefs, explicit: null, agentId: agent.id });
+      const layered = resolveRuntimeForAgent({
+        db,
+        prefs: ctx.prefs,
+        explicit: parsed.runtime,
+        model: parsed.model,
+        effort: parsed.effort,
+        role: "orchestrator",
+        agentId: agent.id,
+      });
       if (layered.unavailableOverride) ctx.err(ctx.uiInstance.c.dim(unavailableOverrideNote(layered, ctx.lang)));
+      if (layered.unavailableRoleSelection) ctx.err(ctx.uiInstance.c.dim(unavailableRoleNote(layered, ctx.lang)));
+      if (parsed.tier) layered.modelTier = parsed.tier;
       runtime = layered;
-    } catch { /* 오버라이드 층 실패 → 이미 확정된 기본 런타임 유지 */ }
+    } catch (e) {
+      ctx.err(String((e && e.message) || e));
+      return 1;
+    }
   }
 
   const orch = new Orchestrator({ db, lang: ctx.lang });
@@ -125,7 +177,9 @@ async function runOnce(ctx, args) {
   if (!parsed.print) {
     renderer = new Renderer(ctx.uiInstance);
     renderer.attach(session, { replay: false });
-    ctx.err(ctx.uiInstance.c.dim(`${agent.slug} · ${runtime.kind}`));
+    ctx.err(ctx.uiInstance.c.dim(
+      `${agent.slug} · ${runtime.kind}${runtime.model ? ` · ${runtime.model}` : ""}${runtime.effort ? ` · ${runtime.effort}` : ""}`,
+    ));
   }
 
   const res = await session.send(prompt);
