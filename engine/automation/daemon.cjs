@@ -167,6 +167,14 @@ async function runAutomationOnce(ctx, db, row, opts = {}) {
     return { ok: false, skipped: true, reason: "lease" };
   }
 
+  // 데스크탑 스케줄러는 60초마다 리스를 갱신한다. 여기는 한 번 잡고 끝이라
+  // TTL(15분)을 넘긴 실행은 프로세스가 살아 있어도 회수 대상이 됐다 — 같은
+  // 자동화가 두 실행기에서 겹쳐 도는 경로. 같은 주기로 심장박동을 보낸다.
+  const leaseHeartbeat = setInterval(() => {
+    try { store.renewAutomationLease(db, row.id); } catch { /* best-effort */ }
+  }, 60_000);
+  if (typeof leaseHeartbeat.unref === "function") leaseHeartbeat.unref();
+
   try {
     // ── raw-row 실행 계약 게이트 (데스크탑 automation-scheduler.ts:538-549 동형) ──
     // 손상된 계약 값으로는 무인 실행하지 않는다 — 문구까지 데스크탑과 동일.
@@ -246,6 +254,7 @@ async function runAutomationOnce(ctx, db, row, opts = {}) {
     store.advanceAfterRun(db, row, { ok: false, advanceSchedule: !!opts.advanceSchedule });
     return { ok: false, error: msg };
   } finally {
+    clearInterval(leaseHeartbeat);
     store.releaseAutomation(db, row.id);
   }
 }

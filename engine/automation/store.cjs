@@ -105,6 +105,27 @@ function claimAutomation(db, id, now = new Date(), owner = LEASE_OWNER) {
   return (result.changes ?? result.rowsAffected ?? 0) > 0;
 }
 
+/**
+ * 이 프로세스가 아직 들고 있는 리스의 claimed_at 을 현재로 민다.
+ *
+ * claimAutomation 은 한 번만 부르고 갱신이 없었다. 데스크탑 스케줄러는 60초마다
+ * 갱신하므로, TTL(15분)을 넘긴 CLI 실행은 프로세스가 멀쩡히 살아 있는데도
+ * 회수 대상이 된다 — 에이전트 세션에서 15분은 평범하고, 그러면 같은 자동화가
+ * 두 실행기에서 겹쳐 돈다. 소유자가 나일 때만 갱신하므로, 이미 남에게 넘어간
+ * 리스를 되빼앗지는 않는다.
+ */
+function renewAutomationLease(db, id, now = new Date(), owner = LEASE_OWNER) {
+  if (!leaseSupported(db)) return false;
+  try {
+    const result = db
+      .prepare("UPDATE automations SET claimed_at = ? WHERE id = ? AND lease_owner = ?")
+      .run(now.toISOString(), id, owner);
+    return (result.changes ?? result.rowsAffected ?? 0) > 0;
+  } catch {
+    return false;
+  }
+}
+
 function releaseAutomation(db, id) {
   try {
     db.prepare("UPDATE automations SET claimed_at = NULL, lease_owner = NULL WHERE id = ?").run(id);
@@ -201,6 +222,7 @@ module.exports = {
   setEnabled,
   removeAutomation,
   claimAutomation,
+  renewAutomationLease,
   releaseAutomation,
   recordRun,
   listRuns,

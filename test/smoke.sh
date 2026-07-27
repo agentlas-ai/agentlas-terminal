@@ -123,6 +123,21 @@ if [ -f "$SYNC" ]; then
   fi
 fi
 
+# 런타임 번들 계약 패리티 — 허브(TS 발신) ↔ Core(파이썬 수신) ↔ 이 repo(CJS 수신).
+# 허브는 머지 즉시 배포되고 두 수신자는 사용자 속도로 갱신되므로, 발신 쪽 필드명
+# 하나가 바뀌면 배포된 클라이언트가 통째로 fail-closed 한다. 2026-07-27 P0
+# (lazyRead ↔ allowRead)가 정확히 이 자리였고, 세 제품의 자체 테스트는 모두 초록이었다.
+BUNDLE_SYNC="$(cd "$(dirname "$0")/.." && pwd)/../scripts/sync-runtime-bundle-contract.sh"
+if [ -f "$BUNDLE_SYNC" ]; then
+  if bash "$BUNDLE_SYNC"; then
+    echo "PASS bundle-contract-parity"
+    pass=$((pass + 1))
+  else
+    echo "FAIL bundle-contract-parity"
+    fail=$((fail + 1))
+  fi
+fi
+
 echo ""
 echo "smoke: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
