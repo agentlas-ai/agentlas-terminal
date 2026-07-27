@@ -21,6 +21,12 @@
 const { buildStormDeps } = require("../storm/deps.cjs");
 const { projectCwd } = require("../workforce/capture.cjs");
 
+function assertPermissionFlag(value) {
+  if (value && !["read", "write", "full"].includes(String(value))) {
+    throw new Error(`unknown --permission ${value} (use: read | write | full)`);
+  }
+}
+
 function resolvePermission(ctx) {
   // v1 resolveTerminalPermission 포팅: 저장된 `full` 은 세션 한정 계약이라
   // persistent()가 fail-closed 로 강등한다.

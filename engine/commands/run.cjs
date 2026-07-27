@@ -43,6 +43,12 @@ function parseArgs(args) {
 
 async function runOnce(ctx, args) {
   const parsed = parseArgs(args);
+  // 플래그 검증은 모델을 부르기 전에. normalize는 알 수 없는 값을 read로 fail-closed
+  // 강등하는데, 조용히 강등하면 full을 요청한 사용자가 read로 도는 걸 모른다.
+  if (parsed.permission && !["read", "write", "full"].includes(String(parsed.permission))) {
+    ctx.err(`unknown --permission ${parsed.permission} (use: read | write | full)`);
+    return 1;
+  }
   const db = ctx.db();
 
   let agent = null;

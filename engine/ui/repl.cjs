@@ -406,6 +406,9 @@ function handleSlash(ctx, cmdline, api) {
       return;
     }
     case "permission": {
+      if (!["read", "write", "full"].includes(String(rest[0] || ""))) {
+        throw new Error("Usage: /permission read|write|full");
+      }
       const level = permissions.normalize(rest[0]);
       api.setPermission(level);
       ctx.out(ui.c.dim(`permission: ${level} (${en ? "applies to new sessions" : "새 세션부터 적용"})`));
