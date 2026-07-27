@@ -2,6 +2,33 @@
 
 ## 1.0.8 — 2026-07-27
 
+Three repairs of one mistake, found by a live run that a 4-agent task force
+(two of them managers over 8 and 10 sub-workers) completed in full before the
+result was thrown away.
+
+- **Field bounds are now stated in the prompt that must obey them.** A nested
+  manager wrote a synthesis brief over 2,000 characters and the whole run —
+  20 model calls, 14 minutes, every worker's finished output — was discarded
+  on a contract error. The engine enforced that ceiling and had never told the
+  manager it existed, so the one repair attempt it does allow failed the same
+  way. Every enforced bound now appears in the stage's schema requirements
+  with headroom (1,900 against a 2,000 ceiling).
+- **An empty worker deliverable reaches its retry.** The corrective re-run had
+  always existed but a contract assertion fired first, so it was dead code.
+- **A failed nested team leaves a real ledger.** Nested executions were
+  recorded only on success, so a mid-flight failure left `nestedExecutions`
+  empty while 20 model calls had already been billed, and the failure receipt
+  minted an `invocationId` with `crypto.randomUUID()` that had never named a
+  real call. Nested runs are now written as `running` when they start and
+  updated per stage; stages that never ran stay `null` rather than invented,
+  and failures carry the real invocation id.
+
+These four defects (with the verifier overflow in 1.0.7) share one shape: a
+fail-closed assertion placed ahead of the repair path it makes unreachable,
+enforcing a limit the other side was never told. Four regression tests pin it.
+
+## 1.0.8 — 2026-07-27
+
 - **Arrow keys navigate the slash palette instead of collapsing it.** Moving
   the highlight also wrote the highlighted command into the input line, and
   the candidate list is derived from that line — so the list became a function

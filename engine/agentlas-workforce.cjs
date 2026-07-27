@@ -1737,6 +1737,9 @@ function buildPrompts(task, identity) {
     "Choose capabilityBindingPlan.inventory only from POLICY_FILTERED_LOCAL_TOOL_MENU_DATA. Cover every requiredToolCapabilities id exactly once for each slot/release pair. One selected tool row may cover multiple capabilities. If a required capability has no exact ready tool, do not invent a binding; return the best schema-valid plan and allow deterministic validation to reject it.",
     "Each bound inventory row must explicitly contain slotId, agentReleaseId, permissionPolicyDigest, provider, toolId, capabilityIds, status=bound. An empty inventory is required when every slot has no required tool capability.",
     "synthesis must explicitly author slotId, agentReleaseId, and brief. verifier must explicitly author slotId, agentReleaseId, brief, and a non-empty criteria array. The host will not add, remove, normalize, or substitute a release or field.",
+    // 호스트가 강제하는 상한을 미리 알려준다 — 알려주지 않은 상한은 첫 시도를 반드시
+    // 깨고 교정 1회로도 회복되지 않는다(2026-07-27 라이브 실측, 중첩 매니저 동일 계열).
+    "Field bounds are hard: each packet objective at most 3800 characters, each expectedOutput at most 1900, at most 64 inputs of at most 1900 characters each, each synthesis/verifier brief at most 1900, and at most 32 verifier criteria of at most 450 characters each. Write briefs and criteria tightly.",
   ].join("\n");
   return {
     searchSystem: [
@@ -3149,6 +3152,9 @@ function create(deps = {}) {
           "Return exactly one agentlas.workforce-team-delegation-plan.v1 object with plannedWorkerIds, packets, and synthesisBrief.",
           `plannedWorkerIds and packet ids must be exactly this declared order: ${stableJson(exactWorkerIds)}.`,
           "Every packet contains exactly id, objective, inputs, expectedOutput. No worker may be omitted, added, reordered, or substituted.",
+          // 상한을 말해주지 않으면 첫 시도가 반드시 상한을 넘고, 교정 1회로도 못 줄인다
+          // (2026-07-27 라이브 실측: synthesisBrief > 2000자로 4워커 런이 통째로 폐기).
+          "Field bounds are hard: synthesisBrief at most 1900 characters, each packet objective at most 3800, each expectedOutput at most 1900, and at most 64 inputs of at most 1900 characters each. Write briefs tightly; do not restate the packet contents.",
         ].join("\n");
         let attemptPrompt = stableJson({ sharedTask: workOrder.taskBrief, roleSlot: slotById.get(packet.slotId), packet, declaredWorkerIds: exactWorkerIds });
         let priorDigest = null;
