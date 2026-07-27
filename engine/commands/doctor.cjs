@@ -38,6 +38,8 @@ function run(ctx) {
     bad(en ? "runtimes" : "런타임", en
       ? "no agent CLI on PATH (claude / codex / gemini / kimi / grok / cursor-agent)"
       : "PATH에 에이전트 CLI 없음 (claude / codex / gemini / kimi / grok / cursor-agent)");
+    // 막다른 길 방지: 무엇을 설치해야 하는지 그 자리에서 알려준다.
+    ctx.out(ctx.ui.dim("      npm i -g @anthropic-ai/claude-code  ·  @openai/codex  ·  @google/gemini-cli"));
   }
   try {
     const active = activeRuntimeRow(ctx.db());

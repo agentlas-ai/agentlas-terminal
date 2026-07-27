@@ -47,9 +47,18 @@ function resolveRuntime({ db, prefs, explicit }) {
   }
   const found = listAvailableCliRuntimes().filter((r) => EXECUTABLE_KINDS.has(r.kind));
   if (found.length) return { kind: found[0].kind, bin: found[0].path, source: "detected" };
-  throw new NoRuntimeError(
-    "no_runtime: no agent CLI found (claude / codex / gemini / kimi / grok / cursor-agent). Install one and retry.",
-  );
+  // 신규 사용자의 최빈 막다른 길: "설치하라"만 있고 방법이 없으면 여기서 이탈한다.
+  // 실제 설치 명령을 그대로 준다(데스크탑 온보딩의 "Claude Code 무료로 설치하기"와 동형).
+  throw new NoRuntimeError([
+    "no_runtime: no agent CLI is connected — Agentlas runs your agents on a CLI you already subscribe to.",
+    "",
+    "Install one, then rerun:",
+    "  npm i -g @anthropic-ai/claude-code    # Claude Code",
+    "  npm i -g @openai/codex                # Codex CLI",
+    "  npm i -g @google/gemini-cli           # Gemini CLI",
+    "",
+    "Already installed? Make sure its binary is on PATH (agentlas doctor shows what was detected).",
+  ].join("\n"));
 }
 
 module.exports = { resolveRuntime, NoRuntimeError, EXECUTABLE_KINDS };
