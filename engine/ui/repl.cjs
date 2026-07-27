@@ -102,16 +102,18 @@ async function startRepl(ctx, opts = {}) {
   }
 
   return new Promise((resolve) => {
-    // v1 input 모듈 재사용: 히스토리 영속 + 탭 완성(슬래시/에이전트/회사/@경로).
+    // 히스토리는 v1 input 모듈 재사용, 완성기는 v2 팔레트(ui/palette)가 정본이다.
     const input = require("../agentlas-input.cjs");
+    const palette = require("./palette.cjs");
     const rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
-      completer: input.makeCompleter({
+      completer: palette.makeCompleter({
         getAgentSlugs: () => { try { return listAgents(db).map((a) => a.slug); } catch { return []; } },
         getFirmSlugs: () => {
           try { return db.prepare("SELECT slug FROM firms ORDER BY slug").all().map((r) => r.slug); } catch { return []; }
         },
+        getSessionKeys: () => orch.list().map((r) => r.key),
         getCwd: () => process.cwd(),
       }),
     });
@@ -317,14 +319,12 @@ function handleSlash(ctx, cmdline, api) {
       require("../commands/help.cjs").run(ctx, rest);
       ctx.out("");
       ctx.out(ui.c.bold(en ? "In-REPL session control (Orca)" : "REPL 세션 조종 (오르카)"));
-      ctx.out("  /spawn <agent> [task]   " + (en ? "start a background subagent session" : "백그라운드 서브에이전트 세션 시작"));
-      ctx.out("  /sessions · /tree       " + (en ? "session table / tree" : "세션 표 / 트리"));
-      ctx.out("  /s <n>                  " + (en ? "switch active session (tail replay + live)" : "활성 세션 전환 (tail 재생 + 라이브)"));
-      ctx.out("  /steer <n> <msg>        " + (en ? "queue a steering message" : "스티어링 메시지 큐잉"));
-      ctx.out("  /kill <n> · /rm <n>     " + (en ? "interrupt turn / remove session" : "턴 중단 / 세션 제거"));
-      ctx.out("  /broadcast <msg>        " + (en ? "send to every session" : "모든 세션에 지시"));
-      ctx.out("  /use <agent>            " + (en ? "switch the main session's agent" : "메인 세션 에이전트 교체"));
-      ctx.out("  /runtime <kind> · /permission <level>");
+      // 팔레트는 Tab 완성과 같은 정본(ui/palette)에서 렌더한다 — 목록 드리프트 금지.
+      ctx.out(require("./palette.cjs").renderPalette(ctx.lang));
+      ctx.out("");
+      ctx.out(ctx.uiInstance.c.dim(en
+        ? "Tab completes commands, agent names and session keys · ↑/↓ history · typing during a run queues steering · ctrl-c interrupts"
+        : "Tab: 명령·에이전트·세션키 완성 · ↑/↓ 히스토리 · 실행 중 입력은 스티어링 큐 · ctrl-c 턴 중단"));
       return;
     }
     case "agents": case "list": require("../commands/list.cjs").run(ctx, rest); return;

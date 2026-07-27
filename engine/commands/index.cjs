@@ -76,6 +76,30 @@ const NOT_YET_PORTED = [
       
         ];
 
+/*
+ * 데스크탑 전용 표면 — 터미널에 같은 이름의 명령이 없다.
+ * 이 이름들을 그냥 프롬프트로 흘리면 사용자가 "명령을 쳤는데" 에이전트가
+ * 저장소를 뒤지고 토큰을 쓴다(실사용 테스트에서 실증). 정직하게 멈추고
+ * 데스크탑/대체 경로를 안내한다.
+ */
+const DESKTOP_ONLY_SURFACES = {
+  site: "Site studio (웹·모바일·Agent App 디자인) is Desktop-only.",
+  sites: "Site studio (웹·모바일·Agent App 디자인) is Desktop-only.",
+  trex: "T-rex slide studio is Desktop-only.",
+  slides: "T-rex slide studio is Desktop-only.",
+  prompts: "Prompt Store is Desktop-only.",
+  dashboard: "Dashboard is Desktop-only — use: agentlas doctor · usage · list · chats",
+  marketplace: "Marketplace browsing is Desktop-only — use: agentlas search \"<what you need>\"",
+  library: "Library is Desktop-only — use: agentlas list · env · mcp",
+  groups: "Agent groups (조합) are Desktop-only.",
+  "agent-groups": "Agent groups (조합) are Desktop-only.",
+  settings: "Settings UI is Desktop-only — use: agentlas setup · env · creds · multimodal · doctor",
+  apps: "Apps surface is Desktop-only.",
+  quests: "Quests are Desktop-only.",
+  bookmarks: "Hub bookmarks are Desktop-only.",
+  one: "Agentlas One is a separate Desktop/Mobile product surface.",
+};
+
 // 무인자 호출이 프롬프트로 오라우팅되면 안 되는 명령 (smoke 가드 대상)
 const GUARDED_NO_ARG = new Set(["search", "install", "upload"]);
 
@@ -92,6 +116,11 @@ function dispatch(ctx, argv) {
     return 1;
   }
 
+  if (DESKTOP_ONLY_SURFACES[cmd] && rest.length === 0) {
+    ctx.err(`${DESKTOP_ONLY_SURFACES[cmd]}\nIt was not run as a prompt — rerun with quotes if you meant a task: agentlas "${cmd} …"`);
+    return 1;
+  }
+
   if (NOT_YET_PORTED.includes(cmd)) {
     ctx.err(
       `'${cmd}' is not wired into the v2 engine yet.\n` +
@@ -104,4 +133,4 @@ function dispatch(ctx, argv) {
   return undefined; // 알 수 없는 토큰 — 엔진이 에이전트 이름/프롬프트로 해석 시도
 }
 
-module.exports = { dispatch, COMMANDS, NOT_YET_PORTED, GUARDED_NO_ARG };
+module.exports = { dispatch, COMMANDS, NOT_YET_PORTED, GUARDED_NO_ARG, DESKTOP_ONLY_SURFACES };
