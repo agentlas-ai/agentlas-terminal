@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.8 — 2026-07-27
+
+- **Arrow keys navigate the slash palette instead of collapsing it.** Moving
+  the highlight also wrote the highlighted command into the input line, and
+  the candidate list is derived from that line — so the list became a function
+  of the selection rather than of what you typed. Typing `/s` offered nine
+  commands; two presses of Down rewrote the line to `/switch` and cut the list
+  to two, leaving `/spawn`, `/steer`, `/search`, `/storm` and `/swarm`
+  unreachable no matter how many keys you pressed. Arrows now move the
+  highlight only and leave your query alone. Deleting the line rewrite was not
+  enough on its own: readline treats Up/Down as history navigation and a
+  prepended keypress listener runs first but cannot suppress that default, so
+  the query is now restored if readline moved through history.
+
 ## 1.0.7 — 2026-07-27
 
 - **The selection prompt no longer carries the whole candidate set.** Measured
