@@ -369,15 +369,19 @@ async function startRepl(ctx, opts = {}) {
        */
       const finish = () => { orch.shutdown(); ui.ensureNl(); resolve(0); };
       if (!pendingCommands.size) { finish(); return; }
-      ui.ensureNl();
-      ui.line(ui.c.dim(en
-        ? `finishing ${pendingCommands.size} command(s)…`
-        : `실행 중인 명령 ${pendingCommands.size}개를 마무리하는 중…`));
       let settled = false;
-      const once = () => { if (settled) return; settled = true; finish(); };
-      const timer = setTimeout(once, 30_000);
-      if (timer.unref) timer.unref();
-      Promise.allSettled([...pendingCommands]).then(() => { clearTimeout(timer); once(); }, once);
+      const once = () => { if (settled) return; settled = true; clearTimeout(notice); finish(); };
+      // 곧 끝나는 명령까지 매번 고지하면 종료 화면이 시끄러워진다 — 실제로 기다릴 때만 알린다.
+      const notice = setTimeout(() => {
+        ui.ensureNl();
+        ui.line(ui.c.dim(en
+          ? `finishing ${pendingCommands.size} command(s)…`
+          : `실행 중인 명령 ${pendingCommands.size}개를 마무리하는 중…`));
+      }, 400);
+      if (notice.unref) notice.unref();
+      const cap = setTimeout(once, 30_000);
+      if (cap.unref) cap.unref();
+      Promise.allSettled([...pendingCommands]).then(() => { clearTimeout(cap); once(); }, once);
     });
 
     prompt();
