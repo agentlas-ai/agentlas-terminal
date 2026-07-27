@@ -23,6 +23,7 @@ const { findAgent, listAgents } = require("../agents/registry.cjs");
 const { resolveRuntime, NoRuntimeError } = require("../runtimes/resolve.cjs");
 const permissions = require("../agentlas-permissions.cjs");
 const i18n = require("../agentlas-i18n.cjs");
+const { tokenizeCommandLine } = require("../agentlas-input.cjs");
 
 const DEFAULT_AGENT_SLUG = "agentlas-orchestrator";
 
@@ -90,7 +91,8 @@ function pickDefaultAgent(db) {
 }
 
 async function startRepl(ctx, opts = {}) {
-  const en = ctx.lang === "en";
+  // 마법사가 언어를 바꾸면 이 뒤의 문구도 따라가야 한다 — 아래 온보딩 블록에서 갱신한다.
+  let en = ctx.lang === "en";
   const ui = ctx.uiInstance;
   const db = ctx.db();
 
@@ -103,7 +105,17 @@ async function startRepl(ctx, opts = {}) {
       const { runWizard } = require("../commands/setup.cjs");
       const result = await runWizard(ctx, wizardRl);
       if (result) {
-        if (result.lang) { ctx.prefs.language = result.lang; }
+        /*
+         * 고른 언어를 이번 세션에도 즉시 반영한다. 예전에는 prefs 에만 적어서,
+         * runOnboard 가 손댄 ui.lang 덕에 배너만 새 언어로 나오고 /help·팔레트·
+         * 오케스트레이터·단축키 안내는 재시작 전까지 OS 로케일 언어로 남았다.
+         */
+        if (result.lang) {
+          ctx.prefs.language = result.lang;
+          ctx.lang = result.lang;
+          ui.lang = result.lang;
+          en = ctx.lang === "en";
+        }
         if (result.permission) ctx.prefs.permission = result.permission;
         if (result.runtime) ctx.prefs.runtime = result.runtime;
         ctx.prefs.onboarded = !!result.onboarded;
@@ -186,6 +198,13 @@ async function startRepl(ctx, opts = {}) {
       getSessionKeys: () => orch.list().map((r) => r.key),
       getCwd: () => process.cwd(),
     });
+    // 진행 중인 비동기 슬래시 명령 — 종료가 이걸 잘라먹지 않도록 close 핸들러가 기다린다.
+    const pendingCommands = new Set();
+    const trackCommand = (promise) => {
+      pendingCommands.add(promise);
+      promise.then(() => pendingCommands.delete(promise), () => pendingCommands.delete(promise));
+      return promise;
+    };
     // Shift-Tab 이 온 턴에는 완성 후보를 비운다 — 아래 권한 순환 주석 참고.
     let swallowCompletion = false;
     const rl = readline.createInterface({
@@ -299,7 +318,7 @@ async function startRepl(ctx, opts = {}) {
 
       if (input.startsWith("/")) {
         try {
-          const quit = handleSlash(ctx, input.slice(1), { orch, renderer, ensureMainSession, resolveRt, setPermission: (p) => { permission = p; }, getPermission: () => permission, setRuntime: (r) => { runtimeOverride = r; } });
+          const quit = handleSlash(ctx, input.slice(1), { orch, renderer, ensureMainSession, resolveRt, track: trackCommand, setPermission: (p) => { permission = p; }, getPermission: () => permission, setRuntime: (r) => { runtimeOverride = r; } });
           if (quit === "quit") { rl.close(); return; }
         } catch (e) {
           ui.error(String((e && e.message) || e));
@@ -341,9 +360,24 @@ async function startRepl(ctx, opts = {}) {
       process.stdin.removeListener("keypress", onShortcutKey);
       slashPalette.detach();
       renderer.detach();
-      orch.shutdown();
+      /*
+       * 슬래시 명령은 비동기다. 예전에는 close 가 곧바로 resolve 해서 프로세스가 끝나 버렸고,
+       * `/search …` 직후 `/quit` 을 치면 그 명령이 출력 한 줄 없이 사라졌다(실측: 같은 입력을
+       * 25초 벌려 치면 결과가 나온다). 진행 중인 명령을 먼저 기다린다.
+       *
+       * 다만 무한정 기다리지는 않는다 — 종료를 누른 사용자를 응답 없는 프로세스에 가둘 수 없다.
+       */
+      const finish = () => { orch.shutdown(); ui.ensureNl(); resolve(0); };
+      if (!pendingCommands.size) { finish(); return; }
       ui.ensureNl();
-      resolve(0);
+      ui.line(ui.c.dim(en
+        ? `finishing ${pendingCommands.size} command(s)…`
+        : `실행 중인 명령 ${pendingCommands.size}개를 마무리하는 중…`));
+      let settled = false;
+      const once = () => { if (settled) return; settled = true; finish(); };
+      const timer = setTimeout(once, 30_000);
+      if (timer.unref) timer.unref();
+      Promise.allSettled([...pendingCommands]).then(() => { clearTimeout(timer); once(); }, once);
     });
 
     prompt();
@@ -448,8 +482,19 @@ function handleSlash(ctx, cmdline, api) {
   const en = ctx.lang === "en";
   const ui = ctx.uiInstance;
   const { orch, renderer, ensureMainSession } = api;
-  const [cmd, ...rest] = cmdline.split(/\s+/);
-  const restStr = cmdline.slice(cmd.length).trim();
+  const commands = require("../commands/index.cjs");
+  /*
+   * 인자는 따옴표를 인식해 쪼갠다. 공백 분해는 따옴표를 인자 안에 그대로 남겨,
+   * 팔레트가 안내하는 그대로 `/search "무엇이 필요한지"` 를 치면 따옴표째 검색어가 됐다.
+   * 최상위 CLI 와 같은 토크나이저를 쓴다. restStr 은 원문 꼬리를 그대로 넘기는 자리
+   * (/spawn·/steer·/broadcast)라 계속 원문에서 자른다.
+   */
+  const rawCmd = cmdline.split(/\s+/)[0] || "";
+  const rest = tokenizeCommandLine(cmdline).slice(1);
+  const restStr = cmdline.slice(rawCmd.length).trim();
+  // 별칭도 최상위 CLI 와 동일하게 해석한다 — `agentlas hep-network` 는 되는데
+  // `/hep-network` 는 "알 수 없는 명령" 이던 비대칭을 없앤다.
+  const cmd = commands.resolveCommandName(rawCmd);
 
   switch (cmd) {
     case "quit": case "exit": return "quit";
@@ -564,11 +609,11 @@ function handleSlash(ctx, cmdline, api) {
        */
       // help/agents/list/chats/mcp/doctor 등은 위 케이스에서 이미 처리된다.
       const REPL_EXCLUDED = new Set(["chat", "open", "firm", "setup", "run"]);
-      const commands = require("../commands/index.cjs");
       if (!REPL_EXCLUDED.has(cmd) && commands.COMMANDS[cmd]) {
         const result = commands.COMMANDS[cmd]().run(ctx, rest);
-        if (result && typeof result.catch === "function") {
-          result.catch((e) => ctx.err(String((e && e.message) || e)));
+        if (result && typeof result.then === "function") {
+          // 진행 중임을 REPL 이 알아야 종료가 이걸 잘라먹지 않는다 (close 핸들러 참고).
+          api.track(result.catch((e) => ctx.err(String((e && e.message) || e))));
         }
         return;
       }

@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.0.10 — 2026-07-27
+
+Four defects in the REPL's slash surface, all found by sweeping for the shape
+that produced 1.0.8: a v2 caller using a v1-era contract.
+
+- **Quoted arguments survive.** Slash arguments were split on whitespace, so
+  the quotes the palette itself advertises (`/search "<what you need>"`) were
+  passed through as part of the query — `/search "hello world"` searched for
+  `"hello`. The quote-aware tokenizer the top-level CLI uses was exported but
+  had no call sites; the REPL now uses it.
+- **Aliases work inside the REPL.** `agentlas hep-network …` was accepted
+  while `/hep-network …` answered "unknown", because alias resolution lived
+  only in the top-level dispatcher. Both surfaces now resolve the same names,
+  and a test pins every alias to a command that actually exists.
+- **A command issued just before `/quit` is no longer discarded.** Slash
+  commands are async and were fire-and-forget, so closing the prompt resolved
+  immediately and the process exited mid-flight: `/search …` followed by
+  `/quit` printed nothing at all, while the same pair typed 25 seconds apart
+  worked. In-flight commands are now awaited — bounded at 30s, so quitting
+  can never hang — and the wait is announced rather than silent.
+- **The first-run wizard's language applies to the whole session.** Choosing a
+  language wrote it to preferences and to `ui.lang`, but not to `ctx.lang`, so
+  the banner switched while `/help`, the palette, orchestrator notices and the
+  shortcut hints stayed in the OS-locale language until the next launch.
+
 ## 1.0.9 — 2026-07-27
 
 Three repairs of one mistake, found by a live run that a 4-agent task force

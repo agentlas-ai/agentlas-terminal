@@ -90,7 +90,7 @@ for optional in \
   memory-prompt-budget credential-env-regression runtime-env-protection permission-mapping \
   session-fences-contract auto-route-contract firm-orchestrate-contract \
   repl-banner-contract repl-shortcuts-contract language-resolution-contract \
-  slash-palette-navigation-contract
+  slash-palette-navigation-contract repl-slash-parsing-contract
 do
   if [ -f "$SCRIPT_DIR/$optional.cjs" ]; then
     check "$optional" node "$SCRIPT_DIR/$optional.cjs"
