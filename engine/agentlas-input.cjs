@@ -602,13 +602,27 @@ function attachSlashPalette(rl, opts = {}) {
     stream.write("\x1b7\x1b[E\x1b[0J" + body + "\x1b8");
     state.visible = true;
   }
+  /*
+   * 화살표는 강조만 옮긴다 — 사용자가 친 질의는 그대로 둔다.
+   *
+   * 예전에는 여기서 선택 항목을 입력 줄에 써 넣었다(replaceLine(selectedCommand)).
+   * 그러면 후보 목록이 "질의로 거른 결과"가 아니라 "선택의 함수"가 되어 되먹임이 생긴다:
+   * `/s` 에서 ↓ 두 번이면 줄이 `/switch` 로 바뀌며 후보가 9개→2개로 접히고,
+   * 그 아래 항목(/spawn·/steer·/search·/storm·/swarm)엔 영원히 닿지 못했다.
+   * 오너가 본 "방향키 무브 안 됨"의 정체다(PTY 실측).
+   *
+   * 다만 readline 은 up/down 을 히스토리 이동으로 처리하고, prependListener 로는 그
+   * 기본 동작을 막을 수 없다(전파 중단이 없다). 팔레트가 열려 있는 동안 화살표의 의미는
+   * 목록 이동이므로, readline 이 줄을 건드렸으면 원래 질의로 되돌린다.
+   */
   function move(delta) {
     const list = rows();
     if (!list.length) return false;
     state.selected = (state.selected + delta + list.length) % list.length;
     state.selectedCommand = list[state.selected].command;
+    const query = rl.line || "";
     setImmediate(() => {
-      replaceLine(state.selectedCommand);
+      if ((rl.line || "") !== query) replaceLine(query);
       render();
     });
     return true;

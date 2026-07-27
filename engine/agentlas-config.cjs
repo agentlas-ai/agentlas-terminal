@@ -1,7 +1,9 @@
 "use strict";
 /*
  * CLI preferences (separate from the app's SQLite/keychain) — first-run onboarding result.
- * Stored at <userData>/cli-prefs.json: { onboarded, lang, runtime, permission }.
+ * Stored at <userData>/cli-prefs.json: { onboarded, language, runtime, permission }.
+ * `lang` is the v1 key for the same value — still read (engine/agentlas.cjs resolveLang)
+ * so an upgraded user keeps the language they chose, but never written by v2.
  * Persisted permission is read|write; unrestricted/full is session-only.
  */
 const fs = require("node:fs");
