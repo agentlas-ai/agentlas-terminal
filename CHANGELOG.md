@@ -1,6 +1,18 @@
 # Changelog
 
-## 1.0.0 — 2026-07-27
+## 1.0.1 — 2026-07-27
+
+- Fixes the two gates that failed on the v1.0.0 tag (never published):
+  project bootstrap no longer applies the context-map minimum-version gate
+  when probing Core capability — the real probe is
+  `agentlas_cloud/project_bootstrap.py`, and a source checkout without
+  version metadata (exactly what CI pins) was being filtered out, skipping
+  bootstrap entirely; and the smoke gate now asserts that `doctor` produces
+  a report rather than that the machine happens to have an agent CLI
+  installed (`doctor` still exits non-zero when it finds problems, which is
+  what scripts want).
+
+## 1.0.0 — 2026-07-27 (tagged, not published)
 
 - The 13,347-line v1 engine monolith is replaced by a modular v2 engine
   (one concern per module: core/ runtimes/ agents/ sessions/ ui/ commands/

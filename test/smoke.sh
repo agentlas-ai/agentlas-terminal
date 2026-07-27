@@ -49,7 +49,13 @@ guard() {
 check "where"   node "$BIN" --where
 check "version" node "$BIN" version
 check "list"    node "$BIN" list
-check "doctor"  node "$BIN" doctor
+# doctor는 문제를 찾으면 정직하게 exit 1 한다(스크립트가 쓰라고). 게이트가 확인할 것은
+# "진단이 돌아서 보고를 냈는가"이지 "이 머신에 런타임이 깔렸는가"가 아니다.
+if node "$BIN" doctor 2>&1 | grep -q "doctor:"; then
+  echo "PASS doctor"; pass=$((pass + 1))
+else
+  echo "FAIL doctor (no report line)"; fail=$((fail + 1))
+fi
 check "help"    node "$BIN" help
 check "usage"   node "$BIN" usage
 check "mcp"     node "$BIN" mcp

@@ -245,11 +245,14 @@ function ensureCoreProjectCli(projectPath, options = {}) {
     return cached === "core";
   }
   projectBootstrapStates.delete(root);
-  const coreRoot = resolveCoreRuntimeRoot(
-    options.coreRoot,
-    [],
-    { minVersion: CONTEXT_MAP_MIN_CORE_VERSION },
-  );
+  /*
+   * 프로젝트 부트스트랩의 능력 판정은 minVersion이 아니라 실제 모듈 존재
+   * (agentlas_cloud/project_bootstrap.py)다. 버전 메타데이터가 없는 소스
+   * 체크아웃(CI가 Agentlas-OS를 특정 커밋으로 받는 경우)에서 minVersion 게이트가
+   * 정상 Core를 걸러 부트스트랩이 통째로 스킵됐다(v1.0.0 태그 CI 실패의 진범).
+   * minVersion은 context-map 능력 경로에만 적용한다.
+   */
+  const coreRoot = resolveCoreRuntimeRoot(options.coreRoot);
   const hasCanonicalBootstrap = Boolean(
     coreRoot && fs.existsSync(path.join(coreRoot, "agentlas_cloud", "project_bootstrap.py")),
   );
