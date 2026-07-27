@@ -103,9 +103,32 @@ const DESKTOP_ONLY_SURFACES = {
 // 무인자 호출이 프롬프트로 오라우팅되면 안 되는 명령 (smoke 가드 대상)
 const GUARDED_NO_ARG = new Set(["search", "install", "upload"]);
 
+// 플랫폼 간 이름 통일(오너 결정 2026-07-27): 클로드코드/코덱스에서 부르는 hep-*
+// 스킬명과 터미널 명령이 서로 다르면 사용자가 어느 표면에 있는지에 따라 이름을
+// 바꿔 써야 한다. 같은 기능은 어디서든 같은 이름으로 부른다.
+const COMMAND_ALIASES = {
+  "hep-network": "workforce",
+  network: "workforce",
+  "hep-cloud": "cloud",
+  "hep-build": "build",
+  "hep-call": "call",
+  "hep-search": "search",
+  "hep-upload": "upload",
+  "hep-storm": "storm",
+  "hep-browser": "browser",
+  "hep-connect": "connect",
+  "hep-local": "workforce",
+  "hep-hub": "search",
+};
+
+function resolveCommandName(cmd) {
+  return COMMAND_ALIASES[cmd] || cmd;
+}
+
 function dispatch(ctx, argv) {
-  const [cmd, ...rest] = argv;
-  if (!cmd) return null; // 엔진이 REPL로 진입
+  const [rawCmd, ...rest] = argv;
+  if (!rawCmd) return null; // 엔진이 REPL로 진입
+  const cmd = resolveCommandName(rawCmd);
 
   if (COMMANDS[cmd]) {
     return COMMANDS[cmd]().run(ctx, rest);
@@ -133,4 +156,4 @@ function dispatch(ctx, argv) {
   return undefined; // 알 수 없는 토큰 — 엔진이 에이전트 이름/프롬프트로 해석 시도
 }
 
-module.exports = { dispatch, COMMANDS, NOT_YET_PORTED, GUARDED_NO_ARG, DESKTOP_ONLY_SURFACES };
+module.exports = { dispatch, COMMANDS, COMMAND_ALIASES, resolveCommandName, NOT_YET_PORTED, GUARDED_NO_ARG, DESKTOP_ONLY_SURFACES };

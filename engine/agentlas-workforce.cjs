@@ -100,7 +100,11 @@ const HUB_PATH_PATTERNS = [
   /(?:^|[\s"'`()\[\]{}=:,;])~[/\\](?=\S)/,
   /(?<![A-Za-z0-9])[A-Za-z]:[/\\](?=\S)/,
   /(?:^|[\s"'`()\[\]{}=:,;])\\\\[^\\/\s]+[\\/][^\\/\s]+/,
-  /(?<![A-Za-z0-9$])\/(?!\/|\s)(?:[^/\s"'`<>]+\/)*[^/\s"'`<>]+/,
+  // lookbehind가 ASCII만 제외하면 한글 단어 뒤 슬래시("진단/멱등키", "한국어/영어")가
+  // 절대경로로 오탐된다(2026-07-27 실측 — 한국어 워크오더 전멸 원인). 문자·숫자
+  // 전반(\p{L}\p{N})을 제외해 "A/B" 표기는 통과시키고, 공백·행머리 뒤 실제 경로는
+  // 그대로 잡는다.
+  /(?<![\p{L}\p{N}$])\/(?!\/|\s)(?:[^/\s"'`<>]+\/)*[^/\s"'`<>]+/u,
 ];
 const HUB_SECRET_PATTERNS = [
   ["provider_token", /\b(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,})\b/],
@@ -1133,12 +1137,16 @@ function validateSelection(value, candidateSet, workOrder, identity, options = {
     if (!["reportsTo", "handsOffTo", "reviews", "coordinatesWith"].includes(edge.relation)) fail("selection_invalid", "selection edge relation is invalid");
     assertIds(edge.artifactKinds, "selection edge artifactKinds");
   }
-  // handsOffTo/reportsTo 사이클은 Hub validate가 task_force_cycle로 거절한다. 로컬에서
-  // 먼저 걸어야 구조화 재시도 루프가 서버 왕복 없이 교정한다.
+  // 엣지 사이클은 Hub validate가 task_force_cycle로 거절한다. 서버 규칙과 동일하게:
+  // 관계 종류 불문 모든 엣지 + 자기참조가 사이클이다(reviews 맞교환도 거절 —
+  // 2026-07-27 실측: handsOffTo만 검사하던 로컬 검증이 reviews 사이클을 통과시켜
+  // 서버 거절로 되돌아왔다). 로컬에서 먼저 걸어야 재시도 루프가 왕복 없이 교정한다.
   {
-    const directed = selection.edges.filter((edge) => edge.relation === "handsOffTo" || edge.relation === "reportsTo");
     const adjacency = new Map();
-    for (const edge of directed) {
+    for (const edge of selection.edges) {
+      if (edge.fromSlot === edge.toSlot) {
+        fail("selection_invalid", `edges form a circular task force: ${edge.fromSlot} points at itself`);
+      }
       if (!adjacency.has(edge.fromSlot)) adjacency.set(edge.fromSlot, []);
       adjacency.get(edge.fromSlot).push(edge.toSlot);
     }
@@ -1147,7 +1155,7 @@ function validateSelection(value, candidateSet, workOrder, identity, options = {
       const state = states.get(slot);
       if (state === "done") return;
       if (state === "visiting") {
-        fail("selection_invalid", `handsOffTo/reportsTo edges form a circular task force: ${[...trail, slot].join(" -> ")}`);
+        fail("selection_invalid", `edges form a circular task force: ${[...trail, slot].join(" -> ")}`);
       }
       states.set(slot, "visiting");
       for (const next of adjacency.get(slot) || []) walk(next, [...trail, slot]);
@@ -1628,7 +1636,7 @@ function buildPrompts(task, identity) {
     `Exact direct Selection example: ${stableJson(selectionShape)}`,
     "decisionAuthor must contain exactly kind, modelId, and runtimeId. Every required slot must have exactly its cardinality in assignments. Every assignment must contain exactly slotId, an exact candidate agentReleaseId, and a non-empty reasonCodes array.",
     "edges, alternativesConsidered, and requestExpansionForSlots must be explicitly authored arrays. Every edge must contain exactly fromSlot, toSlot, relation (one of reportsTo|handsOffTo|reviews|coordinatesWith), and artifactKinds. The host will not add or normalize fields.",
-    "handsOffTo and reportsTo edges must form an acyclic directed graph. Never author a circular chain (for example A handsOffTo B while B handsOffTo A); the Hub rejects circular task forces.",
+    "edges must form an acyclic directed graph regardless of relation — reviews and coordinatesWith count too, and a slot may never point at itself. Never author a circular chain (for example A reviews B while B reviews A); the Hub rejects circular task forces.",
   ].join("\n");
   const plannerSchemaRequirements = [
     `Return exactly one object: ${stableJson(plannerShape)}`,
@@ -2701,10 +2709,28 @@ function create(deps = {}) {
         workOrderInvocationId,
       };
 
+      // 실황 내레이션: 사용자는 "누가 소집됐고 지금 뭘 하는지"를 보면서 신뢰를
+      // 형성한다(2026-07-27 오너 요구). 결과에 영향 없는 표시 전용 — silent 존중.
+      if (!ctx.silent) {
+        const nameByRelease = new Map();
+        for (const slotRow of candidateSet.slots) {
+          for (const cand of slotRow.candidates) nameByRelease.set(cand.agentReleaseId, cand.name || cand.agentReleaseId);
+        }
+        const menuCount = candidateSet.slots.reduce((sum, slotRow) => sum + slotRow.candidates.length, 0);
+        ui.info(ui.lang === "ko"
+          ? `워크오더 ${workOrder.roleSlots.length}슬롯 · 허브 후보 ${menuCount}명 메뉴 수신`
+          : `work order: ${workOrder.roleSlots.length} slot(s) · hub menu of ${menuCount} candidates`);
+        for (const row of selection.assignments) {
+          ui.info(ui.lang === "ko"
+            ? `  선발 ${row.slotId} ← ${nameByRelease.get(row.agentReleaseId) || row.agentReleaseId}`
+            : `  picked ${row.slotId} ← ${nameByRelease.get(row.agentReleaseId) || row.agentReleaseId}`);
+        }
+      }
       const validationRaw = await hubStage("workforce.validate_selection", { workOrder, candidateSet, selection });
       validationReceipt = validateSelectionReceipt(validationRaw, selection, candidateSet, workOrder);
       benchmarkState.selectionValidation = validationReceipt;
       receipt.selectionReceiptId = validationReceipt.selectionReceiptId;
+      if (!ctx.silent) ui.info(ui.lang === "ko" ? "허브 검증 수락 — 번들 준비 중" : "hub validation accepted — preparing bundles");
 
       const preparedRaw = await hubStage("workforce.prepare_execution", { workOrder, candidateSet, selection, validationReceipt });
       ({ prepared, rosterByPair } = validatePreparedExecution(preparedRaw, workOrder, selection, candidateSet, validationReceipt));
@@ -2996,6 +3022,7 @@ function create(deps = {}) {
           const packet = delegationPlan.packets[index];
           const pair = `${packet.slotId}\0${packet.agentReleaseId}`;
           const pinned = rosterByPair.get(pair);
+          if (!ctx.silent) ui.info(ui.lang === "ko" ? `  워커 실행 중: ${packet.slotId}` : `  worker running: ${packet.slotId}`);
           const capabilityBindings = bindingsByPair.get(pair) || [];
           const grantedToolIds = [...new Set(capabilityBindings.map((row) => row.toolId))].sort();
           const startedAt = nowIso(D.now);
@@ -3152,6 +3179,7 @@ function create(deps = {}) {
       let verifierInvocationId = null;
       let priorAttempt = null;
       receipt.correctiveHistory = [];
+      if (!ctx.silent) ui.info(ui.lang === "ko" ? "합성 → 검증 단계" : "synthesis → verification");
       for (let verifyAttempt = 1; verifyAttempt <= 2; verifyAttempt += 1) {
         const synthesisStarted = nowIso(D.now);
         synthesisInvocationId = `workforce-invocation:${crypto.randomUUID()}`;

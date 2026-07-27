@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.0.3 — 2026-07-27
+
+Live `workforce` runs surfaced four defects that no unit gate could reach.
+
+- **A slash after Korean/Japanese/Chinese text no longer reads as a file
+  path.** The hub-boundary guard's absolute-path lookbehind excluded only
+  ASCII, so ordinary phrases ("진단/멱등키", "한국어/영어") were rejected as
+  private paths — and the phrase being the task itself meant no repair was
+  possible. Shared fixtures now pin this in both this engine and the server
+  (`scripts/sync-privacy-guard.sh`).
+- **Bundle preparation is no longer killed by the connect timeout.** The
+  15s "connect" budget actually measured time-to-response-headers, and the
+  server computes a multi-slot roster before its first byte, so preparation
+  died as a transport error. Workforce calls now use their own budget.
+- **Selection cycle rules match the Hub exactly.** Local validation only
+  checked handsOffTo/reportsTo, so a `reviews` cycle passed locally and came
+  back as a Hub rejection. All relations and self-edges now count.
+- **A worker that exits non-zero reports its stdout tail too**, so a failure
+  whose stderr holds only unrelated warnings is no longer a dead end.
+
+Also in this release:
+
+- **Live narration**: a `workforce` run now prints the slot count and hub
+  menu size, the picked agent per slot by name, hub acceptance, each worker
+  as it starts, and the synthesis→verification transition.
+- **One name per feature across platforms**: `hep-network`, `hep-cloud`,
+  `hep-build`, `hep-call`, `hep-search`, `hep-upload`, `hep-storm`,
+  `hep-browser`, `hep-connect` now work as terminal commands, matching the
+  skill names used from Claude Code and Codex. The typo guard suggests them.
+
 ## 1.0.2 — 2026-07-27
 
 Workforce execution-contract fixes. Every worker in a `workforce` run now

@@ -425,7 +425,13 @@ function buildWorkforceDeps(ctx = {}) {
     // v1과 동일: callHubTool은 주입하지 않는다. 워크포스 모듈 내부의 jsonrpc 경로가
     // 거절 코드 원문 전파·retryClass 계약을 소유하며, fetchHub는 버퍼드
     // {ok,status,headers,text} 어댑터 형태를 만족한다(3중 타임아웃 + 16MB 상한).
-    fetchHub: (url, init) => hubClient.fetchHub(url, init),
+    // 워크포스 전용 타임아웃: prepare_execution은 서버가 로스터 번들을 조립하는 동안
+    // 첫 바이트 없이 계산한다(1슬롯 실측 7.2s, 다슬롯은 그 배수). 기본 connect 15s는
+    // 실제로는 "응답 헤더까지"를 재므로 다슬롯 준비를 처형한다(2026-07-27 전송오류
+    // 2연속의 진범). 준비 상한을 여유 있게 준다 — idle/total 계약은 유지.
+    fetchHub: (url, init) => hubClient.fetchHub(url, init, {
+      timeoutConfig: { connectMs: 120_000, idleMs: 60_000, totalMs: 300_000 },
+    }),
     resolveRuntime: resolveWorkforceRuntime,
     captureRuntime: capture.captureRuntime,
     runApi: capture.runApi,

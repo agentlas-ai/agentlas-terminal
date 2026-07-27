@@ -359,7 +359,13 @@ function captureRuntime(kind, systemPrompt, prompt, opts) {
       const stdout = Buffer.concat(stdoutChunks).toString("utf8");
       const stderr = Buffer.concat(stderrChunks).toString("utf8");
       if (code && code !== 0) {
-        finishReject(new Error(`${kind} exited ${code}: ${stderr.slice(-500)}`));
+        // stderr가 경고문뿐이면 진짜 원인이 stdout(JSON 오류 응답 등)에 있을 수 있다 —
+        // 2026-07-27 실측: 워커 exit 1이 설정 경고 2줄만 남기고 원인 불명이 됐다.
+        // 두 스트림의 꼬리를 모두 싣는다.
+        const stdoutTail = stdout.trim().slice(-400);
+        finishReject(new Error(
+          `${kind} exited ${code}: ${stderr.slice(-500)}${stdoutTail ? `\n--- stdout tail ---\n${stdoutTail}` : ""}`,
+        ));
         return;
       }
       const raw = stdout.trim() || stderr.trim();

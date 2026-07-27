@@ -127,7 +127,9 @@ function main() {
      */
     if (!agent && normalized.length === 1 && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(normalized[0])) {
       const token = normalized[0];
-      const names = Object.keys(commands.COMMANDS).concat(commands.NOT_YET_PORTED || []);
+      const names = Object.keys(commands.COMMANDS)
+        .concat(Object.keys(commands.COMMAND_ALIASES || {}))
+        .concat(commands.NOT_YET_PORTED || []);
       const near = nearestCommands(token, names);
       const ko = ctx.lang === "ko";
       ctx.err(ko
