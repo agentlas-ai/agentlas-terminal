@@ -33,6 +33,15 @@ const MAX_SLOTS = 32;
 const MAX_ASSIGNMENTS = 64;
 const MAX_MODEL_OUTPUT = 2 * 1024 * 1024;
 const MAX_STRUCTURED_MODEL_ATTEMPTS = 2;
+// 도구가 0개인 워커가 도구 호출을 시도하면 그 문법이 산출물에 그대로 남는다.
+// 속성 형태까지 요구해 산문에서 마크업을 "언급"만 한 경우의 오탐을 줄인다.
+const HANDOFF_TOOL_MARKUP_RE = /<(?:antml:)?invoke\s+name=|<(?:antml:)?parameter\s+name=|<\/(?:antml:)?(?:invoke|parameter)>|<(?:antml:)?function_calls>/i;
+
+function handoffContractViolation(text) {
+  if (HANDOFF_TOOL_MARKUP_RE.test(text)) return "tool_markup";
+  if (String(text).replace(/[\s`#*_>\-|:.~]+/g, "").length < 12) return "empty_deliverable";
+  return null;
+}
 const MAX_REPAIR_PRIOR_OUTPUT = 64 * 1024;
 const MAX_WORK_ORDER_REFINEMENTS = 2;
 const MAX_SEARCH_TRANSPORT_ATTEMPTS = 2;
@@ -1124,6 +1133,28 @@ function validateSelection(value, candidateSet, workOrder, identity, options = {
     if (!["reportsTo", "handsOffTo", "reviews", "coordinatesWith"].includes(edge.relation)) fail("selection_invalid", "selection edge relation is invalid");
     assertIds(edge.artifactKinds, "selection edge artifactKinds");
   }
+  // handsOffTo/reportsTo 사이클은 Hub validate가 task_force_cycle로 거절한다. 로컬에서
+  // 먼저 걸어야 구조화 재시도 루프가 서버 왕복 없이 교정한다.
+  {
+    const directed = selection.edges.filter((edge) => edge.relation === "handsOffTo" || edge.relation === "reportsTo");
+    const adjacency = new Map();
+    for (const edge of directed) {
+      if (!adjacency.has(edge.fromSlot)) adjacency.set(edge.fromSlot, []);
+      adjacency.get(edge.fromSlot).push(edge.toSlot);
+    }
+    const states = new Map();
+    const walk = (slot, trail) => {
+      const state = states.get(slot);
+      if (state === "done") return;
+      if (state === "visiting") {
+        fail("selection_invalid", `handsOffTo/reportsTo edges form a circular task force: ${[...trail, slot].join(" -> ")}`);
+      }
+      states.set(slot, "visiting");
+      for (const next of adjacency.get(slot) || []) walk(next, [...trail, slot]);
+      states.set(slot, "done");
+    };
+    for (const slot of adjacency.keys()) walk(slot, []);
+  }
   for (const releaseId of assertIds(selection.alternativesConsidered, "selection.alternativesConsidered")) {
     if (!maps.all.has(releaseId)) fail("selection_invalid", `alternative ${releaseId} was outside the candidate set`);
   }
@@ -1597,6 +1628,7 @@ function buildPrompts(task, identity) {
     `Exact direct Selection example: ${stableJson(selectionShape)}`,
     "decisionAuthor must contain exactly kind, modelId, and runtimeId. Every required slot must have exactly its cardinality in assignments. Every assignment must contain exactly slotId, an exact candidate agentReleaseId, and a non-empty reasonCodes array.",
     "edges, alternativesConsidered, and requestExpansionForSlots must be explicitly authored arrays. Every edge must contain exactly fromSlot, toSlot, relation (one of reportsTo|handsOffTo|reviews|coordinatesWith), and artifactKinds. The host will not add or normalize fields.",
+    "handsOffTo and reportsTo edges must form an acyclic directed graph. Never author a circular chain (for example A handsOffTo B while B handsOffTo A); the Hub rejects circular task forces.",
   ].join("\n");
   const plannerSchemaRequirements = [
     `Return exactly one object: ${stableJson(plannerShape)}`,
@@ -2864,7 +2896,13 @@ function create(deps = {}) {
 
       const runPinnedInvocation = async ({ pinned, system, prompt, label, grantedToolIds, extra = {} }) => {
         const invocationId = `workforce-invocation:${crypto.randomUUID()}`;
-        const text = assertString(await runModel(runtime, system, prompt, {
+        // 워커는 도구 상태를 스스로 알 수 없다. 고지 없이 잠그면 존재하지 않는 도구를
+        // 부르다 호출 문법이 산출물에 그대로 새고, 코드 저장소 워크플로를 가정한 채
+        // 본 작업 없이 끝난다(2026-07-27 실측). 결정적 문자열만 사용(3-OS 바이트 패리티).
+        const authorityDirective = grantedToolIds.length
+          ? `EXECUTION AUTHORITY: only these exact granted tools exist for this invocation: ${grantedToolIds.join(", ")}. Every other tool, file, shell, or web access is unavailable; never emit a call to anything else.`
+          : "EXECUTION AUTHORITY: zero tools are granted to this invocation — no file system, no shell, no web, no MCP, no subagents. Never emit tool-call syntax or XML-like invocation markup, and never explore or wait for a workspace. Author the complete deliverable directly in this reply as plain text or markdown, using only the packet inputs provided.";
+        const text = assertString(await runModel(runtime, [system, authorityDirective].join("\n\n"), prompt, {
           ...modelContext,
           authorityMode: grantedToolIds.length ? "policy-filtered" : "no-authority",
           grantedToolIds,
@@ -2885,6 +2923,31 @@ function create(deps = {}) {
             }),
           }),
         };
+      };
+
+      // 핸드오프 산출물 전용 게이트: 도구 마크업/빈 산출물이면 교정 지시로 1회 재실행,
+      // 재발 시 조용한 완화 대신 정직 정지(silent-default 금지 원칙).
+      const runHandoffInvocation = async (args) => {
+        const first = await runPinnedInvocation(args);
+        const violation = handoffContractViolation(first.text);
+        if (!violation) return first;
+        const repairDirective = violation === "tool_markup"
+          ? "HANDOFF REPAIR MODE: your previous reply contained raw tool-call markup, but no tools exist in this invocation. Rewrite the complete deliverable as plain text or markdown only, with zero tool-call syntax."
+          : "HANDOFF REPAIR MODE: your previous reply contained no usable deliverable. You have everything you need in the packet inputs; author the complete concrete handoff artifact now, directly in this reply.";
+        const retried = await runPinnedInvocation({
+          ...args,
+          system: [args.system, repairDirective].join("\n\n"),
+          extra: { ...(args.extra || {}), handoffContractRetry: violation },
+        });
+        const repeat = handoffContractViolation(retried.text);
+        if (repeat) {
+          fail("worker_output_contract_violation", `${args.label} kept violating the handoff contract (${repeat}) after one corrective retry`, {
+            violation: repeat,
+            firstViolation: violation,
+            label: args.label,
+          });
+        }
+        return retried;
       };
 
       const runNestedManagerPlan = async ({ pinned, packet, grantedToolIds }) => {
@@ -2941,7 +3004,7 @@ function create(deps = {}) {
             let directInvocation = null;
             let nestedExecutionId = null;
             if (pinned.entityKind === "agent") {
-              const direct = await runPinnedInvocation({
+              const direct = await runHandoffInvocation({
                 pinned,
                 grantedToolIds,
                 label: `worker ${packet.packetId}`,
@@ -2962,7 +3025,7 @@ function create(deps = {}) {
               const manager = await runNestedManagerPlan({ pinned, packet, grantedToolIds });
               const graphWorkerOutputs = await Promise.all(pinned.executionGraph.workers.map(async (graphWorker, workerIndex) => {
                 const graphPacket = manager.plan.packets[workerIndex];
-                const invoked = await runPinnedInvocation({
+                const invoked = await runHandoffInvocation({
                   pinned,
                   grantedToolIds,
                   label: `nested worker ${graphWorker.id}`,
@@ -2978,7 +3041,7 @@ function create(deps = {}) {
                 });
                 return { graphWorker, graphPacket, text: invoked.text, invocation: invoked.invocation };
               }));
-              const managerSynthesis = await runPinnedInvocation({
+              const managerSynthesis = await runHandoffInvocation({
                 pinned,
                 grantedToolIds,
                 label: `nested manager synthesis ${packet.packetId}`,
@@ -3080,55 +3143,86 @@ function create(deps = {}) {
       if (rejectedWorker) throw rejectedWorker.reason;
 
       const synthesisAssignment = selection.assignments.find((row) => row.slotId === delegationPlan.synthesis.slotId && row.agentReleaseId === delegationPlan.synthesis.agentReleaseId);
-      const synthesisStarted = nowIso(D.now);
-      const synthesisInvocationId = `workforce-invocation:${crypto.randomUUID()}`;
-      const finalText = assertString(await runModel(runtime, [
-        "You are the top-level host LLM synthesizer for this immutable Agentlas workforce run.",
-        "Integrate the separate worker handoffs into one coherent deliverable. Preserve disagreements and explicitly name incomplete work. Do not claim a tool or worker ran unless its handoff is present.",
-      ].join("\n\n"), stableJson({ workOrder, synthesis: delegationPlan.synthesis, handoffs: outputs }), modelContext), "synthesis output", 1_000_000);
-      receipt.synthesis = {
-        schemaVersion: "agentlas.workforce-synthesis-receipt.v1",
-        receiptId: synthesisInvocationId,
-        invocationId: synthesisInvocationId,
-        modelId: identity.modelId,
-        runtimeId: identity.runtimeId,
-        provider,
-        status: "completed",
-        agentReleaseId: synthesisAssignment.agentReleaseId,
-        startedAt: synthesisStarted,
-        completedAt: nowIso(D.now),
-        inputChildReceiptIds: receipt.workers.filter((row) => row.status === "completed").map((row) => row.receiptId),
-        outputDigest: sha256(finalText),
-      };
-
       const verifierAssignment = selection.assignments.find((row) => row.slotId === delegationPlan.verifier.slotId && row.agentReleaseId === delegationPlan.verifier.agentReleaseId);
-      const verifierStarted = nowIso(D.now);
-      const verifierInvocationId = `workforce-invocation:${crypto.randomUUID()}`;
-      const verifierRaw = await runModel(runtime, [
-        "You are the top-level host LLM verifier for this Agentlas workforce run.",
-        'Evaluate the synthesis against every criterion and worker handoff. Return exactly one JSON object: {"schemaVersion":"agentlas.workforce-verification.v1","status":"passed|failed","checks":[{"checkId":"check:<id>","status":"passed|failed","evidence":"..."}],"issues":[]}.',
-        "Use double-quoted valid JSON. Passing requires evidence for every criterion; do not rubber-stamp.",
-      ].join("\n\n"), stableJson({ workOrder, criteria: delegationPlan.verifier.criteria, handoffs: outputs, synthesis: finalText }), modelContext);
-      const verification = validateVerifierResult(parseModelObject(verifierRaw, "workforce verifier"));
-      receipt.verifier = {
-        schemaVersion: "agentlas.workforce-verifier-receipt.v1",
-        receiptId: verifierInvocationId,
-        invocationId: verifierInvocationId,
-        modelId: identity.modelId,
-        runtimeId: identity.runtimeId,
-        provider,
-        status: "completed",
-        agentReleaseId: verifierAssignment.agentReleaseId,
-        startedAt: verifierStarted,
-        completedAt: nowIso(D.now),
-        inputSynthesisReceiptId: receipt.synthesis.receiptId,
-        outputDigest: sha256(verification),
-        result: verification,
-        verdict: verification.status === "passed" ? "pass" : "fail",
-      };
+      // 검증자가 불합격을 내면 그 지적을 들고 합성을 1회 교정 후 재검증한다.
+      // 첫 시도의 영수증도 correctiveHistory로 보존한다(감사 추적 진실성).
+      let finalText = null;
+      let verification = null;
+      let synthesisInvocationId = null;
+      let verifierInvocationId = null;
+      let priorAttempt = null;
+      receipt.correctiveHistory = [];
+      for (let verifyAttempt = 1; verifyAttempt <= 2; verifyAttempt += 1) {
+        const synthesisStarted = nowIso(D.now);
+        synthesisInvocationId = `workforce-invocation:${crypto.randomUUID()}`;
+        finalText = assertString(await runModel(runtime, [
+          "You are the top-level host LLM synthesizer for this immutable Agentlas workforce run.",
+          "Integrate the separate worker handoffs into one coherent deliverable. Preserve disagreements and explicitly name incomplete work. Do not claim a tool or worker ran unless its handoff is present.",
+          verifyAttempt > 1 ? "CORRECTIVE SYNTHESIS MODE: a pinned verifier rejected the prior synthesis. Repair the deliverable so every criterion is satisfied using only the existing worker handoffs. Never invent work that did not run." : "",
+        ].filter(Boolean).join("\n\n"), stableJson(verifyAttempt > 1
+          ? { workOrder, synthesis: delegationPlan.synthesis, handoffs: outputs, priorSynthesis: priorAttempt.text, verifierRejection: priorAttempt.verification }
+          : { workOrder, synthesis: delegationPlan.synthesis, handoffs: outputs }), modelContext), "synthesis output", 1_000_000);
+        receipt.synthesis = {
+          schemaVersion: "agentlas.workforce-synthesis-receipt.v1",
+          receiptId: synthesisInvocationId,
+          invocationId: synthesisInvocationId,
+          modelId: identity.modelId,
+          runtimeId: identity.runtimeId,
+          provider,
+          status: "completed",
+          agentReleaseId: synthesisAssignment.agentReleaseId,
+          startedAt: synthesisStarted,
+          completedAt: nowIso(D.now),
+          inputChildReceiptIds: receipt.workers.filter((row) => row.status === "completed").map((row) => row.receiptId),
+          outputDigest: sha256(finalText),
+          attempt: verifyAttempt,
+        };
+
+        const verifierStarted = nowIso(D.now);
+        verifierInvocationId = `workforce-invocation:${crypto.randomUUID()}`;
+        const verifierRaw = await runModel(runtime, [
+          "You are the top-level host LLM verifier for this Agentlas workforce run.",
+          'Evaluate the synthesis against every criterion and worker handoff. Return exactly one JSON object: {"schemaVersion":"agentlas.workforce-verification.v1","status":"passed|failed","checks":[{"checkId":"check:<id>","status":"passed|failed","evidence":"..."}],"issues":[]}.',
+          "Use double-quoted valid JSON. Passing requires evidence for every criterion; do not rubber-stamp.",
+        ].join("\n\n"), stableJson({ workOrder, criteria: delegationPlan.verifier.criteria, handoffs: outputs, synthesis: finalText }), modelContext);
+        verification = validateVerifierResult(parseModelObject(verifierRaw, "workforce verifier"));
+        receipt.verifier = {
+          schemaVersion: "agentlas.workforce-verifier-receipt.v1",
+          receiptId: verifierInvocationId,
+          invocationId: verifierInvocationId,
+          modelId: identity.modelId,
+          runtimeId: identity.runtimeId,
+          provider,
+          status: "completed",
+          agentReleaseId: verifierAssignment.agentReleaseId,
+          startedAt: verifierStarted,
+          completedAt: nowIso(D.now),
+          inputSynthesisReceiptId: receipt.synthesis.receiptId,
+          outputDigest: sha256(verification),
+          result: verification,
+          verdict: verification.status === "passed" ? "pass" : "fail",
+          attempt: verifyAttempt,
+        };
+        if (verification.status === "passed") break;
+        if (verifyAttempt === 1) {
+          priorAttempt = { text: finalText, verification };
+          receipt.correctiveHistory.push({
+            synthesisReceiptId: synthesisInvocationId,
+            verifierReceiptId: verifierInvocationId,
+            synthesisOutputDigest: sha256(finalText),
+            verification,
+          });
+        }
+      }
 
       receipt.benchmarkAudit = auditBenchmarkReceipt(receipt);
-      if (verification.status !== "passed") fail("workforce_verification_failed", "pinned verifier rejected the synthesis", { issues: verification.issues });
+      if (verification.status !== "passed") {
+        fail("workforce_verification_failed", "pinned verifier rejected the synthesis twice (initial and one corrective retry)", {
+          issues: verification.issues,
+          correctiveRetryUsed: true,
+          firstAttemptIssues: receipt.correctiveHistory[0]?.verification?.issues || [],
+        });
+      }
       if (ctx.benchmark === true && !receipt.benchmarkAudit.passed) fail("benchmark_receipt_incomplete", "benchmark mode requires planner, every child, synthesis, verifier, and no planner fallback", receipt.benchmarkAudit);
 
       receipt.status = "passed";
@@ -3236,10 +3330,20 @@ function create(deps = {}) {
       if (!ctx.silent) {
         // 서버/검증 거절 사유(details)는 영수증에만 남고 화면에서 누락되던 표시 결함 —
         // 정직 중계 원칙상 사유를 원문 그대로 병기한다(실사용 network 테스트에서 실증).
-        const detailText = receipt.failure.details
-          ? ` — ${JSON.stringify(receipt.failure.details).slice(0, 600)}`
+        // issues 배열은 JSON 캡에 잘리지 않도록 항목별로 온전히 표시한다.
+        const details = receipt.failure.details;
+        const issues = Array.isArray(details?.issues) ? details.issues : null;
+        const otherDetails = details && typeof details === "object" && !Array.isArray(details)
+          ? Object.fromEntries(Object.entries(details).filter(([key]) => key !== "issues"))
+          : details;
+        const detailText = otherDetails && (typeof otherDetails !== "object" || Object.keys(otherDetails).length)
+          ? ` — ${JSON.stringify(otherDetails).slice(0, 1_200)}`
           : "";
         ui.error(`${receipt.failure.code}: ${receipt.failure.message}${detailText}`);
+        if (issues) {
+          for (const issue of issues.slice(0, 16)) ui.error(`  - ${String(issue).slice(0, 400)}`);
+          if (issues.length > 16) ui.error(`  … ${issues.length - 16} more issues in the persisted receipt`);
+        }
       }
       return { ok: false, error: receipt.failure, receipt, benchmarkArtifactPath };
     }

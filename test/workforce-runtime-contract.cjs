@@ -1984,8 +1984,172 @@ async function privateWorkOrderRepairsLocallyAndNeverCallsHubOnExhaustion() {
   assert.match(h.modelCalls[1].prompt, /hub_private_labeled_identifier/);
 }
 
+async function workersAreToldTheirExactExecutionAuthority() {
+  const h = harness();
+  const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true, concurrency: 2 });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  const workerCalls = h.modelCalls.filter((call) => /PINNED_RELEASE=/.test(call.system));
+  assert.equal(workerCalls.length, 2);
+  for (const call of workerCalls) {
+    assert.match(call.system, /EXECUTION AUTHORITY: zero tools are granted/);
+    assert.match(call.system, /Author the complete deliverable directly in this reply/);
+  }
+}
+
+async function workerToolMarkupLeakRepairsOnceAndSucceeds() {
+  const f = fixture();
+  const h = harness({
+    modelOutputs: [
+      JSON.stringify(f.workOrder),
+      JSON.stringify(f.selection),
+      JSON.stringify(f.plan),
+      '<invoke name="Read">\n<parameter name="path">src/index.ts</parameter>\n</invoke>',
+      "Backend handoff: repaired concrete idempotency design with transaction boundary.",
+      "Verifier handoff: replay, partial-failure, forged-key, and concurrent-commit adversarial cases.",
+      "Integrated deliverable with transaction design, adversarial tests, and explicit limitations.",
+      JSON.stringify({
+        schemaVersion: "agentlas.workforce-verification.v1",
+        status: "passed",
+        checks: [{ checkId: "check:repair", status: "passed", evidence: "handoff is markup-free" }],
+        issues: [],
+      }),
+    ],
+  });
+  const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true, concurrency: 1 });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  const repairCall = h.modelCalls.find((call) => /HANDOFF REPAIR MODE/.test(call.system));
+  assert.ok(repairCall, "the leaking worker must be re-run once with an explicit repair directive");
+  assert.match(repairCall.system, /zero tool-call syntax/);
+  assert.equal(
+    h.receipts[0].workers.some((row) => row.directInvocation && row.directInvocation.handoffContractRetry === "tool_markup"),
+    true,
+    "the corrective retry must be recorded on the public worker invocation",
+  );
+}
+
+async function persistentWorkerContractViolationStopsHonestly() {
+  const f = fixture();
+  const markup = '<invoke name="Bash">\n<parameter name="command">ls</parameter>\n</invoke>';
+  const h = harness({
+    modelOutputs: [
+      JSON.stringify(f.workOrder),
+      JSON.stringify(f.selection),
+      JSON.stringify(f.plan),
+      markup,
+      markup,
+    ],
+  });
+  const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true, concurrency: 1 });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "worker_output_contract_violation");
+  assert.equal(result.receipt.synthesis, null, "a violating handoff must never reach synthesis");
+}
+
+async function verifierRejectionTriggersOneCorrectiveSynthesisThenPasses() {
+  const f = fixture();
+  const h = harness({
+    modelOutputs: [
+      JSON.stringify(f.workOrder),
+      JSON.stringify(f.selection),
+      JSON.stringify(f.plan),
+      "Backend handoff: idempotency key state machine and serializable transaction boundary.",
+      "Verifier handoff: replay, partial-failure, forged-key, and concurrent-commit adversarial cases.",
+      "First synthesis that omits the rollback design entirely.",
+      JSON.stringify({
+        schemaVersion: "agentlas.workforce-verification.v1",
+        status: "failed",
+        checks: [{ checkId: "check:rollback", status: "failed", evidence: "no atomic boundary present" }],
+        issues: ["rollback design missing from the synthesis"],
+      }),
+      "Corrected synthesis with the rollback design restored from the backend handoff.",
+      JSON.stringify({
+        schemaVersion: "agentlas.workforce-verification.v1",
+        status: "passed",
+        checks: [{ checkId: "check:rollback", status: "passed", evidence: "atomic boundary present" }],
+        issues: [],
+      }),
+    ],
+  });
+  const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true, concurrency: 1 });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  const correctiveCall = h.modelCalls.find((call) => /CORRECTIVE SYNTHESIS MODE/.test(call.system));
+  assert.ok(correctiveCall, "the rejected synthesis must be repaired once with the verifier issues attached");
+  assert.match(correctiveCall.prompt, /verifierRejection/);
+  assert.match(correctiveCall.prompt, /rollback design missing/);
+  assert.equal(result.receipt.synthesis.attempt, 2);
+  assert.equal(result.receipt.verifier.attempt, 2);
+  assert.equal(result.receipt.verifier.verdict, "pass");
+  assert.equal(result.receipt.correctiveHistory.length, 1);
+  assert.equal(result.receipt.correctiveHistory[0].verification.status, "failed");
+}
+
+async function verifierRejectionTwiceFailsHonestlyAfterCorrectiveRetry() {
+  const f = fixture();
+  const failedVerdict = JSON.stringify({
+    schemaVersion: "agentlas.workforce-verification.v1",
+    status: "failed",
+    checks: [{ checkId: "check:rollback", status: "failed", evidence: "still missing" }],
+    issues: ["rollback design missing from the synthesis"],
+  });
+  const h = harness({
+    modelOutputs: [
+      JSON.stringify(f.workOrder),
+      JSON.stringify(f.selection),
+      JSON.stringify(f.plan),
+      "Backend handoff: idempotency key state machine and serializable transaction boundary.",
+      "Verifier handoff: replay, partial-failure, forged-key, and concurrent-commit adversarial cases.",
+      "First synthesis that omits the rollback design entirely.",
+      failedVerdict,
+      "Second synthesis that still omits the rollback design.",
+      failedVerdict,
+    ],
+  });
+  const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true, concurrency: 1 });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "workforce_verification_failed");
+  assert.equal(result.error.details.correctiveRetryUsed, true);
+  assert.deepEqual(result.error.details.firstAttemptIssues, ["rollback design missing from the synthesis"]);
+}
+
+async function circularSelectionEdgesAreRepairedLocallyBeforeHubValidation() {
+  const f = fixture();
+  const cyclicSelection = structuredClone(f.selection);
+  cyclicSelection.edges = [
+    { fromSlot: "slot:backend", toSlot: "slot:verification", relation: "handsOffTo", artifactKinds: ["artifact:worker-result"] },
+    { fromSlot: "slot:verification", toSlot: "slot:backend", relation: "handsOffTo", artifactKinds: ["artifact:worker-result"] },
+  ];
+  const h = harness({
+    modelOutputs: [
+      JSON.stringify(f.workOrder),
+      JSON.stringify(cyclicSelection),
+      JSON.stringify(f.selection),
+      JSON.stringify(f.plan),
+      "Backend handoff: idempotency key state machine and serializable transaction boundary.",
+      "Verifier handoff: replay, partial-failure, forged-key, and concurrent-commit adversarial cases.",
+      "Integrated deliverable with transaction design, adversarial tests, and explicit limitations.",
+      JSON.stringify({
+        schemaVersion: "agentlas.workforce-verification.v1",
+        status: "passed",
+        checks: [{ checkId: "check:acyclic", status: "passed", evidence: "handoff graph is acyclic" }],
+        issues: [],
+      }),
+    ],
+  });
+  const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true, concurrency: 1 });
+  assert.equal(result.ok, true, result.error && result.error.message);
+  const repairCall = h.modelCalls.find((call) => /STRUCTURED OUTPUT REPAIR MODE/.test(call.system) && /circular task force/.test(call.prompt));
+  assert.ok(repairCall, "a cyclic selection must be repaired locally through the structured repair loop");
+  assert.equal(h.hubCalls.filter((row) => row.name === "workforce.validate_selection").length, 1, "the Hub must only ever see the acyclic repaired selection");
+}
+
 async function main() {
   await successContract();
+  await workersAreToldTheirExactExecutionAuthority();
+  await workerToolMarkupLeakRepairsOnceAndSucceeds();
+  await persistentWorkerContractViolationStopsHonestly();
+  await verifierRejectionTriggersOneCorrectiveSynthesisThenPasses();
+  await verifierRejectionTwiceFailsHonestlyAfterCorrectiveRetry();
+  await circularSelectionEdgesAreRepairedLocallyBeforeHubValidation();
   await incumbentRosterIsReusedWithoutAnotherNetworkCall();
   await incumbentGoalCanChooseLocalOnlyWithoutEndingTheRoster();
   workforceMemoryContinuityWiring();

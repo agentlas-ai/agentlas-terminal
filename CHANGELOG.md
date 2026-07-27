@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.0.2 — 2026-07-27
+
+Workforce execution-contract fixes. Every worker in a `workforce` run now
+knows its exact execution authority, and the run recovers honestly instead
+of shipping broken output:
+
+- Tool-less (no-authority) workers are told explicitly that zero tools are
+  granted and that the deliverable must be authored directly in the reply.
+  Previously a borrowed worker was silently stripped of tools, tried to
+  call them anyway, leaked raw tool-call markup into deliverables, and
+  produced empty output on content-type tasks.
+- Worker handoffs are gated: leaked tool-call markup or an empty
+  deliverable triggers exactly one corrective re-run with a repair
+  directive; a repeat violation stops the run honestly with
+  `worker_output_contract_violation` (never a silent cleanup).
+- A verifier rejection now triggers exactly one corrective synthesis pass
+  with the verifier's issues attached, then a re-verification. A second
+  rejection still fails honestly (`workforce_verification_failed`), now
+  reporting both attempts' issues.
+- Selection handoff graphs are validated locally for circular
+  handsOffTo/reportsTo chains, so the structured repair loop fixes a cyclic
+  task force before the Hub sees it (previously a `task_force_cycle`
+  round-trip rejection).
+- Failure display: verifier/server `issues` arrays are printed line by line
+  instead of being truncated inside a capped JSON blob.
+
 ## 1.0.1 — 2026-07-27
 
 - Fixes the two gates that failed on the v1.0.0 tag (never published):
