@@ -415,8 +415,29 @@ function handleSlash(ctx, cmdline, api) {
       return;
     }
 
-    default:
+    default: {
+      /*
+       * 최상위 명령 폴스루: REPL 안에서 /search /install /storm /usage … 를 그대로
+       * 쓸 수 있어야 한다(없으면 사용자가 REPL을 나갔다 들어와야 했다).
+       * 제외: 자기 자신을 다시 여는 대화형 명령(chat/open/firm/setup)과 run
+       * (REPL의 평문 입력이 곧 run이다).
+       */
+      // help/agents/list/chats/mcp/doctor 등은 위 케이스에서 이미 처리된다.
+      const REPL_EXCLUDED = new Set(["chat", "open", "firm", "setup", "run"]);
+      const commands = require("../commands/index.cjs");
+      if (!REPL_EXCLUDED.has(cmd) && commands.COMMANDS[cmd]) {
+        const result = commands.COMMANDS[cmd]().run(ctx, rest);
+        if (result && typeof result.catch === "function") {
+          result.catch((e) => ctx.err(String((e && e.message) || e)));
+        }
+        return;
+      }
+      if (commands.DESKTOP_ONLY_SURFACES && commands.DESKTOP_ONLY_SURFACES[cmd]) {
+        ctx.out(ui.c.dim(commands.DESKTOP_ONLY_SURFACES[cmd]));
+        return;
+      }
       ctx.out(ui.c.dim(en ? `unknown: /${cmd} (see /help)` : `알 수 없는 명령: /${cmd} (/help 참고)`));
+    }
   }
 }
 
