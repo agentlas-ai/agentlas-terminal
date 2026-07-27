@@ -101,3 +101,6 @@ signing/*
 credentials/*
 !credentials/README.md
 # <<< agentlas local project state <<<
+
+# 내부 설계 문서 — 공개 저장소에 올리지 않는다(오너 공개 allowlist 정책).
+ARCHITECTURE-V2.md
