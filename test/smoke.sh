@@ -91,7 +91,7 @@ for optional in \
   session-fences-contract auto-route-contract firm-orchestrate-contract \
   repl-banner-contract repl-shortcuts-contract language-resolution-contract \
   slash-palette-navigation-contract repl-slash-parsing-contract \
-  palette-command-coverage-contract
+  palette-command-coverage-contract repl-enter-and-arity-contract
 do
   if [ -f "$SCRIPT_DIR/$optional.cjs" ]; then
     check "$optional" node "$SCRIPT_DIR/$optional.cjs"

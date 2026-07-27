@@ -482,6 +482,18 @@ function printSessions(ctx, orch) {
   }
 }
 
+/*
+ * 세션 키 파싱. 인자가 없으면 사용법을 낸다 — 예전에는 `s${undefined}` 가 그대로
+ * 조립돼 `/kill` 이 "no such session: sundefined" 를, `/steer` 는 rest[0].length 에서
+ * 날 TypeError 를 냈다. 팔레트가 `/steer <n> <msg>` 라고 안내하므로 인자 없이 Enter 를
+ * 눌러 사용법을 보려는 것은 정상적인 탐색이다.
+ */
+function sessionKeyArg(rest, usage) {
+  const token = rest[0];
+  if (!token) throw new Error(usage);
+  return String(token).startsWith("s") ? token : `s${token}`;
+}
+
 function handleSlash(ctx, cmdline, api) {
   const en = ctx.lang === "en";
   const ui = ctx.uiInstance;
@@ -524,7 +536,7 @@ function handleSlash(ctx, cmdline, api) {
     case "sessions": case "tree": printSessions(ctx, orch); return;
 
     case "s": case "switch": {
-      const key = rest[0] && rest[0].startsWith("s") ? rest[0] : `s${rest[0]}`;
+      const key = sessionKeyArg(rest, `Usage: /${cmd} <n>`);
       const session = orch.setActive(key);
       renderer.attach(session, { replay: true });
       return;
@@ -552,7 +564,7 @@ function handleSlash(ctx, cmdline, api) {
     }
 
     case "steer": {
-      const key = rest[0] && rest[0].startsWith("s") ? rest[0] : `s${rest[0]}`;
+      const key = sessionKeyArg(rest, `Usage: /${cmd} <n> <message>`);
       const msg = restStr.slice(rest[0].length).trim();
       if (!msg) throw new Error("Usage: /steer <n> <message>");
       orch.sendTo(key, msg);
@@ -561,12 +573,12 @@ function handleSlash(ctx, cmdline, api) {
     }
 
     case "kill": {
-      const key = rest[0] && rest[0].startsWith("s") ? rest[0] : `s${rest[0]}`;
+      const key = sessionKeyArg(rest, `Usage: /${cmd} <n>`);
       orch.kill(key);
       return;
     }
     case "rm": {
-      const key = rest[0] && rest[0].startsWith("s") ? rest[0] : `s${rest[0]}`;
+      const key = sessionKeyArg(rest, `Usage: /${cmd} <n>`);
       orch.remove(key);
       const active = orch.active();
       if (active) renderer.attach(active, { replay: false });

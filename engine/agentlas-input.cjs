@@ -582,6 +582,7 @@ function attachSlashPalette(rl, opts = {}) {
     selected: 0,
     selectedCommand: null,
     visible: false,
+    navigated: false,
     dismissedForLine: null,
   };
 
@@ -678,6 +679,7 @@ function attachSlashPalette(rl, opts = {}) {
     if (!list.length) return false;
     state.selected = (state.selected + delta + list.length) % list.length;
     state.selectedCommand = list[state.selected].command;
+    state.navigated = true;
     const query = rl.line || "";
     setImmediate(() => {
       if ((rl.line || "") !== query) replaceLine(query);
@@ -706,12 +708,28 @@ function attachSlashPalette(rl, opts = {}) {
       move(name === "down" ? 1 : -1);
       return;
     }
-    // Shift-Tab 은 팔레트 확정 키가 아니다 — 호출자(REPL)의 권한 순환 단축키다.
-    // 여기서 select() 하면 한 번의 Shift-Tab 이 줄 내용까지 바꿔 버린다.
-    if (active() && ((name === "tab" && !key.shift) || name === "return")) {
+    // Tab 은 완성이다 — 강조된 항목으로 줄을 채운다.
+    // Shift-Tab 은 팔레트 확정 키가 아니다(호출자 REPL 의 권한 순환 단축키다).
+    if (active() && name === "tab" && !key.shift) {
       select();
       return;
     }
+    /*
+     * Enter 는 사용자가 실제로 목록을 훑었을 때만 강조 항목을 확정한다.
+     *
+     * 예전에는 팔레트가 떠 있기만 하면 Enter 가 무조건 select() 를 불렀고,
+     * 훑은 적이 없으면 state.selected 는 0이라 "목록 첫 줄"이 대신 실행됐다.
+     * `/s`(활성 세션 전환)를 치고 Enter 하면 `/sessions` 가 돌아간다 — 친 것과
+     * 다른 명령이 실행되는 것이다(pty 실측). 게다가 피해 대상은 팔레트 정렬의
+     * 함수라, 명령 목록을 손볼 때마다 어떤 명령이 가로채이는지가 조용히 바뀐다.
+     */
+    if (active() && name === "return") {
+      if (state.navigated) select();
+      else clear();
+      return;
+    }
+    // 타이핑이 이어지면 "훑었다"는 사실은 무효가 된다 — 질의가 달라졌기 때문.
+    state.navigated = false;
     state.dismissedForLine = null;
     setImmediate(render);
   }
