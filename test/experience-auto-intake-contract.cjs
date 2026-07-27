@@ -195,7 +195,7 @@ async function main() {
   // Unsafe evidence is blocked before any bundle write. Decision receipts are
   // value-free and contain only privacy reason codes.
   const unsafeMemories = [
-    { id: "memory:path", kind: "procedure", content: "Read /Users/mason/customer/private.csv before retrying.", confidence: "high", sensitivity: "internal" },
+    { id: "memory:path", kind: "procedure", content: "Read /Users/example/customer/private.csv before retrying.", confidence: "high", sensitivity: "internal" },
     { id: "memory:email", kind: "procedure", content: "Contact owner@example.com before retrying.", confidence: "high", sensitivity: "internal" },
     { id: "memory:secret", kind: "procedure", content: "Use sk-proj-abcdefghijklmnopqrstuvwxyz before retrying.", confidence: "high", sensitivity: "internal" },
     { id: "memory:customer", kind: "decision", content: "customer_name: Alice must receive the private report.", confidence: "medium", sensitivity: "private" },
