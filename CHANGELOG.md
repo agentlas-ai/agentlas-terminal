@@ -1,14 +1,14 @@
 # Changelog
 
-## Unreleased — v2 engine ground-up rewrite (2026-07-27)
+## 1.0.0 — 2026-07-27
 
 - The 13,347-line v1 engine monolith is replaced by a modular v2 engine
   (one concern per module: core/ runtimes/ agents/ sessions/ ui/ commands/
   cloud/ hub/ mcp/ automation/ workforce/ storm/ experience/ project/
-  hephaestus/ oberon/ cloud-assets/). The full v1 command surface (55
-  commands) is live; commands that are not wired stop honestly with exit 1 —
-  there are no silent successes and no facades. The complete v1 engine
-  remains recoverable at git tag `legacy-v1-engine-snapshot`.
+  hephaestus/ oberon/ cloud-assets/). The full v1 command surface (56
+  commands, plus `uninstall` and `billing`) is live; nothing is stubbed and
+  there are no facades. The complete v1 engine remains recoverable at git
+  tag `legacy-v1-engine-snapshot`.
 - Multi-session subagent orchestration (Orca) is first-class: every run —
   foreground chat, one-shot, storm/swarm worker, automation run — is a
   session owned by one orchestrator. Subagent sessions persist as Desktop
@@ -24,9 +24,28 @@
   Agentlas OS Core harness. The known dev-only Hephaestus root defect and
   the terminal-owned Desktop .app self-updater were removed (the latter
   belongs to Desktop; `agentlas update` is npm-channel only).
-- smoke gate expanded to 47 checks (basic surface, no-arg guards, fresh
-  bootstrap, 30+ restored/new contract tests, doctor parity) — all green.
-  Not released; the version stays 0.9.10 until an explicit release decision.
+- Product-model parity with the current Desktop, not with v1: the Hub is
+  borrow-first, so `install` refuses call-only listings (bookmark or
+  `agentlas call`), instruction-less packages, trust grades below A/B, and
+  web-only agents, with Desktop's exact wording; `uninstall` mirrors
+  Desktop's firm-membership guard. Hub plugins register stdio servers
+  disabled and needing approval (the table is shared with Desktop, so an
+  auto-enabled row would have bypassed Desktop's own gate); remote MCP
+  endpoints must be https and a real `/mcp`|`/sse` path. Automation runs
+  execute in Desktop-identical hidden division sessions and skip
+  hub/browser/computer-use rows without consuming the lease or the
+  scheduled occurrence.
+- New-user protection: an unknown one-word argument is refused with an
+  edit-distance suggestion instead of being spent as a model call (a typo
+  used to start an agent and run shell); Desktop-only screen names
+  (site, trex, prompts, dashboard, marketplace, settings…) stop honestly;
+  invalid `--permission` values are refused before any model call instead
+  of being silently downgraded to read; `no_runtime` now prints the exact
+  CLI install commands.
+- smoke gate: 54 checks (surface, no-arg guards, fresh bootstrap, 30+
+  restored/new contract tests, runtime-doctor 3-product parity) — all
+  green. Verified end to end against a packed tarball installed with
+  `npm i -g` into a clean prefix and a pristine userData.
 
 ## 0.9.10 — 2026-07-26
 
