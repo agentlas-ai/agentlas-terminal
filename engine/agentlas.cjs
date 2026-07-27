@@ -20,9 +20,24 @@ const { loadPrefs } = require("./agentlas-config.cjs");
 const { Ui } = require("./agentlas-ui.cjs");
 const commands = require("./commands/index.cjs");
 
+const SUPPORTED_LANGS = new Set(["ko", "en"]);
+
+/*
+ * 우선순위: AGENTLAS_LANG > prefs.language > prefs.lang(v1 레거시) > OS 로케일 > en.
+ *
+ * v1은 언어를 `lang` 키에 저장하고 폴백이 "en"이었다(레거시 엔진 스냅샷 9e2beae의
+ * agentlas.cjs:10866 — `lang = prefs.lang || "en"`). v2 재작성이 키를 `language`로
+ * 바꾸면서 마이그레이션을 두지 않아, 예전에 언어를 고른 사용자의 설정이 통째로 무시되고
+ * OS 로케일로 떨어졌다 — 영어를 저장해 둔 맥에서 Terminal.app의 ko_KR 때문에 UI가
+ * 한국어로 뜨던 실사용 증상의 원인이다. 레거시 키를 계속 읽어 그 선택을 존중한다.
+ *
+ * 새로 저장하는 쪽(commands/setup)은 정본 `language`만 쓴다. `language`가 항상
+ * 우선하므로 파일에 남은 옛 `lang` 값이 새 선택을 이길 수는 없다.
+ */
 function resolveLang(prefs) {
-  if (process.env.AGENTLAS_LANG === "ko" || process.env.AGENTLAS_LANG === "en") return process.env.AGENTLAS_LANG;
-  if (prefs && (prefs.language === "ko" || prefs.language === "en")) return prefs.language;
+  if (SUPPORTED_LANGS.has(process.env.AGENTLAS_LANG)) return process.env.AGENTLAS_LANG;
+  const saved = prefs && (prefs.language || prefs.lang);
+  if (SUPPORTED_LANGS.has(saved)) return saved;
   const envLang = String(process.env.LANG || process.env.LC_ALL || "");
   return /^ko/i.test(envLang) ? "ko" : "en";
 }

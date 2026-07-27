@@ -545,6 +545,13 @@ function attachSlashPalette(rl, opts = {}) {
     return { clear() {}, detach() {}, setEnabled() {}, active: () => false };
   }
   const colors = opts.colors || (opts.ui && opts.ui.c) || {};
+  /*
+   * 후보 출처는 주입 가능하다. 이 모듈의 SLASH_COMMAND_META 는 v1 REPL 전용
+   * 목록이라, v2 처럼 명령 표면이 다른 호출자가 그대로 쓰면 오버레이가 없는
+   * 명령을 광고한다(engine/ui/palette.cjs 상단 주석의 그 사고). 호출자가
+   * 자기 정본을 넘기면 그것만 뜬다.
+   */
+  const suggest = typeof opts.suggest === "function" ? opts.suggest : slashCommandSuggestions;
   const state = {
     enabled: true,
     selected: 0,
@@ -557,7 +564,8 @@ function attachSlashPalette(rl, opts = {}) {
 
   function rows() {
     if (!state.enabled) return [];
-    return slashCommandSuggestions(rl.line || "", 12, opts.lang || (opts.ui && opts.ui.lang) || "en");
+    const list = suggest(rl.line || "", 12, opts.lang || (opts.ui && opts.ui.lang) || "en");
+    return Array.isArray(list) ? list : [];
   }
   function active() {
     return rows().length > 0 && state.dismissedForLine !== (rl.line || "");
@@ -626,7 +634,9 @@ function attachSlashPalette(rl, opts = {}) {
       move(name === "down" ? 1 : -1);
       return;
     }
-    if (active() && (name === "tab" || name === "return")) {
+    // Shift-Tab 은 팔레트 확정 키가 아니다 — 호출자(REPL)의 권한 순환 단축키다.
+    // 여기서 select() 하면 한 번의 Shift-Tab 이 줄 내용까지 바꿔 버린다.
+    if (active() && ((name === "tab" && !key.shift) || name === "return")) {
       select();
       return;
     }

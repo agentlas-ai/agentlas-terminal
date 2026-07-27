@@ -92,6 +92,37 @@ function makeCompleter(ctx = {}) {
   };
 }
 
+/*
+ * 입력 중 뜨는 슬래시 오버레이의 후보 — Tab 완성·/help 와 같은 정본에서 나온다.
+ * v1 input 모듈의 slashCommandSuggestions 를 쓰면 오버레이만 v1 목록을 광고하게
+ * 되므로(이 파일 상단 주석의 그 사고), 오버레이도 여기서 후보를 받는다.
+ * 반환 모양은 input.renderSlashPalette 가 기대하는 행 계약을 따른다.
+ */
+function suggestions(line, limit = 12, lang = "en") {
+  const value = String(line || "");
+  if (!value.startsWith("/")) return [];
+  if (isAbsolutePathTask(value)) return []; // /Users/… 같은 절대경로 작업은 명령이 아니다
+  if (/\s/.test(value)) return []; // 인자를 타이핑하는 중이면 명령 목록은 방해다
+  const ko = lang === "ko";
+  const rows = SLASH_COMMANDS.map((entry) => ({
+    command: entry.command,
+    description: ko ? entry.ko : entry.en,
+    usage: entry.command + (entry.args ? " " + entry.args : ""),
+    detail: "",
+    category: "",
+    examples: [],
+  }));
+  const q = value.toLowerCase();
+  if (q === "/") return rows.slice(0, limit);
+  const starts = rows.filter((row) => row.command.toLowerCase().startsWith(q));
+  const contains = rows.filter(
+    (row) =>
+      !row.command.toLowerCase().startsWith(q) &&
+      (row.command.toLowerCase().includes(q.slice(1)) || row.description.toLowerCase().includes(q.slice(1))),
+  );
+  return starts.concat(contains).slice(0, limit);
+}
+
 /** /help 팔레트 렌더 — Tab 완성과 같은 정본에서 나온다. */
 function renderPalette(lang) {
   const ko = lang === "ko";
@@ -102,4 +133,4 @@ function renderPalette(lang) {
     .join("\n");
 }
 
-module.exports = { SLASH_COMMANDS, SLASH_NAMES, makeCompleter, renderPalette };
+module.exports = { SLASH_COMMANDS, SLASH_NAMES, makeCompleter, renderPalette, suggestions };

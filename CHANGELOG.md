@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.7 — 2026-07-27
+
+- **The selection prompt no longer carries the whole candidate set.** Measured
+  on a live 30-candidate search, the complete set was 116KB — roughly 30k
+  tokens shipped on the single most expensive call of every run — while the
+  leader only reads names, communities, roles and top skills to staff a team.
+  Digests, package hashes and qualification evidence were paying for prompt
+  space and then being re-verified in full by the Hub anyway. The leader now
+  receives a projection: **2.8k tokens, a 91% reduction**, with every exact
+  `agentReleaseId` preserved so the leader still authors its own exact
+  selection and the Hub still validates against the complete set.
+- A verifier that reports absence as `[""]`, `[null]` or `[{}]` no longer
+  fails the run on a contract error; non-empty non-string issues are
+  serialized rather than dropped, and oversized issues still go through the
+  bounded schema repair that shortens them without losing intent.
+
 ## 1.0.6 — 2026-07-27
 
 - **The startup banner is back.** The v2 REPL called `renderBanner` with the

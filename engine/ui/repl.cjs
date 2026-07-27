@@ -22,8 +22,64 @@ const { Renderer } = require("./renderer.cjs");
 const { findAgent, listAgents } = require("../agents/registry.cjs");
 const { resolveRuntime, NoRuntimeError } = require("../runtimes/resolve.cjs");
 const permissions = require("../agentlas-permissions.cjs");
+const i18n = require("../agentlas-i18n.cjs");
 
 const DEFAULT_AGENT_SLUG = "agentlas-orchestrator";
+
+/*
+ * Shift-Tab 권한 순환 — 배너(banner.location)와 permCycleHint/permFullArm/
+ * help.shiftTab 이 광고해 온 단축키의 실제 구현.
+ *
+ * 배경: v1→v2 재작성에서 이 단축키를 들고 있던 입력면(composer)이 호출되지
+ * 않게 되면서, 배너는 계속 "Shift-Tab 권한"을 광고하는데 눌러도 아무 일이
+ * 없었다. 화면 문구와 키 동작을 다시 같은 곳에 묶는다.
+ *
+ * 두 단계 확인은 계약이다 — write 에서 Shift-Tab 은 곧장 full 로 가지 않고
+ * 5초 창을 무장(permFullArm)하고, 그 사이 다른 키가 오면 무장을 푼다.
+ * full 은 이 프로세스 한정이라 prefs 에 저장하지 않는다(v2 /permission 과 동일).
+ *
+ * 입력면과 무관하게 단위 테스트할 수 있도록 순수 상태기계로 분리한다.
+ */
+function createPermissionShortcut(opts = {}) {
+  const lang = opts.lang || "en";
+  const getPermission = opts.getPermission || (() => "write");
+  const setPermission = opts.setPermission || (() => {});
+  const emit = opts.onMessage || (() => {});
+  const cycle = permissions.createCycleController(opts.controller || {});
+  let armed = false;
+
+  return {
+    armed: () => armed,
+    /*
+     * 이 키를 소비했으면 true. readline 은 Shift-Tab 을 Tab 과 구분하지 않고
+     * 완성기를 호출하므로(Node 25 확인), 호출자는 true 를 받은 턴의 완성
+     * 후보를 비워 입력 줄이 순환에 휘말리지 않게 해야 한다.
+     */
+    handleKey(_str, key = {}) {
+      if (!(key && key.name === "tab" && key.shift)) {
+        if (armed) { cycle.cancel(); armed = false; } // 다른 키 = FULL 무장 취소
+        return false;
+      }
+      const step = cycle.step(getPermission());
+      if (step.armed) {
+        armed = true;
+        emit({ kind: "arm", level: permissions.normalize(getPermission()), text: i18n.t(lang, "permFullArm") });
+        return true;
+      }
+      armed = false;
+      const level = permissions.normalize(step.level);
+      setPermission(level);
+      emit({
+        kind: step.enteredFull ? "full" : "set",
+        level,
+        text: step.enteredFull
+          ? i18n.t(lang, "permFullConfirm")
+          : i18n.t(lang, "permCycleConfirm", permissions.copy(level, lang).label),
+      });
+      return true;
+    },
+  };
+}
 
 function pickDefaultAgent(db) {
   const visible = listAgents(db);
@@ -104,10 +160,10 @@ async function startRepl(ctx, opts = {}) {
     ctx.err(ui.c.dim(`banner failed: ${(e && e.message) || e}`));
   }
 
-  // 배너가 런타임·권한·작업 폴더를 이미 보여준다 — 여기서는 배너에 없는 것만.
+  // 배너 카드가 런타임·권한·작업 폴더와 명령 메뉴를 이미 보여준다 — 남은 것만.
   ctx.out(ui.c.dim(en
-    ? `v2 engine · parallel ≤${maxParallel()} — /help, /sessions, /quit`
-    : `v2 엔진 · 동시 ≤${maxParallel()} — /help, /sessions, /quit`));
+    ? `v2 engine · parallel ≤${maxParallel()}`
+    : `v2 엔진 · 동시 ≤${maxParallel()}`));
 
   if (opts.agent) {
     try {
@@ -122,19 +178,42 @@ async function startRepl(ctx, opts = {}) {
     // 히스토리는 v1 input 모듈 재사용, 완성기는 v2 팔레트(ui/palette)가 정본이다.
     const input = require("../agentlas-input.cjs");
     const palette = require("./palette.cjs");
+    const completer = palette.makeCompleter({
+      getAgentSlugs: () => { try { return listAgents(db).map((a) => a.slug); } catch { return []; } },
+      getFirmSlugs: () => {
+        try { return db.prepare("SELECT slug FROM firms ORDER BY slug").all().map((r) => r.slug); } catch { return []; }
+      },
+      getSessionKeys: () => orch.list().map((r) => r.key),
+      getCwd: () => process.cwd(),
+    });
+    // Shift-Tab 이 온 턴에는 완성 후보를 비운다 — 아래 권한 순환 주석 참고.
+    let swallowCompletion = false;
     const rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
-      completer: palette.makeCompleter({
-        getAgentSlugs: () => { try { return listAgents(db).map((a) => a.slug); } catch { return []; } },
-        getFirmSlugs: () => {
-          try { return db.prepare("SELECT slug FROM firms ORDER BY slug").all().map((r) => r.slug); } catch { return []; }
-        },
-        getSessionKeys: () => orch.list().map((r) => r.key),
-        getCwd: () => process.cwd(),
-      }),
+      completer: (line) => (swallowCompletion ? [[], line] : completer(line)),
     });
     input.attachHistory(rl);
+
+    /*
+     * 입력 중 뜨는 슬래시 오버레이. 후보는 v2 정본(ui/palette)에서만 받는다 —
+     * input 모듈의 기본 목록은 v1 REPL 전용이라 여기 없는 명령을 광고한다.
+     */
+    const slashPalette = input.attachSlashPalette(rl, {
+      ui,
+      lang: ctx.lang,
+      force: true,
+      suggest: (line, limit, lang) => {
+        /*
+         * 턴이 도는 동안 화면은 append-only 다(agentlas-ui `_drawFooter` 규약:
+         * 활성 턴에 멀티행 라이브 프레임은 스크롤백 안전하지 않다). 스트리밍
+         * 위에 오버레이를 그리면 실제 출력이 지워진다 — 그동안은 접어 둔다.
+         */
+        const active = orch.active();
+        if (active && active.isBusy()) return [];
+        return palette.suggestions(line, limit, lang);
+      },
+    });
     const PROMPT = "› ";
     const prompt = () => {
       if (!renderer.session || !renderer.session.isBusy()) {
@@ -142,6 +221,46 @@ async function startRepl(ctx, opts = {}) {
         rl.prompt();
       }
     };
+
+    /*
+     * Shift-Tab 권한 순환을 입력 줄에 붙인다.
+     *
+     * readline 은 Shift-Tab 을 Tab 과 구분하지 않고 완성기를 호출한다(Node 25
+     * 확인: `\x1b[Z` → {name:"tab", shift:true} 인데도 완성이 돌아 줄이 바뀐다).
+     * 그래서 이 키를 소비한 턴에는 완성 후보를 비워(swallowCompletion) 타이핑
+     * 중이던 내용을 지킨다. 오버레이 쪽도 Shift-Tab 을 확정 키로 보지 않는다.
+     */
+    const clearInputLine = () => {
+      slashPalette.clear();
+      // 턴이 도는 동안은 append-only — 스트리밍 중인 줄을 지우면 실제 출력이 날아간다.
+      const busy = Boolean(renderer.session && renderer.session.isBusy());
+      if (!busy && process.stdout.isTTY) ui.write("\r\x1b[2K");
+      else ui.ensureNl();
+    };
+    const permissionShortcut = createPermissionShortcut({
+      lang: ctx.lang,
+      getPermission: () => permission,
+      setPermission: (level) => { permission = level; },
+      onMessage: ({ kind, text }) => {
+        clearInputLine();
+        // 활성 세션은 이미 자기 권한으로 떠 있다 — /permission 과 같은 범위 안내.
+        const scope = en ? "applies to new sessions" : "새 세션부터 적용";
+        if (kind === "arm") ui.line(ui.c.amber("! ") + text);
+        else if (kind === "full") ui.line(ui.c.paw("▶▶ ") + text + ui.c.dim(` (${scope})`));
+        else ui.line(ui.c.dim(`◆ ${text} (${scope})`));
+        if (!renderer.session || !renderer.session.isBusy()) rl.prompt(true); // 커서 보존 = 타이핑 중이던 줄 유지
+      },
+    });
+    const onShortcutKey = (str, key) => {
+      if (!permissionShortcut.handleKey(str, key)) return;
+      swallowCompletion = true;
+      setImmediate(() => { swallowCompletion = false; });
+    };
+    if (process.stdin.isTTY) {
+      readline.emitKeypressEvents(process.stdin, rl);
+      // readline 자신의 핸들러보다 먼저 돌아야 완성 억제 플래그가 제때 선다.
+      process.stdin.prependListener("keypress", onShortcutKey);
+    }
 
     orch.on("notice", ({ text, ok }) => {
       ui.ensureNl();
@@ -219,6 +338,8 @@ async function startRepl(ctx, opts = {}) {
 
     rl.on("close", () => {
       input.persistHistory(rl);
+      process.stdin.removeListener("keypress", onShortcutKey);
+      slashPalette.detach();
       renderer.detach();
       orch.shutdown();
       ui.ensureNl();
@@ -342,6 +463,8 @@ function handleSlash(ctx, cmdline, api) {
       ctx.out(ctx.uiInstance.c.dim(en
         ? "Tab completes commands, agent names and session keys · ↑/↓ history · typing during a run queues steering · ctrl-c interrupts"
         : "Tab: 명령·에이전트·세션키 완성 · ↑/↓ 히스토리 · 실행 중 입력은 스티어링 큐 · ctrl-c 턴 중단"));
+      // 배너가 광고하는 Shift-Tab 은 여기에도 적힌다 — 문구와 구현은 한 곳에서 움직인다.
+      ctx.out(ctx.uiInstance.c.dim(`Shift-Tab: ${i18n.t(ctx.lang, "help.shiftTab")}`));
       return;
     }
     case "agents": case "list": require("../commands/list.cjs").run(ctx, rest); return;
@@ -458,4 +581,4 @@ function handleSlash(ctx, cmdline, api) {
   }
 }
 
-module.exports = { startRepl, printSessions };
+module.exports = { startRepl, printSessions, createPermissionShortcut };
