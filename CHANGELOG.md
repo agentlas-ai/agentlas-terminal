@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.0.6 — 2026-07-27
+
+- **The startup banner is back.** The v2 REPL called `renderBanner` with the
+  v1 contract — no `ui`, and using the return value as a string — so it threw
+  a TypeError on every launch, and an argument-less `catch` disguised the
+  crash as a one-line `agentlas <version>` fallback. Nobody could see it,
+  including the tests. A banner contract test now guards it.
+- **Per-stage model assignment.** One workforce run has stages with very
+  different demands: the leader must author a large exact schema (measured:
+  Haiku failed it twice in a row), while a worker writes one packet of prose
+  (measured: Haiku workers produced real code patches in the SWE run). The
+  engine used a single model for all of them. Stages now resolve their model
+  independently:
+  `AGENTLAS_WORKFORCE_MODEL_LEADER` (leader/selection/planner/refinement),
+  `AGENTLAS_WORKFORCE_MODEL_WORKER`, `AGENTLAS_WORKFORCE_MODEL_SYNTHESIS`,
+  `AGENTLAS_WORKFORCE_MODEL_VERIFIER`. Unset stages inherit the leader
+  setting, and with nothing set the behaviour is byte-identical to before.
+
 ## 1.0.5 — 2026-07-27
 
 - A verifier that reports "no issues" as `[""]` instead of `[]` no longer

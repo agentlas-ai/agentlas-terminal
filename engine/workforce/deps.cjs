@@ -421,6 +421,9 @@ function buildWorkforceDeps(ctx = {}) {
     prefsLang: () => ctx.lang || "en",
     userDataDir,
     projectCwd: capture.projectCwd,
+    // 무도구 핀 호출 전용 중립 작업 폴더 — 프로젝트 작업트리의 설정/지시문/디렉터리
+    // 문맥이 자식 CLI로 새는 것을 끊는다(agentlas-workforce.cjs neutralCwd 계약).
+    runCwd: capture.runCwd,
     cloudSessionCookie: hubClient.cloudSessionCookie,
     // v1과 동일: callHubTool은 주입하지 않는다. 워크포스 모듈 내부의 jsonrpc 경로가
     // 거절 코드 원문 전파·retryClass 계약을 소유하며, fetchHub는 버퍼드

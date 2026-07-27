@@ -1754,8 +1754,45 @@ function create(deps = {}) {
     return new Ui({ lang: lang || (typeof D.prefsLang === "function" ? D.prefsLang() : "en") });
   }
 
+  /*
+   * 스테이지별 모델 배정 (토큰 이코노미).
+   *
+   * 한 실행 안의 단계는 요구 난이도가 다르다: 리더/플래너는 거대한 스키마를 정확히
+   * 작성해야 하고(실측 2026-07-27: Haiku는 워크오더 JSON에서 2회 연속 실패), 워커는
+   * 자기 패킷 하나를 글로 쓰면 된다(같은 날 SWE 벤치에서 Haiku 워커가 실제 패치 생성).
+   * 그런데 엔진은 전 단계에 모델 하나를 썼다 — 제일 어려운 단계에 맞추면 워커까지
+   * 비싸고, 워커에 맞추면 리더가 죽는다.
+   *
+   * 설정은 명시적이며 기본값은 무변경이다(미설정 시 기존 동작 그대로):
+   *   AGENTLAS_WORKFORCE_MODEL_LEADER     리더/선발/플래너/워크오더 정제
+   *   AGENTLAS_WORKFORCE_MODEL_WORKER     워커(중첩 팀 워커 포함)
+   *   AGENTLAS_WORKFORCE_MODEL_SYNTHESIS  합성
+   *   AGENTLAS_WORKFORCE_MODEL_VERIFIER   검증
+   * 미지정 스테이지는 리더 설정 → 명시 modelPin → 런타임 기본 순으로 내려간다.
+   */
+  const STAGE_MODEL_ENV = Object.freeze({
+    leader: "AGENTLAS_WORKFORCE_MODEL_LEADER",
+    worker: "AGENTLAS_WORKFORCE_MODEL_WORKER",
+    synthesis: "AGENTLAS_WORKFORCE_MODEL_SYNTHESIS",
+    verifier: "AGENTLAS_WORKFORCE_MODEL_VERIFIER",
+  });
+
+  function stageModelPin(stage, env = process.env) {
+    const key = STAGE_MODEL_ENV[stage];
+    const exact = key ? String(env[key] || "").trim() : "";
+    if (exact) return exact;
+    // 워커/합성/검증에 별도 지정이 없으면 리더 설정을 상속한다 — 리더만 올려도
+    // 전 단계가 일관되게 동작하고, 아무것도 없으면 기존 경로와 완전히 동일하다.
+    const leader = String(env[STAGE_MODEL_ENV.leader] || "").trim();
+    return leader || null;
+  }
+
   async function runModel(runtime, system, prompt, context) {
-    const localContextSlice = typeof D.projectContextSlice === "function"
+    // Core context slice는 리더 단계(작업 분석/선택/플래너/goal)의 프로젝트 접지다.
+    // 핀 워커·합성·검증 호출의 계약 입력은 패킷/핸드오프뿐이므로(EXECUTION AUTHORITY
+    // 고지와 동일 원칙) projectGrounding=false로 붙이지 않는다 — 2026-07-27 실측:
+    // 무도구 콘텐츠 브리프에 프로젝트 파일 지도가 붙자 산출물이 디렉터리 나열로 샜다.
+    const localContextSlice = context.projectGrounding !== false && typeof D.projectContextSlice === "function"
       ? D.projectContextSlice(context.cwd, context.task || "")
       : "";
     const effectiveSystem = localContextSlice
@@ -1780,12 +1817,12 @@ function create(deps = {}) {
         cwd: context.cwd,
         env: context.env,
         permission: context.permission,
-        model: context.modelPin || runtime.model || null,
+        model: stageModelPin(context.stage) || context.modelPin || runtime.model || null,
         effort: context.effortPin == null ? null : context.effortPin,
         authorityMode,
       }));
     }
-    return normalizeModelText(await D.runApi(runtime.backend, context.modelPin || runtime.model, effectiveSystem, prompt));
+    return normalizeModelText(await D.runApi(runtime.backend, stageModelPin(context.stage) || context.modelPin || runtime.model, effectiveSystem, prompt));
   }
 
   async function callHubTool(name, args) {
@@ -2002,6 +2039,11 @@ function create(deps = {}) {
     const runtime = ctx.runtime || D.resolveRuntime(db, ctx.runtimeOverride);
     const identity = runtimeIdentity(runtime, ctx.modelPin || null);
     const cwd = ctx.cwd || (typeof D.projectCwd === "function" ? D.projectCwd() : process.cwd());
+    // 무도구(no-authority) 자식 CLI를 프로젝트 작업트리에서 실행하면 자식 CLI가
+    // 프로젝트 설정·프로젝트 지시문·디렉터리 문맥을 스스로 삼킨다(2026-07-27 실측:
+    // 프로젝트 설정 경고와 함께 워커 exit 1, 콘텐츠 브리프가 워크스페이스 코딩
+    // 과제처럼 수행됨). 파일 권한이 없는 호출은 전용 중립 폴더에서 실행한다.
+    const neutralCwd = typeof D.runCwd === "function" ? D.runCwd() : cwd;
     const permission = ctx.permission || "write";
     const env = typeof D.buildChildEnv === "function" ? await D.buildChildEnv(db, {
       projectPath: ctx.projectPath || null, permission, cwd, lang: ui.lang,
@@ -2134,7 +2176,7 @@ function create(deps = {}) {
           : system;
         let raw;
         try {
-          raw = await runModel(runtime, attemptSystem, attemptPrompt, modelContext);
+          raw = await runModel(runtime, attemptSystem, attemptPrompt, { ...modelContext, stage: "leader" });
         } catch (error) {
           receipt.structuredModelAttempts.push({
             schemaVersion: "agentlas.workforce-structured-model-attempt.v1",
@@ -2976,6 +3018,10 @@ function create(deps = {}) {
           : "EXECUTION AUTHORITY: zero tools are granted to this invocation — no file system, no shell, no web, no MCP, no subagents. Never emit tool-call syntax or XML-like invocation markup, and never explore or wait for a workspace. Author the complete deliverable directly in this reply as plain text or markdown, using only the packet inputs provided.";
         const text = assertString(await runModel(runtime, [system, authorityDirective].join("\n\n"), prompt, {
           ...modelContext,
+          // 무도구 호출은 패킷 입력만이 계약이다: 중립 cwd + 프로젝트 접지 차단.
+          cwd: grantedToolIds.length ? modelContext.cwd : neutralCwd,
+          projectGrounding: false,
+          stage: "worker",
           authorityMode: grantedToolIds.length ? "policy-filtered" : "no-authority",
           grantedToolIds,
           permissionPolicy: pinned.permissionPolicy,
@@ -3225,6 +3271,8 @@ function create(deps = {}) {
       let verifierInvocationId = null;
       let priorAttempt = null;
       receipt.correctiveHistory = [];
+      // 합성·검증도 무도구 핸드오프 파이프라인이다 — 워커와 동일한 격리 계약.
+      const handoffModelContext = { ...modelContext, cwd: neutralCwd, projectGrounding: false };
       if (!ctx.silent) ui.info(ui.lang === "ko" ? "합성 → 검증 단계" : "synthesis → verification");
       for (let verifyAttempt = 1; verifyAttempt <= 2; verifyAttempt += 1) {
         const synthesisStarted = nowIso(D.now);
@@ -3235,7 +3283,7 @@ function create(deps = {}) {
           verifyAttempt > 1 ? "CORRECTIVE SYNTHESIS MODE: a pinned verifier rejected the prior synthesis. Repair the deliverable so every criterion is satisfied using only the existing worker handoffs. Never invent work that did not run." : "",
         ].filter(Boolean).join("\n\n"), stableJson(verifyAttempt > 1
           ? { workOrder, synthesis: delegationPlan.synthesis, handoffs: outputs, priorSynthesis: priorAttempt.text, verifierRejection: priorAttempt.verification }
-          : { workOrder, synthesis: delegationPlan.synthesis, handoffs: outputs }), modelContext), "synthesis output", 1_000_000);
+          : { workOrder, synthesis: delegationPlan.synthesis, handoffs: outputs }), handoffModelContext), "synthesis output", 1_000_000);
         receipt.synthesis = {
           schemaVersion: "agentlas.workforce-synthesis-receipt.v1",
           receiptId: synthesisInvocationId,
@@ -3254,12 +3302,35 @@ function create(deps = {}) {
 
         const verifierStarted = nowIso(D.now);
         verifierInvocationId = `workforce-invocation:${crypto.randomUUID()}`;
-        const verifierRaw = await runModel(runtime, [
-          "You are the top-level host LLM verifier for this Agentlas workforce run.",
-          'Evaluate the synthesis against every criterion and worker handoff. Return exactly one JSON object: {"schemaVersion":"agentlas.workforce-verification.v1","status":"passed|failed","checks":[{"checkId":"check:<id>","status":"passed|failed","evidence":"..."}],"issues":[]}.',
+        // 검증자 JSON도 다른 구조화 단계처럼 1회 유계 스키마 교정을 받는다. 2026-07-27
+        // 실측: 정직한 불합격 판정이 2000자 초과 issues 문자열 하나 때문에
+        // invalid_contract 크래시가 되어 판정·교정 재합성이 통째로 증발했다.
+        // 교정 후에도 스키마가 깨지면 조용한 절단 없이 정직하게 던진다.
+        const verifierSchemaRequirements = [
+          'Return exactly one JSON object: {"schemaVersion":"agentlas.workforce-verification.v1","status":"passed|failed","checks":[{"checkId":"check:<id>","status":"passed|failed","evidence":"..."}],"issues":[]}.',
           "Use double-quoted valid JSON. Passing requires evidence for every criterion; do not rubber-stamp.",
-        ].join("\n\n"), stableJson({ workOrder, criteria: delegationPlan.verifier.criteria, handoffs: outputs, synthesis: finalText }), modelContext);
-        verification = validateVerifierResult(parseModelObject(verifierRaw, "workforce verifier"));
+          "Every issues entry and every evidence value must be a plain string of at most 1900 characters; cite handoffs by slot id instead of quoting them at length.",
+        ].join("\n");
+        let verifierPrompt = stableJson({ workOrder, criteria: delegationPlan.verifier.criteria, handoffs: outputs, synthesis: finalText });
+        let verifierParseAttempts = 0;
+        verification = null;
+        while (verification === null) {
+          verifierParseAttempts += 1;
+          const verifierRaw = await runModel(runtime, [
+            "You are the top-level host LLM verifier for this Agentlas workforce run.",
+            "Evaluate the synthesis against every criterion and worker handoff.",
+            verifierSchemaRequirements,
+            verifierParseAttempts > 1 ? "STRUCTURED OUTPUT REPAIR MODE: repair the schema and field bounds only; keep your verdict and findings." : "",
+          ].filter(Boolean).join("\n\n"), verifierPrompt, handoffModelContext);
+          try {
+            verification = validateVerifierResult(parseModelObject(verifierRaw, "workforce verifier"));
+          } catch (error) {
+            if (!(error instanceof WorkforceContractError) || verifierParseAttempts >= MAX_STRUCTURED_MODEL_ATTEMPTS) throw error;
+            const repair = buildSchemaRepairPrompt(error, verifierSchemaRequirements, verifierRaw);
+            if (!repair.prompt) throw error;
+            verifierPrompt = repair.prompt;
+          }
+        }
         receipt.verifier = {
           schemaVersion: "agentlas.workforce-verifier-receipt.v1",
           receiptId: verifierInvocationId,
@@ -3276,6 +3347,7 @@ function create(deps = {}) {
           result: verification,
           verdict: verification.status === "passed" ? "pass" : "fail",
           attempt: verifyAttempt,
+          structuredAttemptCount: verifierParseAttempts,
         };
         if (verification.status === "passed") break;
         if (verifyAttempt === 1) {

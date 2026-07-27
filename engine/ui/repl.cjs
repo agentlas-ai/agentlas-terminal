@@ -38,13 +38,9 @@ async function startRepl(ctx, opts = {}) {
   const ui = ctx.uiInstance;
   const db = ctx.db();
 
-  try {
-    process.stdout.write(renderBanner({ version: readVersion(), lang: ctx.lang }) + "\n");
-  } catch {
-    ctx.out(`agentlas ${readVersion()}`);
-  }
-
   // 첫 실행 온보딩 (언어 → 런타임 → 권한). setup 명령으로 언제든 재실행 가능.
+  // 스플래시는 이 뒤에 그린다 — 배너가 광고하는 런타임·권한은 이번 세션에 실제로
+  // 적용될 값이어야 한다. 첫 실행 사용자는 마법사가 먼저 마스코트를 띄운다.
   if (!ctx.prefs.onboarded && process.stdin.isTTY) {
     const wizardRl = readline.createInterface({ input: process.stdin, output: process.stdout });
     try {
@@ -88,9 +84,30 @@ async function startRepl(ctx, opts = {}) {
     return session;
   };
 
+  /*
+   * renderBanner는 ui.line으로 직접 그리고 아무것도 반환하지 않는다(ctx는 {ui,...} 형태).
+   * v2 REPL이 이걸 "문자열을 반환하는 v1 배너"로 호출해 매 실행 TypeError로 죽었고,
+   * 인자 없는 catch가 그 크래시를 `agentlas <version>` 한 줄로 위장해 왔다 —
+   * 스플래시 전체가 사라진 걸 사람도 게이트도 못 봤다. 실패 사유는 이제 남긴다.
+   */
+  try {
+    let runtimeLabel = "—";
+    try { runtimeLabel = resolveRt().kind; } catch { /* no_runtime: 첫 턴에서 정직 정지 */ }
+    let subjectLabel;
+    try {
+      const subject = opts.agent ? findAgent(db, opts.agent) : pickDefaultAgent(db);
+      if (subject) subjectLabel = subject.slug;
+    } catch { /* 표시용 — 못 정해도 배너는 그린다 */ }
+    renderBanner({ ui, version: readVersion(), runtimeLabel, subjectLabel, permission, cwd: process.cwd() });
+  } catch (e) {
+    ctx.out(`agentlas ${readVersion()}`);
+    ctx.err(ui.c.dim(`banner failed: ${(e && e.message) || e}`));
+  }
+
+  // 배너가 런타임·권한·작업 폴더를 이미 보여준다 — 여기서는 배너에 없는 것만.
   ctx.out(ui.c.dim(en
-    ? `v2 engine · runtime auto · permission ${permission} · parallel ≤${maxParallel()} — /help, /sessions, /quit`
-    : `v2 엔진 · 런타임 auto · 권한 ${permission} · 동시 ≤${maxParallel()} — /help, /sessions, /quit`));
+    ? `v2 engine · parallel ≤${maxParallel()} — /help, /sessions, /quit`
+    : `v2 엔진 · 동시 ≤${maxParallel()} — /help, /sessions, /quit`));
 
   if (opts.agent) {
     try {
