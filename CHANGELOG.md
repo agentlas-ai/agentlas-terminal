@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.5 — 2026-07-27
+
+- A verifier that reports "no issues" as `[""]` instead of `[]` no longer
+  fails the run on a contract error. An empty string is a mis-spelling of
+  absence, not content, so it is normalized away before the issue contract
+  is checked — a passing verification stopped the last step of a real run
+  this way.
+
 ## 1.0.4 — 2026-07-27
 
 **The hub boundary stops guessing.** Owner decision after live runs: rules

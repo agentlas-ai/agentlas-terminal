@@ -1487,7 +1487,12 @@ function validateVerifierResult(value) {
     if (!["passed", "failed"].includes(check.status)) fail("verifier_invalid", "verifier check status is invalid");
     assertString(check.evidence, "verifier.evidence", 2_000);
   }
-  assertArray(result.issues, "verifier.issues", 64).forEach((item, index) => assertString(item, `verifier.issues[${index}]`, 2_000));
+  // 모델은 "지적 없음"을 []가 아니라 [""]로 쓰기도 한다(합격 판정 실측). 빈 문자열은
+  // 내용이 아니라 부재의 오표기이므로 정규화해서 버린다 — 남은 항목만 계약 검사.
+  const issues = assertArray(result.issues, "verifier.issues", 64)
+    .filter((item) => !(typeof item === "string" && !item.trim()));
+  issues.forEach((item, index) => assertString(item, `verifier.issues[${index}]`, 2_000));
+  result.issues = issues;
   return result;
 }
 
