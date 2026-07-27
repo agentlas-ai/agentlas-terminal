@@ -2847,7 +2847,7 @@ async function firstFatalWorkerStopsBurningTheRemainingPackets() {
   assert.equal(h.modelCalls.some((call) => /PINNED_RELEASE=release:verifier-v7/.test(call.system)), false);
 }
 
-async function structuredPlannersAreToldEveryBoundTheHostEnforces() {
+async function structuredPlannersAreToldTheRealFieldContract() {
   const f = teamFixture();
   const nestedPlan = {
     schemaVersion: "agentlas.workforce-team-delegation-plan.v1",
@@ -2885,30 +2885,27 @@ async function structuredPlannersAreToldEveryBoundTheHostEnforces() {
   // 완주한 워커 3명과 중첩 팀 2개의 결과가 통째로 폐기됐다. 상한은 반드시 선고지한다.
   const nestedManagerCall = h.modelCalls.find((call) => /agentlas\.workforce-team-delegation-plan\.v1/.test(call.system));
   assert.ok(nestedManagerCall, "the nested manager must receive its schema contract");
-  assert.match(nestedManagerCall.system, /synthesisBrief at most 1900 characters/);
-  assert.match(nestedManagerCall.system, /objective at most 3800/);
+  // 오너 결정: 설명형 필드에 글자수 한도 없음. 프롬프트가 존재하지 않는 규칙을
+  // 지시하면 모델이 지킬 수 없는 계약을 지키려다 산출물을 스스로 깎는다.
+  assert.doesNotMatch(nestedManagerCall.system, /at most 1900 characters|at most 3800/);
+  assert.match(nestedManagerCall.system, /no character limit/);
   const plannerCall = h.modelCalls.find((call) => /agentlas\.workforce-orchestration-plan\.v2/.test(call.system));
   assert.ok(plannerCall, "the top-level planner must receive its schema contract");
-  assert.match(plannerCall.system, /brief at most 1900/);
-  assert.match(plannerCall.system, /verifier criteria of at most 450 characters/);
+  assert.doesNotMatch(plannerCall.system, /at most 1900|at most 3800/);
+  assert.match(plannerCall.system, /no character limit/);
+  assert.match(plannerCall.system, /at most 64 inputs per packet and at most 32 verifier criteria/);
 }
 
-async function verifierOversizedIssueRepairsOnceAndKeepsHonestVerdict() {
+async function verifierExplanationHasNoCharacterLimit() {
   const f = fixture();
-  const oversizedRejection = JSON.stringify({
-    schemaVersion: "agentlas.workforce-verification.v1",
-    status: "failed",
-    failedPacketIds: ["packet:backend"],
-    checks: [{ checkId: "check:rollback", status: "failed", evidence: "no atomic boundary present" }],
-    issues: ["rollback design missing: ".concat("x".repeat(2400))],
-  });
-  const repairedRejection = JSON.stringify({
-    schemaVersion: "agentlas.workforce-verification.v1",
-    status: "failed",
-    failedPacketIds: ["packet:backend"],
-    checks: [{ checkId: "check:rollback", status: "failed", evidence: "no atomic boundary present" }],
-    issues: ["rollback design missing from the synthesis"],
-  });
+  // 오너 결정 2026-07-27: 설명형 필드에 글자수 한도 없음. 예전에는 모든 문자열에
+  // 2000이라는 근거 없는 숫자가 복붙돼 있었고, 검증자가 불합격 사유를 자세히 쓰자
+  // 판정 전체가 invalid_contract로 증발했다. 폭주 방지는 모델 출력 전체 상한(2MB)이
+  // 담당하며, 필드마다 숫자를 지어내지 않는다.
+  const longIssue = `rollback design missing from the synthesis. ${"세부 근거 ".repeat(900)}`.trim();
+  assert.ok(longIssue.length > 2_000, "회귀 픽스처는 옛 상한을 확실히 넘어야 한다");
+  const longEvidence = `no atomic boundary present. ${"인용 ".repeat(900)}`.trim();
+  assert.ok(longEvidence.length > 2_000);
   const h = harness({
     modelOutputs: [
       JSON.stringify(f.workOrder),
@@ -2917,8 +2914,13 @@ async function verifierOversizedIssueRepairsOnceAndKeepsHonestVerdict() {
       "Backend handoff: idempotency key state machine and serializable transaction boundary.",
       "Verifier handoff: replay, partial-failure, forged-key, and concurrent-commit adversarial cases.",
       "First synthesis that omits the rollback design entirely.",
-      oversizedRejection,
-      repairedRejection,
+      JSON.stringify({
+        schemaVersion: "agentlas.workforce-verification.v1",
+        status: "failed",
+        failedPacketIds: ["packet:backend"],
+        checks: [{ checkId: "check:rollback", status: "failed", evidence: longEvidence }],
+        issues: [longIssue],
+      }),
       "Corrected synthesis with the rollback design restored from the backend handoff.",
       JSON.stringify({
         schemaVersion: "agentlas.workforce-verification.v1",
@@ -2931,13 +2933,20 @@ async function verifierOversizedIssueRepairsOnceAndKeepsHonestVerdict() {
   });
   const result = await h.runtime.workforceRun({}, "hard payment benchmark", { silent: true, benchmark: true, concurrency: 1 });
   assert.equal(result.ok, true, result.error && result.error.message);
-  const repairCall = h.modelCalls.find((call) => /STRUCTURED OUTPUT REPAIR MODE: repair the schema and field bounds only/.test(call.system));
-  assert.ok(repairCall, "an oversized honest verifier rejection must get one bounded schema repair, not an invalid_contract crash");
-  assert.match(repairCall.prompt, /PRIOR_MODEL_OUTPUT_DATA=/);
-  assert.equal(result.receipt.correctiveHistory.length, 1, "the repaired honest rejection must still drive one corrective synthesis");
-  assert.equal(result.receipt.correctiveHistory[0].verification.status, "failed");
+  assert.equal(
+    h.modelCalls.some((call) => /STRUCTURED OUTPUT REPAIR MODE: repair the schema and field bounds only/.test(call.system)),
+    false,
+    "한도가 없으므로 긴 판정에 스키마 교정이 붙으면 안 된다",
+  );
+  assert.equal(result.receipt.verifier.structuredAttemptCount, 1, "긴 판정도 첫 시도에 그대로 수용된다");
+  assert.equal(result.receipt.correctiveHistory.length, 1, "정직한 불합격은 교정 재합성 1회를 이끌어야 한다");
+  assert.equal(result.receipt.correctiveHistory[0].verification.issues[0], longIssue, "지적 원문이 잘리지 않고 보존된다");
+  assert.equal(result.receipt.correctiveHistory[0].verification.checks[0].evidence, longEvidence);
   assert.equal(result.receipt.verifier.verdict, "pass");
-  assert.equal(result.receipt.verifier.structuredAttemptCount, 1, "the passing verify attempt needed no schema repair");
+  // 프롬프트가 존재하지 않는 규칙을 지시하면 안 된다.
+  const verifierCall = h.modelCalls.find((call) => /workforce-verification\.v1/.test(call.system));
+  assert.doesNotMatch(verifierCall.system, /at most 1900 characters/);
+  assert.match(verifierCall.system, /no character limit/);
 }
 
 async function zeroToolHandoffCallsRunInNeutralCwdWithoutProjectGrounding() {
@@ -3020,11 +3029,11 @@ async function main() {
   await verifierRejectionTwiceEscalatesExactWorkerOnceThenPasses();
   await verifierRejectionAfterExactEscalationFailsHonestlyWithoutLoop();
   await verifierFailuresWithoutOneRepeatedExactPacketDoNotEscalate();
-  await verifierOversizedIssueRepairsOnceAndKeepsHonestVerdict();
+  await verifierExplanationHasNoCharacterLimit();
   await emptyWorkerDeliverableReachesTheHandoffRepairGate();
   await emptySynthesisRepairsOnceInsteadOfDiscardingEveryHandoff();
   await failedNestedTeamKeepsTheInvocationsThatActuallyRan();
-  await structuredPlannersAreToldEveryBoundTheHostEnforces();
+  await structuredPlannersAreToldTheRealFieldContract();
   await firstFatalWorkerStopsBurningTheRemainingPackets();
   await readOnlyFileAuthorityIsGrantableAndExactlyBounded();
   await declaredEdgesActuallyDeliverUpstreamHandoffs();

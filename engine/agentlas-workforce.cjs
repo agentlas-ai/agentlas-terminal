@@ -43,6 +43,29 @@ function handoffContractViolation(text) {
   return null;
 }
 const MAX_REPAIR_PRIOR_OUTPUT = 64 * 1024;
+/*
+ * 설명형 필드: 글자수 한도 없음 (오너 결정 2026-07-27).
+ *
+ * 원본 구현은 모든 문자열에 2000을 복붙했다 — 슬롯 설명, 패킷 입력, 브리프, 검증
+ * 근거, 검증 지적까지 전부 같은 숫자였고, 각 필드가 실제로 얼마나 필요한지 따진
+ * 근거는 없다. 라이브에서 두 번 사고를 냈다: 검증자가 불합격 사유를 자세히 쓰자
+ * 판정 전체가 invalid_contract로 증발했고, 중첩 매니저의 종합 브리프가 2000자를
+ * 넘어 워커 4명·14분치 실행이 통째로 폐기됐다. 두 필드 모두 "자세히 설명하는 것"이
+ * 존재 이유라 임의 상한과 목적이 정면 충돌한다.
+ *
+ * 폭주 방지는 이미 상위에 실재하는 경계가 담당한다: parseModelObject의
+ * MAX_MODEL_OUTPUT(2MB)이 모델 출력 전체를 막고, captureRuntime의 출력 상한이
+ * 자식 스트림을 막는다. 필드마다 숫자를 또 지어낼 이유가 없다.
+ *
+ * Hub로 나가는 WorkOrder 필드(taskBrief/roleSlots)는 서버 스키마와 맞물려 있어
+ * 그대로 둔다 — 여기서 늘려도 서버가 거절한다.
+ */
+const UNBOUNDED_EXPLANATION_FIELD = MAX_MODEL_OUTPUT;
+// Hub 로 나가는 워크오더 필드는 서버 스키마와 정확히 같아야 한다 — 여기서만 늘리면
+// 서버가 거절해 실패 지점만 옮긴다. 2026-07-27 세 곳(터미널·Core 스키마·Hub zod)을
+// 함께 상향했다. 값을 바꿀 때는 반드시 셋 다 같이 바꾼다.
+const HUB_TASK_BRIEF_MAX = 64_000;
+const HUB_SLOT_TASK_MAX = 32_000;
 // 워커에게 부여 가능한 유일한 네이티브 능력 — 읽기 전용. workforce/deps.cjs의
 // READ_ONLY_* 와 같은 값이어야 한다(그쪽이 인벤토리 발행자, 여기가 소비자).
 const READ_ONLY_BUILTIN_TOOL_ID = "builtin:file-read";
@@ -982,7 +1005,7 @@ function validateWorkOrder(value) {
   ], "direct WorkOrder", "work_order_invalid");
   if (order.schemaVersion !== "agentlas.workforce-work-order.v1") fail("work_order_invalid", "unsupported work order schema");
   assertId(order.workOrderId, "workOrder.workOrderId");
-  assertString(order.taskBrief, "workOrder.taskBrief", 4_000);
+  assertString(order.taskBrief, "workOrder.taskBrief", HUB_TASK_BRIEF_MAX);
   if (order.redacted !== true) fail("work_order_not_redacted", "work order must be explicitly redacted before Hub search");
   if (order.ontologyVersion !== WORKFORCE_ONTOLOGY_VERSION) {
     fail("work_order_ontology_stale", `work order must use ontology ${WORKFORCE_ONTOLOGY_VERSION}`);
@@ -1002,7 +1025,7 @@ function validateWorkOrder(value) {
     if (seen.has(slotId)) fail("work_order_invalid", `duplicate slot ${slotId}`);
     seen.add(slotId);
     assertString(slot.title, `roleSlots[${index}].title`, 160);
-    assertString(slot.task, `roleSlots[${index}].task`, 2_000);
+    assertString(slot.task, `roleSlots[${index}].task`, HUB_SLOT_TASK_MAX);
     if (!Number.isInteger(slot.cardinality) || slot.cardinality < 1 || slot.cardinality > 16) {
       fail("work_order_invalid", `roleSlots[${index}].cardinality must be 1-16`);
     }
@@ -1508,9 +1531,9 @@ function validateDelegationPlan(value, selection) {
     if (!assignments.has(pair)) fail("planner_invalid", "planner assigned a release outside the accepted roster");
     if (pairs.has(pair)) fail("planner_invalid", "planner created duplicate release packets");
     pairs.add(pair);
-    assertString(packet.objective, "packet.objective", 4_000);
-    assertArray(packet.inputs, "packet.inputs", 64).forEach((item, index) => assertString(item, `packet.inputs[${index}]`, 2_000));
-    assertString(packet.expectedOutput, "packet.expectedOutput", 2_000);
+    assertString(packet.objective, "packet.objective", UNBOUNDED_EXPLANATION_FIELD);
+    assertArray(packet.inputs, "packet.inputs", 64).forEach((item, index) => assertString(item, `packet.inputs[${index}]`, UNBOUNDED_EXPLANATION_FIELD));
+    assertString(packet.expectedOutput, "packet.expectedOutput", UNBOUNDED_EXPLANATION_FIELD);
   }
   if (pairs.size !== assignments.size || [...assignments.keys()].some((pair) => !pairs.has(pair))) fail("planner_missing_child", "planner must create one separate child packet for every accepted assignment");
   for (const key of ["synthesis", "verifier"]) {
@@ -1518,7 +1541,7 @@ function validateDelegationPlan(value, selection) {
     const slotId = assertId(stage.slotId, `executionPlan.${key}.slotId`);
     const releaseId = assertId(stage.agentReleaseId, `executionPlan.${key}.agentReleaseId`);
     if (!selection.assignments.some((row) => row.slotId === slotId && row.agentReleaseId === releaseId)) fail("planner_invalid", `${key} slot/release is outside the accepted roster`);
-    assertString(stage.brief, `executionPlan.${key}.brief`, 2_000);
+    assertString(stage.brief, `executionPlan.${key}.brief`, UNBOUNDED_EXPLANATION_FIELD);
     if (key === "verifier") assertArray(stage.criteria, "executionPlan.verifier.criteria", 32, { min: 1 }).forEach((item, index) => assertString(item, `verifier.criteria[${index}]`, 500));
   }
   return plan;
@@ -1558,11 +1581,11 @@ function validateNestedManagerPlan(value, graph) {
     const row = assertObject(packet, `nestedManagerPlan.packets[${index}]`);
     assertExactKeys(row, ["id", "objective", "inputs", "expectedOutput"], `nestedManagerPlan.packets[${index}]`, "planner_invalid");
     if (assertId(row.id, `nestedManagerPlan.packets[${index}].id`) !== expectedIds[index]) fail("planner_invalid", "nested worker packet order or identity drifted");
-    assertString(row.objective, `nestedManagerPlan.packets[${index}].objective`, 4_000);
-    assertArray(row.inputs, `nestedManagerPlan.packets[${index}].inputs`, 64).forEach((item, itemIndex) => assertString(item, `nestedManagerPlan.packets[${index}].inputs[${itemIndex}]`, 2_000));
-    assertString(row.expectedOutput, `nestedManagerPlan.packets[${index}].expectedOutput`, 2_000);
+    assertString(row.objective, `nestedManagerPlan.packets[${index}].objective`, UNBOUNDED_EXPLANATION_FIELD);
+    assertArray(row.inputs, `nestedManagerPlan.packets[${index}].inputs`, 64).forEach((item, itemIndex) => assertString(item, `nestedManagerPlan.packets[${index}].inputs[${itemIndex}]`, UNBOUNDED_EXPLANATION_FIELD));
+    assertString(row.expectedOutput, `nestedManagerPlan.packets[${index}].expectedOutput`, UNBOUNDED_EXPLANATION_FIELD);
   });
-  assertString(plan.synthesisBrief, "nestedManagerPlan.synthesisBrief", 2_000);
+  assertString(plan.synthesisBrief, "nestedManagerPlan.synthesisBrief", UNBOUNDED_EXPLANATION_FIELD);
   return plan;
 }
 
@@ -1637,7 +1660,7 @@ function validateVerifierResult(value, packetIds) {
     assertObject(check, "verifier check");
     assertId(check.checkId, "verifier.checkId");
     if (!["passed", "failed"].includes(check.status)) fail("verifier_invalid", "verifier check status is invalid");
-    assertString(check.evidence, "verifier.evidence", 2_000);
+    assertString(check.evidence, "verifier.evidence", UNBOUNDED_EXPLANATION_FIELD);
   }
   // 모델은 "지적 없음"을 []가 아니라 [""]로 쓰기도 한다(합격 판정 실측). 빈 문자열은
   // 내용이 아니라 부재의 오표기이므로 정규화해서 버린다 — 남은 항목만 계약 검사.
@@ -1650,7 +1673,7 @@ function validateVerifierResult(value, packetIds) {
     .map((item) => (typeof item === "string" ? item : (item == null ? "" : stableJson(item))))
     .map((item) => item.trim())
     .filter((item) => item && item !== "{}" && item !== "[]");
-  issues.forEach((item, index) => assertString(item, `verifier.issues[${index}]`, 2_000));
+  issues.forEach((item, index) => assertString(item, `verifier.issues[${index}]`, UNBOUNDED_EXPLANATION_FIELD));
   result.issues = issues;
   return result;
 }
@@ -1822,7 +1845,7 @@ function buildPrompts(task, identity) {
     `Exact direct WorkOrder example: ${stableJson(workOrderShape)}`,
     "Every roleSlots item must contain exactly slotId, title, task, cardinality, criticality, requiredCommunities, optionalCommunities, excludedCommunities, requiredRoles, requiredSkills, optionalSkills, requiredKnowledge, requiredToolCapabilities, consumes, produces, requiredAuthorities, forbiddenAuthorities, runtimes, languages, modalities, and allowedEntityKinds; minimumEvidenceLevel is the only optional extra key. Empty arrays must still be present; the host will not add them.",
     "consumes and produces are hard eligibility fields matched against exact candidate-profile declarations. Do not use them for ordinary project workflow. Describe normal inputs/outputs in task and represent inter-slot handoffs with edges and edges.artifactKinds.",
-    "workOrderId and every concept/reference id must match [A-Za-z0-9][A-Za-z0-9._:/@-]{1,255} and have total length at most 255 characters. taskBrief is limited to 4000 characters; each slot title to 160 and slot task to 2000. Each id array is limited to 256 unique items.",
+    "workOrderId and every concept/reference id must match [A-Za-z0-9][A-Za-z0-9._:/@-]{1,255} and have total length at most 255 characters. taskBrief is limited to 64000 characters; each slot title to 160 and slot task to 32000 — describe each responsibility as fully as the work honestly needs. Each id array is limited to 256 unique items.",
     "roleSlots must contain 1-32 items. cardinality must be an integer from 1 through 16. criticality must be exactly required or optional. allowedEntityKinds must be a non-empty unique subset of executable agent, team. group is ontology/discovery metadata and cannot be executed. minimumEvidenceLevel, when authored, must be exactly declared, checked, demonstrated, or attested.",
     "edges must contain at most 128 items. Every edge must contain exactly from, to, relation, and artifactKinds. from and to must reference declared slotId values. relation must be exactly one of reportsTo, handsOffTo, reviews, coordinatesWith.",
     "forbiddenCommunities and edges must be explicitly authored arrays. selectionPolicy must contain exactly allowHistoryEvidence=false, integer minimumCandidatesPerSlot from 2 through 30, and integer maximumCandidatesPerSlot from 2 through 100 that is not below the minimum.",
@@ -1846,7 +1869,7 @@ function buildPrompts(task, identity) {
     "synthesis must explicitly author slotId, agentReleaseId, and brief. verifier must explicitly author slotId, agentReleaseId, brief, and a non-empty criteria array. The host will not add, remove, normalize, or substitute a release or field.",
     // 호스트가 강제하는 상한을 미리 알려준다 — 알려주지 않은 상한은 첫 시도를 반드시
     // 깨고 교정 1회로도 회복되지 않는다(2026-07-27 라이브 실측, 중첩 매니저 동일 계열).
-    "Field bounds are hard: each packet objective at most 3800 characters, each expectedOutput at most 1900, at most 64 inputs of at most 1900 characters each, each synthesis/verifier brief at most 1900, and at most 32 verifier criteria of at most 450 characters each. Write briefs and criteria tightly.",
+    "Objectives, inputs, expectedOutput, and briefs have no character limit — write them as long as the work honestly needs. Only counts are bounded: at most 64 inputs per packet and at most 32 verifier criteria of at most 450 characters each.",
   ].join("\n");
   return {
     searchSystem: [
@@ -3526,7 +3549,7 @@ function create(deps = {}) {
           "Every packet contains exactly id, objective, inputs, expectedOutput. No worker may be omitted, added, reordered, or substituted.",
           // 상한을 말해주지 않으면 첫 시도가 반드시 상한을 넘고, 교정 1회로도 못 줄인다
           // (2026-07-27 라이브 실측: synthesisBrief > 2000자로 4워커 런이 통째로 폐기).
-          "Field bounds are hard: synthesisBrief at most 1900 characters, each packet objective at most 3800, each expectedOutput at most 1900, and at most 64 inputs of at most 1900 characters each. Write briefs tightly; do not restate the packet contents.",
+          "synthesisBrief, objective, expectedOutput, and inputs have no character limit — write them as long as the work honestly needs. Only the count is bounded: at most 64 inputs per packet.",
         ].join("\n");
         let attemptPrompt = stableJson({ sharedTask: workOrder.taskBrief, roleSlot: slotById.get(packet.slotId), packet, declaredWorkerIds: exactWorkerIds });
         let priorDigest = null;
@@ -3954,7 +3977,7 @@ function create(deps = {}) {
           'Return exactly one JSON object: {"schemaVersion":"agentlas.workforce-verification.v1","status":"passed|failed","failedPacketIds":[],"checks":[{"checkId":"check:<id>","status":"passed|failed","evidence":"..."}],"issues":[]}.',
           "Use double-quoted valid JSON. Passing requires evidence for every criterion; do not rubber-stamp.",
           `If status is failed, failedPacketIds must contain one or more exact ids from this delegation plan: ${stableJson(delegationPlan.packets.map((packet) => packet.packetId))}. If status is passed, it must be empty.`,
-          "Every issues entry and every evidence value must be a plain string of at most 1900 characters; cite handoffs by slot id instead of quoting them at length.",
+          "issues entries and evidence values are plain strings with no character limit — state the full reasoning a reader needs to act on the verdict. Only the count is bounded: at most 64 checks and 64 issues.",
         ].join("\n");
         let verifierPrompt = stableJson({ workOrder, criteria: delegationPlan.verifier.criteria, handoffs: outputs, synthesis: finalText });
         let verifierParseAttempts = 0;
