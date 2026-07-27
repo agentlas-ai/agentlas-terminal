@@ -42,12 +42,24 @@
   invalid `--permission` values are refused before any model call instead
   of being silently downgraded to read; `no_runtime` now prints the exact
   CLI install commands.
+- Release validation pins Agentlas Core v1.1.67 commit
+  `04258b7541f604479dc04279146a506e363ad85e` (carried from 0.9.10).
 - smoke gate: 54 checks (surface, no-arg guards, fresh bootstrap, 30+
   restored/new contract tests, runtime-doctor 3-product parity) — all
   green. Verified end to end against a packed tarball installed with
   `npm i -g` into a clean prefix and a pristine userData.
 
 ## 0.9.10 — 2026-07-26
+
+- `agentlas context refresh|refs|slice|impact|verify` now invokes the installed
+  Agentlas Core module directly. Context commands no longer fall through the
+  natural-language Hephaestus command route.
+- Context Slice generation refreshes the project fingerprint before each
+  concrete Terminal task, so a long-running Terminal session sees newly added
+  or changed CommonJS, ESM, TypeScript, and JavaScript files.
+- Release validation pins Agentlas Core v1.1.67 commit
+  `04258b7541f604479dc04279146a506e363ad85e`, including Code Map v2 backlinks,
+  functional Sitemap dependencies, and fail-closed impact verification.
 
 - Concurrent Terminal work against the Desktop-shared SQLite database now uses
   one bounded lock policy. Every Terminal write transaction acquires writer
@@ -68,6 +80,7 @@
   respects a real 40-column terminal while preserving arrow-key selection.
 - Top-level runtime failures follow the saved Terminal language, including
   unknown runtime names and the no-runtime-available recovery message.
+## 0.9.9 — 2026-07-26
 
 - In an explicitly initialized project, ordinary runs, firms, Stormbreaker, and
   Workforce now receive the same local Context Slice from Agentlas OS v1.1.66
