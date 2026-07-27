@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.0.8 — 2026-07-27
+## 1.0.9 — 2026-07-27
 
 Three repairs of one mistake, found by a live run that a 4-agent task force
 (two of them managers over 8 and 10 sub-workers) completed in full before the
