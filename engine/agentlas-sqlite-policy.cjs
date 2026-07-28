@@ -6,15 +6,26 @@
 // fail immediately with SQLITE_BUSY even when busy_timeout is configured.
 const SQLITE_BUSY_TIMEOUT_MS = 15_000;
 
+// `foreign_keys` 는 파일이 아니라 **커넥션** 속성이다. 데스크탑은
+// `electron/store/db.ts` 에서 `foreign_keys = ON` 으로 열고, 터미널은 켜지 않아
+// **같은 테이블인데 터미널이 쓰는 행만 참조 무결성 검사를 건너뛰고 있었다**
+// (2026-07-28 확인). journal_mode 처럼 파일에 박히는 값이 아니라서 한쪽이 켠 것이
+// 다른 쪽에 전파되지 않는다. 스키마 소유는 데스크탑이므로 그 규칙을 그대로 따른다.
+const SQLITE_CONNECTION_PRAGMAS = [
+  `busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`,
+  "foreign_keys = ON",
+];
+
 function configureSqliteConnection(db) {
   if (!db) throw new TypeError("SQLite connection is required");
-  if (typeof db.pragma === "function") {
-    db.pragma(`busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
-  } else if (typeof db.exec === "function") {
-    db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
-  } else {
-    throw new TypeError("SQLite connection must expose pragma() or exec()");
-  }
+  const applyPragma =
+    typeof db.pragma === "function"
+      ? (statement) => db.pragma(statement)
+      : typeof db.exec === "function"
+        ? (statement) => db.exec(`PRAGMA ${statement}`)
+        : null;
+  if (!applyPragma) throw new TypeError("SQLite connection must expose pragma() or exec()");
+  for (const statement of SQLITE_CONNECTION_PRAGMAS) applyPragma(statement);
   return db;
 }
 

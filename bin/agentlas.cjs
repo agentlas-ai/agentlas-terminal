@@ -117,9 +117,23 @@ function bootstrapDbIfMissing() {
   const dir = path.dirname(p);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   securePrivateMode(dir, 0o700);
+  // 존재 여부만 보면 **0바이트 파일이 부트스트랩을 영구히 막는다.** 실측 2026-07-28:
+  // `sqlite3 <없는경로> 'PRAGMA user_version;'` 같은 무해한 명령 하나가 빈 파일을 남기고,
+  // 그 뒤 모든 실행이 "이미 있음"으로 판단해 스키마 없이 진행하다 `no such table` 로
+  // 죽는다. 사용자에게는 원인이 전혀 안 보이는 상태다.
+  //
+  // SQLite 파일은 최소 한 페이지(512바이트)를 갖는다. 0바이트는 DB 가 아니라 자리만
+  // 잡힌 파일이므로 없는 것으로 취급해 정상 부트스트랩 경로를 태운다. 내용이 있는데
+  // 손상된 경우는 여기서 판단하지 않는다 — 그건 복구지 부트스트랩이 아니고, 멀쩡한
+  // DB 를 빈 것으로 오판해 덮어쓰는 위험이 훨씬 크다.
   if (exists(p)) {
-    securePrivateMode(p, 0o600);
-    return { created: false, path: p };
+    let empty = false;
+    try { empty = fs.statSync(p).size === 0; } catch { empty = false; }
+    if (!empty) {
+      securePrivateMode(p, 0o600);
+      return { created: false, path: p };
+    }
+    try { fs.rmSync(p, { force: true }); } catch { /* 지울 수 없으면 아래 link 가 EEXIST 로 알려준다 */ }
   }
   const schemaFile = path.join(PKG_ROOT, "engine", "bootstrap-schema.sql");
   if (!exists(schemaFile)) {

@@ -32,13 +32,9 @@ function sha(value) {
   return crypto.createHash("sha256").update(value).digest("hex");
 }
 
-function ensureMemoryContextColumn(db) {
-  try {
-    if (tableExists(db, "memory_entries") && !columnExists(db, "memory_entries", "context_json")) {
-      db.exec("ALTER TABLE memory_entries ADD COLUMN context_json TEXT NOT NULL DEFAULT '{}'");
-    }
-  } catch { /* ignore */ }
-}
+// 사본 3벌을 하나로 합치고 커넥션당 1회로 줄였다 — 이 보정이 매 턴 공유 DB 에
+// 쓰기 락을 잡고 있었다(2026-07-28). 소유자는 데스크탑 스키마다.
+const { ensureMemoryContextColumn } = require("../core/schema-ensure.cjs");
 
 function prefsLangCli() {
   try {

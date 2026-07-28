@@ -84,7 +84,20 @@ function resolveCoreRuntimeRootFromCandidates(candidateRoots, requiredMarkers = 
         const version = readCoreRuntimeVersion(root);
         if (!version || compareSemVer(version, minVersion) < 0) continue;
       }
-      return root;
+      // `~/.agentlas/runtime/current` 는 업데이터가 원자적으로 갈아 끼우는 심볼릭
+      // 링크다. 그 경로를 그대로 넘기면 Python 이 import 를 늦게 해석하는 특성상,
+      // 긴 실행 도중 업데이트가 일어나면 **옛 버전 모듈과 새 버전 모듈이 한 프로세스에
+      // 섞여 로드된다** — 어떤 버전에서도 시험된 적 없는 조합이고 버전 번호로는
+      // 재현조차 못 한다(감사 D3).
+      //
+      // 실경로로 고정해도 라이브 버전 선택은 그대로다: **다음** 호출이 다시 해석해
+      // 새 릴리스를 집는다. 없어지는 것은 실행 중 교체뿐이다.
+      try {
+        return fs.realpathSync(root);
+      } catch {
+        // 링크를 읽을 수 없다고 실행을 거부할 이유는 없다 — 이전 동작대로 경로를 쓴다.
+        return root;
+      }
     } catch {
       // Continue to the next installed/bundled root.
     }

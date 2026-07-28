@@ -88,13 +88,10 @@ function contextLine(json) {
   }
 }
 
-function ensureMemoryContextColumn(db) {
-  try {
-    if (tableExists(db, "memory_entries") && !columnExists(db, "memory_entries", "context_json")) {
-      db.exec("ALTER TABLE memory_entries ADD COLUMN context_json TEXT NOT NULL DEFAULT '{}'");
-    }
-  } catch { /* 앱 마이그레이션 중이면 다음 턴에 */ }
-}
+// 사본 3벌을 하나로 합치고 커넥션당 1회로 줄였다. 이 파일의 호출부는 **매 턴** 도는
+// 자리라(cliMemoryContext), 여기가 공유 DB 에 쓰기 락을 가장 자주 잡던 지점이었다.
+// 실패는 여전히 다음 호출에서 재시도된다 — 실패를 "완료"로 기억하지 않는다.
+const { ensureMemoryContextColumn } = require("../core/schema-ensure.cjs");
 
 /** Context Map 슬라이스 — Core 부재 시 정직하게 빈 문자열 (조작된 지도 금지). */
 function cliProjectContextSlice(projectPath, task) {

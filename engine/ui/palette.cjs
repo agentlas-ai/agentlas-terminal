@@ -68,7 +68,11 @@ const SLASH_COMMANDS = [
   { command: "/variant", args: "resolve", ko: "로컬 변형 선택", en: "Local variant selection" },
   { command: "/memory", args: "<sub>", ko: "메모리", en: "Memory" },
   { command: "/evolve", args: "", ko: "프롬프트 진화 제안", en: "Prompt-evolution proposals" },
-  { command: "/ontology", args: "", ko: "프로젝트 지식", en: "Project knowledge" },
+  // 데스크탑의 `ontology` 는 Core 의 지식·메모리 **런타임**(임베딩 포함)이고, 터미널의
+  // 이것은 **이 프로젝트의 지식 소스 등록부**다. 서로 다른 것이 같은 이름을 쓰고 있어
+  // (감사 D6) 라벨이라도 정확해야 한다 — 명령 이름은 사용자 습관과 스크립트가 걸려
+  // 있어 바꾸지 않는다. Core 의 지식 런타임은 터미널에 아직 미노출이다(결함 아님).
+  { command: "/ontology", args: "", ko: "프로젝트 지식 소스 등록", en: "Project knowledge sources" },
   { command: "/career-graph", args: "", ko: "소스 라우팅 그래프", en: "Source routing graph" },
   { command: "/journal", args: "<sub>", ko: "Stormbreaker 실행 일지", en: "Stormbreaker run journal" },
   { command: "/project", args: "[status|init]", ko: ".agentlas 프로젝트 상태", en: "Private project state" },

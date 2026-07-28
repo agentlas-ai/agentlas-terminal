@@ -31,13 +31,9 @@ function loadArch() {
   return _arch;
 }
 
-function ensureMemoryContextColumn(db) {
-  try {
-    if (tableExists(db, "memory_entries") && !columnExists(db, "memory_entries", "context_json")) {
-      db.exec("ALTER TABLE memory_entries ADD COLUMN context_json TEXT NOT NULL DEFAULT '{}'");
-    }
-  } catch { /* ignore */ }
-}
+// 사본 3벌을 하나로 합치고 커넥션당 1회로 줄였다 — 이 보정이 매 턴 공유 DB 에
+// 쓰기 락을 잡고 있었다(2026-07-28). 소유자는 데스크탑 스키마다.
+const { ensureMemoryContextColumn } = require("../core/schema-ensure.cjs");
 
 const SECRET_RE = [/\b(?:sk|pk|rk)-[A-Za-z0-9]{16,}/, /AKIA[0-9A-Z]{16}/, /ghp_[A-Za-z0-9]{20,}/, /xox[baprs]-[A-Za-z0-9-]{10,}/, /-----BEGIN [A-Z ]*PRIVATE KEY-----/, /\b(?:password|passwd|secret|api[_-]?key|access[_-]?token|bearer)\b\s*[:=]\s*\S+/i];
 

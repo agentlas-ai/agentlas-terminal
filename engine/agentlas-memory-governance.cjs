@@ -163,7 +163,17 @@ function tableExists(db, name) {
   }
 }
 
+// 커넥션당 1회. 이전에는 `beginTurn`/`listScopedTimeline` 이 부를 때마다, 즉 **매 턴**
+// 공유 DB 에 테이블 4개 + 인덱스 5개 DDL 과 `UPDATE … stale` 을 날렸다. 전부
+// IF NOT EXISTS 라 결과는 멱등이지만 쓰기 락을 잡는 것은 매번이었고, 데스크탑
+// 마이그레이션과 겹치면 15초 busy_timeout 을 소진했다(2026-07-28).
+const { ensureOnce } = require("./core/schema-ensure.cjs");
+
 function ensureGovernanceSchema(db) {
+  return ensureOnce(db, "terminal_memory.schema", (conn) => ensureGovernanceSchemaOnce(conn));
+}
+
+function ensureGovernanceSchemaOnce(db) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS terminal_memory_turn_intents (
       turn_id TEXT PRIMARY KEY,

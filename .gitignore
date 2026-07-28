@@ -12,15 +12,18 @@ credentials/
 .bug-hunter/
 
 # Development-only material. The npm package is built from runtime paths;
-# fixtures, benchmarks, docs, receipts, and generated output stay local.
+# tests, fixtures, benchmarks, docs, receipts, and generated output stay local.
 #
-# test/ is deliberately NOT ignored (2026-07-28). npm publication is already
-# bounded twice over — package.json "files" allowlists only bin/ engine/
-# install.* CHANGELOG README, and the release CI re-scans the packed tarball —
-# so ignoring test/ never protected the published package. What it did do was
-# hide 23 of 52 suites from GitHub, where smoke.sh's `if [ -f ]` loop then
-# skipped them silently: the release gate reported "66 passed" locally while
-# roughly 41 ran in CI. A test that cannot run in CI is not a gate.
+# test/ is ignored again (오너 결정 2026-07-28). 오늘 낮에 이걸 잠깐 해제했는데,
+# 근거가 "CI 에서 못 도는 테스트는 게이트가 아니다" 였다. 그 전제가 틀렸다 — 이
+# 제품의 CI 는 굽고 서명하고 배포만 하며 스위트를 돌리지 않는 것이 방침이고,
+# 테스트는 로컬에서 돌린다(`bash test/smoke.sh`, `bash ../test_CI/run.sh`).
+# 데스크탑 저장소도 같은 방침이다(scripts/test-*.cjs 무시).
+#
+# 그러니 공개 저장소에 테스트를 둘 이유가 없다. 게이트가 죽는 문제는 GitHub 가 아니라
+# **전체를 돌리는 진입점이 없던 것**이 원인이었고, 그건 test_CI/run.sh 로 해결했다.
+test/
+**/test/
 tests/
 **/tests/
 benchmarks/

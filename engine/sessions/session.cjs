@@ -124,6 +124,25 @@ class Session extends EventEmitter {
     return result;
   }
 
+  /**
+   * 이미 동의된 시스템 MCP 서버 목록. `full` 권한이 아니면 빈 배열이다.
+   *
+   * 권한 확인을 여기서 한 번 더 하는 이유: native-host 도 `full` 게이트를 갖고
+   * 있지만, 권한이 낮은 턴에서 목록을 **읽는 것 자체를** 하지 않는 편이 낫다.
+   * 읽지 않은 값은 실수로 새 나갈 수 없다.
+   */
+  _consentedMcpServers() {
+    if (permissions.normalize(this.permission) !== "full") return [];
+    try {
+      const consent = require("../mcp/consent.cjs");
+      return consent.readConsentedSystemMcpServers(this.db, { env: process.env }) || [];
+    } catch {
+      // 동의 상태를 못 읽으면 MCP 없이 간다. 여기서 실패해 턴을 죽이면,
+      // MCP 는 부가 기능인데 대화 자체가 불가능해진다.
+      return [];
+    }
+  }
+
   async _runTurn(prompt) {
     this.status = "running";
     this.startedAt = Date.now();
@@ -196,6 +215,19 @@ class Session extends EventEmitter {
         session: { ...this.runtimeSession },
         model: this.runtime.model,
         effort: this.runtime.effort,
+        // 사용자가 이미 동의한 MCP 서버를 턴에 싣는다.
+        //
+        // 여기가 비어 있어서 챗 경로의 MCP 가 통째로 죽어 있었다(2026-07-28 확인:
+        // `mcpServers` 를 넘기는 호출자가 0곳). native-host 는 `full` 권한에서만
+        // 주입하도록 이미 게이팅돼 있었는데, 그 분기에 도달할 데이터를 아무도
+        // 채우지 않았다 — `agentlas mcp probe` 가 connected 를 찍어도 실제 턴에서는
+        // 그 서버를 쓸 수 없었다.
+        //
+        // 여기서 새로 묻지 않는다. `readConsentedSystemMcpServers` 는 이미 받아 둔
+        // 동의 영수증과 지문이 **지금도 일치하는** 서버만 돌려준다. 동의가 없으면
+        // 빈 배열이고, native-host 가 명시적 빈 격리로 간다. 턴 도중에 동의를 묻는
+        // 것은 사용자가 답할 수 없는 자리에서 묻는 것이라 하지 않는다.
+        mcpServers: this._consentedMcpServers(),
         onSpawn: (child) => { this._child = child; },
       };
       if (this._spawnImpl) req.spawn = this._spawnImpl;
