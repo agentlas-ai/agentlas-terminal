@@ -40,6 +40,13 @@ const USAGE = Object.freeze({
   call: 'usage: agentlas call "<agent-slugs>" "<context>"',
   connect: "usage: agentlas connect [status|telegram|help]",
   hep: "usage: agentlas hep <subcommand> [args]",
+  // 소스 스코프를 지키는 스태핑 표면 3종. 이름이 곧 계약이라 usage 도 스코프를
+  // 문장으로 적는다 — 이전에는 별칭이 스코프를 버려 hep-cloud 가 자산 보관함
+  // usage 를, hep-hub 가 검색 목록을 뱉었다(2026-07-28 수리).
+  "hep-network": 'usage: agentlas hep-network "<request>"  # Local + owner Cloud + public Hub, federated by Core',
+  "hep-local": 'usage: agentlas hep-local "<request>"   # registered Local agents only',
+  "hep-cloud": 'usage: agentlas hep-cloud "<request>"   # owner Agent Cloud agents only',
+  "hep-hub": 'usage: agentlas hep-hub "<request>"     # public Agentlas Hub agents only',
   hephaestus: "usage: agentlas hephaestus <subcommand> [args]",
   journal: "usage: agentlas journal <status|verify|repair|gate> --run-id <id> | --journal <path>",
   "legacy-network": 'usage: agentlas legacy-network "<request>"',

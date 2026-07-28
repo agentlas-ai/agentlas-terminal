@@ -117,6 +117,27 @@ class Orchestrator extends EventEmitter {
     if (!session) return;
     if (session.isBusy()) session.kill();
     this.sessions.delete(key);
+
+    // 부모를 지워도 자식 세션은 살아 있다(실행 중이며 병렬 슬롯을 쥔 채일 수 있다).
+    // 자식의 parent 포인터가 지워진 세션을 계속 가리키면 list()의 루트 판정
+    // (!s.parent)에서 탈락하고, 어떤 루트에서도 닿지 않아 /sessions·/tree 에서
+    // 통째로 사라진다 — 실행 중인데 보이지도 끌 수도 없는 유령 세션이 된다.
+    // 그래서 세션이 맵을 떠날 때 트리를 함께 정리한다: 남은 자식은 살아 있는
+    // 조부모로 승계하고(없으면 루트로 승격), 지워진 키는 부모 목록에서 뗀다.
+    const grandparent = session.parent && this.sessions.has(session.parent.key) ? session.parent : null;
+    for (const childKey of session.children) {
+      const child = this.sessions.get(childKey);
+      if (!child) continue;
+      child.parent = grandparent;
+      if (grandparent && !grandparent.children.includes(childKey)) grandparent.children.push(childKey);
+    }
+    session.children = [];
+    if (session.parent) {
+      const siblings = session.parent.children;
+      const at = siblings.indexOf(key);
+      if (at >= 0) siblings.splice(at, 1);
+    }
+
     if (this.activeKey === key) {
       const rest = [...this.sessions.keys()];
       this.activeKey = rest.length ? rest[rest.length - 1] : null;
@@ -124,14 +145,31 @@ class Orchestrator extends EventEmitter {
     this.emit("sessions-changed");
   }
 
+  /**
+   * 전 세션 브로드캐스트 — {sent, skipped}를 반환한다(throw 하지 않는다).
+   *
+   * WHY: 예전엔 루프 안에서 sendTo()의 throw가 그대로 올라갔다. 동시 상한(기본 4)보다
+   * 유휴 세션이 많으면 앞의 몇 개는 이미 프롬프트를 받아 실행을 시작한 뒤 상한 세션에서
+   * 터졌고, 그때까지 모은 sent 배열은 스택과 함께 버려졌다. 호출자(REPL)는 상한 에러
+   * 한 줄만 찍어 "전부 실패"로 보고했지만 실제로는 4개 세션이 그 지시를 받아 토큰을
+   * 쓰고 쓰기 작업까지 할 수 있는 상태였다 — 부분 성공을 전면 실패로 오보하는 것은
+   * 브로드캐스트에서 가장 위험한 거짓말이다.
+   * 그래서 실패는 세션 단위로 모으고, 실제 전달된 목록은 무슨 일이 있어도 반환한다.
+   * (sendTo/spawn의 "상한 초과는 정직한 거부" 계약 자체는 그대로 둔다.)
+   */
   broadcast(prompt) {
     const sent = [];
+    const skipped = [];
     for (const [key, session] of this.sessions) {
       if (session.status === "killed") continue;
-      this.sendTo(key, prompt);
-      sent.push(key);
+      try {
+        this.sendTo(key, prompt);
+        sent.push(key);
+      } catch (e) {
+        skipped.push({ key, error: String((e && e.message) || e) });
+      }
     }
-    return sent;
+    return { sent, skipped };
   }
 
   /** 세션 표: [{key, active, agent, status, elapsed, lastLine, parentKey, depth}] */

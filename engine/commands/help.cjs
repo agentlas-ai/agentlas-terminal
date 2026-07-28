@@ -22,12 +22,13 @@ AGENTS & HUB
   import <path> · cd · native prepare  local folder agents
   list                     installed agents/companies + orchestrator/worker runtimes
   experience <sub>         portable Experience: list|inspect|validate|save|publish|status|export|unpublish
-  variant resolve          local variant selection
+  variant resolve --base-release <id>   local variant selection (variant help)
 
 EXECUTE
   storm <goal>             Goal+UltraCode harness: plan → allocate → execute → verify  [--research]
   swarm <goal>             emergent agent swarm  [--parallel N]
   workforce | network <request>   Agent Workforce Ontology route
+  hep-local | hep-cloud | hep-hub "<request>"   same, restricted to one source scope
   call "a,b" "<ctx>" · browser · route "<req>" [--json] · research <sub>
 
 KNOWLEDGE

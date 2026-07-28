@@ -73,6 +73,13 @@ async function run(ctx, args) {
     const { EFFORTS, TIERS } = require("../agentlas-workload-routing.cjs");
     const { Orchestrator } = require("../sessions/orchestrator.cjs");
     const permissions = require("../agentlas-permissions.cjs");
+    // 플래그 검증은 CEO 계획 턴을 부르기 전에. normalize는 모르는 값을 read로 fail-closed
+    // 강등하는데, firm은 그 권한을 CEO·본부 전 세션·종합 턴까지 그대로 물려주므로 조용히
+    // 강등하면 full을 요청한 사용자가 쓰기 차단된 채 3-tier 전체를 돌린 줄 모른다 (run.cjs 동일 가드).
+    if (flags.permission && !permissions.LEVELS.includes(String(flags.permission))) {
+      ctx.err(`unknown --permission ${flags.permission} (use: ${permissions.LEVELS.join(" | ")})`);
+      return 1;
+    }
     if (flags.effort && !EFFORTS.includes(String(flags.effort))) {
       ctx.err(`unknown --effort ${flags.effort} (use: ${EFFORTS.join(" | ")})`);
       return 1;

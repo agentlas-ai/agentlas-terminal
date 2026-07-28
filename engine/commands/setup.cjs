@@ -10,20 +10,20 @@ const { userDataDir } = require("../core/paths.cjs");
 const { RUNTIME_BIN, whichSync } = require("../runtimes/detect.cjs");
 
 async function runWizard(ctx, rl) {
-  const result = await runOnboard({
+  // 저장을 마법사 "밖"에서 하면 이미 "완료" 문구가 찍힌 뒤다. 저장 함수를 넘겨
+  // 성공 문구보다 먼저 쓰게 하고, updatePrefs가 던지는 실패를 그대로 올려보낸다
+  // (예전엔 반환값을 버려서 잠금 경합·읽기전용 디렉터리에서도 exit 0으로 거짓말).
+  return runOnboard({
     ui: ctx.uiInstance,
     rl,
     helpers: { RUNTIME_BIN, which: whichSync },
-  });
-  if (result && result.onboarded) {
-    updatePrefs(userDataDir(), {
+    persist: (choices) => updatePrefs(userDataDir(), {
       onboarded: true,
-      ...(result.lang ? { language: result.lang } : {}),
-      ...(result.runtime ? { runtime: result.runtime } : {}),
-      ...(result.permission ? { permission: result.permission } : {}),
-    });
-  }
-  return result;
+      ...(choices.lang ? { language: choices.lang } : {}),
+      ...(choices.runtime ? { runtime: choices.runtime } : {}),
+      ...(choices.permission ? { permission: choices.permission } : {}),
+    }),
+  });
 }
 
 async function run(ctx) {
@@ -36,7 +36,8 @@ async function run(ctx) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
     const result = await runWizard(ctx, rl);
-    return result && result.onboarded ? 0 : 1;
+    // 저장까지 성공해야 0 — 설정이 디스크에 없으면 사용자에겐 아무것도 안 한 것과 같다.
+    return result && result.onboarded && result.saved ? 0 : 1;
   } finally {
     rl.close();
   }

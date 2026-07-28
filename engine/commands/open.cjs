@@ -25,7 +25,11 @@ function run(ctx, args) {
     return 1;
   }
   if (rows.length > 1) {
-    ctx.err(ko ? `모호합니다 — 더 긴 접두사를 쓰세요 (${rows.map((r) => r.id.slice(0, 8)).join(", ")})` : `Ambiguous — use a longer prefix (${rows.map((r) => r.id.slice(0, 8)).join(", ")})`);
+    // 안내 접두사는 사용자가 입력한 것보다 반드시 길어야 한다 — chats 목록이
+    // 8자를 찍으므로, 8자로 고정하면 8자 충돌 시 같은 문자열 두 개를 돌려주는
+    // 막다른 길이 된다("더 긴 접두사"를 만들 방법이 없음).
+    const hintLen = Math.max(8, prefix.length + 4);
+    ctx.err(ko ? `모호합니다 — 더 긴 접두사를 쓰세요 (${rows.map((r) => r.id.slice(0, hintLen)).join(", ")})` : `Ambiguous — use a longer prefix (${rows.map((r) => r.id.slice(0, hintLen)).join(", ")})`);
     return 1;
   }
   const chat = rows[0];

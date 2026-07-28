@@ -112,6 +112,41 @@ function resolveTargetAgent(db, row) {
 }
 
 /**
+ * 이 터미널이 실행할 수 없는 계열 판정 — 실행 게이트와 due 셀렉션의 유일한 정본.
+ * store.runnerUnsupportedSql 의 SQL 술어와 반드시 같은 조건을 본다(갈리면 굶주림이
+ * 되돌아온다: 셀렉션이 담은 행을 실행기가 거부하면 그 행이 due 창을 영구 점유한다).
+ *
+ * Hub 타깃: 데스크탑은 정확 릴리스 핀 + Hub 런타임으로 실행한다
+ * (automation-scheduler.ts:573-630 hub_version_pin 게이트) — 터미널에는 그 실행
+ * 계층이 없으므로 위장 실행 금지, 정직 스킵.
+ * tool_mode 'browser'/'computer-use': 데스크탑은 Agentlas Browser/컴퓨터유즈 러너를
+ * 배선하고 권한 프리플라이트까지 건다(automation-scheduler.ts:619-625). 터미널
+ * 세션 계층에는 그 러너가 없다 — 평문 세션으로 돌리는 조용한 다운그레이드 대신
+ * 정직 스킵으로 Desktop 실행분(회차)을 그대로 남겨 둔다.
+ * @returns {{reason:string, message:string}|null}
+ */
+function runnerSkip(db, row, ko) {
+  if (row.target_type === "hub") {
+    return {
+      reason: "hub-target-unsupported",
+      message: ko
+        ? `Hub 타깃 자동화는 터미널 데몬이 실행하지 않습니다(정확 릴리스 핀 실행은 Desktop 스케줄러 몫): ${row.name}`
+        : `Hub-target automations are not run by the terminal daemon (exact-release Hub execution belongs to the Desktop scheduler): ${row.name}`,
+    };
+  }
+  const rowToolMode = columnExists(db, "automations", "tool_mode") ? row.tool_mode : null;
+  if (rowToolMode === "browser" || rowToolMode === "computer-use") {
+    return {
+      reason: "tool-mode-unsupported",
+      message: ko
+        ? `tool_mode '${rowToolMode}' 자동화는 터미널 데몬이 실행하지 않습니다(브라우저/컴퓨터유즈 러너는 Desktop 몫): ${row.name}`
+        : `tool_mode '${rowToolMode}' automations are not run by the terminal daemon (the browser/computer-use runner belongs to Desktop): ${row.name}`,
+    };
+  }
+  return null;
+}
+
+/**
  * 자동화 1건 실행(헤드리스). 권한은 자동화 행의 permission 열(있으면), 없으면 "write".
  * opts:
  *   advanceSchedule  데몬 경로 true / run-now false (v1과 동일)
@@ -131,26 +166,10 @@ async function runAutomationOnce(ctx, db, row, opts = {}) {
     return { ok: false, skipped: true, reason: "disabled" };
   }
   // ── 터미널이 충실히 실행할 수 없는 계열은 리스를 잡지 않고 스킵한다 ──
-  // 리스/스케줄을 소비하면 데스크탑 스케줄러가 그 회차를 영영 실행하지 못한다.
-  // Hub 타깃: 데스크탑은 정확 릴리스 핀 + Hub 런타임으로 실행한다
-  // (automation-scheduler.ts:573-630 hub_version_pin 게이트) — 터미널에는 그
-  // 실행 계층이 없으므로 위장 실행 금지, 정직 스킵.
-  if (row.target_type === "hub") {
-    ctx.err(ko
-      ? `Hub 타깃 자동화는 터미널 데몬이 실행하지 않습니다(정확 릴리스 핀 실행은 Desktop 스케줄러 몫): ${row.name}`
-      : `Hub-target automations are not run by the terminal daemon (exact-release Hub execution belongs to the Desktop scheduler): ${row.name}`);
-    return { ok: false, skipped: true, reason: "hub-target-unsupported" };
-  }
-  // tool_mode 'browser'/'computer-use': 데스크탑은 Agentlas Browser/컴퓨터유즈
-  // 러너를 배선하고 권한 프리플라이트까지 건다(automation-scheduler.ts:619-625).
-  // 터미널 세션 계층에는 그 러너가 없다 — 평문 세션으로 돌리는 조용한 다운그레이드
-  // (위장 실행) 대신 정직 스킵으로 Desktop 실행분을 남겨 둔다.
-  const rowToolMode = columnExists(db, "automations", "tool_mode") ? row.tool_mode : null;
-  if (rowToolMode === "browser" || rowToolMode === "computer-use") {
-    ctx.err(ko
-      ? `tool_mode '${rowToolMode}' 자동화는 터미널 데몬이 실행하지 않습니다(브라우저/컴퓨터유즈 러너는 Desktop 몫): ${row.name}`
-      : `tool_mode '${rowToolMode}' automations are not run by the terminal daemon (the browser/computer-use runner belongs to Desktop): ${row.name}`);
-    return { ok: false, skipped: true, reason: "tool-mode-unsupported" };
+  const unsupported = runnerSkip(db, row, ko);
+  if (unsupported) {
+    ctx.err(unsupported.message);
+    return { ok: false, skipped: true, reason: unsupported.reason };
   }
   if (!store.leaseSupported(db)) {
     // 리스 열이 없는 DB에서는 Desktop 과의 배타성을 증명할 수 없다 — fail-closed.
@@ -268,17 +287,31 @@ async function daemonTick(ctx, db, opts = {}) {
   const nowIso = (opts.now || new Date()).toISOString();
   let due = [];
   try {
-    due = store.dueAutomations(db, nowIso, 5);
+    // 실행 창은 "이 실행기가 실제로 실행할 수 있는" 행만 담는다 (runnable: true).
+    // 미지원 계열/남의 리스 행은 스킵돼도 next_run_at 이 전진하지 않으므로, 창에
+    // 담으면 시간순 LIMIT 5 의 머리를 영구 점유해 뒤의 자동화를 전부 굶긴다.
+    due = store.dueAutomations(db, nowIso, 5, { runnable: true });
   } catch (e) {
     ctx.err("Failed to query due automations: " + String((e && e.message) || e));
     return 0;
   }
+  // 미지원 계열은 실행 창에서 빠졌어도 존재 사실은 정직하게 알린다 — Desktop 몫으로
+  // 남겨둔 회차이므로 틱마다 반복하지 않고 데몬 수명당 1회만 고지한다.
+  if (opts.skipAnnounced) {
+    let deferred = [];
+    // 고지 상한 50 — 실행 창(5)과 달리 이 목록은 실행에 쓰이지 않으므로 넉넉해도 안전하다.
+    try { deferred = store.dueAutomations(db, nowIso, 50, { runnable: false }); } catch { /* best-effort */ }
+    for (const row of deferred) {
+      if (opts.skipAnnounced.has(row.id)) continue;
+      const skip = runnerSkip(db, row, ctx.lang === "ko");
+      if (!skip) continue;
+      ctx.err(skip.message);
+      opts.skipAnnounced.add(row.id);
+    }
+  }
   let ran = 0;
   for (const row of due) {
     if (opts.shouldStop && opts.shouldStop()) break;
-    // 터미널 미지원 계열(hub 타깃/browser/computer-use)은 due 로 계속 남는다 —
-    // Desktop 몫으로 남겨둔 것이므로 틱마다 같은 안내를 반복하지 않는다.
-    if (opts.skipAnnounced && opts.skipAnnounced.has(row.id)) continue;
     ran += 1;
     const result = await runAutomationOnce(ctx, db, row, {
       advanceSchedule: true,
@@ -288,12 +321,15 @@ async function daemonTick(ctx, db, opts = {}) {
       spawnImpl: opts.spawnImpl,
       timeoutConfig: opts.timeoutConfig,
     });
-    if (
-      opts.skipAnnounced && result && result.skipped &&
-      (result.reason === "hub-target-unsupported" || result.reason === "tool-mode-unsupported")
-    ) {
-      opts.skipAnnounced.add(row.id);
-      continue; // 스케줄/1회성 비활성화도 건드리지 않는다 — Desktop 이 실행해야 할 회차다.
+    // 스킵은 회차를 소비하지 않는다 — 1회성 비활성화조차 건드리지 않는다.
+    // (미지원 계열은 Desktop 몫이고, lease 스킵은 지금 남이 돌리는 회차다. 셀렉션과
+    //  실행 사이의 리스 레이스로 스킵된 1회성 행을 여기서 꺼 버리면 그 실행은 영영 사라진다.)
+    if (result && result.skipped) {
+      if (
+        opts.skipAnnounced &&
+        (result.reason === "hub-target-unsupported" || result.reason === "tool-mode-unsupported")
+      ) opts.skipAnnounced.add(row.id);
+      continue;
     }
     // 스케줄이 없는(1회성) 행이 남으면 재발화 방지 (v1과 동일).
     if (!row.schedule || !schedule.nextAutomationRun(row)) {
@@ -340,5 +376,6 @@ module.exports = {
   resolveTargetAgent,
   automationContractState,
   automationSessionChatId,
+  runnerSkip,
   decodeRuntimeSelection,
 };

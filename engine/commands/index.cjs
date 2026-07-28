@@ -47,6 +47,12 @@ const COMMANDS = {
   evolve: () => require("./evolve.cjs"),
   variant: () => require("./variant.cjs"),
   hep: () => require("./hep.cjs"),
+  // 소스 스코프 스태핑 3종은 1급 명령이다 — 별칭으로 접으면 스코프가 사라진다.
+  // (아래 COMMAND_ALIASES 주석의 2026-07-28 수리 참조.)
+  "hep-network": () => require("./hep-network.cjs"),
+  "hep-local": () => require("./hep-local.cjs"),
+  "hep-cloud": () => require("./hep-cloud.cjs"),
+  "hep-hub": () => require("./hep-hub.cjs"),
   build: () => require("./build.cjs"),
   connect: () => require("./connect.cjs"),
   call: () => require("./call.cjs"),
@@ -106,10 +112,25 @@ const GUARDED_NO_ARG = new Set(["search", "install", "upload"]);
 // 플랫폼 간 이름 통일(오너 결정 2026-07-27): 클로드코드/코덱스에서 부르는 hep-*
 // 스킬명과 터미널 명령이 서로 다르면 사용자가 어느 표면에 있는지에 따라 이름을
 // 바꿔 써야 한다. 같은 기능은 어디서든 같은 이름으로 부른다.
+//
+// 불변식(2026-07-28 수리): 별칭은 "같은 기능"에만 건다. 소스 스코프를 이름에
+// 달고 있는 hep-local / hep-cloud / hep-hub 는 여기 넣으면 안 된다 — 별칭은
+// 이름만 바꿔주고 스코프는 어디에도 전달되지 않기 때문이다. 실제로 그랬다:
+//   hep-cloud → cloud      : 자산 보관함 명령. 과제 문자열을 서브커맨드로 읽어
+//                            `usage: agentlas cloud <save|…>` + exit 1.
+//   hep-local → workforce  : cmdWorkforce 는 스코프 플래그를 받지 않는다(전량
+//                            공개 Hub 메뉴 스태핑). "로컬 전용"이 조용히 넓어짐.
+//   hep-hub   → search     : 디렉터리 나열만 하고 아무것도 실행하지 않음.
+// 세 명령은 스코프를 실제로 지키는 Hephaestus 네이티브 표면으로 가는 1급 명령
+// (COMMANDS 의 hep-local/hep-cloud/hep-hub)으로 승격했다.
+//
+// 같은 이유로 hep-network 도 별칭에서 뺐다(2026-07-28). 이름은 "Local + owner
+// Cloud + public Hub"인데 cmdWorkforce 는 스코프를 어디에도 싣지 않고
+// agentlas.cloud/api/mcp/v1 을 직접 친다. 그 서버는 sourceScope 가 없으면 "hub"
+// 로 기본값을 잡으므로(agentlas/.../lib/mcp/workforce.ts:228) 로컬·클라우드
+// 에이전트는 후보에 들어간 적이 없는데 결과는 네트워크 전량을 본 것처럼 남았다.
+// 연합은 Core 가 소유한다 — 네이티브 표면으로 넘긴다.
 const COMMAND_ALIASES = {
-  "hep-network": "workforce",
-  network: "workforce",
-  "hep-cloud": "cloud",
   "hep-build": "build",
   "hep-call": "call",
   "hep-search": "search",
@@ -117,8 +138,6 @@ const COMMAND_ALIASES = {
   "hep-storm": "storm",
   "hep-browser": "browser",
   "hep-connect": "connect",
-  "hep-local": "workforce",
-  "hep-hub": "search",
 };
 
 function resolveCommandName(cmd) {
@@ -139,8 +158,20 @@ function dispatch(ctx, argv) {
     return 1;
   }
 
-  if (DESKTOP_ONLY_SURFACES[cmd] && rest.length === 0) {
-    ctx.err(`${DESKTOP_ONLY_SURFACES[cmd]}\nIt was not run as a prompt — rerun with quotes if you meant a task: agentlas "${cmd} …"`);
+  /*
+   * 인자 유무와 무관하게 막는다. `rest.length === 0` 조건이 붙어 있던 동안은
+   * 단어 하나만 더 붙이면(`agentlas settings theme`, `marketplace browse`)
+   * 가드를 그냥 지나쳐 dispatch가 undefined를 반환했고, 엔진은 그걸 프롬프트로
+   * 보고 실제 에이전트를 띄웠다 — 제품이 "데스크탑 전용"이라고 선언한 화면
+   * 이름에 토큰이 청구되고 에이전트가 사용자 저장소에서 셸까지 돌렸다(실사용
+   * 실증: settings theme → System Optimizer가 Bash 실행, marketplace browse →
+   * 20883 토큰 소진). agentlas.cjs의 오타 가드는 `normalized.length === 1`
+   * 이라 이 경로를 못 받는다. 여기가 유일한 차단 지점이므로 arity를 보지 않는다.
+   * 진짜 작업이면 안내대로 따옴표로 묶어 하나의 프롬프트로 넘긴다.
+   */
+  if (DESKTOP_ONLY_SURFACES[cmd]) {
+    const asTask = [rawCmd, ...rest].join(" ");
+    ctx.err(`${DESKTOP_ONLY_SURFACES[cmd]}\nIt was not run as a prompt — rerun with quotes if you meant a task: agentlas "${asTask}"`);
     return 1;
   }
 

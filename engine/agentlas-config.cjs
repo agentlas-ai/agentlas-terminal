@@ -100,28 +100,35 @@ function mergePrefs(base, patch) {
   return next;
 }
 
+/*
+ * Throws on failure (lock timeout, read-only data dir, ENOSPC …) — it used to
+ * swallow every error and return null, so `agentlas setup` announced "All set."
+ * and exited 0 while the user's language/runtime/permission were never written.
+ * A caller that cannot persist must be able to say so; use savePrefs for the
+ * best-effort boolean contract.
+ */
 function updatePrefs(userDataDir, patch) {
-  try {
-    fs.mkdirSync(userDataDir, { recursive: true });
-    return withPrefsLock(userDataDir, () => {
-      const file = prefsPath(userDataDir);
-      const currentWasValid = Boolean(readPrefsFile(file));
-      const current = loadPrefs(userDataDir);
-      if (fs.existsSync(file) && !currentWasValid) {
-        try { fs.renameSync(file, `${file}.corrupt-${Date.now()}-${process.pid}`); } catch { /* recover from backup */ }
-      }
-      const next = mergePrefs(current, patch);
-      if (currentWasValid) atomicWrite(backupPath(userDataDir), current);
-      atomicWrite(file, next);
-      return next;
-    });
-  } catch {
-    return null;
-  }
+  fs.mkdirSync(userDataDir, { recursive: true });
+  return withPrefsLock(userDataDir, () => {
+    const file = prefsPath(userDataDir);
+    const currentWasValid = Boolean(readPrefsFile(file));
+    const current = loadPrefs(userDataDir);
+    if (fs.existsSync(file) && !currentWasValid) {
+      try { fs.renameSync(file, `${file}.corrupt-${Date.now()}-${process.pid}`); } catch { /* recover from backup */ }
+    }
+    const next = mergePrefs(current, patch);
+    if (currentWasValid) atomicWrite(backupPath(userDataDir), current);
+    atomicWrite(file, next);
+    return next;
+  });
 }
 
 function savePrefs(userDataDir, prefs) {
-  return Boolean(updatePrefs(userDataDir, prefs));
+  try {
+    return Boolean(updatePrefs(userDataDir, prefs));
+  } catch {
+    return false;
+  }
 }
 
 module.exports = { prefsPath, loadPrefs, savePrefs, updatePrefs, mergePrefs };

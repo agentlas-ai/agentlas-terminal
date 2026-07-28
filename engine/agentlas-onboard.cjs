@@ -7,8 +7,13 @@ const i18n = require("./agentlas-i18n.cjs");
 const banner = require("./agentlas-banner.cjs");
 const { visWidth, wrapWidth } = require("./agentlas-composer.cjs");
 
-// req = { ui, rl, helpers }  → Promise<{ onboarded, lang, runtime, permission }>
-async function runOnboard({ ui, rl, helpers }) {
+/*
+ * req = { ui, rl, helpers, persist } → Promise<{ onboarded, saved, saveError, lang, runtime, permission }>
+ * `persist` writes the answers and must throw when it cannot. The wizard calls it
+ * itself, before announcing "All set." — the caller used to save afterwards, so a
+ * failed write (locked/read-only data dir) was announced as success and dropped.
+ */
+async function runOnboard({ ui, rl, helpers, persist }) {
   const H = helpers;
   const c = ui.c;
   const contentWidth = () => Math.max(20, (ui.out.columns || 80) - 5);
@@ -149,10 +154,22 @@ async function runOnboard({ ui, rl, helpers }) {
   const pi = await pickNum(permOpts.length);
   const permission = permOpts[pi - 1].v;
 
+    // Save first, then report what actually happened — never the other way round.
+    let saveError = null;
+    try {
+      if (typeof persist !== "function") throw new Error("no persistence handler");
+      await persist({ lang, runtime, permission });
+    } catch (error) {
+      saveError = error;
+    }
     ui.line("");
-    printSaved(ui.t("wiz.saved"));
-    printIndented(ui.t("wiz.changeLang"), c.faint);
-    return { onboarded: true, lang, runtime, permission };
+    if (saveError) {
+      ui.error(ui.t("wiz.saveFailed", String((saveError && saveError.message) || saveError)));
+    } else {
+      printSaved(ui.t("wiz.saved"));
+      printIndented(ui.t("wiz.changeLang"), c.faint);
+    }
+    return { onboarded: true, saved: !saveError, saveError, lang, runtime, permission };
   } finally {
     rl.removeListener("line", onLine);
     if (ownsSigint) rl.removeListener("SIGINT", onSigint);

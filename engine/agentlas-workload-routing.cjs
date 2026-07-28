@@ -17,7 +17,15 @@ const SCHEMA_VERSION = 1;
 const ALLOCATION_SCHEMA = "agentlas.workload-allocation.v1";
 const TIERS = Object.freeze(["economy", "balanced", "frontier"]);
 const TIER_RANK = Object.freeze({ economy: 0, balanced: 1, frontier: 2 });
+// 알려진 값은 랭크 폴백으로만 쓴다 — "유효한가" 게이트로 쓰지 않는다. 2026-07-28 라이브
+// 실측: codex의 모델 카탈로그가 프론티어 모델 하나에서 "ultra"(자동 위임) 리즌
+// 레벨을 광고했는데, normalizeEffort가 이 튜플로 게이트를 걸면 parent-AI의 할당
+// 결정 전체가 통째로 null(무효) 처리된다. 새 값이 나올 때마다 이 튜플을 고치지
+// 않고, resolveEffort가 모델 자체 목록의 순서(=능력 랭크, provider 계약)를
+// 신뢰하도록 뒤집었다. (구체적 모델 id는 이 파일에 절대 하드코딩하지 않는다 —
+// 아래 doesNotMatch 계약 테스트 참고.)
 const EFFORTS = Object.freeze(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
+const EFFORT_TOKEN_RE = /^[a-z][a-z0-9-]{0,23}$/;
 const CAPABILITIES = new Set(["code", "image", "tools", "long-context"]);
 const PHASES = new Set(["plan", "delegate", "synthesize"]);
 
@@ -31,8 +39,9 @@ function normalizeTier(value) {
 }
 
 function normalizeEffort(value) {
+  // 신택스만 검증한다 — 화이트리스트 존재는 게이트로 쓰지 않는다(위 EFFORTS 주석).
   const v = String(value || "").toLowerCase().trim();
-  return EFFORTS.includes(v) ? v : null;
+  return EFFORT_TOKEN_RE.test(v) ? v : null;
 }
 
 function normalizeCapabilities(value) {
@@ -251,10 +260,29 @@ function resolveEffort(provider, requested, supported = []) {
     const available = Array.isArray(supported) ? supported : [];
     if (!available.length) return null;
     if (available.includes(requested)) return requested;
-    const requestedRank = EFFORTS.indexOf(requested);
+    // 이 모델이 정확히 그 값을 광고하지 않을 때만 여기로 온다. 랭크는 모델 자체
+    // 목록의 순서(=능력 랭크, provider 계약)를 최우선으로 쓰고, 알려진 7단계
+    // 표는 순서 정보가 없는 값의 폴백일 뿐이다 — 화이트리스트 게이트가 아니다.
+    // 미광고 known 값은 available 안에서 known-rank가 자기 이하인 마지막 항목
+    // 바로 뒤(소수 위치)에 끼워 넣는다 — 무조건 "목록 끝"으로 밀면 사실 available의
+    // 상위 항목들보다 낮은 값(예: low/xhigh/max만 있을 때의 "medium")이 전부 통과돼
+    // 요청보다 위로 에스컬레이션된다. 표에도 없는 완전 미지의 값만 +Infinity.
+    const rank = (value) => {
+      const own = available.indexOf(value);
+      if (own !== -1) return own;
+      const known = EFFORTS.indexOf(value);
+      if (known === -1) return Infinity;
+      let insertAfter = -1;
+      available.forEach((item, index) => {
+        const itemKnown = EFFORTS.indexOf(item);
+        if (itemKnown !== -1 && itemKnown <= known) insertAfter = index;
+      });
+      return insertAfter + 0.5;
+    };
+    const requestedRank = rank(requested);
     const lower = available
-      .filter((item) => EFFORTS.indexOf(item) <= requestedRank)
-      .sort((a, b) => EFFORTS.indexOf(b) - EFFORTS.indexOf(a))[0];
+      .filter((item) => rank(item) <= requestedRank)
+      .sort((a, b) => rank(b) - rank(a))[0];
     return lower || available[0] || null;
   }
   return null;

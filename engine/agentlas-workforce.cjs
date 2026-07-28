@@ -21,6 +21,7 @@ const fs = require("node:fs");
 const net = require("node:net");
 const path = require("node:path");
 const { Ui } = require("./agentlas-ui.cjs");
+const { recommendedConcurrency } = require("./workforce/concurrency.cjs");
 
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{1,255}$/;
 const HASH_RE = /^sha256:[0-9a-f]{64}$/;
@@ -1516,7 +1517,9 @@ function validatePreparedExecution(value, workOrder, selection, candidateSet, va
 function validateDelegationPlan(value, selection) {
   const plan = assertObject(value, "delegationPlan");
   assertExactKeys(plan, ["schemaVersion", "planId", "packets", "synthesis", "verifier"], "delegationPlan", "planner_invalid");
-  if (plan.schemaVersion !== "agentlas.workforce-delegation-plan.v1") fail("planner_invalid", "unsupported workforce delegation plan schema");
+  // v2: 패킷에 doneWhen(검증 가능한 완료조건 체크리스트)이 필수가 됐다. 생산자(같은
+  // 파일의 플래너 프롬프트)와 검증자가 항상 함께 배포되므로 호환 창구는 없다.
+  if (plan.schemaVersion !== "agentlas.workforce-delegation-plan.v2") fail("planner_invalid", "unsupported workforce delegation plan schema");
   assertId(plan.planId, "executionPlan.planId");
   const assignments = new Map(selection.assignments.map((row) => [`${row.slotId}\0${row.agentReleaseId}`, row]));
   const packets = assertArray(plan.packets, "executionPlan.packets", MAX_ASSIGNMENTS, { min: 1 });
@@ -1534,6 +1537,9 @@ function validateDelegationPlan(value, selection) {
     assertString(packet.objective, "packet.objective", UNBOUNDED_EXPLANATION_FIELD);
     assertArray(packet.inputs, "packet.inputs", 64).forEach((item, index) => assertString(item, `packet.inputs[${index}]`, UNBOUNDED_EXPLANATION_FIELD));
     assertString(packet.expectedOutput, "packet.expectedOutput", UNBOUNDED_EXPLANATION_FIELD);
+    // 완료조건은 위임 계약의 필수 요소다(v2) — 각 항목이 워커 반환물만 보고 참/거짓
+    // 판정 가능한 문장이어야 하며, 검증자 criteria와 같은 개수·길이 상한을 쓴다.
+    assertArray(packet.doneWhen, "packet.doneWhen", 16, { min: 1 }).forEach((item, index) => assertString(item, `packet.doneWhen[${index}]`, 500));
   }
   if (pairs.size !== assignments.size || [...assignments.keys()].some((pair) => !pairs.has(pair))) fail("planner_missing_child", "planner must create one separate child packet for every accepted assignment");
   for (const key of ["synthesis", "verifier"]) {
@@ -1818,11 +1824,12 @@ function buildPrompts(task, identity) {
     requestExpansionForSlots: [],
   };
   const delegationPlanShape = {
-    schemaVersion: "agentlas.workforce-delegation-plan.v1",
+    schemaVersion: "agentlas.workforce-delegation-plan.v2",
     planId: "workforce-plan:<id>",
     packets: [{
       packetId: "packet:<id>", slotId: "<selected slot>", agentReleaseId: "<selected release>",
       objective: "bounded objective", inputs: [], expectedOutput: "concrete handoff",
+      doneWhen: ["checkable completion condition"],
     }],
     synthesis: { slotId: "<selected slot>", agentReleaseId: "<selected release>", brief: "integration brief" },
     verifier: { slotId: "<selected slot>", agentReleaseId: "<selected release>", brief: "verification brief", criteria: ["criterion"] },
@@ -1863,13 +1870,14 @@ function buildPrompts(task, identity) {
   const plannerSchemaRequirements = [
     `Return exactly one object: ${stableJson(plannerShape)}`,
     "Return agentlas.workforce-orchestration-plan.v2 with exactly delegationPlan and capabilityBindingPlan. Copy plannerInvocationId, executionContextDigest, and toolInventoryDigest exactly from PLANNER_LINEAGE_DATA. The host computes bindingPlanDigest after validating your choices; do not emit bindingPlanDigest.",
-    "Create exactly one delegationPlan packet for every accepted slot/release pair. Every packet must explicitly author packetId, slotId, agentReleaseId, objective, inputs, and expectedOutput.",
+    "Create exactly one delegationPlan packet for every accepted slot/release pair. Every packet must explicitly author packetId, slotId, agentReleaseId, objective, inputs, expectedOutput, and doneWhen.",
+    "doneWhen is that packet's acceptance checklist: 1..16 conditions, each independently checkable as true or false from the worker's returned handoff alone (name concrete artifacts, fields, counts, or observable facts — never vibes like 'high quality'). State the goal and required results, but do not over-specify the worker's method or ordering. The verifier receives every packet's doneWhen alongside its handoff.",
     "Choose capabilityBindingPlan.inventory only from POLICY_FILTERED_LOCAL_TOOL_MENU_DATA. Cover every requiredToolCapabilities id exactly once for each slot/release pair. One selected tool row may cover multiple capabilities. If a required capability has no exact ready tool, do not invent a binding; return the best schema-valid plan and allow deterministic validation to reject it.",
     "Each bound inventory row must explicitly contain slotId, agentReleaseId, permissionPolicyDigest, provider, toolId, capabilityIds, status=bound. An empty inventory is required when every slot has no required tool capability.",
     "synthesis must explicitly author slotId, agentReleaseId, and brief. verifier must explicitly author slotId, agentReleaseId, brief, and a non-empty criteria array. The host will not add, remove, normalize, or substitute a release or field.",
     // 호스트가 강제하는 상한을 미리 알려준다 — 알려주지 않은 상한은 첫 시도를 반드시
     // 깨고 교정 1회로도 회복되지 않는다(2026-07-27 라이브 실측, 중첩 매니저 동일 계열).
-    "Objectives, inputs, expectedOutput, and briefs have no character limit — write them as long as the work honestly needs. Only counts are bounded: at most 64 inputs per packet and at most 32 verifier criteria of at most 450 characters each.",
+    "Objectives, inputs, expectedOutput, and briefs have no character limit — write them as long as the work honestly needs. Only counts are bounded: at most 64 inputs per packet, 1..16 doneWhen conditions of at most 500 characters each, and at most 32 verifier criteria of at most 450 characters each.",
   ].join("\n");
   return {
     searchSystem: [
@@ -2012,6 +2020,71 @@ function create(deps = {}) {
     };
   }
 
+  // ── 격리 고지 + 토큰 계측 ───────────────────────────────────────────────
+  // 실행마다 어느 단계가 어느 런타임에서 얼마의 토큰을 썼는지 모은다. 새는 곳을
+  // 추측하지 않고 보기 위한 장부다 — 2026-07-28 실측에서 codex 리더가 사소한
+  // 프롬프트 하나에 입력 18,235 토큰을 실었고, 그 원인(스킬 라이브러리 전량 적재)은
+  // 합계를 보기 전까지 아무도 몰랐다.
+  const isolationNotices = new Map();
+  const tokenLedger = [];
+  // ui 는 실행 컨텍스트에만 있으므로 여기서는 버퍼에 모으고, 영수증 시점에 낸다.
+  function noteIsolationWeakness(kind, role) {
+    const key = `${kind}:${role || "stage"}`;
+    if (isolationNotices.has(key)) return;
+    isolationNotices.set(key, `${kind}(${role || "stage"} 단계)`);
+  }
+  /**
+   * 단계별 토큰 장부를 사람이 읽는 표로 낸다.
+   *
+   * 총합만 보면 "많이 썼다"밖에 모른다. 어느 단계가, 어느 런타임에서, 호출 하나당
+   * 얼마를 실었는지를 나란히 놓아야 새는 곳이 보인다 — 입력이 출력보다 자릿수로
+   * 크면 그건 작업이 아니라 적재다.
+   */
+  function reportTokenLedger(ui) {
+    if (!tokenLedger.length && !isolationNotices.size) return;
+    const byStage = new Map();
+    for (const row of tokenLedger) {
+      const key = `${row.role}·${row.runtime}${row.model ? `/${row.model}` : ""}`;
+      const acc = byStage.get(key) || { calls: 0, input: 0, output: 0, cached: 0 };
+      acc.calls += 1; acc.input += row.input; acc.output += row.output; acc.cached += row.cached;
+      byStage.set(key, acc);
+    }
+    const totalIn = tokenLedger.reduce((sum, row) => sum + row.input, 0);
+    const totalOut = tokenLedger.reduce((sum, row) => sum + row.output, 0);
+    for (const label of isolationNotices.values()) {
+      ui.warn(
+        `격리 고지: ${label}는 도구 인벤토리가 비었음을 증명하지 못합니다. 도구 호출은 차단되지만 `
+          + "이 런타임은 호스트의 스킬/플러그인 이름을 컨텍스트에 싣습니다(그래서 입력 토큰도 큽니다). "
+          + "강한 격리가 필요하면 그 단계를 claude-code로 배정하세요.",
+      );
+    }
+    ui.line("");
+    ui.info(`token ledger — 입력 ${totalIn.toLocaleString()} / 출력 ${totalOut.toLocaleString()} · 호출 ${tokenLedger.length}건`);
+    const rows = [...byStage.entries()].sort((a, b) => b[1].input - a[1].input);
+    for (const [key, acc] of rows) {
+      const perCall = Math.round(acc.input / Math.max(1, acc.calls));
+      const share = totalIn ? Math.round((acc.input / totalIn) * 100) : 0;
+      ui.line(
+        `  ${key.padEnd(34)} 호출 ${String(acc.calls).padStart(2)} · 입력 ${String(acc.input).padStart(8)}`
+          + ` (${String(share).padStart(2)}%, 호출당 ${perCall.toLocaleString()}) · 출력 ${acc.output}`,
+      );
+    }
+    // 입력이 출력의 100배를 넘는 단계는 일이 아니라 적재를 하고 있다.
+    for (const [key, acc] of rows) {
+      if (acc.output > 0 && acc.input / acc.output > 100) {
+        ui.warn(`토큰 누수 의심: ${key} — 입력이 출력의 ${Math.round(acc.input / acc.output)}배. 컨텍스트 적재를 확인하세요.`);
+      }
+    }
+  }
+
+  function recordStageTokens(role, runtimeKind, modelPin, usage) {
+    if (!usage) return;
+    const input = Number(usage.inputTokens ?? usage.input_tokens ?? 0) || 0;
+    const output = Number(usage.outputTokens ?? usage.output_tokens ?? 0) || 0;
+    const cached = Number(usage.cachedInputTokens ?? usage.cached_input_tokens ?? 0) || 0;
+    tokenLedger.push({ role: role || "stage", runtime: runtimeKind || "?", model: modelPin || null, input, output, cached });
+  }
+
   async function runModel(runtime, system, prompt, context) {
     const invocation = stageInvocation(runtime, context);
     const executionRuntime = invocation.executionRuntime;
@@ -2041,19 +2114,32 @@ function create(deps = {}) {
     }
     if (executionRuntime.mode === "cli") {
       const authorityMode = context.authorityMode || "no-authority";
-      if (executionRuntime.kind === "codex" && authorityMode === "no-authority") {
-        fail(
-          "workforce_runtime_isolation_unverified",
-          "Codex CLI workforce execution is blocked until this host proves an empty built-in, collaboration, and MCP tool inventory; feature-disable flags and an isolated CODEX_HOME are not sufficient proof",
-        );
+      // 격리 강도는 런타임마다 다르다. claude-code는 `--tools ""`로 도구 인벤토리가
+      // 비었음을 증명할 수 있고, codex/gemini는 못 한다 — 2026-07-28 실측: 모든
+      // 격리 플래그(--ephemeral --ignore-user-config --ignore-rules --disable
+      // plugins/tool_suggest/...)를 준 codex가 사용자의 개인 스킬 이름을 전부
+      // 열거했고 사소한 프롬프트에 입력 18,235 토큰을 실었다.
+      //
+      // 그런데 그걸 이유로 실행을 통째로 거부하면 그 런타임을 오케스트레이터로
+      // 고른 사용자는 네트워크 전체를 잃는다. 실제로 새는 것은 "스킬 이름 목록"이고,
+      // 그것도 사용자 본인 기계에서 본인이 시작한 실행이다 — 도구 호출은 여전히
+      // 막혀 있다. 비례가 맞지 않는 차단이었고, 우회 수단조차 없었다.
+      //
+      // 그래서 거부 대신 고지한다: 무엇이 격리되지 않는지 이름을 대고, 실행은 한다.
+      // 강한 격리가 필요한 호스트는 AGENTLAS_WORKFORCE_REQUIRE_PROVEN_ISOLATION=1로
+      // 예전 동작(거부)을 되찾을 수 있다.
+      const provenIsolation = executionRuntime.kind === "claude-code";
+      if (!provenIsolation && authorityMode === "no-authority") {
+        if (String(process.env.AGENTLAS_WORKFORCE_REQUIRE_PROVEN_ISOLATION || "") === "1") {
+          fail(
+            "workforce_runtime_isolation_unverified",
+            `${executionRuntime.kind} cannot prove an empty tool inventory, and this host requires proven isolation. `
+              + "Assign claude-code for this stage, or unset AGENTLAS_WORKFORCE_REQUIRE_PROVEN_ISOLATION.",
+          );
+        }
+        noteIsolationWeakness(executionRuntime.kind, invocation.role);
       }
-      if (executionRuntime.kind === "gemini" && authorityMode === "no-authority") {
-        fail(
-          "workforce_runtime_isolation_unverified",
-          "Gemini CLI workforce execution is blocked until this host proves an empty built-in and MCP tool inventory",
-        );
-      }
-      return normalizeModelResult(await D.captureRuntime(executionRuntime.kind, effectiveSystem, prompt, {
+      const captured = normalizeModelResult(await D.captureRuntime(executionRuntime.kind, effectiveSystem, prompt, {
         cwd: context.cwd,
         env: context.env,
         permission: context.permission,
@@ -2066,14 +2152,18 @@ function create(deps = {}) {
         outputLimitBytes: authorityMode === "read-only" ? 24 * 1024 * 1024 : undefined,
         envelope: true,
       }));
+      recordStageTokens(invocation.role, executionRuntime.kind, invocation.modelPin, captured.usage);
+      return captured;
     }
-    return normalizeModelResult(await D.runApi(
+    const viaApi = normalizeModelResult(await D.runApi(
       executionRuntime.backend,
       invocation.modelPin,
       effectiveSystem,
       prompt,
       { effort: invocation.effort, envelope: true },
     ));
+    recordStageTokens(invocation.role, executionRuntime.backend, invocation.modelPin, viaApi.usage);
+    return viaApi;
   }
 
   async function callHubTool(name, args) {
@@ -3331,7 +3421,10 @@ function create(deps = {}) {
       }
 
       const slotById = new Map(workOrder.roleSlots.map((slot) => [slot.slotId, slot]));
-      const concurrency = Math.max(1, Math.min(8, Number(ctx.concurrency) || 3));
+      // 사용자가 --parallel/-n을 명시하면 그 값(상한만 적용), 아니면 사양 기반 추천값.
+      const concurrency = Number.isFinite(Number(ctx.concurrency)) && Number(ctx.concurrency) > 0
+        ? Math.max(1, Math.min(8, Number(ctx.concurrency)))
+        : recommendedConcurrency();
       let cursor = 0;
       const outputs = new Array(delegationPlan.packets.length);
       const publicWorkers = new Array(delegationPlan.packets.length);
@@ -3680,6 +3773,9 @@ function create(deps = {}) {
                   `PINNED_PACKAGE_HASH=${pinned.packageHash}`,
                   `PINNED_CONTENT_DIGEST=${pinned.contentDigest}`,
                   "Do only your packet. Do not select or summon another agent. Return a concrete handoff artifact for the manager.",
+                  // 산출물과 한계·상태를 분리해야 검증자가 판정할 근거가 생긴다(위임
+                  // 계약 7요소 중 상태·증거). COMPLETED는 워커의 주장일 뿐이다.
+                  "End your handoff with two labeled sections: LIMITATIONS (what you could not verify or complete — write 'none' only if truly none) and STATUS (COMPLETED, PARTIAL, or FAILED; for PARTIAL/FAILED name each unmet doneWhen condition from your packet). Claiming COMPLETED does not finish the run — a pinned verifier accepts or rejects your claim.",
                 ].join("\n\n"),
                 prompt: stableJson({
                   sharedTask: workOrder.taskBrief,
@@ -4108,14 +4204,25 @@ function create(deps = {}) {
               system: [
                 pinned.instructions,
                 "VERIFIER ESCALATION MODE: this exact worker packet was identified as failed by two independent verifier rounds. You are the single allowed orchestrator retry for this packet. Produce one replacement handoff, preserve the packet scope and pinned release, and do not delegate or retry again.",
+                // 수정 지시는 전체 재작성 지시가 아니다 — 통과분(preserve)을 명시하지
+                // 않으면 정확했던 부분이 재작성 과정에서 손상된다(위임 계약 수정 규칙).
+                "Repair, do not rewrite from scratch: preservedChecks lists verifier checks that already PASSED — keep the prior handoff's content that satisfied them and do not regress it. defects lists what failed — change only what those defects require. End with the same LIMITATIONS and STATUS sections required of every worker handoff.",
               ].join("\n\n"),
               prompt: stableJson({
                 sharedTask: workOrder.taskBrief,
                 roleSlot: slotById.get(packet.slotId),
                 packet,
                 priorHandoff: output.text,
-                verifierFailures: receipt.correctiveHistory.map((row) => ({
+                preservedChecks: receipt.correctiveHistory.flatMap((row) =>
+                  (row.verification.checks || [])
+                    .filter((check) => check.status === "passed")
+                    .map((check) => ({ checkId: check.checkId, evidence: check.evidence })),
+                ),
+                defects: receipt.correctiveHistory.map((row) => ({
                   issues: row.verification.issues,
+                  failedChecks: (row.verification.checks || [])
+                    .filter((check) => check.status === "failed")
+                    .map((check) => ({ checkId: check.checkId, evidence: check.evidence })),
                   failedPacketIds: row.verification.failedPacketIds,
                 })),
               }),
@@ -4316,6 +4423,7 @@ function create(deps = {}) {
         ui.line("");
         ui.markdown(finalText);
         ui.info(`workforce receipt: ${runId} · roster ${receipt.workers.length}/${delegationPlan.packets.length} · verifier passed`);
+        reportTokenLedger(ui);
         if (benchmarkArtifactPath) ui.info(`workforce benchmark artifacts: ${benchmarkArtifactPath}`);
       }
       return {
@@ -4368,6 +4476,10 @@ function create(deps = {}) {
           for (const issue of issues.slice(0, 16)) ui.error(`  - ${String(issue).slice(0, 400)}`);
           if (issues.length > 16) ui.error(`  … ${issues.length - 16} more issues in the persisted receipt`);
         }
+        // 실패한 실행이야말로 토큰이 어디로 갔는지 알아야 하는 순간이다. issues 유무와
+        // 무관하게 낸다 — 첫 배선이 이 블록 안에 들어가는 바람에 issues 없는 실패에서는
+        // 장부가 통째로 사라졌다.
+        reportTokenLedger(ui);
       }
       return { ok: false, error: receipt.failure, receipt, benchmarkArtifactPath };
     }

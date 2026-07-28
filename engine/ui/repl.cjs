@@ -616,8 +616,14 @@ function handleSlash(ctx, cmdline, api) {
 
     case "broadcast": {
       if (!restStr) throw new Error("Usage: /broadcast <message>");
-      const sent = orch.broadcast(restStr);
+      /*
+       * broadcast 는 {sent, skipped} 를 준다. 전달된 목록을 먼저 찍고 못 보낸 세션은
+       * 사유와 함께 경고로 덧붙인다 — 예전엔 상한 throw 가 이 catch 로 떨어져 에러 한
+       * 줄만 보였고, 이미 지시를 받아 돌기 시작한 세션이 화면에 전혀 안 나왔다.
+       */
+      const { sent, skipped } = orch.broadcast(restStr);
       ctx.out(ui.c.dim(`→ ${sent.join(", ") || "(none)"}`));
+      for (const s of skipped) ui.warn(`${s.key} ${en ? "not sent" : "미전송"}: ${s.error}`);
       return;
     }
 

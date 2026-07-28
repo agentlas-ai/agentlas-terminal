@@ -139,6 +139,37 @@ function resolveVariantCandidates(options) {
   };
 }
 
+/*
+ * usage/설명은 사람 출력 전용이다 — JSON 결과(schemaVersion v1)와 decision 어휘는
+ * 손대지 않는다. README·`agentlas help`가 광고하는 `agentlas variant resolve`는
+ * 인자 없이 부르면 항상 decision=error 로 끝나는데, 그동안 사람에게 보인 건
+ * 내부 enum 한 줄(`error: EXACT_BASE_RELEASE_REQUIRED`) 뿐이라 필요한 플래그
+ * 이름이 소스 주석에만 존재했다. 그래서 (1) error 코드마다 사람이 읽고 바로
+ * 고칠 수 있는 사유 + usage 를 붙이고, (2) help 서브커맨드를 뚫는다.
+ */
+const VARIANT_USAGE_LINES = Object.freeze([
+  "usage: agentlas variant resolve [candidates.json] [--base-release <agent-release-id>]",
+  "                                [--prefer <variant-id>] [--no-base-only] [--json]",
+  "  --base-release <id>  required: the exact base agent release to resolve against.",
+  "                       May instead come from candidates.json's baseAgentReleaseId.",
+  "  candidates.json      variant candidates: a JSON array, or {baseAgentReleaseId, candidates[]}.",
+  "  --prefer <id>        preferred variant; picking another one reports decision=fallback.",
+  "  --no-base-only       fail instead of falling back to the base release with no Experience Pack.",
+  "  --json               emit the agentlas.terminal-variant-resolution.v1 document.",
+  "Local advisory preview only: it never authorizes execution, rental, or reputation.",
+]);
+
+const VARIANT_ERROR_HINTS = Object.freeze({
+  EXACT_BASE_RELEASE_REQUIRED:
+    "no base agent release was given — pass --base-release <agent-release-id>, or a candidates.json carrying baseAgentReleaseId.",
+  NO_ELIGIBLE_VARIANT_AND_NO_BASE_FALLBACK:
+    "no candidate survived the checks above and --no-base-only forbids the base-only fallback.",
+});
+
+function variantUsage() {
+  return VARIANT_USAGE_LINES.join("\n");
+}
+
 function renderVariantResolution(result) {
   const lines = [
     `VARIANT RESOLUTION: ${result.decision}`,
@@ -148,17 +179,29 @@ function renderVariantResolution(result) {
   if (result.decision === "selected") lines.push(`selected: ${result.selectedVariantId}`);
   else if (result.decision === "fallback") lines.push(`fallback selected: ${result.selectedVariantId}`);
   else if (result.decision === "base-only") lines.push(`base-only: ${result.baseAgentReleaseId} (no Experience Pack attached)`);
-  else lines.push(`error: ${result.code}`);
+  else {
+    lines.push(`error: ${result.code}`);
+    const hint = VARIANT_ERROR_HINTS[result.code];
+    if (hint) lines.push(hint);
+  }
   if (result.fallbackOrder.length) lines.push(`next fallbacks: ${result.fallbackOrder.join(", ")}`);
   for (const excluded of result.excluded) lines.push(`excluded only ${excluded.variantId}: ${excluded.reasons.join(", ")}`);
   lines.push("Required MCP shortages exclude only the affected variant; they never create an agent-wide shortage.");
+  // 실패했을 때만 usage를 붙인다 — 성공 출력은 v1과 바이트 동일하게 유지한다.
+  if (result.decision === "error") lines.push("", variantUsage());
   return lines.join("\n");
 }
 
 function cmdVariant(options) {
   const args = options.args || [];
   const sub = args[0] || "resolve";
-  if (sub !== "resolve") throw new Error(`unknown variant subcommand: ${sub} (resolve)`);
+  // help 탈출구: 상위 라우터가 -h/--help 를 "help" 로 정규화하지만, 직접 호출도
+  // 받도록 셋 다 인정한다. usage는 성공(exit 0)이지 알 수 없는 서브커맨드가 아니다.
+  if (sub === "help" || sub === "--help" || sub === "-h") {
+    (options.out || console.log)(variantUsage());
+    return null;
+  }
+  if (sub !== "resolve") throw new Error(`unknown variant subcommand: ${sub} (resolve|help)`);
   const flags = parseSimpleFlags(args.slice(1));
   let candidates = [];
   let baseAgentReleaseId = flags["base-release"] || null;
@@ -192,5 +235,6 @@ module.exports = {
   validateVariantCandidate,
   resolveVariantCandidates,
   renderVariantResolution,
+  variantUsage,
   cmdVariant,
 };

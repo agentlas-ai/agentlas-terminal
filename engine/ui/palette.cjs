@@ -44,6 +44,13 @@ const SLASH_COMMANDS = [
   { command: "/network", args: "<request>", ko: "Workforce 라우트", en: "Workforce route" },
   { command: "/workforce", args: "<request>", ko: "Workforce 라우트", en: "Workforce route" },
   { command: "/taskforce", args: "<request>", ko: "임시 태스크포스 편성", en: "Assemble a task force" },
+  // 소스 스코프가 이름에 붙은 스태핑 3종. 스코프를 문장에 적는다 — 예전에는
+  // 별칭이 스코프를 버려 /hep-cloud 가 자산 보관함으로, /hep-hub 가 검색으로
+  // 갔다(2026-07-28 수리). 팔레트 문구가 곧 사용자에게 하는 약속이다.
+  { command: "/hep-network", args: "\"<request>\"", ko: "로컬+오너 클라우드+공개 Hub 연합 편성", en: "Staff across Local + owner Cloud + public Hub" },
+  { command: "/hep-local", args: "\"<request>\"", ko: "등록된 로컬 에이전트만으로 편성", en: "Staff from registered Local agents only" },
+  { command: "/hep-cloud", args: "\"<request>\"", ko: "오너 Agent Cloud만으로 편성", en: "Staff from owner Agent Cloud only" },
+  { command: "/hep-hub", args: "\"<request>\"", ko: "공개 Hub 에이전트만으로 편성", en: "Staff from public Hub agents only" },
   { command: "/build", args: "\"<request>\"", ko: "에이전트·팀 제작/수리/패키징", en: "Build, repair or package an agent or team" },
   { command: "/call", args: "\"a,b\" \"<ctx>\"", ko: "지정 에이전트 호출", en: "Call named agents" },
   { command: "/route", args: "\"<req>\"", ko: "최적 에이전트 라우팅", en: "Route to the best agent" },
@@ -77,7 +84,8 @@ const SLASH_COMMANDS = [
   { command: "/update", args: "", ko: "npm 업데이트 확인", en: "npm update check" },
   { command: "/version", args: "", ko: "버전", en: "Version" },
   { command: "/logout", args: "", ko: "로그아웃", en: "Sign out" },
-  { command: "/uninstall", args: "<slug>", ko: "에이전트 제거", en: "Uninstall an agent" },
+  // 대화가 있으면 --yes 없이는 거절한다(챗/메시지 CASCADE 삭제) — 팔레트에도 노출.
+  { command: "/uninstall", args: "<slug> [--yes]", ko: "에이전트 제거", en: "Uninstall an agent" },
   { command: "/quit", args: "", ko: "종료", en: "Quit" },
   { command: "/exit", args: "", ko: "종료", en: "Quit" },
 ];

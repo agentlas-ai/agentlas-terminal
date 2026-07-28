@@ -260,6 +260,7 @@ const STRINGS = {
     "wiz.default": "(Enter default)",
     "wiz.invalid": "Choose 1–%s.",
     "wiz.saved": "All set. You can change any of this later with /runtime, /permission.",
+    "wiz.saveFailed": "Could not save your choices (%s) — they apply to this session only, and setup will ask again next launch.",
     "wiz.changeLang": "Tip: re-run setup anytime with  agentlas setup",
   },
   ko: {
@@ -505,6 +506,7 @@ const STRINGS = {
     "wiz.default": "(Enter 기본값)",
     "wiz.invalid": "1–%s 중 고르세요.",
     "wiz.saved": "완료. 나중에 /runtime, /permission으로 언제든 바꿀 수 있어요.",
+    "wiz.saveFailed": "선택을 저장하지 못했습니다 (%s) — 이번 세션에만 적용되고, 다음 실행 때 다시 물어봅니다.",
     "wiz.changeLang": "팁: 언제든  agentlas setup  으로 다시 설정",
   },
 };

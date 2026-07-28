@@ -110,9 +110,11 @@ agentlas connect <sub>           # Telegram 등 플랫폼 연결 (무인자는 u
 agentlas import <폴더>            # 로컬 에이전트/팀 임포트
 agentlas native prepare <agent>  # 네이티브 CLI 문맥 파일 생성
 agentlas list                    # 설치 에이전트/회사 + 활성 런타임
-agentlas uninstall <agent>       # 설치 에이전트 제거 (빌트인 거부)
+agentlas uninstall <agent> [--yes]  # 설치 에이전트 제거 (빌트인 거부).
+                                 # 대화 이력이 있으면 건수를 보여주고 --yes 없이는 거절한다
+                                 # (챗/메시지가 CASCADE로 함께 영구 삭제되기 때문).
 agentlas experience <sub>        # list|inspect|validate|save|publish|status|export|unpublish|withdraw
-agentlas variant resolve         # 로컬 variant 호환성 프리뷰 (권위 없음)
+agentlas variant resolve --base-release <id>   # 로컬 variant 호환성 프리뷰 (권위 없음, `agentlas variant help`)
 ```
 
 ### EXECUTE

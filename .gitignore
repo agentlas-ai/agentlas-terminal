@@ -12,11 +12,17 @@ credentials/
 .bug-hunter/
 
 # Development-only material. The npm package is built from runtime paths;
-# tests, fixtures, benchmarks, docs, receipts, and generated output stay local.
+# fixtures, benchmarks, docs, receipts, and generated output stay local.
+#
+# test/ is deliberately NOT ignored (2026-07-28). npm publication is already
+# bounded twice over — package.json "files" allowlists only bin/ engine/
+# install.* CHANGELOG README, and the release CI re-scans the packed tarball —
+# so ignoring test/ never protected the published package. What it did do was
+# hide 23 of 52 suites from GitHub, where smoke.sh's `if [ -f ]` loop then
+# skipped them silently: the release gate reported "66 passed" locally while
+# roughly 41 ran in CI. A test that cannot run in CI is not a gate.
 tests/
-test/
 **/tests/
-**/test/
 benchmarks/
 **/benchmarks/
 fixtures/

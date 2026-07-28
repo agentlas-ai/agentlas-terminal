@@ -102,6 +102,21 @@ function nextCronRun(cron, from = new Date(), timezone = null) {
   return null;
 }
 
+/**
+ * IANA 타임존으로 해석 가능한지만 본다(빈 값 = 로컬존이므로 유효).
+ * nextCronRun 은 cron 파싱 실패와 잘못된 존을 똑같이 null 로 접어버리므로,
+ * 호출부가 "어느 필드가 틀렸는지"를 구분하려면 이 검사가 따로 필요하다.
+ */
+function isValidTimezone(timezone) {
+  if (!timezone) return true;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: String(timezone) });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function localTimezone() {
   try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"; } catch { return "UTC"; }
 }
@@ -175,6 +190,7 @@ module.exports = {
   cronField,
   zonedDateParts,
   nextCronRun,
+  isValidTimezone,
   localTimezone,
   legacyScheduleSpec,
   nextAutomationRun,

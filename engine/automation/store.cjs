@@ -164,10 +164,27 @@ function listRuns(db, limit = 15) {
 }
 
 /**
+ * 다음 회차가 없어 자동화를 끝낼 때만 쓰는 단방향(끄기 전용) write.
+ *
+ * advanceAfterRun 은 실행 시작 시점의 row 스냅샷을 들고 있는데, 그 사이 사용자가
+ * 다른 터미널이나 Desktop 토글로 `automation off` 를 할 수 있다(에이전트 실행은
+ * 수 분~수십 분). 스냅샷의 enabled 를 되쓰면 그 끄기가 조용히 되돌아가고
+ * ("Disabled: … morning" 을 보고 exit 0 인데도) 다음 예정 시각에 또 발화한다.
+ * 그래서 enabled 는 "켜기"로는 절대 쓰지 않고, 종료 조건일 때만 0 으로 내린다.
+ */
+function disableExhausted(db, id) {
+  db.prepare("UPDATE automations SET enabled = 0 WHERE id = ?").run(id);
+}
+
+/**
  * 실행 후 스케줄 북키핑 — v1 runAutomationOnce 의 성공/실패 분기와 동일:
  *  - 성공: run_count 증가. 실패: last_run_at 만 갱신(성공 카운트 오염 금지).
  *  - advanceSchedule(데몬 경로)일 때만 next_run_at 전진; 다음 시각이 없으면 비활성화.
  *  - run-now(advanceSchedule=false)는 스케줄을 건드리지 않는다(앱 advanceSchedule=false와 동일).
+ *
+ * enabled 는 여기서 스냅샷 값으로 되쓰지 않는다 — disableExhausted 주석 참조.
+ * (같은 이유로 성공/실패 두 분기 모두 같은 규칙을 따라야 한다: 한쪽만 고치면
+ *  실패로 끝난 실행이 여전히 끈 자동화를 부활시킨다.)
  */
 function advanceAfterRun(db, row, { ok, advanceSchedule, ranAt = new Date() } = {}) {
   const hasRunCount = columnExists(db, "automations", "run_count");
@@ -177,12 +194,13 @@ function advanceAfterRun(db, row, { ok, advanceSchedule, ranAt = new Date() } = 
     if (shouldAdvance) {
       if (hasRunCount) {
         db.prepare(
-          "UPDATE automations SET last_run_at = ?, run_count = run_count + 1, next_run_at = ?, enabled = ? WHERE id = ?",
-        ).run(ranAt.toISOString(), advance ? advance.toISOString() : null, advance ? row.enabled : 0, row.id);
+          "UPDATE automations SET last_run_at = ?, run_count = run_count + 1, next_run_at = ? WHERE id = ?",
+        ).run(ranAt.toISOString(), advance ? advance.toISOString() : null, row.id);
       } else {
-        db.prepare("UPDATE automations SET last_run_at = ?, next_run_at = ?, enabled = ? WHERE id = ?")
-          .run(ranAt.toISOString(), advance ? advance.toISOString() : null, advance ? row.enabled : 0, row.id);
+        db.prepare("UPDATE automations SET last_run_at = ?, next_run_at = ? WHERE id = ?")
+          .run(ranAt.toISOString(), advance ? advance.toISOString() : null, row.id);
       }
+      if (!advance) disableExhausted(db, row.id);
     } else if (hasRunCount) {
       db.prepare("UPDATE automations SET last_run_at = ?, run_count = run_count + 1 WHERE id = ?")
         .run(ranAt.toISOString(), row.id);
@@ -191,25 +209,64 @@ function advanceAfterRun(db, row, { ok, advanceSchedule, ranAt = new Date() } = 
     }
     // max_runs 도달 시 비활성화 (앱과 동일한 종료 조건).
     if (row.max_runs && (row.run_count || 0) + 1 >= row.max_runs) {
-      db.prepare("UPDATE automations SET enabled = 0 WHERE id = ?").run(row.id);
+      disableExhausted(db, row.id);
       return { advance, maxRunsReached: true };
     }
   } else if (shouldAdvance) {
-    db.prepare("UPDATE automations SET last_run_at = ?, next_run_at = ?, enabled = ? WHERE id = ?")
-      .run(ranAt.toISOString(), advance ? advance.toISOString() : null, advance ? row.enabled : 0, row.id);
+    db.prepare("UPDATE automations SET last_run_at = ?, next_run_at = ? WHERE id = ?")
+      .run(ranAt.toISOString(), advance ? advance.toISOString() : null, row.id);
+    if (!advance) disableExhausted(db, row.id);
   } else {
     db.prepare("UPDATE automations SET last_run_at = ? WHERE id = ?").run(ranAt.toISOString(), row.id);
   }
   return { advance, maxRunsReached: false };
 }
 
-/** 데몬 폴링: 활성 + 스케줄 트리거 + next_run_at 도래분. trigger_type 열은 방어적. */
-function dueAutomations(db, nowIso = new Date().toISOString(), limit = 5) {
+/**
+ * 이 실행기가 실행할 수 없는 계열의 SQL 술어 — daemon.runnerSkip 게이트와 짝이다.
+ * (hub 타깃 / tool_mode browser·computer-use = Desktop 몫.)
+ * IFNULL 필수: SQLite 3치 논리에서 NULL 열이 있으면 NOT (…) 이 NULL 이 되어
+ * 멀쩡한 행까지 조용히 사라진다.
+ */
+function runnerUnsupportedSql(db) {
+  const parts = ["IFNULL(target_type,'') = 'hub'"];
+  if (columnExists(db, "automations", "tool_mode")) {
+    parts.push("IFNULL(tool_mode,'') IN ('browser','computer-use')");
+  }
+  return `(${parts.join(" OR ")})`;
+}
+
+/**
+ * 데몬 폴링: 활성 + 스케줄 트리거 + next_run_at 도래분. trigger_type 열은 방어적.
+ *
+ * opts.runnable=true (데몬 실행 창): 이 실행기가 실행할 수 없는 행을 셀렉션에서 뺀다.
+ * 이유(굶주림 근본): 미지원 행(Desktop 몫)과 남이 리스를 쥔 행은 스킵돼도 next_run_at
+ * 이 전진하지 않는다 — 시간순 LIMIT n 창의 머리에 영구히 남아 뒤의 실행 가능한
+ * 자동화를 전부 굶긴다(데몬은 멀쩡해 보이고 아무것도 안 돈다). 실행 못 할 행은
+ * 애초에 창에 담지 않는 것이 유일한 근본 수리다 — 그 행의 회차는 그대로 보존된다.
+ * opts.runnable=false: 그 미지원 행만(고지용). 미지정: 예전 그대로 전체.
+ */
+function dueAutomations(db, nowIso = new Date().toISOString(), limit = 5, opts = {}) {
   if (!tableExists(db, "automations")) return [];
-  const triggerFilter = columnExists(db, "automations", "trigger_type") ? "AND trigger_type = 'schedule'" : "";
+  const where = ["enabled = 1"];
+  const params = [];
+  if (columnExists(db, "automations", "trigger_type")) where.push("trigger_type = 'schedule'");
+  where.push("next_run_at IS NOT NULL", "next_run_at <= ?");
+  params.push(nowIso);
+  if (opts.runnable === true) {
+    where.push(`NOT ${runnerUnsupportedSql(db)}`);
+    if (leaseSupported(db)) {
+      // 남이 유효 리스를 쥔 행은 claimAutomation 이 반드시 실패한다 — 같은 굶주림 경로.
+      where.push("(claimed_at IS NULL OR claimed_at < ?)");
+      params.push(new Date(Date.parse(nowIso) - LEASE_TTL_MS).toISOString());
+    }
+  } else if (opts.runnable === false) {
+    where.push(runnerUnsupportedSql(db));
+  }
+  params.push(limit);
   return db.prepare(
-    `SELECT * FROM automations WHERE enabled = 1 ${triggerFilter} AND next_run_at IS NOT NULL AND next_run_at <= ? ORDER BY next_run_at ASC LIMIT ?`,
-  ).all(nowIso, limit);
+    `SELECT * FROM automations WHERE ${where.join(" AND ")} ORDER BY next_run_at ASC LIMIT ?`,
+  ).all(...params);
 }
 
 module.exports = {
@@ -228,4 +285,5 @@ module.exports = {
   listRuns,
   advanceAfterRun,
   dueAutomations,
+  runnerUnsupportedSql,
 };

@@ -92,6 +92,14 @@ async function run(ctx, args) {
       targetId = f.id;
       targetLabel = f.name;
     }
+    // 잘못된 IANA 존이면 nextCronRun 이 cron 파싱 실패와 똑같이 null 을 돌려준다.
+    // 그대로 두면 멀쩡한 cron 을 범인으로 지목해서, 사용자가 cron 만 계속 고쳐 쓰며
+    // 매번 같은 실패를 본다. 존을 먼저 검증해 틀린 필드를 정확히 지목한다.
+    if (flags.tz && !schedule.isValidTimezone(flags.tz)) {
+      return fail(ko
+        ? `타임존을 해석하지 못했습니다: "${flags.tz}" (IANA 형식이 필요합니다 — 예: Asia/Seoul, UTC, America/New_York)`
+        : `Could not parse timezone: "${flags.tz}" (needs IANA format — e.g. Asia/Seoul, UTC, America/New_York)`);
+    }
     const next = schedule.nextCronRun(flags.cron, new Date(), flags.tz || null);
     if (!next) {
       return fail(ko
