@@ -3845,6 +3845,11 @@ function create(deps = {}) {
                 system: [
                   pinned.executionGraph.manager.content,
                   "You are the pinned manager synthesizing every declared worker handoff. Do not omit a worker or claim an undeclared worker ran.",
+                  // 팀 합성물은 최상위 패킷의 핸드오프가 된다 — 직접 워커와 동일한 반환
+                  // 계약을 적용해야 검증자가 판정 근거를 얻는다. (2026-07-28 라이브 A/B
+                  // 실측: 최상위 패킷 2개가 모두 중첩 팀이라 이 요구가 어디에도 적용되지
+                  // 않았다 — 직접 워커 경로에만 넣은 커버리지 갭.)
+                  "End your synthesis with two labeled sections: LIMITATIONS (what the team could not verify or complete — write 'none' only if truly none) and STATUS (COMPLETED, PARTIAL, or FAILED; for PARTIAL/FAILED name each unmet doneWhen condition from the parent packet). Claiming COMPLETED does not finish the run — a pinned verifier accepts or rejects the claim.",
                 ].join("\n\n"),
                 prompt: stableJson({ parentPacket: packet, synthesisBrief: manager.plan.synthesisBrief, handoffs: graphWorkerOutputs.map((row) => ({ id: row.graphWorker.id, text: row.text })) }),
               });
