@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.0.13 — 2026-07-28
+
+- **MCP servers reach the chat again.** `runNativeTurn` only injects them at
+  `full` permission and that gate was right, but `sessions/session.cjs` never
+  put `mcpServers` in the request — zero callers — so no CLI ever received a
+  server. `agentlas mcp probe` printed "connected" while the turn that followed
+  could not use it. Turns now carry servers the user already consented to;
+  nothing new is asked mid-turn, because a turn is not a place a user can answer.
+- **The shared database stops taking a write lock every turn.** Four
+  `CREATE TABLE IF NOT EXISTS`, five indexes and an `ALTER TABLE` ran on every
+  single turn against the file Desktop also uses. All idempotent, all taking the
+  lock; during a Desktop migration that burns the 15s busy timeout and every
+  call site swallowed the failure. Schema repair is once per connection now, and
+  the three copies of `ensureMemoryContextColumn` are one function.
+- **Rows written here are checked for referential integrity.** `foreign_keys` is
+  a connection property, not a file property — Desktop opened with it ON and the
+  terminal did not, so terminal writes skipped the check on shared tables.
+- **A zero-byte database file no longer blocks first run forever.** One stray
+  `sqlite3 <missing-path>` left an empty file, and every run after that read
+  "already exists" and died on `no such table` with nothing visible to explain it.
+- **Bootstrap schema is current again** (v81; it was a v45 snapshot from
+  2026-07-07), and a mismatch with Desktop's migration target now fails a gate.
+- **An engine update landing mid-run cannot mix two releases.** Core roots
+  resolve to their real path, so a long run keeps the modules it started with.
+  The next call still picks up the new release.
+- `/ontology` says what it manages — this project's knowledge sources, not the
+  engine's knowledge runtime. The command itself is unchanged.
+
 ## 1.0.12 — 2026-07-28
 
 - **Orchestrator/worker model roles now resolve from ordered candidate
