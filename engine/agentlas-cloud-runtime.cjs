@@ -74,7 +74,7 @@ function buildManifest(root, options = {}) {
     memoryPolicy: { writeBack: "ask", publicCopy: "reset" },
     memory: files.filter((file) => [".agentlas/memory-map.json", ".agentlas/agent-card.json"].includes(file.path)).map((file) => file.path),
     allowRead: ["README.md", "AGENTS.md", "agent.md", "skills/**", ".agentlas/*.json"],
-    denyRead: [".env", ".env.*", "**/secrets/**", "**/credentials/**", "**/cookies/**", "**/*token*", "**/*secret*"],
+    denyRead: [".env", ".env.*", "secrets/**", "**/secrets/**", "credentials/**", "**/credentials/**", "cookies/**", "**/cookies/**"],
     publicExportPolicy: "clean-copy",
     requiredRuntime: ["mcp-client"],
     license: "call-only-default",
@@ -92,7 +92,13 @@ function scanFiles(files) {
     findings.push({ verdict, type, path: file.path, ...(line ? { line } : {}), message, redacted: true });
   }
   for (const file of files) {
-    if ([".env", ".env.local"].includes(file.path) || /(?:^|\/)(secrets|credentials|cookies)\//i.test(file.path) || /token|secret/i.test(file.path)) {
+    // A credential store is a path SEGMENT, never a filename substring. The old
+    // `/token|secret/i` test blocked ordinary vocabulary — measured 2026-07-29,
+    // it gave the live `web-master` package a BLOCK verdict for its own design
+    // system (`token-architecture.md`, `reference-token-db.json`). Dropping it
+    // costs no coverage: the per-line SECRET_PATTERNS scan below reads every
+    // packaged file and is the check that actually looks at values.
+    if (/^\.env(\.|$)/.test(file.path.split("/").pop() || "") || /(?:^|\/)(secrets|credentials|cookies)\//i.test(file.path)) {
       add("BLOCK", "credential-path", file, null, "Credential-like file path is excluded from Cloud package and public publish.");
     }
     file.content.split(/\r?\n/).forEach((line, index) => {
