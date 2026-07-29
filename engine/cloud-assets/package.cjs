@@ -33,10 +33,12 @@ const {
   cloudPortablePathConflict,
   cloudPackageHashVersion,
   cloudHashPackage,
+  normalizeCloudAssetDescriptor,
 } = require("../hub/install.cjs");
 const { SECRET_PATTERNS } = require("../agentlas-secret-patterns.cjs");
 const { userDataDir } = require("../core/paths.cjs");
 const state = require("./state.cjs");
+const { cargoSearchAgents } = require("./cargo.cjs");
 const cas = require("./cas.cjs");
 
 const CLOUD_TEXT_EXTS = new Set([".cfg", ".cjs", ".conf", ".config", ".css", ".csv", ".env", ".html", ".ini", ".js", ".json", ".jsonl", ".md", ".mjs", ".properties", ".ps1", ".psd1", ".psm1", ".py", ".sh", ".toml", ".ts", ".tsx", ".txt", ".xml", ".yaml", ".yml"]);
@@ -748,6 +750,28 @@ function cloudSecuritySummary(findings) {
 
 // ── 메인: 패키지(+등록) ──
 
+/**
+ * 이 계정이 소유한 자산의 현재 리비전을 서버에서 조회한다.
+ * 로컬 관측 기록이 전혀 없는 새 PC/새 클론에서 갱신을 가능하게 하는 유일한 경로다.
+ * 소유자 세션이 없거나 자산이 없으면 null — 조용한 폴백은 만들지 않는다.
+ */
+async function lookupOwnedCloudDescriptor(slug, scope) {
+  let response;
+  try {
+    response = await cargoSearchAgents({ q: slug, limit: 20 });
+  } catch {
+    return null;
+  }
+  const rows = Array.isArray(response && response.results) ? response.results : [];
+  const row = rows.find((item) => item && item.slug === slug && item.scope === scope);
+  if (!row) return null;
+  try {
+    return normalizeCloudAssetDescriptor(row, "owner cloud search result");
+  } catch {
+    return null;
+  }
+}
+
 async function packageCloudAgent(db, root, opts = {}) {
   const requestedRoot = path.resolve(root);
   let st;
@@ -796,7 +820,7 @@ async function packageCloudAgent(db, root, opts = {}) {
   const name = cloudReadName(snapshot, path.basename(rootPath));
   const slug = cloudSlug(opts.slug || cloudReadStableSlug(snapshot) || name || path.basename(rootPath));
   const scope = cas.cloudScopeForVisibility(visibility);
-  const baseDescriptor = state.cloudBaseDescriptorForSource(scan.localPackageMarker, rootPath, slug, scope);
+  let baseDescriptor = state.cloudBaseDescriptorForSource(scan.localPackageMarker, rootPath, slug, scope);
   const packageHashVersion = CLOUD_PACKAGE_HASH_V2;
   const packageHash = cloudHashPackage(scan.included, packageHashVersion);
   const manifest = {
@@ -844,6 +868,30 @@ async function packageCloudAgent(db, root, opts = {}) {
   let registration = null;
   let status = blocked ? "blocked" : opts.dryRun ? "dry-run" : "ready";
   if (!blocked && !opts.dryRun) {
+    // 자산의 정체성은 (로그인 계정, slug)다 — 어느 폴더에서 올리는지는 중요하지 않다.
+    // 쓰기 전에 서버가 들고 있는 내 자산의 현재 버전을 조회해서:
+    //   · 이 폴더에 기록이 없으면(새 PC, 새 클론) 그 버전을 기준으로 업데이트한다.
+    //   · 이 폴더 기록이 서버보다 오래됐으면(다른 곳에서 먼저 올림) 덮어쓰기 전에 멈춘다.
+    // 이것은 412 뒤의 자동 재시도가 아니라 쓰기 전 refresh다. 등록 자체는 여전히
+    // 조회한 정확한 리비전에 대한 조건부 쓰기(If-Match)라 경합은 서버가 막는다.
+    const remote = await lookupOwnedCloudDescriptor(slug, scope);
+    if (!baseDescriptor && remote) {
+      baseDescriptor = state.rememberCloudAssetDescriptor(remote, { sourceRoot: rootPath });
+    } else if (baseDescriptor && remote && baseDescriptor.revision !== remote.revision) {
+      if (opts.overwriteRemote) {
+        baseDescriptor = state.rememberCloudAssetDescriptor(remote, { sourceRoot: rootPath });
+      } else {
+        const error = new Error(
+          `업로드하지 않았습니다. "${slug}"에 더 새 버전이 있습니다 (${remote.updatedAt || "시각 미상"}에 다른 곳에서 저장됨).\n` +
+          `  지금 폴더 내용으로 그 버전을 덮어쓰려면: --overwrite\n` +
+          `  먼저 그 버전을 받아서 비교하려면:      agentlas cloud restore ${slug}\n` +
+          `  (서버 cloudId ${remote.cloudId} · revision ${remote.revision})`,
+        );
+        error.code = "cloud_agent_revision_conflict";
+        error.current = remote;
+        throw error;
+      }
+    }
     registration = await cas.registerCloudAgent(manifest, bundlePath, review, visibility, { baseDescriptor });
     let descriptor;
     try {

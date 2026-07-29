@@ -103,6 +103,7 @@ const CLOUD_HELP = [
   "  publish <path> [--dry-run] [--slug name]",
   "                                      explicitly publish to the public Agentlas Hub",
   "  package <path> [--json] [--visibility private-link|marketplace]",
+  "  --overwrite                         서버에 더 새 버전이 있어도 지금 폴더 내용으로 덮어쓰기",
   "                                      package only; defaults to private-save checks",
   "  list [--json]                       list packages in your private Agent Cloud",
   "  restore <slug> [--json]             restore an owned Cloud package on this machine",
@@ -241,6 +242,7 @@ async function runCloud(ctx, args) {
     slug: typeof flags.slug === "string" ? flags.slug : undefined,
     visibility,
     llmReview: Boolean(flags["llm-review"]),
+    overwriteRemote: Boolean(flags.overwrite),
     dryRun,
   });
   if (flags.json) {

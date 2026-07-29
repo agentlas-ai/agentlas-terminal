@@ -42,9 +42,14 @@ function cloudCasResponseError(response, label) {
   let message = `${label} failed with HTTP ${response.status}`;
   if (response.status === 412 && code === "cloud_agent_revision_conflict") {
     const current = body && body.current ? body.current : body && body.conflict && body.conflict.current;
+    // 서버가 알려준 사실만 사람 말로 전달한다. 내부 개념(precondition, base, 연결)은
+    // 사용자에게 아무 의미가 없다 — 기준은 "이 이름이 내 계정 것인가" 하나다.
     message = current
-      ? `다른 PC에서 이 Agent Cloud 자산이 변경되었습니다. 자동 덮어쓰기는 중단했습니다. \`agentlas cloud list\`로 최신 revision을 확인하고 \`agentlas cloud restore ${current.slug || "<slug>"}\`로 복원한 뒤 변경 사항을 병합하세요.`
-      : "이 Agent Cloud 자산은 다른 PC에서 삭제되었거나 다른 식별자로 다시 생성되었습니다. 자동 재생성은 중단했습니다. `agentlas cloud list`로 현재 상태를 확인하세요.";
+      ? `업로드하지 않았습니다. "${current.slug || "이 이름"}"의 서버 버전이 지금 보낸 것과 맞지 않습니다` +
+        `${current.updatedAt ? ` (서버 쪽 마지막 저장: ${current.updatedAt})` : ""}.\n` +
+        `  내 계정 자산이면: agentlas cloud restore ${current.slug || "<slug>"} 로 받아서 확인한 뒤 다시 저장하세요.\n` +
+        `  (서버 cloudId ${current.cloudId || "?"} · revision ${current.revision || "?"})`
+      : "업로드하지 않았습니다. 이 이름의 자산이 삭제됐거나 다른 계정 소유입니다. `agentlas cloud list`로 내 자산을 확인하세요.";
   } else if (response.status === 428 && code === "client_upgrade_required") {
     message = "No base revision is available to safely update the existing Cloud asset. The server revision will not be copied automatically. Check `agentlas cloud list`, restore with `agentlas cloud restore <slug>`, then save again.";
   } else if (response.status === 503 && code === "cloud_mutations_maintenance") {

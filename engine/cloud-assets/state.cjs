@@ -174,6 +174,39 @@ function cloudBaseDescriptorFromMarker(marker, slug, scope) {
  * 톰스톤에 걸린 마커 디스크립터는 무시(삭제 후 재저장은 새 생성이어야 한다).
  * 둘 다 있으면 같은 cloudId에서 더 최신 관측을 채택한다.
  */
+/**
+ * 이 slug/scope의 관측된 리비전은 있는데, 이 소스 루트에는 아직 연결되지 않은
+ * 경우를 돌려준다.
+ *
+ * 이 구분이 없으면 base 조회가 null을 돌려주고, 호출부는 그것을 "새 자산"으로
+ * 읽어 create precondition을 보낸다. 서버에는 자산이 멀쩡히 존재하므로 412로
+ * 거절되고, 사용자는 "다른 PC에서 변경됨 / restore 하세요"라는 엉뚱한 안내를
+ * 받는다. restore는 디스크립터를 설치 경로에 묶으므로 소스 루트에서 발행하는
+ * 한 영원히 해소되지 않는다. 모름을 그럴듯한 값으로 메꾸지 않기 위한 분기다.
+ */
+function cloudUnboundDescriptorForSource(rootPath, slug, scope) {
+  const state = readCloudAssetState();
+  const entry = state.assets[`${scope}:${slug}`];
+  if (!entry) return null;
+  return entry.sourceRoots.includes(path.resolve(rootPath)) ? null : entry.descriptor;
+}
+
+/** 이 소스 루트를 이미 관측된 클라우드 자산에 명시적으로 연결한다. */
+function bindCloudAssetSourceRoot(rootPath, slug, scope) {
+  const state = readCloudAssetState();
+  const key = `${scope}:${slug}`;
+  const entry = state.assets[key];
+  if (!entry) throw new Error(`No observed Cloud revision for ${key} to bind.`);
+  const normalizedRoot = path.resolve(rootPath);
+  const roots = [...new Set([...entry.sourceRoots, normalizedRoot])].slice(0, 32);
+  state.assets[key] = { descriptor: entry.descriptor, sourceRoots: roots };
+  state.deletedBases = state.deletedBases.filter(
+    (item) => !(item.rootPath === normalizedRoot && item.slug === slug && item.scope === scope),
+  );
+  writeCloudAssetState(state);
+  return entry.descriptor;
+}
+
 function cloudBaseDescriptorForSource(marker, rootPath, slug, scope) {
   const state = readCloudAssetState();
   const normalizedRoot = path.resolve(rootPath);
@@ -263,6 +296,8 @@ module.exports = {
   cloudMarkerDescriptors,
   cloudBaseDescriptorFromMarker,
   cloudBaseDescriptorForSource,
+  cloudUnboundDescriptorForSource,
+  bindCloudAssetSourceRoot,
   writeCloudSourceMarker,
   readCloudSourceMarker,
 };

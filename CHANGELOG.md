@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.15 — 2026-07-29
+
+- **Agent Cloud saves work from a new machine or fresh clone.** Before writing,
+  the terminal resolves the signed-in owner's exact asset revision by
+  `slug` and scope, then keeps the conditional-write guard on that revision.
+  A missing local receipt no longer turns an owned asset into a false create
+  conflict.
+- **A real stale-copy conflict stays fail-closed.** The terminal stops before
+  replacing a newer server revision, reports its identity, and offers an
+  explicit `--overwrite` only when the owner deliberately chooses the current
+  folder over the newer copy.
+- Conflict messages now describe ownership and the next command instead of
+  exposing storage precondition terminology.
+
 ## 1.0.14 — 2026-07-29
 
 - **Write-capable commands now prepare every project automatically.** The first
