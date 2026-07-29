@@ -66,4 +66,24 @@ function run(ctx) {
   return 0;
 }
 
-module.exports = { run, HELP };
+function runForCommand(ctx, command) {
+  const name = String(command || "").trim();
+  const rows = HELP.split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line && !line.endsWith(":"))
+    .filter((line) => {
+      const commandColumn = line.split(/\s{2,}/, 1)[0];
+      return commandColumn
+        .split(/\s*·\s*|\s*\|\s*/)
+        .some((entry) => entry === name || entry.startsWith(`${name} `));
+    });
+  ctx.out(`Usage: agentlas ${name} [options]`);
+  if (rows.length > 0) {
+    for (const row of rows) ctx.out(`  ${row}`);
+  } else {
+    ctx.out(`  See "agentlas help" for the full command list.`);
+  }
+  return 0;
+}
+
+module.exports = { run, runForCommand, HELP };

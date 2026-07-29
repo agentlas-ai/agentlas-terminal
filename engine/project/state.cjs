@@ -341,15 +341,16 @@ function activeProjectPath(db, options = {}) {
   return result.activated ? root : null;
 }
 
-// v1 시그니처 보존: permission/reason은 받되 절대 초기화 권한으로 쓰지 않는다.
 function ensureTerminalProjectForExecutionCli(db, projectPath, permission = "write", reason = "terminal-first-contact") {
   const root = terminalProjectCandidateCli(projectPath);
   if (!root) return null;
-  // Every ordinary execution mode is passive. Only `agentlas project init`
-  // may create .agentlas state or edit .gitignore; write/full permission is
-  // authority for the requested task, not consent to initialize the folder.
-  void permission;
-  void reason;
+  // A real write-capable execution is the product's first-contact boundary.
+  // Install the same private, merge-only Core infrastructure in whichever
+  // project the user opened; never key this behavior to the Agentlas_F repo.
+  if (permission === "write" || permission === "full") {
+    return initializeTerminalProjectCli(db, root, reason);
+  }
+  // Read-only inspection remains passive and never creates files.
   const active = activeProjectPath(db, { projectPath: root });
   if (!active) return null;
   return initializedAgentlasProjectPathCli(root);

@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.14 — 2026-07-29
+
+- **Write-capable commands now prepare every project automatically.** The first
+  `run`, `storm`, `swarm`, or workforce execution in any folder installs the
+  same private, merge-only Agentlas project infrastructure through Core. This
+  is based on the folder the user opened, not on the Agentlas source checkout.
+  Read-only commands remain passive and do not create files.
+- **Per-command help works before database startup.** Commands such as
+  `agentlas run --help` and `agentlas workforce --help` no longer require an
+  SQLite driver or open the project database just to print usage.
+
 ## 1.0.13 — 2026-07-28
 
 - **MCP servers reach the chat again.** `runNativeTurn` only injects them at

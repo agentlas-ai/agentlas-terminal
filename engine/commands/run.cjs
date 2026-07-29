@@ -26,6 +26,8 @@ const { Orchestrator } = require("../sessions/orchestrator.cjs");
 const { Renderer } = require("../ui/renderer.cjs");
 const permissions = require("../agentlas-permissions.cjs");
 const { EFFORTS, TIERS } = require("../agentlas-workload-routing.cjs");
+const { projectCwd } = require("../project/paths.cjs");
+const { ensureTerminalProjectForExecutionCli } = require("../project/state.cjs");
 
 function readStdin() {
   return new Promise((resolve) => {
@@ -164,12 +166,20 @@ async function runOnce(ctx, args) {
     }
   }
 
+  const permission = permissions.normalize(parsed.permission || (ctx.prefs && ctx.prefs.permission) || "write");
+  const cwd = projectCwd();
+  try {
+    ensureTerminalProjectForExecutionCli(db, cwd, permission, "terminal-run");
+  } catch (e) {
+    ctx.err(String((e && e.message) || e));
+    return 1;
+  }
   const orch = new Orchestrator({ db, lang: ctx.lang });
   const session = orch.spawn({
     agent,
     runtime,
-    permission: permissions.normalize(parsed.permission || (ctx.prefs && ctx.prefs.permission) || "write"),
-    cwd: process.cwd(),
+    permission,
+    cwd,
     title: prompt.slice(0, 60),
   });
 

@@ -10,16 +10,12 @@
  * stormbreaker-core-harness-unavailable 로 멈춘다 — 하네스의 로컬 모조 실행 금지.
  * 런타임 부재는 resolveRuntime의 code="no_runtime" throw가 그대로 전파돼 exit 1.
  *
- * projectPath 에 대한 정직한 메모: v1은 ensureTerminalProjectForExecutionCli(db,
- * cwd, permission, "terminal-storm")로 프로젝트 상태 머신을 돌려 활성 프로젝트
- * 경로를 만들었다. 그 프로젝트-상태 기계는 아직 v2로 포팅되지 않았다. storm/swarm 이
- * projectPath 를 쓰는 곳은 buildChildEnv 의 프로젝트 dotenv 스코핑뿐이고 부재 시
- * fail-closed 의존이 없다 — 그래서 여기서는 cwd 를 projectPath 로 넘긴다
- * (commands/workforce.cjs 와 동일한 결정·동일한 근거). 프로젝트-상태 모듈이 v2에
- * 착륙하면 이 자리를 그 결과로 교체한다.
+ * Write-capable first contact now runs the canonical Core project bootstrap
+ * for the exact current folder. Read-only execution remains passive.
  */
 const { buildStormDeps } = require("../storm/deps.cjs");
 const { projectCwd } = require("../workforce/capture.cjs");
+const { ensureTerminalProjectForExecutionCli } = require("../project/state.cjs");
 
 function assertPermissionFlag(value) {
   if (value && !["read", "write", "full"].includes(String(value))) {
@@ -62,11 +58,11 @@ async function run(ctx, args) {
   const db = ctx.db();
   const cwd = projectCwd();
   const permission = resolvePermission(ctx);
+  const projectPath = ensureTerminalProjectForExecutionCli(db, cwd, permission, "terminal-storm") || cwd;
   const storm = require("../storm/storm.cjs").create(buildStormDeps(ctx));
   const r = await storm.cmdStorm(db, rest, runtimeOverride, {
     cwd,
-    // v1 ensureTerminalProjectForExecutionCli 미포팅 — 위 파일 머리 주석 참조.
-    projectPath: cwd,
+    projectPath,
     permission,
   });
   return r && r.ok ? 0 : 1;

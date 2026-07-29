@@ -11,17 +11,12 @@
  * parity().cmdHep(["hep-network", ...]) 호환 탈출구였는데, 그 parity 모듈이 아직
  * v2에 없으므로 정직 정지로 안내만 한다(가짜 성공 금지).
  *
- * projectPath 에 대한 정직한 메모: v1은 ensureTerminalProjectForExecutionCli(db,
- * cwd, permission, "terminal-workforce")로 프로젝트 상태 머신을 돌려 활성 프로젝트
- * 경로를 만들었다. 그 프로젝트-상태 기계(폴더 방문 기록/활성화 판정)는 아직 v2로
- * 포팅되지 않았다. cmdWorkforce 가 projectPath 를 쓰는 곳은 buildChildEnv 의
- * 프로젝트 dotenv 스코핑뿐이고(agentlas-workforce.cjs 1926행) 부재 시 fail-closed
- * 의존이 없음을 확인했다 — 그래서 여기서는 cwd 를 projectPath 로 넘긴다(같은 폴더
- * 의 .env/.env.local 이 비신뢰 소스로 한 번 더 스캔될 뿐, 권한이 넓어지지 않는다).
- * 프로젝트-상태 모듈이 v2에 착륙하면 이 자리를 그 결과로 교체한다.
+ * Write-capable first contact bootstraps the exact current project through the
+ * canonical Core merge-only boundary. Read-only inspection remains passive.
  */
 const { workforceRuntime } = require("../workforce/deps.cjs");
 const { projectCwd } = require("../workforce/capture.cjs");
+const { ensureTerminalProjectForExecutionCli } = require("../project/state.cjs");
 
 function resolvePermission(ctx) {
   // v1 resolveTerminalPermission 포팅: 저장된 `full` 은 세션 한정 계약이라
@@ -70,11 +65,16 @@ async function dispatch(ctx, command, args) {
       const db = ctx.db();
       const cwd = projectCwd();
       const permission = resolvePermission(ctx);
+      const projectPath = ensureTerminalProjectForExecutionCli(
+        db,
+        cwd,
+        permission,
+        `terminal-${command}`,
+      ) || cwd;
       const runtime = workforceRuntime({ lang: ctx.lang, out: ctx.out });
       const result = await runtime.cmdWorkforce(db, rest, runtimeOverride, {
         cwd,
-        // v1 ensureTerminalProjectForExecutionCli 미포팅 — 위 파일 머리 주석 참조.
-        projectPath: cwd,
+        projectPath,
         permission,
       });
       return result && result.ok ? 0 : 1;

@@ -11,11 +11,11 @@
  * agentlas-workload-routing 이 검증만 하고, 거부 시 fail-closed 다.
  * 런타임 부재는 resolveRuntime의 code="no_runtime" throw가 그대로 전파돼 exit 1.
  *
- * projectPath: v1 ensureTerminalProjectForExecutionCli 미포팅 —
- * commands/storm.cjs 파일 머리 주석과 동일한 결정·동일한 근거로 cwd 를 넘긴다.
+ * Write-capable first contact bootstraps the exact current project through Core.
  */
 const { buildStormDeps } = require("../storm/deps.cjs");
 const { projectCwd } = require("../workforce/capture.cjs");
+const { ensureTerminalProjectForExecutionCli } = require("../project/state.cjs");
 
 function assertPermissionFlag(value) {
   if (value && !["read", "write", "full"].includes(String(value))) {
@@ -62,11 +62,11 @@ async function run(ctx, args) {
   const db = ctx.db();
   const cwd = projectCwd();
   const permission = resolvePermission(ctx);
+  const projectPath = ensureTerminalProjectForExecutionCli(db, cwd, permission, "terminal-swarm") || cwd;
   const swarm = require("../storm/swarm.cjs").create(buildStormDeps(ctx));
   const r = await swarm.cmdSwarm(db, rest, runtimeOverride, {
     cwd,
-    // v1 ensureTerminalProjectForExecutionCli 미포팅 — commands/storm.cjs 주석 참조.
-    projectPath: cwd,
+    projectPath,
     permission,
   });
   return r && r.ok ? 0 : 1;

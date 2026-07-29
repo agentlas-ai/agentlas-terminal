@@ -102,6 +102,14 @@ function nearestCommands(token, names) {
 
 function main() {
   const argv = process.argv.slice(2);
+  const helpRequested = argv.some((arg) => arg === "--help" || arg === "-h");
+  const helpCommand = argv.find((arg) => arg !== "--help" && arg !== "-h" && !arg.startsWith("-"));
+  if (helpRequested && helpCommand) {
+    const ctx = buildCtx();
+    const command = commands.resolveCommandName(helpCommand);
+    const code = require("./commands/help.cjs").runForCommand(ctx, command);
+    process.exit(typeof code === "number" ? code : 0);
+  }
   // 옵션 정규화: -h/--help/-V/--version 은 하위 명령으로 변환
   const normalized = argv.map((a) => {
     if (a === "--help" || a === "-h") return "help";

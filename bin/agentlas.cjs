@@ -186,7 +186,7 @@ function main() {
   let error = null;
   if (!engineFound) {
     error = "Engine not found (engine/agentlas.cjs). Reinstall with: npm i -g agentlas";
-  } else if (!sqliteDriver) {
+  } else if (!sqliteDriver && !metadataOnly) {
     error = `Node ${process.version} — no SQLite driver. Upgrade to Node 22.5+ or reinstall with 'npm i -g agentlas' to build better-sqlite3.`;
   }
 
