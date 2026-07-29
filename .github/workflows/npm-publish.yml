@@ -115,11 +115,12 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Verify release contracts
-        run: npm run test:release-contracts
-
-      - name: Run smoke suite
-        run: npm run smoke
+      - name: Enforce private verification boundary
+        run: |
+          set -euo pipefail
+          test ! -e test/smoke.sh
+          test ! -e tests
+          echo "Release tests stay in local/private verification and are not published."
 
       - name: Verify package contents
         run: |
