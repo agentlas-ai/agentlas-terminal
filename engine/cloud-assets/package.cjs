@@ -577,6 +577,7 @@ function cloudRoutingCardProblem(card) {
   if (card.type !== "agent" && card.type !== "team" && card.type !== "plugin") return "type must be agent, team, or plugin";
   if (typeof card.name !== "string" || !card.name.trim()) return "name must be a non-empty string";
   if (typeof card.summary !== "string" || !card.summary.trim()) return "summary must be a non-empty string";
+  if (card.summary.length > 240) return "summary must be at most 240 characters";
   if (!Array.isArray(card.capabilities) || card.capabilities.length === 0) return "capabilities must be a non-empty array";
   for (const capability of card.capabilities) {
     if (typeof capability !== "string" || !CLOUD_ROUTING_CARD_CAPABILITY_RE.test(capability)) {
@@ -585,6 +586,33 @@ function cloudRoutingCardProblem(card) {
   }
   if (typeof card.routing_status !== "string" || !CLOUD_ROUTING_CARD_STATUSES.has(card.routing_status)) {
     return "routing_status must be draft, searchable, candidate, routing_ready, or trusted";
+  }
+  const workforce = card.workforce;
+  if (!workforce || typeof workforce !== "object" || Array.isArray(workforce)) {
+    return "workforce must be a complete semantic resume";
+  }
+  const semanticLists = [
+    ["communities", /^community:[a-z0-9][a-z0-9-]*$/, 1, 5],
+    ["roles", /^role:[a-z0-9][a-z0-9-]*$/, 0, 4],
+    ["skills", /^skill:[a-z0-9][a-z0-9-]*$/, 1, 12],
+    ["knowledge", /^knowledge:[a-z0-9][a-z0-9-]*$/, 0, 256],
+  ];
+  for (const [field, pattern, minimum, maximum] of semanticLists) {
+    const values = workforce[field];
+    if (!Array.isArray(values) || values.length < minimum || values.length > maximum) {
+      return `workforce.${field} must contain ${minimum}-${maximum} English semantic IDs`;
+    }
+    if (new Set(values).size !== values.length ||
+        values.some((value) => typeof value !== "string" || !pattern.test(value))) {
+      return `workforce.${field} contains an invalid or duplicate semantic ID`;
+    }
+  }
+  for (const field of ["languages", "modalities"]) {
+    const values = workforce[field];
+    if (!Array.isArray(values) || new Set(values).size !== values.length ||
+        values.some((value) => typeof value !== "string")) {
+      return `workforce.${field} must be a unique string array`;
+    }
   }
   return null;
 }

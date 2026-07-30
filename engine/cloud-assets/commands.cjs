@@ -29,7 +29,7 @@ function purposeRepairNeeded(result) {
   const ids = new Set((result?.review?.findings || []).map((finding) => finding.id));
   return ids.has("routing-card-required") ||
     (result?.review?.findings || []).some((finding) =>
-      finding.id === "routing-card-invalid" && /summary|capabilities|name|id/i.test(finding.message || ""));
+      finding.id === "routing-card-invalid" && /summary|capabilities|name|id|workforce/i.test(finding.message || ""));
 }
 
 async function askPurpose(ctx, flags) {
@@ -131,10 +131,13 @@ function writePurposeRepairCopy(root, projection) {
     id,
     type: routing.type === "team" || routing.type === "plugin" ? routing.type : "agent",
     name: projection.titleEn,
-    summary: projection.summary,
+    summary: projection.summary.slice(0, 240),
     capabilities: projection.capabilities,
     routing_status: "routing_ready",
     workforce: {
+      ...(routing.workforce && typeof routing.workforce === "object" && !Array.isArray(routing.workforce)
+        ? routing.workforce
+        : {}),
       roles: projection.roles,
       communities: projection.communities,
       skills: projection.skills,
