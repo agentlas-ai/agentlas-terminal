@@ -10,12 +10,158 @@
  *    명시적 --visibility marketplace 로만 publish가 된다.
  * 오류는 throw → 명령 파일이 ctx.err + return 1 로 처리한다 (process.exit 금지).
  */
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const readline = require("node:readline/promises");
 const cloudRuntime = require("../agentlas-cloud-runtime.cjs");
 const { installHubAgent } = require("../hub/install.cjs");
 const { callHubTool, HubError } = require("../cloud/hub-client.cjs");
 const { packageCloudAgent } = require("./package.cjs");
 const { deleteCloudAgent } = require("./cas.cjs");
 const { listOwnedCloudAgents, restoreOwnedCloudAgent } = require("./restore.cjs");
+const workforceDeps = require("../workforce/deps.cjs");
+const workforceCapture = require("../workforce/capture.cjs");
+
+const PURPOSE_QUESTION = "What concrete work should this agent complete, and what should the finished result look like?";
+
+function purposeRepairNeeded(result) {
+  const ids = new Set((result?.review?.findings || []).map((finding) => finding.id));
+  return ids.has("routing-card-required") ||
+    (result?.review?.findings || []).some((finding) =>
+      finding.id === "routing-card-invalid" && /summary|capabilities|name|id/i.test(finding.message || ""));
+}
+
+async function askPurpose(ctx, flags) {
+  if (typeof flags.purpose === "string" && flags.purpose.trim()) return flags.purpose.trim();
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return "";
+  const prompt = ctx.lang === "ko"
+    ? "이 에이전트가 실제로 끝내야 할 일과, 완료됐을 때 나와야 할 결과를 평소 말하듯 적어주세요: "
+    : `${PURPOSE_QUESTION} `;
+  const terminal = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return String(await terminal.question(prompt)).trim();
+  } finally {
+    terminal.close();
+  }
+}
+
+function parsePurposeProjection(raw) {
+  const text = String(raw || "").trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  const value = JSON.parse(text);
+  const ids = (input, prefix, min = 1) => {
+    if (!Array.isArray(input)) throw new Error(`${prefix} must be an array`);
+    const pattern = prefix === "capability"
+      ? /^[a-z][a-z0-9]*(_[a-z0-9]+)+$/
+      : new RegExp(`^${prefix}:[a-z0-9][a-z0-9-]*$`);
+    const output = [...new Set(input.map((item) => String(item).trim()).filter((item) => pattern.test(item)))];
+    if (output.length < min) throw new Error(`${prefix} is incomplete`);
+    return output;
+  };
+  const requiredText = (key) => {
+    const output = typeof value[key] === "string" ? value[key].trim() : "";
+    if (!output) throw new Error(`${key} is missing`);
+    return output;
+  };
+  return {
+    titleEn: requiredText("titleEn"),
+    titleKo: requiredText("titleKo"),
+    summary: requiredText("summary"),
+    descriptionKo: requiredText("descriptionKo"),
+    capabilities: ids(value.capabilities, "capability", 2),
+    roles: ids(value.roles, "role"),
+    communities: ids(value.communities, "community"),
+    skills: ids(value.skills, "skill", 2),
+    knowledge: ids(value.knowledge, "knowledge"),
+  };
+}
+
+async function projectPurposeWithConnectedModel(ctx, answer, fallbackName) {
+  const runtime = workforceDeps.resolveWorkforceRuntime(ctx.db()).roleRuntimes.orchestrator;
+  const system = [
+    "Convert an ordinary-language agent purpose into one English internal routing resume.",
+    "The answer may be in any language. Preserve meaning; do not add tools, runtimes, languages, modalities, permissions, authorities, or forbidden authorities.",
+    "Return JSON only.",
+  ].join(" ");
+  const prompt = [
+    `Working name: ${fallbackName}`,
+    `User explanation: ${answer}`,
+    "",
+    'Return {"titleEn":"","titleKo":"","summary":"","descriptionKo":"","capabilities":[],"roles":[],"communities":[],"skills":[],"knowledge":[]}.',
+    "summary must be a concrete English description of work and finished result.",
+    "capabilities are 2-8 English snake_case verb-object phrases.",
+    "roles, communities, skills, knowledge are faithful open-world English IDs with role:, community:, skill:, knowledge: prefixes.",
+    "titleKo and descriptionKo are display translations only; every routing field remains English.",
+  ].join("\n");
+  let raw;
+  if (runtime.mode === "api") {
+    raw = await workforceCapture.runApi(runtime.backend, runtime.model, system, prompt, {});
+  } else {
+    if (runtime.kind === "gemini") {
+      throw new Error("The connected Gemini CLI cannot run this no-tool repair safely yet. Choose Codex/Claude or a BYOK model and retry.");
+    }
+    const env = await workforceCapture.buildChildEnv(ctx.db(), { cwd: process.cwd(), projectPath: process.cwd() });
+    raw = await workforceCapture.captureRuntime(runtime.kind, system, prompt, {
+      cwd: workforceCapture.runCwd(),
+      env,
+      permission: "read",
+      authorityMode: "no-authority",
+      model: runtime.model,
+      effort: runtime.effort,
+      timeoutConfig: { connectMs: 30_000, idleMs: 45_000, totalMs: 90_000 },
+      outputLimitBytes: 256 * 1024,
+    });
+  }
+  return parsePurposeProjection(raw);
+}
+
+function writePurposeRepairCopy(root, projection) {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agentlas-purpose-repair-"));
+  fs.cpSync(path.resolve(root), tempRoot, { recursive: true, dereference: false });
+  const metadataDir = path.join(tempRoot, ".agentlas");
+  fs.mkdirSync(metadataDir, { recursive: true });
+  const routingPath = path.join(metadataDir, "routing-card.json");
+  let routing = {};
+  try { routing = JSON.parse(fs.readFileSync(routingPath, "utf8")); } catch { /* construct it */ }
+  const id = String(routing.id || path.basename(root))
+    .normalize("NFKC").toLowerCase().replace(/[^a-z0-9._/-]+/g, "-").replace(/^-|-$/g, "") || "agent";
+  const card = {
+    ...routing,
+    schemaVersion: "routing-card/2.0",
+    id,
+    type: routing.type === "team" || routing.type === "plugin" ? routing.type : "agent",
+    name: projection.titleEn,
+    summary: projection.summary,
+    capabilities: projection.capabilities,
+    routing_status: "routing_ready",
+    workforce: {
+      roles: projection.roles,
+      communities: projection.communities,
+      skills: projection.skills,
+      knowledge: projection.knowledge,
+      languages: [],
+      modalities: [],
+    },
+  };
+  fs.writeFileSync(routingPath, `${JSON.stringify(card, null, 2)}\n`, "utf8");
+  const agentCardPath = path.join(metadataDir, "agent-card.json");
+  let agentCard = {};
+  try { agentCard = JSON.parse(fs.readFileSync(agentCardPath, "utf8")); } catch { /* construct it */ }
+  agentCard = {
+    ...agentCard,
+    name: agentCard.name || projection.titleEn,
+    summary: projection.summary,
+    localized: {
+      ...(agentCard.localized && typeof agentCard.localized === "object" ? agentCard.localized : {}),
+      titleEn: projection.titleEn,
+      titleKo: projection.titleKo,
+      descriptionEn: projection.summary,
+      descriptionKo: projection.descriptionKo,
+    },
+  };
+  fs.writeFileSync(agentCardPath, `${JSON.stringify(agentCard, null, 2)}\n`, "utf8");
+  return tempRoot;
+}
 
 function parseCloudFlags(args) {
   const flags = { _: [] };
@@ -102,6 +248,7 @@ const CLOUD_HELP = [
   "                                      save owner-private in Agent Cloud (default upload)",
   "  publish <path> [--dry-run] [--slug name]",
   "                                      explicitly publish to the public Agentlas Hub",
+  "  --purpose \"ordinary explanation\"     repair a missing purpose through your connected model",
   "  package <path> [--json] [--visibility private-link|marketplace]",
   "  --overwrite                         서버에 더 새 버전이 있어도 지금 폴더 내용으로 덮어쓰기",
   "                                      package only; defaults to private-save checks",
@@ -238,13 +385,30 @@ async function runCloud(ctx, args) {
   if (!root) { ctx.err(`usage: agentlas cloud ${sub} <path>`); return 1; }
   const visibility = cloudVisibilityForAction(sub, flags);
   const dryRun = sub === "package" || Boolean(flags["dry-run"]);
-  const result = await packageCloudAgent(ctx.db(), root, {
+  const packageOptions = {
     slug: typeof flags.slug === "string" ? flags.slug : undefined,
     visibility,
     llmReview: Boolean(flags["llm-review"]),
     overwriteRemote: Boolean(flags.overwrite),
     dryRun,
-  });
+  };
+  let result = await packageCloudAgent(ctx.db(), root, packageOptions);
+  if (sub === "publish" && result.status === "blocked" && purposeRepairNeeded(result) && !flags.json) {
+    const answer = await askPurpose(ctx, flags);
+    if (answer) {
+      const projection = await projectPurposeWithConnectedModel(ctx, answer, path.basename(path.resolve(root)));
+      const repairedRoot = writePurposeRepairCopy(root, projection);
+      try {
+        result = await packageCloudAgent(ctx.db(), repairedRoot, packageOptions);
+      } finally {
+        fs.rmSync(repairedRoot, { recursive: true, force: true });
+      }
+    } else {
+      ctx.err(ctx.lang === "ko"
+        ? `업로드를 완성하려면 답이 필요합니다. 다시 실행할 때 --purpose "평소 말로 설명"을 붙이세요.`
+        : `This upload needs one answer. Retry with --purpose "your ordinary explanation".`);
+    }
+  }
   if (flags.json) {
     ctx.out(JSON.stringify(result, null, 2));
     return (sub === "save" || sub === "publish") && result.status === "blocked" ? 1 : 0;
@@ -269,6 +433,8 @@ module.exports = {
   cloudVisibilityFlag,
   cloudVisibilityForAction,
   cloudActionForTopLevelUpload,
+  purposeRepairNeeded,
+  parsePurposeProjection,
   printCloudPackageResult,
   runCloud,
   runUpload,
