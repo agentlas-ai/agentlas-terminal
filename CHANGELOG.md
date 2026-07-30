@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.16 — 2026-07-30
+
+- **Project-scoped plugin listing now fails closed.** A missing, unsafe, or
+  uninitialized `--project` path returns a clear error instead of silently
+  showing the global Hub catalog as if project compatibility had been checked.
+- Plugin listing names its actual scope: the global Hub catalog does not claim
+  to evaluate project compatibility or local installation state.
+- Unknown, conflicting, or incomplete plugin flags now return usage errors
+  instead of being ignored.
+
 ## 1.0.15 — 2026-07-29
 
 - **Agent Cloud saves work from a new machine or fresh clone.** Before writing,

@@ -12,6 +12,7 @@ const {
   installPluginMcpRows,
   listHubPlugins,
 } = require("../hub/plugins.cjs");
+const { terminalProjectCandidateCli, initializedAgentlasProjectPathCli } = require("../project/state.cjs");
 
 async function pluginAdd(ctx, slug) {
   if (!slug) {
@@ -90,12 +91,90 @@ async function pluginList(ctx) {
   return 0;
 }
 
+async function pluginListWithProject(ctx, projectPath) {
+  const root = terminalProjectCandidateCli(projectPath);
+  if (!root) {
+    ctx.err(`project path is invalid or not safe: ${projectPath}`);
+    return 1;
+  }
+  if (!initializedAgentlasProjectPathCli(root)) {
+    ctx.err("project is not initialized for plugin listing. Run `agentlas project init` in that folder first.");
+    return 1;
+  }
+  ctx.out("Scope: global Hub plugin catalog (project compatibility and local installation state are not evaluated).");
+  return pluginList(ctx);
+}
+
+function parsePluginListFlags(args) {
+  const flags = {
+    global: false,
+    project: null,
+    errors: [],
+    positionals: [],
+  };
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--global") {
+      flags.global = true;
+      continue;
+    }
+    if (arg === "--project") {
+      const next = args[i + 1];
+      if (!next || next.startsWith("-")) {
+        flags.errors.push("usage: agentlas plugin list --project <path>");
+        return flags;
+      }
+      flags.project = next;
+      i += 1;
+      continue;
+    }
+    if (arg === "--help" || arg === "-h") {
+      flags.errors.push("usage: agentlas plugin list [--global | --project <path>]");
+      return flags;
+    }
+    if (arg.startsWith("--")) {
+      flags.errors.push(`unknown flag: ${arg}`);
+      return flags;
+    }
+    flags.positionals.push(arg);
+  }
+  if (flags.project && flags.global) {
+    flags.errors.push("cannot use --project and --global together");
+  }
+  if (flags.positionals.length > 0) {
+    flags.errors.push("usage: agentlas plugin list [--global | --project <path>]");
+  }
+  return flags;
+}
+
+async function runPluginList(ctx, args) {
+  const flags = parsePluginListFlags(args);
+  if (flags.errors.length) {
+    ctx.err(flags.errors[0]);
+    return 1;
+  }
+  if (flags.project) return pluginListWithProject(ctx, flags.project);
+  return pluginList(ctx);
+}
+
 function run(ctx, args) {
   const action = args[0];
-  if (action === "add") return pluginAdd(ctx, args[1]);
-  if (action === "list" || !action) return pluginList(ctx);
+  if (action === "add") {
+    if (args.length !== 2) {
+      ctx.err("usage: agentlas plugin add <slug>   (run agentlas plugin list first)");
+      return 1;
+    }
+    return pluginAdd(ctx, args[1]);
+  }
+  if (action === "list" || !action) {
+    const rest = action === "list" ? args.slice(1) : [];
+    return runPluginList(ctx, rest);
+  }
   ctx.err("usage: agentlas plugin add <slug> | agentlas plugin list");
   return 1;
 }
 
-module.exports = { run };
+module.exports = {
+  run,
+  parsePluginListFlags,
+};
