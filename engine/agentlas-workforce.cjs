@@ -142,11 +142,12 @@ const HUB_SECRET_PATTERNS = [
   ["credential_assignment", /\b(?:api[_-]?key|access[_-]?key|client[_-]?secret|secret|token|password|passwd|cookie)\s*[:=]\s*['"]?[^\s'";,]{8,}/i],
   ["credential_url", /\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s/:@]+:[^\s/@]+@[^\s/]+/i],
 ];
-const WORKFORCE_ONTOLOGY_MENU = [
-  "Controlled communities: community:software-engineering, community:backend-engineering, community:frontend-engineering, community:database-engineering, community:payments-engineering, community:quality-engineering, community:security-engineering, community:data-engineering, community:ai-engineering, community:devops, community:product-design, community:research, community:marketing, community:finance, community:corporate-development, community:insurance, community:insurance-actuarial, community:insurance-claims, community:insurance-underwriting, community:human-resources, community:information-technology, community:legal, community:travel, community:operations, community:agent-systems.",
-  "Controlled roles: role:software-architect, role:backend-engineer, role:frontend-engineer, role:database-engineer, role:payments-engineer, role:quality-engineer, role:security-engineer, role:ontology-architect, role:agent-runtime-engineer, role:researcher, role:ma-diligence-lead, role:insurance-actuary, role:claims-diligence-specialist, role:underwriting-diligence-specialist, role:travel-planner.",
-  "Canonical skills: skill:software-architecture, skill:api-design, skill:server-implementation, skill:frontend-implementation, skill:data-modeling, skill:database-querying, skill:billing-integration, skill:transaction-integrity, skill:test-design, skill:verification, skill:security-review, skill:ontology-modeling, skill:knowledge-graph-design, skill:multi-agent-orchestration, skill:runtime-integration, skill:evidence-synthesis, skill:deal-diligence, skill:valuation, skill:actuarial-reserving, skill:solvency-analysis, skill:claims-liability-assessment, skill:underwriting-portfolio-analysis, skill:travel-planning.",
-  "Canonical tool capabilities: tool:file-system, tool:file-read, tool:file-write, tool:shell, tool:web-search, tool:browser, tool:mongodb, tool:database, tool:github, tool:payments.",
+const WORKFORCE_ONTOLOGY_GUIDE = [
+  "Roles, communities, skills and knowledge are open-world English semantic IDs. Seed values are aliases and graph anchors, never allowlists. Author a new faithful namespaced ID when no seed expresses the work.",
+  "Community seed examples: community:software-engineering, community:backend-engineering, community:frontend-engineering, community:database-engineering, community:payments-engineering, community:quality-engineering, community:security-engineering, community:data-engineering, community:ai-engineering, community:devops, community:product-design, community:research, community:marketing, community:finance, community:legal, community:travel, community:operations, community:agent-systems.",
+  "Role seed examples: role:software-architect, role:backend-engineer, role:frontend-engineer, role:database-engineer, role:payments-engineer, role:quality-engineer, role:security-engineer, role:ontology-architect, role:agent-runtime-engineer, role:researcher, role:travel-planner.",
+  "Skill seed examples: skill:software-architecture, skill:api-design, skill:server-implementation, skill:frontend-implementation, skill:data-modeling, skill:test-design, skill:verification, skill:ontology-modeling, skill:knowledge-graph-design, skill:evidence-synthesis, skill:travel-planning.",
+  "Tool capability seed examples: tool:file-system, tool:file-read, tool:file-write, tool:shell, tool:web-search, tool:browser, tool:mongodb, tool:database, tool:github, tool:payments. Tool binding remains a prepare-time runtime concern.",
   "Use artifact:<kind> only for edges.artifactKinds. Do not fill consumes, produces, requiredRoles, requiredToolCapabilities, requiredAuthorities, forbiddenAuthorities, or modalities on a slot — tools, authorities, and modalities attach to the executing runtime, not the agent card, and card-declaration gates on those fields only exclude real candidates. Put ordinary workflow inputs, outputs, and handoffs in the slot task and edges.artifactKinds. Express desired role fit through title, task, optionalCommunities, and optionalSkills.",
   "Use a broad required community for the job-family boundary, put desired expertise in optional communities/skills plus the role task, and let the host LLM judge title, summary and semantic evidence.",
   "forbiddenCommunities and excludedCommunities are not exhaustive lists of every unused job family. Add only an explicit user prohibition or an inherent incompatibility with the assignment. Never forbid a broad ancestor, descendant, adjacent, or legitimately co-occurring community merely because another community was selected.",
@@ -1874,7 +1875,7 @@ function buildPrompts(task, identity) {
     "edges must contain at most 128 items. Every edge must contain exactly from, to, relation, and artifactKinds. from and to must reference declared slotId values. relation must be exactly one of reportsTo, handsOffTo, reviews, coordinatesWith.",
     "forbiddenCommunities and edges must be explicitly authored arrays. selectionPolicy must contain exactly allowHistoryEvidence=false, integer minimumCandidatesPerSlot from 2 through 30, and integer maximumCandidatesPerSlot from 2 through 100 that is not below the minimum.",
     "A community cannot appear in forbiddenCommunities or a slot's excludedCommunities when that same slot requires or optionally prefers it. Also avoid broader ancestor, descendant, adjacent, and legitimately co-occurring exclusions; the host rejects exact contradictions but does not invent ontology lineage or mutate your decision.",
-    `redacted must be true and ontologyVersion must be exactly ${WORKFORCE_ONTOLOGY_VERSION}. Do not invent controlled concept IDs.`,
+    `redacted must be true and ontologyVersion must be exactly ${WORKFORCE_ONTOLOGY_VERSION}; this pins graph semantics, not a finite vocabulary. Write all discovery-facing content in English and use faithful open namespaced concept IDs.`,
   ].join("\n");
   const selectionSchemaRequirements = [
     "Return the direct agentlas.workforce-selection.v1 JSON object. Do not emit schemaVersion=agentlas.workforce-leader-call.v1 and do not emit toolCall, name, or arguments wrappers. The host invokes workforce.validate_selection with your exact validated Selection.",
@@ -1911,7 +1912,7 @@ function buildPrompts(task, identity) {
       "Explicitly author every structural field (slotId, title, task, cardinality, criticality, allowedEntityKinds, edges, forbiddenCommunities, selectionPolicy). A list-valued slot field you leave out is the empty constraint; the host normalizes absent to [].",
       "Never copy secrets, local file contents, account identifiers, or private memory into taskBrief; summarize them as local protected inputs and set redacted=true.",
       `ontologyVersion must be exactly ${WORKFORCE_ONTOLOGY_VERSION}.`,
-      WORKFORCE_ONTOLOGY_MENU,
+      WORKFORCE_ONTOLOGY_GUIDE,
       searchSchemaRequirements,
     ].join("\n"),
     searchUser: task,
@@ -1927,7 +1928,7 @@ function buildPrompts(task, identity) {
       "Before returning JSON, self-check that each explicitly named specialized domain responsibility has an independent accountable slot and that every hard gate still satisfies the execution-impossible or exact-profile-declaration test.",
       "The host will validate your replacement exactly and will not add slots, defaults, constraints, candidates, or substitutions. At most two total semantic WorkOrder refinements are allowed.",
       `ontologyVersion must remain exactly ${WORKFORCE_ONTOLOGY_VERSION}.`,
-      WORKFORCE_ONTOLOGY_MENU,
+      WORKFORCE_ONTOLOGY_GUIDE,
       searchSchemaRequirements,
     ].join("\n"),
     selectionSystem: [
