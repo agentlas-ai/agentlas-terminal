@@ -10,7 +10,7 @@ const { compareSemVer, normalizeSemVer } = require("./semver.cjs");
 const HARNESS_SCHEMA_VERSION = "agentlas.stormbreaker.goal-ultracode-harness.v1";
 const HARNESS_ID = "agentlas-core/stormbreaker-goal-ultracode";
 const HARNESS_MODE = "stormbreaker-goal-ultracode";
-const CONTEXT_MAP_MIN_CORE_VERSION = "1.1.66";
+const CONTEXT_MAP_MIN_CORE_VERSION = "1.1.86";
 const CORE_MANIFEST_MAX_BYTES = 64 * 1024;
 const CORE_RUNTIME_MARKERS = [
   ["agentlas_cloud", "__main__.py"],

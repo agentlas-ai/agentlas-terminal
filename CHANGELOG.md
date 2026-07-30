@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.17 — 2026-07-31
+
+- **Terminal requires the verification-aware Context Map engine.** Context
+  commands now select Agentlas OS 1.1.86 or newer, whose impact graph connects
+  code changes to tests, test commands, CI workflows, and product-version
+  contracts, including local test files intentionally excluded from Git.
+- A stale Core can no longer satisfy the Terminal context capability merely by
+  exposing the old module path; the version gate fails closed before execution.
+
 ## 1.0.16 — 2026-07-30
 
 - **Project-scoped plugin listing now fails closed.** A missing, unsafe, or
