@@ -51,6 +51,7 @@ jobs:
         run: npm ci
       - name: Verify public Terminal adapter against exact Agentlas OS
         working-directory: agentlas-terminal
+        shell: bash
         env:
           HEPHAESTUS_RUNTIME_ROOT: ${{ github.workspace }}/Agentlas-OS
           HEPHAESTUS_PYTHON: python
