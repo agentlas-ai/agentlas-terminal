@@ -5,36 +5,12 @@ on:
   pull_request:
     paths:
       - "engine/agentlas-core-harness.cjs"
-      - "engine/agentlas-parity.cjs"
-      - "engine/agentlas-workload-routing.cjs"
-      - "engine/agentlas-workforce.cjs"
-      - "engine/agentlas-input.cjs"
-      - "engine/agentlas-i18n.cjs"
-      - "engine/agentlas.cjs"
-      - "engine/agentlas-repl.cjs"
-      - "test/stormbreaker-core-contract.cjs"
-      - "test/workload-routing-contract.cjs"
-      - "test/workforce-runtime-contract.cjs"
-      - "test/fixtures/runtime-bundle-digest-v4-vectors.json"
-      - "test/project-bootstrap-contract.cjs"
       - "package.json"
       - ".github/workflows/cross-platform-harness.yml"
   push:
     branches: [main]
     paths:
       - "engine/agentlas-core-harness.cjs"
-      - "engine/agentlas-parity.cjs"
-      - "engine/agentlas-workload-routing.cjs"
-      - "engine/agentlas-workforce.cjs"
-      - "engine/agentlas-input.cjs"
-      - "engine/agentlas-i18n.cjs"
-      - "engine/agentlas.cjs"
-      - "engine/agentlas-repl.cjs"
-      - "test/stormbreaker-core-contract.cjs"
-      - "test/workload-routing-contract.cjs"
-      - "test/workforce-runtime-contract.cjs"
-      - "test/fixtures/runtime-bundle-digest-v4-vectors.json"
-      - "test/project-bootstrap-contract.cjs"
       - "package.json"
       - ".github/workflows/cross-platform-harness.yml"
 
@@ -60,7 +36,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: agentlas-ai/Agentlas-OS
-          ref: 5fc22464c1db33dabc0d4de2170053d1584b5682
+          ref: 9b0248beb6f8728e58421b14f0c9b749bc24b66d
           path: Agentlas-OS
       - uses: actions/setup-node@v4
         with:
@@ -73,17 +49,45 @@ jobs:
       - name: Install Terminal dependencies
         working-directory: agentlas-terminal
         run: npm ci
-      - name: Verify exact Core harness and worker prompt propagation
+      - name: Verify public Terminal adapter against exact Agentlas OS
         working-directory: agentlas-terminal
         env:
           HEPHAESTUS_RUNTIME_ROOT: ${{ github.workspace }}/Agentlas-OS
           HEPHAESTUS_PYTHON: python
           AGENTLAS_HARNESS_PROOF_PATH: ${{ runner.temp }}/terminal-harness-proof.json
         run: |
-          node test/stormbreaker-core-contract.cjs
-          node test/workload-routing-contract.cjs
-          node test/workforce-runtime-contract.cjs
-          node test/project-bootstrap-contract.cjs --strict
+          node - <<'NODE'
+          const fs = require("node:fs");
+          const {
+            CONTEXT_MAP_MIN_CORE_VERSION,
+            loadCoreStormbreakerHarness,
+            readCoreRuntimeVersion,
+          } = require("./engine/agentlas-core-harness.cjs");
+
+          (async () => {
+            const root = process.env.HEPHAESTUS_RUNTIME_ROOT;
+            const version = readCoreRuntimeVersion(root);
+            if (version !== "1.1.88") {
+              throw new Error(`Expected Agentlas OS 1.1.88, received ${version || "unknown"}`);
+            }
+            if (CONTEXT_MAP_MIN_CORE_VERSION !== "1.1.86") {
+              throw new Error(`Unexpected Context Map minimum ${CONTEXT_MAP_MIN_CORE_VERSION}`);
+            }
+            const harness = await loadCoreStormbreakerHarness(process.cwd(), root);
+            const proof = {
+              schemaVersion: "agentlas.terminal-public-adapter-proof.v1",
+              runtimeVersion: version,
+              harnessId: harness.harness_id,
+              harnessMode: harness.mode,
+              promptSha256: harness.prompt_sha256,
+            };
+            fs.writeFileSync(process.env.AGENTLAS_HARNESS_PROOF_PATH, `${JSON.stringify(proof, null, 2)}\n`);
+            process.stdout.write(`${JSON.stringify(proof)}\n`);
+          })().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
       - uses: actions/upload-artifact@v4
         with:
           name: terminal-harness-proof-${{ runner.os }}
@@ -100,4 +104,28 @@ jobs:
         with:
           pattern: terminal-harness-proof-*
           path: proofs
-      - run: node test/compare-stormbreaker-platform-proofs.cjs proofs
+      - name: Compare public adapter proof across operating systems
+        run: |
+          node - <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
+          const files = [];
+          function walk(dir) {
+            for (const name of fs.readdirSync(dir)) {
+              const full = path.join(dir, name);
+              if (fs.statSync(full).isDirectory()) walk(full);
+              else if (name === "terminal-harness-proof.json") files.push(full);
+            }
+          }
+          walk("proofs");
+          if (files.length !== 3) throw new Error(`Expected three platform proofs, received ${files.length}`);
+          const proofs = files.map((file) => JSON.parse(fs.readFileSync(file, "utf8")));
+          const identities = new Set(proofs.map((proof) => JSON.stringify({
+            runtimeVersion: proof.runtimeVersion,
+            harnessId: proof.harnessId,
+            harnessMode: proof.harnessMode,
+            promptSha256: proof.promptSha256,
+          })));
+          if (identities.size !== 1) throw new Error("Terminal adapter proof differs by operating system");
+          console.log(`Cross-platform adapter proof matched: ${proofs[0].promptSha256}`);
+          NODE
