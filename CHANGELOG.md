@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.18 — 2026-07-31
+
+- **Private Agent Cloud inventory is readable by default.** `agentlas cloud
+  list` now identifies the owner-private scope, shows how many rows are
+  displayed, and labels slug, kind, callability, update date, and name instead
+  of dumping an unlabeled TSV stream.
+- The inventory ends with exact next actions for machine-readable revision
+  inspection and restoring one selected package. `--json` remains the stable
+  full-fidelity contract.
+
 ## 1.0.17 — 2026-07-31
 
 - **Terminal requires the verification-aware Context Map engine.** Context

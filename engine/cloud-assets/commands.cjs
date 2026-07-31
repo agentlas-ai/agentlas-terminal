@@ -303,7 +303,32 @@ async function runCloud(ctx, args) {
     if (flags.json) { ctx.out(JSON.stringify(result, null, 2)); return 0; }
     const agents = Array.isArray(result.results) ? result.results : [];
     if (!agents.length) { ctx.out("No agents are stored in Private Agent Cloud."); return 0; }
-    for (const agent of agents) ctx.out(`${agent.slug}\t${agent.name || agent.nameEn || agent.slug}\t${agent.entityKind || "agent"}`);
+    const total = Number.isSafeInteger(result.total) ? result.total : agents.length;
+    ctx.out(`Private Agent Cloud · ${agents.length} shown${total > agents.length ? ` of ${total}` : ""} · owner-private`);
+    ctx.out("");
+    ctx.out("SLUG                               KIND   CALLABLE  UPDATED       NAME");
+    for (const agent of agents) {
+      const slug = String(agent.slug || "?").slice(0, 34).padEnd(34);
+      const kind = String(agent.entityKind || agent.agentKind || "agent").slice(0, 6).padEnd(6);
+      const callable = agent.callable === true
+        ? "yes"
+        : agent.callable === false
+          ? "no"
+          : agent.routingStatus === "routing_ready"
+            ? "yes"
+            : "unknown";
+      const updated = typeof agent.updatedAt === "string" && /^\d{4}-\d{2}-\d{2}/.test(agent.updatedAt)
+        ? agent.updatedAt.slice(0, 10)
+        : "unknown";
+      const name = String(agent.name || agent.nameEn || agent.slug || "?").replace(/\s+/g, " ").slice(0, 48);
+      ctx.out(`${slug} ${kind} ${callable.padEnd(8)}  ${updated}  ${name}`);
+    }
+    ctx.out("");
+    if (total > agents.length) {
+      ctx.out(`Showing ${agents.length} of ${total}. Use --limit <n> to request more.`);
+    }
+    ctx.out("Inspect machine-readable source, revision, and package identity with: agentlas cloud list --json");
+    ctx.out("Restore one exact owner-private revision with: agentlas cloud restore <slug>");
     return 0;
   }
   if (sub === "restore") {
