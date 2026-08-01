@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.21 — 2026-08-01
+
+- Align the independent Terminal sentence with the exact cross-surface
+  architecture-sync marker used by the Web release gate.
+
 ## 1.0.20 — 2026-08-01
 
 - Restore the explicit independent-Terminal and private Cloud list/restore
