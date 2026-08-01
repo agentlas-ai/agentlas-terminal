@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.20 — 2026-08-01
+
+- Restore the explicit independent-Terminal and private Cloud list/restore
+  guidance required by the cross-surface architecture contract. This corrects
+  the public README without changing the v1.0.19 runtime behavior.
+
 ## 1.0.19 — 2026-08-01
 
 - **Ordinary runs now honor Desktop Work project ownership.** From a connected

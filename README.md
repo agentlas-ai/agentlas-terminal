@@ -11,6 +11,8 @@
 
 **Agentlas Terminal CLI** — Independent AI agent runtime installed via `npm install -g agentlas` and launched with `agentlas`. Run exact installed agents, teams, and parallel sessions directly from your shell without keeping Desktop open. When Desktop is installed, Terminal reads the same local project, agent, and runtime state. Bring your own model — use your existing Claude Code, Codex, or Gemini CLI subscriptions or BYOK API keys.
 
+This existing independent Terminal remains the command-line runtime: inspect owner-private packages with `agentlas cloud list`, restore one with `agentlas cloud restore <slug>`, or install an eligible public package with `agentlas install <slug>`.
+
 > **We are Agent Trust. Your agent is not a program. It is an asset. — Agentlas —**
 
 Agent Trust is our product principle: agent packages are treated as portable, owner-scoped, inspectable, and restorable assets. (It does not imply regulated financial or fiduciary services.) Agent Cloud stores package assets in your private cloud account, while Agentlas Terminal verifies and executes local runtime copies on your host machine.
