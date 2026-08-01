@@ -1,6 +1,6 @@
--- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-07-28T08:31:20Z)
--- 소스 DB user_version=81 — 앱이 나중에 설치되면 여기서부터 마이그레이션한다.
-PRAGMA user_version=81;
+-- Agentlas first-run bootstrap schema (project-first Work contract)
+-- Source DB user_version=85. Desktop remains the migration authority.
+PRAGMA user_version=85;
 CREATE TABLE active_runtime (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         kind TEXT NOT NULL
@@ -21,11 +21,13 @@ CREATE TABLE projects (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         description TEXT,
-        default_agent_id TEXT,
-        context_note TEXT,
+        system_prompt TEXT,
+        agent_pool_json TEXT NOT NULL DEFAULT '[]',
+        source_type TEXT NOT NULL DEFAULT 'local' CHECK(source_type IN ('local','github','sample')),
+        source_ref TEXT,
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL, folder_path TEXT,
-        FOREIGN KEY(default_agent_id) REFERENCES installed_agents(id) ON DELETE SET NULL
+        updated_at TEXT NOT NULL,
+        folder_path TEXT
       );
 CREATE TABLE chats (
         id TEXT PRIMARY KEY,
@@ -33,7 +35,7 @@ CREATE TABLE chats (
         agent_id TEXT NOT NULL,
         title TEXT NOT NULL DEFAULT '새 채팅',
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL, firm_id TEXT REFERENCES firms(id) ON DELETE SET NULL, archived_at TEXT, working_folder TEXT, kind TEXT NOT NULL DEFAULT 'user', parent_chat_id TEXT, used_at TEXT, agent_group_id TEXT REFERENCES agent_groups(id) ON DELETE SET NULL, continuous_mode INTEGER NOT NULL DEFAULT 0, swarm_mode INTEGER NOT NULL DEFAULT 0, last_viewed_at TEXT, hired_agents TEXT, origin_surface TEXT NOT NULL DEFAULT 'work', runtime_selection_json TEXT,
+        updated_at TEXT NOT NULL, firm_id TEXT REFERENCES firms(id) ON DELETE SET NULL, archived_at TEXT, working_folder TEXT, kind TEXT NOT NULL DEFAULT 'user', parent_chat_id TEXT, used_at TEXT, continuous_mode INTEGER NOT NULL DEFAULT 0, swarm_mode INTEGER NOT NULL DEFAULT 0, last_viewed_at TEXT, hired_agents TEXT, origin_surface TEXT NOT NULL DEFAULT 'work', runtime_selection_json TEXT,
         FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL,
         FOREIGN KEY(agent_id) REFERENCES installed_agents(id) ON DELETE CASCADE
       );
@@ -116,8 +118,20 @@ CREATE TABLE automations (
         last_run_at TEXT,
         next_run_at TEXT,
         created_at TEXT NOT NULL
-      , graph_json TEXT, schedule_json TEXT, timezone TEXT, end_at TEXT, max_runs INTEGER, run_count INTEGER NOT NULL DEFAULT 0, trigger_type TEXT NOT NULL DEFAULT 'schedule', trigger_json TEXT, claimed_at TEXT, lease_owner TEXT, tool_mode TEXT NOT NULL DEFAULT 'auto', hub_mode TEXT NOT NULL DEFAULT 'hub-allowed', execution_permission TEXT NOT NULL DEFAULT 'write' CHECK(execution_permission IN ('read','write')), target_version TEXT, runtime_selection_json TEXT);
+      , graph_json TEXT, schedule_json TEXT, timezone TEXT, end_at TEXT, max_runs INTEGER, run_count INTEGER NOT NULL DEFAULT 0, trigger_type TEXT NOT NULL DEFAULT 'schedule', trigger_json TEXT, claimed_at TEXT, lease_owner TEXT, tool_mode TEXT NOT NULL DEFAULT 'auto', hub_mode TEXT NOT NULL DEFAULT 'hub-allowed', execution_permission TEXT NOT NULL DEFAULT 'write' CHECK(execution_permission IN ('read','write')), target_version TEXT, runtime_selection_json TEXT, project_id TEXT REFERENCES projects(id) ON DELETE SET NULL);
 CREATE INDEX idx_automations_due ON automations(enabled, next_run_at);
+CREATE TABLE automation_sessions (
+        id TEXT PRIMARY KEY,
+        automation_id TEXT NOT NULL,
+        target_kind TEXT NOT NULL CHECK(target_kind IN ('host','agent','firm','hub')),
+        target_id TEXT NOT NULL,
+        ledger_chat_id TEXT NOT NULL UNIQUE REFERENCES chats(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(automation_id, target_kind, target_id)
+      );
+CREATE INDEX idx_automation_sessions_owner
+        ON automation_sessions(automation_id, updated_at DESC);
 CREATE TABLE agent_apps (
         id TEXT PRIMARY KEY,
         chat_id TEXT NOT NULL,
@@ -379,18 +393,6 @@ CREATE INDEX idx_persona_loop_runs_updated
 CREATE INDEX idx_persona_loop_runs_automation
         ON persona_loop_runs(automation_id);
 CREATE INDEX idx_chats_used_updated ON chats(used_at, updated_at DESC);
-CREATE TABLE agent_groups (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        description TEXT NOT NULL DEFAULT '',
-        orchestrator_name TEXT NOT NULL,
-        members_json TEXT NOT NULL DEFAULT '[]',
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-CREATE INDEX idx_agent_groups_updated
-        ON agent_groups(updated_at DESC);
-CREATE INDEX idx_chats_agent_group_updated ON chats(agent_group_id, updated_at DESC);
 CREATE TABLE run_history (
         id TEXT PRIMARY KEY,
         automation_id TEXT,

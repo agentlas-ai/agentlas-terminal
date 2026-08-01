@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.0.19 — 2026-08-01
+
+- **Ordinary runs now honor Desktop Work project ownership.** From a connected
+  project folder, the first member of the saved ordered agent pool is the task
+  controller and the remaining members are task-scoped sub-agent candidates.
+  Missing projects, empty teams, remote-only controllers, and unavailable
+  controller releases stop without silently selecting a default agent.
+- Exact-agent invocation remains available as an explicit advanced path. The
+  separate route preview is judged by the connected model against the installed
+  roster and remains unresolved when the evidence or model is unavailable;
+  regex intent gates, keyword dictionaries, and lexical fallback selection were
+  removed.
+- The fresh Terminal schema now matches Desktop project-first schema v85,
+  including ordered project pools and AutomationSession transcript ownership.
+- The npm publication gate now verifies against the exact Agentlas OS v1.1.92
+  source commit used by Desktop instead of an older Core snapshot.
+- Documentation now distinguishes verified macOS behavior, Linux CI coverage,
+  and the provided but not independently end-to-end verified Windows launcher.
+
 ## 1.0.18 — 2026-07-31
 
 - **Private Agent Cloud inventory is readable by default.** `agentlas cloud

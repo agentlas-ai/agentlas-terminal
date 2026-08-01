@@ -9,402 +9,311 @@
  ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝   ╚══════╝╚═╝  ╚═╝╚══════╝
 ```
 
-**Agentlas 터미널 CLI** — `npm install -g agentlas` 하나로 깔리고 `agentlas`
-하나로 도는 독립 에이전트 터미널. 설치된 AI 에이전트·팀과 대화하고, 새로 만들고,
-멀티세션으로 굴린다. 데스크탑 앱이 없어도 동작하며, 앱이 깔려 있으면 같은
-SQLite(userData)를 공유해 에이전트·대화·자동화가 양쪽에서 그대로 보인다.
-모델은 당신 것을 쓴다 — Claude Code / Codex / Gemini CLI 구독 또는 BYOK API 키.
+**Agentlas Terminal CLI** — Independent AI agent runtime installed via `npm install -g agentlas` and launched with `agentlas`. Run exact installed agents, teams, and parallel sessions directly from your shell without keeping Desktop open. When Desktop is installed, Terminal reads the same local project, agent, and runtime state. Bring your own model — use your existing Claude Code, Codex, or Gemini CLI subscriptions or BYOK API keys.
 
 > **We are Agent Trust. Your agent is not a program. It is an asset. — Agentlas —**
 
-Agent Trust는 에이전트 패키지를 소유자 범위·이식 가능·검사 가능·복원 가능하게
-다룬다는 **제품 원칙**이다. 금융·법률상 신탁(trust) 서비스를 뜻하지 않는다.
-Agent Cloud는 소유한 패키지를 보관하고, 이 터미널은 그 로컬 실행 사본을 지원
-런타임으로 검증·실행한다.
+Agent Trust is our product principle: agent packages are treated as portable, owner-scoped, inspectable, and restorable assets. (It does not imply regulated financial or fiduciary services.) Agent Cloud stores package assets in your private cloud account, while Agentlas Terminal verifies and executes local runtime copies on your host machine.
 
 ---
 
-## 요구사항
+## Requirements
 
-| 항목 | 내용 |
+| Category | Requirement |
 | --- | --- |
-| Node | **22+ 권장.** `package.json`의 `engines`는 `>=20`이지만, 런처는 optional 네이티브 의존성 `better-sqlite3` 빌드가 실패하면 Node 22+의 `node:sqlite`로만 폴백한다 (`bin/agentlas.cjs`). 즉 **Node 20은 better-sqlite3 네이티브 빌드가 성공할 때만** 동작한다. |
-| 에이전트 CLI | 실행에는 `claude` · `codex` · `gemini` 중 최소 하나가 PATH에 필요하다. 하나도 없으면 `no_runtime`으로 정직하게 멈춘다(가짜 응답 폴백 없음). |
-| OS | macOS / Linux 검증. Windows는 런처·설치 스크립트가 있으나 미검증. |
+| **Node.js** | **Node 22+ recommended.** `package.json` specifies `engines: ">=20"`, but if native optional dependency `better-sqlite3` build fails, the launcher falls back strictly to `node:sqlite` in Node 22+. Node 20 works when `better-sqlite3` native build succeeds. |
+| **Agent CLI** | Requires at least one supported runtime CLI (`claude`, `codex`, or `gemini`) in your `PATH`. Halts honestly with `no_runtime` if none are found (no fake model responses). |
+| **OS** | macOS is verified by the current local release gate. Linux is covered by the public adapter/CI contract. A Windows launcher is provided, but this release does not claim independent end-to-end Windows verification. |
 
-`kimi` · `grok` · `cursor-agent`는 **탐지만 되고 아직 구동되지 않는다**
-(`engine/runtimes/resolve.cjs`의 `EXECUTABLE_KINDS = claude-code, codex, gemini`).
-`doctor`가 이들을 "감지됨"으로 표시해도 `--runtime`으로 지정하면
-`has no v2 streaming driver yet`으로 거절한다.
+*Note: `kimi`, `grok`, and `cursor-agent` are detected by diagnostics (`doctor`) but not yet executable (`has no v2 streaming driver yet`). Supported active runtimes are `claude-code`, `codex`, and `gemini`.*
 
-## 설치
+## Installation
 
 ```sh
 npm install -g agentlas
-# 또는 이 폴더에서: npm install -g .
-# 또는:            sh install.sh              # ~/.local/bin/agentlas 심링크 (sudo 불필요)
-# 또는:            sh install.sh --prefix /usr/local/bin
+# Or from local source: npm install -g .
+# Or via shell installer: sh install.sh              # Symlinks to ~/.local/bin/agentlas (no sudo needed)
+# Or with custom prefix:  sh install.sh --prefix /usr/local/bin
 ```
 
-Windows(미검증): `powershell -ExecutionPolicy Bypass -File install.ps1`
+Windows (launcher available; end-to-end release not independently verified): `powershell -ExecutionPolicy Bypass -File install.ps1`
 
-## 빠른 시작
+## Quick Start
 
 ```sh
 agentlas
 ```
 
-**1. 첫 실행 마법사** — TTY 첫 실행에서 3단계 온보딩이 뜬다: 언어 → 기본 런타임
-(`auto` 또는 설치된 CLI) → 기본 권한(read/write/full). 결과는 `cli-prefs.json`에
-저장되고, 언제든 `agentlas setup`으로 다시 돌린다. 같은 실행에서 데이터 폴더가
-없으면 데스크탑과 동일한 스키마로 SQLite를 부트스트랩하고 빌트인 에이전트
-(오케스트레이터·PM 소울·메모리 큐레이터 등)를 시드한다.
+**1. Interactive Onboarding Wizard** — On first TTY execution, a 3-step setup guides you through language selection, default runtime preference (`auto` or installed CLI), and default permission level (`read`/`write`/`full`). Settings are saved in `cli-prefs.json` and re-configurable via `agentlas setup`. If no local database exists, it bootstraps SQLite with Desktop-compatible schemas and seeds built-in agents (Orchestrator, PM Soul, Memory Curator).
 
-**2. 실제 작업 한 번 돌리기**
+**2. Single Task Execution**
 
 ```sh
-agentlas "이 저장소의 테스트 실패 원인을 찾아줘"   # 자동 라우팅 → 1회 실행
-agentlas run -p "CHANGELOG 최근 3개 요약"          # 최종 답만 stdout (파이프용)
-git log --oneline -20 | agentlas run              # 프롬프트 없으면 stdin을 읽는다
-agentlas <agent>                                   # 그 에이전트와 대화형 REPL
-agentlas firm <firm> "요청"                        # 회사(팀) CEO에 위임
+agentlas "Identify why repository tests are failing"      # Uses the connected project's first agent as controller
+agentlas run -p "Summarize the last 3 CHANGELOG entries"  # Prints the project controller's final answer to stdout
+git log --oneline -20 | agentlas run                      # Reads stdin; still requires a connected project
+agentlas run <agent> "Advanced direct request"            # Exact-agent direct invocation; no project substitution
+agentlas <agent>                                          # Starts an interactive REPL with an exact agent
+agentlas firm <firm> "Request"                            # Delegates to an exact firm CEO
 ```
 
-자동 라우팅은 호스트 LLM 판정이 고른다. 어휘 점수는 후보 모집에만 쓰고 선택은
-하지 않는다. 판정 런타임이 없으면 기본 에이전트로 폴백하되 그 사실을 stderr에
-반드시 남긴다(조용한 오라우팅 금지).
+Ordinary one-shot work is project-first: run it inside a folder connected to a Desktop Work project. The first agent in that project's ordered pool owns the task; remaining members are eligible task-scoped sub-agents. Missing projects, empty teams, and unavailable controllers stop without substituting another agent. The separate `agentlas route` preview is model-judged and stays unresolved when no exact installed agent can be justified.
 
-**3. 대화 이어가기**
+**3. Resuming & Managing Conversations**
 
 ```sh
-agentlas chats            # 최근 대화 목록 (데스크탑과 같은 DB)
-agentlas chats 30
-agentlas open <chat-id>   # 그 챗의 에이전트로 REPL 재개
+agentlas chats            # List recent conversations (shares SQLite DB with Desktop app)
+agentlas chats 30         # List last 30 conversations
+agentlas open <chat-id>   # Re-open REPL with the chat's assigned agent
 ```
 
-## 명령 목록
+## Command Reference
 
-`agentlas help`가 정본이다. 아래는 같은 그룹 구성이다.
+Run `agentlas help` for the authoritative command list. Below is the organized command structure:
 
 ### TALK & RUN
 ```sh
-agentlas <agent>                 # 에이전트와 대화 (= chat <agent>)
+agentlas <agent>                 # Chat with agent (equivalent to chat <agent>)
 agentlas chat <agent>
-agentlas run [agent] [prompt]    # 1회 실행 (-p · --runtime · --permission · stdin)
-agentlas firm <firm> [task]      # 회사 CEO에 위임
-agentlas chats [n]               # 최근 대화
-agentlas open <chat-id>          # 대화 재개
-agentlas cd <agent>              # 그 에이전트 폴더 경로만 출력 (cd "$(agentlas cd x)")
+agentlas run [agent] [prompt]    # Single-run execution (-p, --runtime, --permission, stdin)
+agentlas firm <firm> [task]      # Delegate task to firm CEO
+agentlas chats [n]               # List recent chat conversations
+agentlas open <chat-id>          # Resume conversation by ID
+agentlas cd <agent>              # Print folder path of an agent (cd "$(agentlas cd x)")
 ```
 
 ### AGENTS & HUB
 ```sh
-agentlas search "<필요한 일>"     # Hub 에이전트 검색 (로그인 불필요)
-agentlas install <slug>          # Hub 에이전트 로컬 설치 (아래 설치 게이트 참고)
-agentlas plugin add <slug>       # Hub 플러그인(MCP 서버) 추가
-agentlas plugin list             # (= agentlas plugins)
-agentlas build "<요청>"           # 에이전트/팀 빌드·수리·패키징
-agentlas upload <경로>            # 기본은 owner-private Agent Cloud 저장
-agentlas upload <경로> --visibility marketplace   # 명시적 공개 Hub 발행
-agentlas connect <sub>           # Telegram 등 플랫폼 연결 (무인자는 usage, exit 0)
-agentlas import <폴더>            # 로컬 에이전트/팀 임포트
-agentlas native prepare <agent>  # 네이티브 CLI 문맥 파일 생성
-agentlas list                    # 설치 에이전트/회사 + 활성 런타임
-agentlas uninstall <agent> [--yes]  # 설치 에이전트 제거 (빌트인 거부).
-                                 # 대화 이력이 있으면 건수를 보여주고 --yes 없이는 거절한다
-                                 # (챗/메시지가 CASCADE로 함께 영구 삭제되기 때문).
-agentlas experience <sub>        # list|inspect|validate|save|publish|status|export|unpublish|withdraw
-agentlas variant resolve --base-release <id>   # 로컬 variant 호환성 프리뷰 (권위 없음, `agentlas variant help`)
+agentlas search "<query>"        # Search Hub agents (no login required)
+agentlas install <slug>          # Install Hub agent locally (gated by security trust checks)
+agentlas plugin add <slug>       # Add Hub plugin (MCP server)
+agentlas plugin list             # List active plugins (= agentlas plugins)
+agentlas build "<prompt>"        # Build, repair, and package agents or multi-agent teams
+agentlas upload <path>           # Upload package to private Agent Cloud (default)
+agentlas upload <path> --visibility marketplace   # Explicitly publish to public Agentlas Hub
+agentlas connect <sub>           # Connect external platforms (e.g. Telegram)
+agentlas import <folder>         # Import local agent or firm directory
+agentlas native prepare <agent>  # Generate native CLI context files
+agentlas list                    # List installed agents/firms and active runtimes
+agentlas uninstall <agent> [--yes] # Remove an installed agent (fails if chat history exists unless --yes)
+agentlas experience <sub>        # Manage agent experience (list|inspect|validate|save|publish|status|export|unpublish|withdraw)
+agentlas variant resolve --base-release <id> # Preview local variant compatibility
 ```
 
 ### EXECUTE
 ```sh
-agentlas storm "<목표>"           # Goal+UltraCode 하네스: 계획 → 배정 → 실행 → 검증 [--research]
-agentlas swarm "<목표>"           # emergent 에이전트 스웜 [--parallel N]
-agentlas workforce "<요청>"       # Agent Workforce Ontology 라우트
-agentlas network "<요청>"         # workforce 별칭
-agentlas taskforce "<요청>"       # workforce 별칭
-agentlas legacy-network "<요청>"  # 이전 Hephaestus 분해기 (명시 호출 전용)
-agentlas call "a,b" "<맥락>"      # 이름을 정확히 지정한 Hub/Cloud 에이전트 호출
-agentlas browser [...]           # 실제 브라우저 하드포인트
-agentlas route "<요청>" [--json]  # 라우팅 미리보기 (실행 없음)
-agentlas research <sub>          # status|gather|search|read|plan
+agentlas storm "<goal>"          # Goal + UltraCode harness: plan -> assign -> execute -> verify [--research]
+agentlas swarm "<goal>"          # Emergent multi-agent swarm [--parallel N]
+agentlas workforce "<prompt>"    # Route through Agent Workforce Ontology
+agentlas network "<prompt>"      # Alias for workforce
+agentlas taskforce "<prompt>"    # Alias for workforce
+agentlas legacy-network "<prompt>" # Legacy Hephaestus solver (explicit invocation only)
+agentlas call "a,b" "<context>"  # Call explicitly named Hub or Cloud agents
+agentlas browser [...]           # Real browser hardpoint launcher
+agentlas route "<prompt>" [--json] # Preview routing decisions without execution
+agentlas research <sub>          # Research loadout (status|gather|search|read|plan)
 ```
 
 ### KNOWLEDGE
 ```sh
-agentlas memory import <경로> --agent <id> [--apply]
+agentlas memory import <path> --agent <id> [--apply]
 agentlas evolve [list|apply <id>|revert <id>]
-agentlas ontology <sub>          # status|list|add
-agentlas career-graph <sub>      # 상태·소스 등록 + ingest|query|verify|trace|public-card 위임
-agentlas journal <sub>           # status|verify|repair|gate
-agentlas project [status|init]   # `.agentlas/` 를 만드는 유일한 진입점
-agentlas context <sub>           # refresh|locate|refs|slice|impact|verify
+agentlas ontology <sub>          # Manage project ontology (status|list|add)
+agentlas career-graph <sub>      # Ingest, query, verify, and trace career graph indices
+agentlas journal <sub>           # Run journal operations (status|verify|repair|gate)
+agentlas project [status|init]   # Explicit entry point to initialize `.agentlas/` context
+agentlas context <sub>           # Context slice operations (refresh|locate|refs|slice|impact|verify)
 ```
 
-`agentlas project init`으로 **명시 초기화한 프로젝트에서만** 일반 실행·팀·
-Stormbreaker·Workforce가 같은 로컬 Context Slice를 받는다. 읽기·쓰기·전체 권한만
-으로는 `.agentlas/`나 `.gitignore`를 만들거나 고치지 않는다. Hub/Cloud 검색에는
-코드맵·소스 경로·프로젝트 파일 내용이 전송되지 않는다.
+Only in projects explicitly initialized with `agentlas project init` do single runs, team executions, Stormbreaker, and Workforce receive local Context Slices. Read, write, or full permissions do not create or alter `.agentlas/` or `.gitignore` files. Code maps, source paths, and file contents are never transmitted during Hub/Cloud search.
 
 ### ACCOUNT & OPS
 ```sh
-agentlas login | logout | whoami  # Agentlas Cloud 로그인 (loopback 브라우저 플로우)
-agentlas billing                  # 크레딧 잔액
-agentlas cloud <sub>              # save|publish|package|list|restore|delete|search|install
-                                  # |security scan|runtime bundle|field-test  (cloud help 참고)
-agentlas automation <sub>         # list|add|on|off|remove|run <id>|runs|daemon
+agentlas login | logout | whoami  # Agentlas Cloud authentication (loopback browser flow)
+agentlas billing                  # Check account credit balance
+agentlas cloud <sub>              # Manage private Agent Cloud packages (save|publish|package|list|restore|delete|search|install|security scan|runtime bundle|field-test)
+agentlas automation <sub>         # Scheduled automations (list|add|on|off|remove|run <id>|runs|daemon)
 agentlas creds save --provider <n> --key <ENV> --value <v>
-agentlas creds file --source <경로> [--env <ENV>]   # 값은 어떤 경로로도 출력하지 않음
-agentlas env                      # 공유 env 키 이름만 열거 (값 없음)
-agentlas usage                    # 로컬 사용 현황 (공급자 쿼터 대시보드는 데스크탑)
-agentlas telegram                 # 바인딩 현황 (읽기 전용)
-agentlas mcp                      # MCP 서버 목록
-agentlas mcp probe <id>           # initialize→tools/list 핸드셰이크만 확인
-agentlas multimodal               # 이미지/영상/음성 provider 설정
-agentlas doctor                   # 런타임·데이터·세션 점검
-agentlas setup                    # 첫 실행 마법사 재실행 (TTY 필요)
-agentlas update                   # npm 최신판 확인 (자기 패키지만)
-agentlas oberon <sub>             # AI 필름 렌더: scaffold|render|list|open (= agentlas film)
-agentlas hep <sub…>               # Hephaestus 네이티브 전체 패스스루
-agentlas netadmin <sub>           # 로컬 네트워크 admin (init|status|reindex|bench|add-source)
+agentlas creds file --source <path> [--env <ENV>]  # Imports credentials (values never logged)
+agentlas env                      # List shared environment variable keys (values hidden)
+agentlas usage                    # Local usage statistics
+agentlas telegram                 # Telegram binding status (read-only)
+agentlas mcp                      # List configured MCP servers
+agentlas mcp probe <id>           # Check initialize -> tools/list handshake
+agentlas multimodal               # Configure provider settings for image/video/audio
+agentlas doctor                   # Runtime, database, and session diagnostics
+agentlas setup                    # Re-run first-time onboarding setup wizard (TTY required)
+agentlas update                   # Check for latest package updates on npm
+agentlas oberon <sub>             # AI film rendering pipeline: scaffold|render|list|open (= agentlas film)
+agentlas hep <sub...>             # Native Hephaestus passthrough
+agentlas netadmin <sub>           # Local network administration (init|status|reindex|bench|add-source)
 agentlas version | help
 ```
 
-공통 옵션: `-p|--print` · `--runtime claude-code|codex|gemini` ·
-`--permission read|write|full`
+Common flags across subcommands: `-p|--print`, `--runtime claude-code|codex|gemini`, `--permission read|write|full`.
 
-### 오타 가드 / 데스크탑 표면 거절
+### Typo Guard & Desktop Surface Redirection
 
-공백 없는 **한 단어**를 넣었는데 명령도 에이전트도 아니면, 프롬프트로 흘려서
-모델을 부르지 않는다. 편집거리로 가장 가까운 명령을 최대 3개 제안하고 exit 1로
-멈춘다.
+If a single non-flag word is entered that does not match a valid command or installed agent slug, Agentlas halts with exit code 1 instead of sending the mistyped command to an LLM:
 
 ```
 $ agentlas lst
-'lst' 은(는) agentlas 명령이 아닙니다. 혹시: list
-명령 목록: agentlas help  ·  한 단어를 그대로 실행하려면: agentlas run -p "lst"
+'lst' is not an agentlas command. Did you mean: list
+Command list: agentlas help  ·  To run this exact prompt: agentlas run -p "lst"
 ```
 
-데스크탑 전용 표면 이름(`site` `trex` `prompts` `dashboard` `marketplace`
-`library` `groups` `settings` `apps` `quests` `bookmarks` `one` …)도 같은 방식으로
-멈추고 터미널 대체 경로를 안내한다. 진짜 그 단어를 작업으로 돌리려면 따옴표로
-감싸거나 `run -p`를 쓴다.
+Desktop-only surface names (`site`, `trex`, `prompts`, `dashboard`, `marketplace`, `library`, `groups`, `settings`, `apps`, `quests`, `bookmarks`, `one`) also halt with typo guard guidance directing you to equivalent terminal commands. To run a single word as a prompt, wrap it in quotes or pass `run -p`.
 
-### 권한
+### Permission Levels
 
-| Agentlas 권한 | Claude Code | Codex | Gemini CLI |
+| Agentlas Level | Claude Code | Codex | Gemini CLI |
 | --- | --- | --- | --- |
 | `read` | `plan` | `read-only` sandbox | `plan` |
 | `write` | `acceptEdits` | `workspace-write` sandbox | `auto_edit` |
-| `full` | permission 검사 우회 | approval + sandbox 우회 | `yolo` |
+| `full` | bypass permission prompts | approval + sandbox bypass | `yolo` |
 
-저장된 `full`은 세션 한정이라 다음 실행에서 `write`로 fail-closed 강등된다.
-REPL의 `!<셸명령>`은 작업 공간 경계를 강제할 수 없어 **`full`에서만** 실행되며,
-출력 8MB 캡·표시 전 시크릿 마스킹·프로세스 그룹 종료가 걸린다.
+*Note: Saved `full` permission is session-bound and automatically fails closed to `write` on subsequent executions. REPL shell execution (`!<command>`) runs strictly under `full` permission, enforced with 8MB output capping, secret masking, and process-group termination.*
 
-## REPL & Orca 멀티세션
+## REPL & Orca Multi-Session Architecture
 
-`agentlas`를 인자 없이 실행하면 REPL로 들어간다. 포그라운드 턴도 하나의 세션이고,
-`/spawn`으로 만든 서브에이전트는 백그라운드 세션으로 병렬로 돈다. 화면은 활성
-세션 하나만 스트리밍하고, 백그라운드 턴 종료는 한 줄 알림으로 뜬다.
+Executing `agentlas` with no arguments starts an interactive REPL session. Foreground execution turns run inside an active session, while subagents created via `/spawn` execute concurrently in background sessions. The terminal streams output from the currently focused active session and displays one-line notices when background tasks finish.
 
-### 슬래시 명령 (정본: `engine/ui/palette.cjs`)
+### REPL Slash Commands
 
-| 명령 | 하는 일 |
+| Command | Action |
 | --- | --- |
-| `/help` | 명령·단축키 |
-| `/sessions` · `/tree` | 세션 표 / 부모-자식 트리 |
-| `/s <n>` · `/switch <n>` | 활성 세션 전환 (tail 재생 + 라이브 구독) |
-| `/spawn <agent> [task]` | 서브에이전트 세션 생성(+task 주면 즉시 실행) |
-| `/steer <n> <msg>` | 그 세션의 다음 턴에 지시 큐잉 |
-| `/kill <n>` | 실행 중 턴 중단 |
-| `/rm <n>` | 세션 제거 |
-| `/broadcast <msg>` | 모든 세션에 같은 지시 |
-| `/use <agent>` | 메인 세션 에이전트 교체 |
-| `/agents` · `/list` | 설치 에이전트 목록 |
-| `/chats [n]` | 최근 대화 |
-| `/mcp` | MCP 서버 목록 |
-| `/doctor` | 런타임·데이터 점검 |
-| `/runtime <kind>` | 새 세션 런타임 지정 (claude-code\|codex\|gemini) |
-| `/permission <level>` | 새 세션 권한 지정 (read\|write\|full) |
-| `/quit` · `/exit` | 종료 |
+| `/help` | Display available commands and keybindings |
+| `/sessions` · `/tree` | View session table or parent-child process tree |
+| `/s <n>` · `/switch <n>` | Switch active session (replays tail logs & subscribes to live stream) |
+| `/spawn <agent> [task]` | Spawn subagent background session (executes task immediately if supplied) |
+| `/steer <n> <msg>` | Queue instruction for session `n`'s next turn |
+| `/kill <n>` | Interrupt active turn in session `n` |
+| `/rm <n>` | Remove session `n` |
+| `/broadcast <msg>` | Broadcast instruction to all running sessions |
+| `/use <agent>` | Change active agent in main session |
+| `/agents` · `/list` | List installed agents |
+| `/chats [n]` | View recent conversations |
+| `/mcp` | List active MCP servers |
+| `/doctor` | Run runtime & database diagnostics |
+| `/runtime <kind>` | Set runtime for new sessions (`claude-code` \| `codex` \| `gemini`) |
+| `/permission <level>` | Set permission level for new sessions (`read` \| `write` \| `full`) |
+| `/quit` · `/exit` | Exit REPL |
 
-목록에 없는 슬래시는 `unknown: /xxx (see /help)`로 멈춘다 — REPL 슬래시는
-top-level 명령으로 흘러가지 않는다.
+Unrecognized slash commands halt with `unknown: /xxx (see /help)`.
 
-### 키·입력
+### Controls & Input Shortcuts
 
-| 입력 | 동작 |
+| Input | Behavior |
 | --- | --- |
-| 실행 중 타이핑 후 Enter | 그 세션의 **다음 턴 스티어링 큐**에 들어간다 (턴을 끊지 않음) |
-| `ctrl-c` (실행 중) | 현재 턴만 중단 |
-| `ctrl-c` (유휴) | 1회는 경고, **2회 연속이면 종료** |
-| `Tab` | 슬래시 명령 · 에이전트/회사 슬러그 · **살아있는 세션 키(s1, s2…)** · `/runtime` `/permission` 값 완성 |
-| `@경로` + `Tab` | 파일 경로 완성 |
-| `↑` / `↓` | 입력 히스토리 |
-| `!<셸명령>` | 셸 실행 — **`full` 권한에서만** |
+| Typing + `Enter` during execution | Queues message into session's **steering queue** for next turn (does not abort current turn) |
+| `Ctrl+C` (during execution) | Interrupts current turn |
+| `Ctrl+C` (when idle) | 1st press shows warning; **2nd consecutive press exits** |
+| `Tab` | Autocompletes slash commands, agent/firm slugs, **live session keys (s1, s2...)**, and `/runtime` / `/permission` values |
+| `@path` + `Tab` | Autocompletes local file paths |
+| `Up` / `Down` | Input history navigation |
+| `!<shell-command>` | Execute shell command (requires **`full` permission**) |
 
-동시 실행 상한은 기본 4다. 초과 스폰은 대기가 아니라 정직한 거부이며
-`AGENTLAS_MAX_PARALLEL`(최대 16)로 올린다.
+Parallel execution limit defaults to 4 concurrent sessions. Exceeding the limit halts with explicit refusal; increase limit via `AGENTLAS_MAX_PARALLEL` (up to 16).
 
-## 동작 방식
+## Operating Architecture
 
-### 엔진 경계 — 터미널은 Agentlas OS를 재구현하지 않는다
+### Engine Boundary — No Duplicated Core OS Logic
 
-이건 자주 오해된다. 터미널은 **설치된 Agentlas OS(Hephaestus/Core) 런타임을 찾아
-그 런타임을 실행**한다. 자체 사본을 들고 있지 않다.
+Agentlas Terminal does not re-implement Agentlas OS. It resolves and executes the installed **Agentlas OS (Hephaestus/Core)** runtime on your system.
 
-탐색 순서 (`engine/agentlas-core-harness.cjs`, `engine/hephaestus/runtime.cjs`):
-
+Runtime Search Order (`engine/agentlas-core-harness.cjs`, `engine/hephaestus/runtime.cjs`):
 1. `HEPHAESTUS_BIN` / `HEPHAESTUS_RUNTIME_ROOT`
 2. `~/.agentlas/runtime/current`
-3. 패키징된 Core (`<resources>/Hephaestus`, macOS는
-   `/Applications/Agentlas.app/Contents/Resources/Hephaestus`)
+3. Packaged Core (`<resources>/Hephaestus`, macOS: `/Applications/Agentlas.app/Contents/Resources/Hephaestus`)
 
-`storm` · `swarm` · `workforce`/`network` · `route` · `research` · `context` ·
-`career-graph`(파생 인덱스) · `journal` · `netadmin` · `hep` · `build` · `call` ·
-`browser` · `connect`은 이 런타임으로 넘어가는 **패스스루**다. 런타임이 없으면
-로컬 모조 실행이나 어휘 폴백을 만들지 않고 무엇이 없는지 말하고 exit 1 한다
-(예: `storm`은 `stormbreaker-core-harness-unavailable`, `context`는 Core/Python
-부재를 보고). 이 정직 정지가 계약이다.
+Commands including `storm`, `swarm`, `workforce`/`network`, `route`, `research`, `context`, `career-graph`, `journal`, `netadmin`, `hep`, `build`, `call`, `browser`, and `connect` pass directly through to this core runtime. If no core runtime is found, Agentlas Terminal halts with an explicit error and exit code 1 (no silent fallback).
 
-터미널 자체가 소유한 것: REPL·세션 오케스트레이션·에이전트 레지스트리·Hub/Cloud
-HTTP 표면·자격증명·MCP 프리플라이트·자동화 스케줄러·SQLite 스키마.
+The terminal package owns REPL orchestration, session trees, agent registries, Hub/Cloud HTTP client surfaces, credential storage, MCP preflight probing, automation scheduling, and SQLite schema management.
 
-### 공유 상태 — 데스크탑과 같은 DB
+### Shared State with Agentlas Desktop
 
-런처(`bin/agentlas.cjs`)가 이 패키지의 `engine/`(정본)을 시스템 Node로 실행한다.
-데이터 폴더는 데스크탑 앱과 **동일한 userData**다 (`engine/core/paths.cjs`):
+The launcher (`bin/agentlas.cjs`) runs system Node against `engine/`. The default data directory is identical to Agentlas Desktop's `userData`:
 
-| OS | 경로 |
+| OS | Default Data Path |
 | --- | --- |
 | macOS | `~/Library/Application Support/Agentlas` |
 | Windows | `%APPDATA%\Agentlas` |
-| Linux | `$XDG_CONFIG_HOME/Agentlas` (기본 `~/.config/Agentlas`) |
+| Linux | `$XDG_CONFIG_HOME/Agentlas` (default `~/.config/Agentlas`) |
 
-DB는 그 폴더의 `agentlas.sqlite`. 첫 실행 시 `engine/bootstrap-schema.sql`
-(`user_version=45`)로 부트스트랩하며, 앱을 나중에 깔면 앱이 거기서부터
-마이그레이션한다. 결과적으로 **에이전트·챗·자동화·MCP 등록이 양쪽에서 같이
-보인다.** `/spawn`으로 만든 서브에이전트 세션은 데스크탑의 `division` 서브챗
-(`kind='division'` + `parent_chat_id`)으로 그대로 남는다.
+The SQLite database file is `agentlas.sqlite` (`user_version=85`). When launched for the first time without an existing database, it bootstraps schemas using `engine/bootstrap-schema.sql`. Consequently, **projects, installed agents, task history, automation sessions, and MCP registrations are shared across Desktop and Terminal**. Subagent sessions spawned via `/spawn` are stored as scoped execution ledgers rather than new global Work conversations.
 
-SQLite 드라이버 사다리: `better-sqlite3`(optionalDependency, 네이티브 빌드
-성공 시) → 실패하면 Node 22+ `node:sqlite`.
+SQLite Driver Fallback Ladder: `better-sqlite3` (optionalDependency native build) -> Node 22+ `node:sqlite`.
 
-### Hub는 빌려 쓰는 게 기본, 설치는 예외
+### Hub Installation & Safety Policy
 
-`engine/hub/install.cjs`의 `assertHubInstallAllowed`가 로컬 설치를 게이트한다.
-막히는 경우:
+Local installation of Hub agents is gated by `assertHubInstallAllowed` (`engine/hub/install.cjs`). Installation is restricted in the following scenarios:
 
-- **cloud-callable / call-only 에이전트** — 로컬 설치 불가. 빌려 쓴다:
-  `agentlas call <slug>` (데스크탑에서는 북마크). 소유자는
-  `agentlas cloud restore <slug>`로 자기 패키지를 복원한다.
-- **지시문 없는 패키지** — 안전한 로컬 설치에 필요한 instructions가 없으면 거절.
-- **trustGrade가 A/B가 아님** — 사이드로드는 명시 승인이 필요하다며 차단.
-- **web-only 에이전트** — 터미널에서 제공하지 않는다.
-- **회수된 공개 리스팅** — 데스크탑 마켓플레이스와 같은 관측 결과
-  (`Hub agent not found`).
+- **Cloud-callable / Call-only Agents**: Local install blocked. Use via `agentlas call <slug>`. Owners restore via `agentlas cloud restore <slug>`.
+- **Packages without Instructions**: Blocked if required instruction manifests are missing.
+- **Untrusted Trust Grades**: Packages with trust grade lower than A/B require explicit side-load overrides.
+- **Web-only Agents**: Blocked on terminal surface.
+- **Withdrawn Catalog Items**: Fails with `Hub agent not found`.
 
-`upload`도 같은 방향이다: 기본은 owner-private Agent Cloud 저장이고, 공개 Hub
-발행은 `--visibility marketplace`를 명시할 때만 일어난다.
+Package uploads (`upload`) default to private owner-scoped Agent Cloud storage; public Hub publishing requires explicit `--visibility marketplace`.
 
-## 데스크탑 전용 (터미널에서 약속하지 않는 것)
+## Desktop-Only Surface Scope
 
-- Telegram 봇 발급·포트 관리 (터미널의 `telegram`은 **읽기 전용 바인딩 조회**)
-- 에이전트 그룹(조합)
-- 승인 인박스 / 브라우저 승인 시트
-- MCP 커스텀 서버 추가·토글 (터미널은 목록 + `mcp probe`만)
-- Site 스튜디오 · T-rex 슬라이드 스튜디오 · Prompt Store
-- 모바일 페어링
-- 퀘스트
-- Hub 북마크
-- 공급자 쿼터 대시보드, Marketplace/Library 브라우징, Agentlas One
+The following GUI-specific features are reserved for Agentlas Desktop and are not exposed in the terminal CLI:
+- Telegram bot token issuance & port configuration (`agentlas telegram` is read-only)
+- Visual project-team composition and ordering
+- Interactive GUI approval sheets & browser popups
+- Custom MCP server addition GUI (Terminal supports listing & `mcp probe`)
+- Site Studio, T-rex slide studio, Prompt Store GUI
+- Mobile pairing QR sheets & Quests
+- Provider quota dashboards & visual marketplace browsing
 
-## 환경변수
+## Environment Variables
 
-| 변수 | 효과 |
+| Variable | Description |
 | --- | --- |
-| `AGENTLAS_USER_DATA_DIR` | 데이터 폴더 override (기본: 데스크탑과 같은 userData) |
-| `AGENTLAS_LANG` | `ko` \| `en` — prefs와 `LANG`보다 우선 |
-| `AGENTLAS_MAX_PARALLEL` | 동시 실행 세션 상한 (기본 4, 최대 16) |
-| `AGENTLAS_SESSION` | Agentlas Cloud 세션 쿠키 값. 해석 순서는 env → 세션 파일이라, 설정돼 있으면 `logout` 후에도 로그인 상태로 보인다 |
-| `AGENTLAS_WEB_BASE_URL` | 웹 베이스 (기본 `https://agentlas.cloud`) |
-| `AGENTLAS_MCP_BASE_URL` | Hub MCP 베이스 (기본 `<web>/api/mcp/v1`) |
-| `HEPHAESTUS_BIN` · `HEPHAESTUS_RUNTIME_ROOT` | Agentlas OS 런타임 위치 지정 (탐색 사다리 1순위) |
-| `AGENTLAS_MODEL_MAX_TIER` | `economy`\|`balanced`\|`frontier` — **swarm 배정 한정** 비용 상한 |
-| `NO_COLOR` | 비어 있지 않으면 컬러 출력 끔 (`FORCE_COLOR=1`로 강제 켜기, `AGENTLAS_NO_COLOR=1`도 끔) |
+| `AGENTLAS_USER_DATA_DIR` | Custom data directory override (default: shared Desktop `userData`) |
+| `AGENTLAS_LANG` | Preferred locale (`ko` \| `en`) — overrides system `LANG` |
+| `AGENTLAS_MAX_PARALLEL` | Maximum concurrent execution sessions (default: 4, max: 16) |
+| `AGENTLAS_SESSION` | Agentlas Cloud session cookie token |
+| `AGENTLAS_WEB_BASE_URL` | Base URL for Web services (default: `https://agentlas.cloud`) |
+| `AGENTLAS_MCP_BASE_URL` | Base URL for Hub MCP APIs (default: `<web>/api/mcp/v1`) |
+| `HEPHAESTUS_BIN` / `HEPHAESTUS_RUNTIME_ROOT` | Custom path to Agentlas OS core runtime |
+| `AGENTLAS_MODEL_MAX_TIER` | Max model tier cap for swarms (`economy` \| `balanced` \| `frontier`) |
+| `NO_COLOR` | Disables ANSI color output if non-empty (`FORCE_COLOR=1` forces color on) |
 
-## 문제 해결
-
-```sh
-agentlas doctor      # DB · PATH의 런타임 · 활성 런타임 · 클라우드 세션
-agentlas --where     # 런처/엔진/DB 해석 결과 + sqlite 드라이버 + Node 버전 JSON
-```
-
-- **`no_runtime: no agent CLI found`** — `claude` / `codex` / `gemini` 중 하나를
-  설치하고 PATH에 올린다. `doctor`가 `kimi`/`grok`/`cursor-agent`를 감지했더라도
-  구동 드라이버가 없어 실행 대상이 아니다.
-- **`runtime '<kind>' has no v2 streaming driver yet`** — `--runtime`에 아직
-  구동되지 않는 런타임을 지정했다. `claude-code` · `codex` · `gemini`만 된다.
-- **`Node vX — Node 22+ (node:sqlite) is required when better-sqlite3 is
-  unavailable.`** — Node 20/21에서 `better-sqlite3` 네이티브 빌드가 실패했다.
-  Node 22+로 올리거나 빌드 도구를 갖추고 재설치한다. `--where`의 `sqliteDriver`가
-  실제 사용 드라이버를 알려준다.
-- **`storm`/`context`/`hep`가 런타임 없음으로 멈춤** — Agentlas OS 런타임이 없다.
-  설치하거나 `HEPHAESTUS_BIN=<경로>`를 지정한다.
-- **`'xxx' 은(는) agentlas 명령이 아닙니다`** — 오타 가드다. 작업으로 돌리려면
-  `agentlas run -p "xxx"`.
-- **`logout` 했는데 로그인 상태** — `AGENTLAS_SESSION`이 설정돼 있다. env를 지운다.
-- **`agentlas setup requires an interactive terminal`** — 비-TTY에서 마법사를 돌리면
-  조용한 성공으로 위장되므로 거절한다.
-
-## 개발
-
-엔진 소스는 `engine/*.cjs` — 여기가 정본이므로 직접 수정한다.
+## Troubleshooting & Diagnostics
 
 ```sh
-sh test/smoke.sh                              # 기본 표면 + 무인자 가드 + 신선 환경 첫 실행
-                                              # + 계약 테스트 + Runtime Doctor 3제품 패리티 게이트
-npm run smoke                                 # 동일 (= npm run test:release-contracts)
-sh scripts/gen-bootstrap-schema.sh [db-path]  # engine/bootstrap-schema.sql 재생성
+agentlas doctor      # Checks database, PATH runtimes, active CLI drivers, and cloud session
+agentlas --where     # Outputs JSON diagnostic of launcher, engine, DB paths, driver, and Node version
 ```
 
-스모크는 임시 `AGENTLAS_USER_DATA_DIR`에서 돌아 실제 데이터를 건드리지 않는다.
-런타임 진단·수리 규칙(`engine/agentlas-doctor.cjs`)을 고쳤다면 3제품 패리티
-게이트를 반드시 통과시켜라.
+- **`no_runtime: no agent CLI found`**: Install `claude`, `codex`, or `gemini` CLI and add to `PATH`. Note that `kimi`/`grok`/`cursor-agent` are detected by `doctor` but do not yet have streaming execution drivers.
+- **`runtime '<kind>' has no v2 streaming driver yet`**: Specified `--runtime` is not supported for active execution. Supported values: `claude-code`, `codex`, `gemini`.
+- **`Node vX — Node 22+ (node:sqlite) is required when better-sqlite3 is unavailable`**: `better-sqlite3` native build failed on Node 20/21. Upgrade to Node 22+ or install build tools for native compilation.
+- **`storm`/`context`/`hep` halting due to missing runtime**: Agentlas OS core runtime is missing. Install Agentlas OS or set `HEPHAESTUS_BIN=<path>`.
+- **`'xxx' is not an agentlas command`**: Typo guard intercepted an unrecognized command. Use `agentlas run -p "xxx"` to run it as a prompt.
 
-## 제거
+## Development & Verification
+
+Engine source code resides in `engine/*.cjs`.
 
 ```sh
-npm uninstall -g agentlas     # npm 설치 시
-rm ~/.local/bin/agentlas      # install.sh 설치 시 (또는 지정한 --prefix)
+sh test/smoke.sh                              # Runs surface tests, guard tests, fresh DB tests, contract tests & parity gates
+npm run smoke                                 # Equivalent to npm run test:release-contracts
+sh scripts/gen-bootstrap-schema.sh [db-path]  # Regenerates engine/bootstrap-schema.sql
 ```
 
-데이터는 userData 폴더에 남는다 (위 "공유 상태" 표 참고) — 데스크탑 앱과 공유하는
-폴더이므로 지우기 전에 확인한다. `agentlas uninstall <agent>`는 **설치 에이전트**를
-지우는 별개 명령이며 CLI 자체를 제거하지 않는다.
+Smoke tests run isolated inside a temporary `AGENTLAS_USER_DATA_DIR` and do not touch local user data.
 
-## 릴리스 / npm 경계
+## Release & Security Allowlist
 
-published 버전은 `npm view agentlas version`이 알려주는 값이 정본이다. 이
-저장소의 소스 커밋이나 `package.json`의 버전은 GitHub 릴리스나 npm 발행을 증명하지
-않는다 — 설치 전에 레지스트리를 직접 확인하라.
+Published package versions on npm are governed strictly by OIDC trusted publisher workflows (`.github/workflows/npm-publish.yml`).
 
-발행은 저장소의 OIDC trusted publisher 워크플로(`.github/workflows/npm-publish.yml`)
-하나로만 이뤄진다. 정확한 immutable `vX.Y.Z` 태그(또는 현재 main의 정확한 커밋
-SHA + 명시 버전)만 받고, 태그↔패키지 identity 검증 → 릴리스 계약 + 스모크 →
-`npm pack` 산출물 allowlist 검사(test/docs/fixtures/scripts 등 개발 전용 경로 차단)
-→ 발행 → 레지스트리 재확인 순으로 진행한다. 장기 npm publish 토큰은 GitHub에
-저장하지 않는다.
+Release verification enforces tag identity (`vX.Y.Z`), contract tests, smoke tests, and manifest allowlists preventing non-release files (development tests, fixtures, internal documents) from being packaged into npm artifacts.
 
-릴리스 이력과 소스-대-레지스트리 경계는 [CHANGELOG.md](CHANGELOG.md)에 기록된다.
-발행된 버전은 언제나 그 정확한 태그에서 나와야 하고, 태그 이후의 `main` 변경은
-다음 버전이지 옛 번호로 재발행되지 않는다.
+Detailed release logs and source-to-registry boundaries are documented in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-Apache-2.0 — Agentlas Terminal is the independent terminal runtime for the
-[Agentlas OS](https://github.com/agentlas-ai/Agentlas-OS) package contract. Its
-`engine/` directory is maintained and released from this repository; it is not
-a generated mirror of Agentlas Desktop.
+[Apache-2.0](LICENSE) — Agentlas Terminal is the independent terminal runtime for the [Agentlas OS](https://github.com/agentlas-ai/Agentlas-OS) package contract.

@@ -9,14 +9,13 @@
  *   --permission <level>  read | write | full
  * 프롬프트가 없고 stdin이 TTY가 아니면 stdin을 읽는다.
  *
- * 자동 라우팅(agents/router.cjs): 첫 토큰이 에이전트로 해석되지 않으면 호스트 LLM
- * 판정(resolveAutoRoute)이 최적 에이전트를 고른다 — 어휘 점수는 후보 모집 전용이다.
- * 판정 런타임이 없으면 기본 에이전트로 정직 폴백하되 note를 stderr에 반드시 출력한다
- * (조용한 오라우팅/폴백 금지 — 오너 결정).
+ * 첫 토큰이 정확한 에이전트이면 고급 직접 호출이다. 그 외 일반 실행은 현재 폴더에
+ * 연결된 Desktop Work 프로젝트의 첫 에이전트를 컨트롤러로 사용한다. 프로젝트나
+ * 컨트롤러가 불명확하면 다른 에이전트로 대체하지 않고 실행을 중단한다.
  * 런타임 사다리: 명시 핀 > 에이전트별 오버라이드(agent_runtime_overrides) >
  * model_roles[orchestrator] > active_runtime > detected (runtimes/overrides.cjs).
  */
-const { findAgent, listAgents } = require("../agents/registry.cjs");
+const { findAgent } = require("../agents/registry.cjs");
 const {
   resolveRuntimeForAgent,
   unavailableOverrideNote,
@@ -28,6 +27,7 @@ const permissions = require("../agentlas-permissions.cjs");
 const { EFFORTS, TIERS } = require("../agentlas-workload-routing.cjs");
 const { projectCwd } = require("../project/paths.cjs");
 const { ensureTerminalProjectForExecutionCli } = require("../project/state.cjs");
+const { resolveProjectController, withProjectControllerContext } = require("../project/controller.cjs");
 
 function readStdin() {
   return new Promise((resolve) => {
@@ -99,7 +99,23 @@ async function runOnce(ctx, args) {
     return 1;
   }
 
-  // 기본 런타임을 먼저 확정한다 — 판정 러너(자동 라우팅)도 이 런타임을 쓴다.
+  const cwd = projectCwd();
+  if (!agent) {
+    try {
+      const resolved = resolveProjectController(db, cwd);
+      agent = withProjectControllerContext(resolved.controller, resolved.project);
+      ctx.err(ctx.uiInstance.c.dim(
+        ctx.lang === "ko"
+          ? `프로젝트: ${resolved.project.name} · 컨트롤러: ${agent.name}`
+          : `Project: ${resolved.project.name} · Controller: ${agent.nameEn || agent.name}`,
+      ));
+    } catch (e) {
+      ctx.err(String((e && e.message) || e));
+      return 1;
+    }
+  }
+
+  // 프로젝트 컨트롤러 또는 명시 에이전트의 런타임을 확정한다.
   let runtime;
   try {
     runtime = resolveRuntimeForAgent({
@@ -109,38 +125,12 @@ async function runOnce(ctx, args) {
       model: parsed.model,
       effort: parsed.effort,
       role: "orchestrator",
+      agentId: agent.id,
     });
     if (parsed.tier) runtime.modelTier = parsed.tier;
   } catch (e) {
     ctx.err(String((e && e.message) || e));
     return 1;
-  }
-
-  if (!agent) {
-    // 자동 라우팅 — 최종 픽은 호스트 LLM 판정. 판정 불가 시 기본 에이전트 정직 폴백 + note.
-    const router = require("../agents/router.cjs");
-    let choice = null;
-    try {
-      choice = await router.resolveAutoRoute(db, prompt, { lang: ctx.lang, runtime });
-    } catch (e) {
-      ctx.err(ctx.lang === "ko"
-        ? `자동 라우팅 실패(${(e && e.message) || e}) — 기본 에이전트로 실행합니다`
-        : `auto-routing failed (${(e && e.message) || e}) — running with the default agent`);
-    }
-    if (choice && choice.agent) {
-      agent = choice.agent;
-    } else {
-      const visible = listAgents(db);
-      agent = visible[0] || findAgent(db, "agentlas-orchestrator");
-      if (!agent) {
-        ctx.err(ctx.lang === "en" ? "no installed agent (agentlas search/install first)" : "설치된 에이전트가 없습니다 (agentlas search/install 먼저)");
-        return 1;
-      }
-      // 직답 판정 — 페르소나 오염 없이 기본 에이전트 챗으로, 플레인 프롬프트로 답한다.
-      if (choice && choice.direct) agent = { ...agent, systemPrompt: router.directSystemPrompt(ctx.lang) };
-    }
-    // 조용한 라우팅 금지 — 누가 왜 선택됐는지(또는 왜 판정을 못 했는지) 반드시 출력.
-    if (choice && choice.note) ctx.err(ctx.uiInstance.c.dim(choice.note));
   }
 
   // 에이전트가 확정된 뒤 에이전트별 오버라이드를 포함한 전체 사다리를 다시 해석한다.
@@ -167,7 +157,6 @@ async function runOnce(ctx, args) {
   }
 
   const permission = permissions.normalize(parsed.permission || (ctx.prefs && ctx.prefs.permission) || "write");
-  const cwd = projectCwd();
   try {
     ensureTerminalProjectForExecutionCli(db, cwd, permission, "terminal-run");
   } catch (e) {
