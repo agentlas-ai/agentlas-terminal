@@ -308,7 +308,7 @@ function resolveAllocation(options = {}) {
       model: modelPin,
       effort: pinnedEffort,
       provider,
-      source: modelPin || effortPinPresent ? "user-pin" : "fallback",
+      source: modelPin ? "user-pin" : "unresolved",
       fallbackReason: pinReasons.join(","),
       aiReason: null,
     };
@@ -355,24 +355,14 @@ function resolveAllocation(options = {}) {
 
   let model = selected && selected.id;
   let effectiveModelEntry = selected;
-  let source = decision.exactModelId ? "parent-ai-exact" : "fallback";
+  let source = decision.exactModelId ? "parent-ai-exact" : "unresolved";
   if (modelPin) {
     model = modelPin;
     effectiveModelEntry = available.find((item) => item.id === modelPin) || null;
     source = "user-pin";
     reasons.push("explicit_model_pin");
   } else if (!model) {
-    source = "fallback";
-    const activeId = cleanText(runtime && runtime.model, 160) || null;
-    const active = activeId ? available.find((item) => item.id === activeId) || null : null;
-    const issue = activeId ? candidateIssue(active, "active_model") : "active_model_unavailable";
-    if (issue) {
-      if (!reasons.includes(issue)) reasons.push(issue);
-    } else {
-      model = active.id;
-      effectiveModelEntry = active;
-      reasons.push("compliant_active_model_fallback");
-    }
+    source = "unresolved";
   }
 
   let effort;
@@ -406,21 +396,20 @@ function resolveAllocation(options = {}) {
 function resolveAllocationAcrossRuntimes(options = {}) {
   const runtimes = Array.isArray(options.runtimes) ? options.runtimes : [];
   const decision = normalizeAllocation(options.decision);
-  const fallbackRuntime = options.fallbackRuntime || options.runtime || runtimes[0] || null;
-  const fallbackId = cleanText(fallbackRuntime && (fallbackRuntime.runtimeId || fallbackRuntime.id), 255) || null;
+  const explicitRuntime = options.runtime || null;
   const requestedId = decision && decision.runtimeId;
   const chosen = requestedId
     ? runtimes.find((runtime, index) => (cleanText(runtime && (runtime.runtimeId || runtime.id), 255) || `runtime-${index + 1}`) === requestedId) || null
-    : fallbackRuntime;
-  const runtime = chosen || fallbackRuntime;
+    : explicitRuntime;
+  const runtime = chosen || null;
   const resolution = resolveAllocation({ ...options, runtime, decision, availableModels: runtime && runtime.availableModels });
   const requestedExact = Boolean(decision && decision.runtimeId && decision.exactModelId);
-  const runtimeId = cleanText(runtime && (runtime.runtimeId || runtime.id), 255) || fallbackId;
+  const runtimeId = cleanText(runtime && (runtime.runtimeId || runtime.id), 255) || null;
   if (requestedExact && chosen && resolution.model === decision.exactModelId) {
     resolution.source = "parent-selected-live-runtime-model";
   } else if (requestedExact) {
     resolution.fallbackReason = [resolution.fallbackReason, chosen ? "parent_model_not_in_live_inventory" : "parent_runtime_not_in_live_inventory"].filter(Boolean).join(",");
-    if (resolution.source !== "user-pin") resolution.source = "fallback";
+    if (resolution.source !== "user-pin") resolution.source = "unresolved";
   }
   return { ...resolution, runtime, runtimeId, requestedRuntimeId: requestedId || null };
 }
@@ -478,9 +467,7 @@ function createDecisionReceipt({ taskId, stage, decision, resolution, role, usag
   );
   const status = source === "user-pin" && hasResolvedCurrent
     ? "user-pin"
-    : source === "fallback" && hasResolvedCurrent
-      ? "fallback-current"
-      : normalized && resolution && resolution.ok
+    : normalized && resolution && resolution.ok
         ? "resolved"
         : "unresolved";
   const riskCodes = new Set(normalized ? normalized.reasonCodes : []);
@@ -509,7 +496,7 @@ function createDecisionReceipt({ taskId, stage, decision, resolution, role, usag
     },
     reasonCodes,
     inputFeatureHash: normalized && normalized.inputFeatureHash ? normalized.inputFeatureHash : featureHash,
-    selectorVersion: normalized ? normalized.selectorVersion : "deterministic-host-fallback",
+    selectorVersion: normalized ? normalized.selectorVersion : "unresolved-no-model-judgment",
     independentVerificationRequired:
       riskCodes.has("high-risk") || riskCodes.has("critical-risk") || riskCodes.has("independent-verification"),
     usage: normalizeObservedUsage(usage),
@@ -548,7 +535,7 @@ function plannerSystemPrompt({ language = "English", maxTasks = 12, mode = "swar
   return [
     `You are the higher-level workload allocator for an Agentlas ${mode}.`,
     "Judge each child task using the full goal and planned dependency graph. Do not use a keyword lookup or fixed role-to-model table.",
-    "LIVE_RUNTIME_INVENTORY below is authoritative. For every child and synthesis, choose an exact runtimeId and exactModelId only from it. Do not infer, rename, or invent a model from a tier. If an exact choice cannot be justified, select the current-runtime fallback from the inventory.",
+    "LIVE_RUNTIME_INVENTORY below is authoritative. For every child and synthesis, choose an exact runtimeId and exactModelId only from it. Do not infer, rename, invent, or substitute a model. If an exact choice cannot be justified, return an unresolved decision.",
     `LIVE_RUNTIME_INVENTORY=${JSON.stringify(liveRuntimeInventory)}`,
     "Choose effort none|minimal|low|medium|high|xhigh|max. Spend frontier/high effort only when the task's complexity, risk, context, or synthesis burden justifies it.",
     `Return strict JSON only with at most ${Math.max(1, Math.min(24, maxTasks))} tasks:`,

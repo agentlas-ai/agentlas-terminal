@@ -144,7 +144,6 @@ async function resolveAutoRoute(db, task, opts = {}) {
       ...roster,
     ].join("\n"),
     multi: false,
-    fallback: [],
     signal: opts.signal,
     timeoutMs: opts.timeoutMs || 40000,
   });

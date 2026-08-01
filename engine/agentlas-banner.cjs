@@ -195,7 +195,6 @@ function renderBanner(ctx) {
   const menu = [
     [ui.t("banner.menu.help"), "/help"],
     [ui.t("banner.menu.sessions"), "/sessions"],
-    [ui.t("banner.menu.chats"), "/chats"],
     [ui.t("banner.menu.quit"), "/quit"],
   ];
   const infoRoom = inner - CARD_PAD * 2;

@@ -32,7 +32,7 @@ const path = require("node:path");
 const { userDataDir } = require("../core/paths.cjs");
 const hubClient = require("../cloud/hub-client.cjs");
 const detect = require("../runtimes/detect.cjs");
-const { resolvedModelRole } = require("../runtimes/roles.cjs");
+const { roleMembers } = require("../runtimes/roles.cjs");
 const capture = require("./capture.cjs");
 
 // ── 런타임 해석 (v1 resolveRuntime의 워크포스 어댑터) ─────────────────────
@@ -115,8 +115,7 @@ function legacyWorkforceRuntime(db, override) {
   throw error;
 }
 
-// 사다리: 명시 override > model_roles[role] > 레거시 prefs/active/PATH.
-// worker가 비어 있거나 inherit=1이면 roles.cjs가 orchestrator로만 승격한다.
+// 명시 override 또는 Dashboard에 저장된 role priority만 실행 권위다.
 function resolveWorkforceRuntime(db, override) {
   if (override) {
     const exact = legacyWorkforceRuntime(db, override);
@@ -129,9 +128,13 @@ function resolveWorkforceRuntime(db, override) {
       },
     };
   }
-  const fallback = legacyWorkforceRuntime(db, null);
-  const orchestrator = runtimeFromSelection(resolvedModelRole(db, "orchestrator")) || fallback;
-  const worker = runtimeFromSelection(resolvedModelRole(db, "worker")) || orchestrator;
+  const orchestrator = runtimeFromSelection(roleMembers(db, "orchestrator")[0] || null);
+  const worker = runtimeFromSelection(roleMembers(db, "worker")[0] || null);
+  if (!orchestrator || !worker) {
+    const error = new Error("Dashboard orchestrator and worker priorities are required for Workforce execution.");
+    error.code = "no_runtime_role_priority";
+    throw error;
+  }
   return {
     ...orchestrator,
     role: "orchestrator",

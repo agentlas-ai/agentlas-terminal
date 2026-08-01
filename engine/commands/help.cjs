@@ -4,14 +4,11 @@
 const HELP = `agentlas — the operating system for agents, in your terminal
 
   agentlas                 open the terminal (REPL)
-  agentlas <agent>         jump into a chat with one agent
-  agentlas "<task>"        auto-route to the best agent and run once
+  agentlas "<task>"        run once with this project's controller
 
-TALK & RUN
-  <agent> · chat <agent>   jump into a chat with one agent
-  run [agent] [prompt]     one-shot (-p · --runtime · --model · --effort · --permission)
+PROJECT WORK
+  run [agent] [prompt]     project-first one-shot; exact agent is an explicit advanced override
   firm <firm> [task]       delegate to a CEO (--runtime · --model · --effort)
-  chats [n] · open <id>    recent conversations · resume one
 
 AGENTS & HUB
   search "<what you need>" discover agents in the Hub
@@ -52,7 +49,7 @@ ACCOUNT & OPS
 
 IN-REPL (agentlas → interactive, Orca multi-session)
   /spawn <agent> [task] · /sessions · /tree · /s <n> · /steer <n> <msg> ·
-  /kill <n> · /rm <n> · /broadcast <msg> · /use · /runtime · /model · /effort · /permission
+  /kill <n> · /rm <n> · /broadcast <msg> · /runtime · /model · /effort · /permission
   typing during a running turn queues steering; ctrl-c interrupts the turn
 
 Options: -p|--print · --runtime claude-code|codex|gemini · --model <exact-id> ·

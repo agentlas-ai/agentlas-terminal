@@ -1,6 +1,6 @@
 -- Agentlas first-run bootstrap schema (project-first Work contract)
--- Source DB user_version=85. Desktop remains the migration authority.
-PRAGMA user_version=85;
+-- Source DB user_version=86. Desktop remains the migration authority.
+PRAGMA user_version=86;
 CREATE TABLE active_runtime (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         kind TEXT NOT NULL
@@ -35,7 +35,7 @@ CREATE TABLE chats (
         agent_id TEXT NOT NULL,
         title TEXT NOT NULL DEFAULT '새 채팅',
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL, firm_id TEXT REFERENCES firms(id) ON DELETE SET NULL, archived_at TEXT, working_folder TEXT, kind TEXT NOT NULL DEFAULT 'user', parent_chat_id TEXT, used_at TEXT, continuous_mode INTEGER NOT NULL DEFAULT 0, swarm_mode INTEGER NOT NULL DEFAULT 0, last_viewed_at TEXT, hired_agents TEXT, origin_surface TEXT NOT NULL DEFAULT 'work', runtime_selection_json TEXT,
+        updated_at TEXT NOT NULL, firm_id TEXT REFERENCES firms(id) ON DELETE SET NULL, archived_at TEXT, working_folder TEXT, kind TEXT NOT NULL DEFAULT 'user', parent_chat_id TEXT, used_at TEXT, continuous_mode INTEGER NOT NULL DEFAULT 0, swarm_mode INTEGER NOT NULL DEFAULT 0, last_viewed_at TEXT, origin_surface TEXT NOT NULL DEFAULT 'work', runtime_selection_json TEXT,
         FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL,
         FOREIGN KEY(agent_id) REFERENCES installed_agents(id) ON DELETE CASCADE
       );

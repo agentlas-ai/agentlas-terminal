@@ -48,7 +48,6 @@ class Renderer {
     }
     const lines = text.trim().split(/\r?\n/).slice(-12);
     for (const l of lines) this.ui.line("  " + l);
-    if (session.lastError) this.ui.error(session.lastError);
   }
 
   _render(ev) {
@@ -57,7 +56,6 @@ class Renderer {
       case "turn-start": this._beginChrome(); return;
       case "turn-end":
         ui.endTurn();
-        if (!ev.ok && ev.error) ui.error(ev.error);
         return;
       case "status": ui.status(ev.text); return;
       case "warn": ui.warn(ev.text); return;
@@ -65,7 +63,6 @@ class Renderer {
         // 사용자가 의도적으로 중단(kill)한 턴의 종료 에러(SIGTERM exit 등)는 소음 —
         // 실사용 테스트에서 확인된 UX 결함. 중단 안내는 REPL이 이미 출력했다.
         if (this.session && this.session.status === "killed") return;
-        ui.error(ev.text);
         return;
       case "line": ui.line(ev.text); return;
       case "tool": ui.tool(ev.name, ev.summary); return;
@@ -104,12 +101,12 @@ class Renderer {
         ui.line(ui.c.dim(`    ↳ agentlas automation list  ·  agentlas automation off ${String(ev.id || "").slice(0, 8)}`));
         return;
       }
-      case "automation-refused": ui.warn(`automation refused: ${ev.name} — ${ev.reason}`); return;
+      case "automation-refused": return;
       case "delegate-spawned":
         ui.ok(`delegate spawned: ${ev.target} → ${ev.key}`);
         return;
-      case "delegate-refused": ui.warn(`delegate refused: ${ev.target} — ${ev.reason}`); return;
-      case "fence-error": ui.error(`fence: ${ev.text}`); return;
+      case "delegate-refused": return;
+      case "fence-error": return;
       case "memory-curated":
         ui.line(ui.c.dim(`  ↳ memory: ${ev.written}/${ev.candidates} written (permission: ${ev.permission})`));
         return;

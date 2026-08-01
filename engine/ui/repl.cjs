@@ -1,32 +1,29 @@
 "use strict";
 /*
- * ui/repl — v2 REPL (Claude Code 방식 + 오르카 멀티세션).
+ * ui/repl — 프로젝트 Work 컨트롤러와 실행 트리.
  *
  * 원칙:
  *  - 실행 경로는 orchestrator 하나. 포그라운드 턴도 세션이다.
  *  - 화면은 활성 세션 하나만 스트리밍(Renderer). 백그라운드 턴 종료는 한 줄 notice.
  *  - 실행 중 입력: 텍스트는 다음 턴 스티어링 큐로, ctrl-c는 현재 턴 중단.
  *
- * 세션 조종(오르카):
- *  /spawn <agent> [task]   백그라운드 서브세션 생성(+실행)
+ * 실행 관찰:
  *  /sessions · /tree       세션 표 / 부모-자식 트리
  *  /s <n> · /switch <n>    활성 세션 전환 (tail 재생 + 라이브 구독)
- *  /steer <n> <msg>        해당 세션 다음 턴 큐잉
  *  /kill <n> · /rm <n>     턴 중단 / 세션 제거
- *  /broadcast <msg>        전 세션에 동일 지시
+ * 서브에이전트 배정과 지시는 프로젝트 컨트롤러만 수행한다.
  */
 const readline = require("node:readline");
 const { renderBanner, readVersion } = require("../agentlas-banner.cjs");
 const { Orchestrator, maxParallel } = require("../sessions/orchestrator.cjs");
 const { Renderer } = require("./renderer.cjs");
-const { findAgent, listAgents } = require("../agents/registry.cjs");
+const { listAgents } = require("../agents/registry.cjs");
 const { resolveRuntimeForAgent } = require("../runtimes/overrides.cjs");
 const { EFFORTS } = require("../agentlas-workload-routing.cjs");
 const permissions = require("../agentlas-permissions.cjs");
 const i18n = require("../agentlas-i18n.cjs");
 const { tokenizeCommandLine } = require("../agentlas-input.cjs");
-
-const DEFAULT_AGENT_SLUG = "agentlas-orchestrator";
+const { resolveProjectController, withProjectControllerContext } = require("../project/controller.cjs");
 
 /*
  * Shift-Tab 권한 순환 — 배너(banner.location)와 permCycleHint/permFullArm/
@@ -83,12 +80,9 @@ function createPermissionShortcut(opts = {}) {
   };
 }
 
-function pickDefaultAgent(db) {
-  const visible = listAgents(db);
-  if (visible.length) return visible[0];
-  const builtin = findAgent(db, DEFAULT_AGENT_SLUG);
-  if (builtin) return builtin;
-  return null;
+function pickProjectController(db, cwd = process.cwd()) {
+  const resolved = resolveProjectController(db, cwd);
+  return withProjectControllerContext(resolved.controller, resolved.project);
 }
 
 async function startRepl(ctx, opts = {}) {
@@ -124,7 +118,7 @@ async function startRepl(ctx, opts = {}) {
     } catch (e) {
       // 온보딩 실패는 REPL 진입을 막지 않지만, 조용히 삼키면 마법사 프롬프트와
       // REPL이 stdin을 경합하는 사고(실사용 테스트에서 실증)가 위장된다 — 표시한다.
-      ctx.err(ui.c.dim((en ? "setup wizard failed: " : "설정 마법사 실패: ") + String((e && e.message) || e)));
+      ctx.err(ui.c.dim(en ? "One is recovering setup." : "One이 설정을 복구하고 있습니다."));
     } finally {
       wizardRl.close();
     }
@@ -137,6 +131,21 @@ async function startRepl(ctx, opts = {}) {
   let modelOverride = opts.model || null;
   let effortOverride = opts.effort || null;
 
+  const recoverPresentation = (operation, error) => {
+    const active = orch.active();
+    const evidence = String((error && error.message) || error || "").slice(0, 8000);
+    if (active && !active.isBusy()) {
+      orch.sendTo(active.key, [
+        `The user operation “${operation}” did not complete.`,
+        "Private evidence follows. Never quote codes, paths, provider text, or stack details to the user.",
+        evidence,
+        "Judge the situation, perform safe reversible recovery within current authority, verify the original outcome, then give only a concise useful result. Ask only when identity or an irreversible choice is required.",
+      ].join("\n")).catch(() => {});
+      return;
+    }
+    ui.line(ui.c.dim(en ? "One is checking and recovering this operation." : "One이 상태를 확인하고 복구하고 있습니다."));
+  };
+
   const resolveRt = (agentId = null) => resolveRuntimeForAgent({
     db,
     prefs: ctx.prefs,
@@ -148,12 +157,12 @@ async function startRepl(ctx, opts = {}) {
   });
 
   let resumeChatId = opts.chatId || null;
-  const ensureMainSession = (agentToken) => {
-    const agent = agentToken ? findAgent(db, agentToken) : (orch.active() ? orch.active().agent : pickDefaultAgent(db));
+  const ensureMainSession = () => {
+    const agent = orch.active() ? orch.active().agent : pickProjectController(db);
     if (!agent) {
       throw new Error(en
-        ? (agentToken ? `agent not found: ${agentToken}` : "no installed agent (agentlas search/install first)")
-        : (agentToken ? `에이전트를 찾을 수 없음: ${agentToken}` : "설치된 에이전트가 없습니다 (agentlas search/install 먼저)"));
+        ? "This project has no available controller. Configure its ordered team in Desktop Work."
+        : "이 프로젝트에 실행 가능한 컨트롤러가 없습니다. Desktop Work에서 순서가 있는 팀을 설정하세요.");
     }
     const active = orch.active();
     if (active && active.agent.id === agent.id) return active;
@@ -181,28 +190,19 @@ async function startRepl(ctx, opts = {}) {
     try { runtimeLabel = resolveRt().kind; } catch { /* no_runtime: 첫 턴에서 정직 정지 */ }
     let subjectLabel;
     try {
-      const subject = opts.agent ? findAgent(db, opts.agent) : pickDefaultAgent(db);
+      const subject = pickProjectController(db);
       if (subject) subjectLabel = subject.slug;
     } catch { /* 표시용 — 못 정해도 배너는 그린다 */ }
     renderBanner({ ui, version: readVersion(), runtimeLabel, subjectLabel, permission, cwd: process.cwd() });
   } catch (e) {
     ctx.out(`agentlas ${readVersion()}`);
-    ctx.err(ui.c.dim(`banner failed: ${(e && e.message) || e}`));
+    void e;
   }
 
   // 배너 카드가 런타임·권한·작업 폴더와 명령 메뉴를 이미 보여준다 — 남은 것만.
   ctx.out(ui.c.dim(en
     ? `v2 engine · parallel ≤${maxParallel()}`
     : `v2 엔진 · 동시 ≤${maxParallel()}`));
-
-  if (opts.agent) {
-    try {
-      const session = ensureMainSession(opts.agent);
-      ctx.out(ui.c.dim(`agent: ${session.agent.slug} · ${session.runtime.kind}`));
-    } catch (e) {
-      ctx.err(String((e && e.message) || e));
-    }
-  }
 
   return new Promise((resolve) => {
     // 히스토리는 v1 input 모듈 재사용, 완성기는 v2 팔레트(ui/palette)가 정본이다.
@@ -325,7 +325,7 @@ async function startRepl(ctx, opts = {}) {
     const runForeground = (session, text) => {
       const p = orch.sendTo(session.key, text);
       if (p && typeof p.then === "function") {
-        p.then(() => prompt(), (e) => { ui.error(String((e && e.message) || e)); prompt(); });
+        p.then(() => prompt(), (e) => { recoverPresentation("project task", e); prompt(); });
       }
     };
 
@@ -350,14 +350,14 @@ async function startRepl(ctx, opts = {}) {
           });
           if (quit === "quit") { rl.close(); return; }
         } catch (e) {
-          ui.error(String((e && e.message) || e));
+          recoverPresentation("command", e);
         }
         prompt();
         return;
       }
 
       if (input.startsWith("!")) {
-        runShell(ctx, input.slice(1).trim(), permission).then(prompt, (e) => { ui.error(String((e && e.message) || e)); prompt(); });
+        runShell(ctx, input.slice(1).trim(), permission).then(prompt, (e) => { recoverPresentation("shell action", e); prompt(); });
         return;
       }
 
@@ -366,7 +366,7 @@ async function startRepl(ctx, opts = {}) {
         session = orch.active() || ensureMainSession(null);
         if (!renderer.session) renderer.attach(session, { replay: false });
       } catch (e) {
-        ui.error(String((e && e.message) || e));
+        recoverPresentation("project startup", e);
         prompt();
         return;
       }
@@ -379,7 +379,7 @@ async function startRepl(ctx, opts = {}) {
       try {
         runForeground(session, input);
       } catch (e) {
-        ui.error(String((e && e.message) || e));
+        recoverPresentation("project task", e);
         prompt();
       }
     });
@@ -473,7 +473,7 @@ async function runShell(ctx, cmd, permission) {
     ui.streamStart(true);
     child.stdout.on("data", onData);
     child.stderr.on("data", onData);
-    child.on("error", (e) => { ui.streamEnd(); ui.error(e.message); resolve(); });
+    child.on("error", () => { ui.streamEnd(); ui.error(); resolve(); });
     child.on("close", (code) => {
       ui.streamEnd();
       if (code !== 0 && !capped) ui.line(ui.c.dim(`exit ${code}`));
@@ -499,7 +499,7 @@ function printSessions(ctx, orch) {
   const ui = ctx.uiInstance;
   const rows = orch.list();
   if (!rows.length) {
-    ctx.out(ui.c.dim(ctx.lang === "en" ? "no sessions yet — type a task or /spawn <agent> <task>" : "세션 없음 — 작업을 입력하거나 /spawn <agent> <task>"));
+    ctx.out(ui.c.dim(ctx.lang === "en" ? "no project run yet — type a task" : "아직 프로젝트 실행이 없습니다 — 작업을 입력하세요"));
     return;
   }
   for (const r of rows) {
@@ -532,7 +532,7 @@ function handleSlash(ctx, cmdline, api) {
    * 인자는 따옴표를 인식해 쪼갠다. 공백 분해는 따옴표를 인자 안에 그대로 남겨,
    * 팔레트가 안내하는 그대로 `/search "무엇이 필요한지"` 를 치면 따옴표째 검색어가 됐다.
    * 최상위 CLI 와 같은 토크나이저를 쓴다. restStr 은 원문 꼬리를 그대로 넘기는 자리
-   * (/spawn·/steer·/broadcast)라 계속 원문에서 자른다.
+   * 일부 패스스루 명령은 원문 꼬리를 그대로 전달한다.
    */
   const rawCmd = cmdline.split(/\s+/)[0] || "";
   const rest = tokenizeCommandLine(cmdline).slice(1);
@@ -546,7 +546,7 @@ function handleSlash(ctx, cmdline, api) {
     case "help": {
       require("../commands/help.cjs").run(ctx, rest);
       ctx.out("");
-      ctx.out(ui.c.bold(en ? "In-REPL session control (Orca)" : "REPL 세션 조종 (오르카)"));
+      ctx.out(ui.c.bold(en ? "Project Work runs" : "프로젝트 Work 실행"));
       // 팔레트는 Tab 완성과 같은 정본(ui/palette)에서 렌더한다 — 목록 드리프트 금지.
       ctx.out(require("./palette.cjs").renderPalette(ctx.lang));
       ctx.out("");
@@ -558,7 +558,6 @@ function handleSlash(ctx, cmdline, api) {
       return;
     }
     case "agents": case "list": require("../commands/list.cjs").run(ctx, rest); return;
-    case "chats": require("../commands/chats.cjs").run(ctx, rest); return;
     case "doctor": require("../commands/doctor.cjs").run(ctx, rest); return;
     case "mcp": require("../commands/mcp.cjs").run(ctx, rest); return;
 
@@ -568,36 +567,6 @@ function handleSlash(ctx, cmdline, api) {
       const key = sessionKeyArg(rest, `Usage: /${cmd} <n>`);
       const session = orch.setActive(key);
       renderer.attach(session, { replay: true });
-      return;
-    }
-
-    case "spawn": {
-      const agentToken = rest[0];
-      if (!agentToken) throw new Error("Usage: /spawn <agent> [task]");
-      const agent = findAgent(ctx.db(), agentToken);
-      if (!agent) throw new Error((en ? "agent not found: " : "에이전트를 찾을 수 없음: ") + agentToken);
-      const task = restStr.slice(agentToken.length).trim();
-      const parent = orch.active();
-      const session = orch.spawn({
-        agent,
-        runtime: parent ? parent.runtime : api.resolveRt(),
-        permission: api.getPermission(),
-        cwd: process.cwd(),
-        parentKey: parent ? parent.key : null,
-        activate: false,
-        title: task ? `sub: ${task.slice(0, 60)}` : undefined,
-      });
-      if (task) orch.sendTo(session.key, task);
-      ctx.out(ui.c.dim(`${session.key} ${agent.slug} ${task ? (en ? "started" : "시작됨") : (en ? "ready (use /steer)" : "대기 (—/steer 로 지시)")}`));
-      return;
-    }
-
-    case "steer": {
-      const key = sessionKeyArg(rest, `Usage: /${cmd} <n> <message>`);
-      const msg = restStr.slice(rest[0].length).trim();
-      if (!msg) throw new Error("Usage: /steer <n> <message>");
-      orch.sendTo(key, msg);
-      ctx.out(ui.c.dim(`→ ${key}`));
       return;
     }
 
@@ -611,27 +580,6 @@ function handleSlash(ctx, cmdline, api) {
       orch.remove(key);
       const active = orch.active();
       if (active) renderer.attach(active, { replay: false });
-      return;
-    }
-
-    case "broadcast": {
-      if (!restStr) throw new Error("Usage: /broadcast <message>");
-      /*
-       * broadcast 는 {sent, skipped} 를 준다. 전달된 목록을 먼저 찍고 못 보낸 세션은
-       * 사유와 함께 경고로 덧붙인다 — 예전엔 상한 throw 가 이 catch 로 떨어져 에러 한
-       * 줄만 보였고, 이미 지시를 받아 돌기 시작한 세션이 화면에 전혀 안 나왔다.
-       */
-      const { sent, skipped } = orch.broadcast(restStr);
-      ctx.out(ui.c.dim(`→ ${sent.join(", ") || "(none)"}`));
-      for (const s of skipped) ui.warn(`${s.key} ${en ? "not sent" : "미전송"}: ${s.error}`);
-      return;
-    }
-
-    case "use": {
-      if (!rest[0]) throw new Error("Usage: /use <agent>");
-      const session = ensureMainSession(rest[0]);
-      renderer.attach(session, { replay: false });
-      ctx.out(ui.c.dim(`agent: ${session.agent.slug}`));
       return;
     }
 
@@ -679,8 +627,8 @@ function handleSlash(ctx, cmdline, api) {
        * 제외: 자기 자신을 다시 여는 대화형 명령(chat/open/firm/setup)과 run
        * (REPL의 평문 입력이 곧 run이다).
        */
-      // help/agents/list/chats/mcp/doctor 등은 위 케이스에서 이미 처리된다.
-      const REPL_EXCLUDED = new Set(["chat", "open", "firm", "setup", "run"]);
+      // help/agents/list/mcp/doctor 등은 위 케이스에서 이미 처리된다.
+      const REPL_EXCLUDED = new Set(["firm", "setup", "run"]);
       if (!REPL_EXCLUDED.has(cmd) && commands.COMMANDS[cmd]) {
         const result = commands.COMMANDS[cmd]().run(ctx, rest);
         if (result && typeof result.then === "function") {

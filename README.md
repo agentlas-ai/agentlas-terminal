@@ -54,33 +54,21 @@ agentlas
 agentlas "Identify why repository tests are failing"      # Uses the connected project's first agent as controller
 agentlas run -p "Summarize the last 3 CHANGELOG entries"  # Prints the project controller's final answer to stdout
 git log --oneline -20 | agentlas run                      # Reads stdin; still requires a connected project
-agentlas run <agent> "Advanced direct request"            # Exact-agent direct invocation; no project substitution
-agentlas <agent>                                          # Starts an interactive REPL with an exact agent
+agentlas run <agent> "Advanced direct request"            # Explicit one-turn exact-agent override
 agentlas firm <firm> "Request"                            # Delegates to an exact firm CEO
 ```
 
 Ordinary one-shot work is project-first: run it inside a folder connected to a Desktop Work project. The first agent in that project's ordered pool owns the task; remaining members are eligible task-scoped sub-agents. Missing projects, empty teams, and unavailable controllers stop without substituting another agent. The separate `agentlas route` preview is model-judged and stays unresolved when no exact installed agent can be justified.
 
-**3. Resuming & Managing Conversations**
-
-```sh
-agentlas chats            # List recent conversations (shares SQLite DB with Desktop app)
-agentlas chats 30         # List last 30 conversations
-agentlas open <chat-id>   # Re-open REPL with the chat's assigned agent
-```
-
 ## Command Reference
 
 Run `agentlas help` for the authoritative command list. Below is the organized command structure:
 
-### TALK & RUN
+### PROJECT WORK
 ```sh
-agentlas <agent>                 # Chat with agent (equivalent to chat <agent>)
-agentlas chat <agent>
-agentlas run [agent] [prompt]    # Single-run execution (-p, --runtime, --permission, stdin)
+agentlas                         # Open the connected project's controller session
+agentlas run [agent] [prompt]    # Project-first run; optional agent is one explicit turn
 agentlas firm <firm> [task]      # Delegate task to firm CEO
-agentlas chats [n]               # List recent chat conversations
-agentlas open <chat-id>          # Resume conversation by ID
 agentlas cd <agent>              # Print folder path of an agent (cd "$(agentlas cd x)")
 ```
 
@@ -164,7 +152,7 @@ $ agentlas lst
 Command list: agentlas help  ·  To run this exact prompt: agentlas run -p "lst"
 ```
 
-Desktop-only surface names (`site`, `trex`, `prompts`, `dashboard`, `marketplace`, `library`, `groups`, `settings`, `apps`, `quests`, `bookmarks`, `one`) also halt with typo guard guidance directing you to equivalent terminal commands. To run a single word as a prompt, wrap it in quotes or pass `run -p`.
+Desktop-only surface names (`site`, `trex`, `prompts`, `dashboard`, `marketplace`, `library`, `settings`, `apps`, `quests`, `bookmarks`, `one`) also halt with typo guard guidance directing you to equivalent terminal commands. To run a single word as a prompt, wrap it in quotes or pass `run -p`.
 
 ### Permission Levels
 
@@ -176,9 +164,9 @@ Desktop-only surface names (`site`, `trex`, `prompts`, `dashboard`, `marketplace
 
 *Note: Saved `full` permission is session-bound and automatically fails closed to `write` on subsequent executions. REPL shell execution (`!<command>`) runs strictly under `full` permission, enforced with 8MB output capping, secret masking, and process-group termination.*
 
-## REPL & Orca Multi-Session Architecture
+## Project Work Execution Tree
 
-Executing `agentlas` with no arguments starts an interactive REPL session. Foreground execution turns run inside an active session, while subagents created via `/spawn` execute concurrently in background sessions. The terminal streams output from the currently focused active session and displays one-line notices when background tasks finish.
+Executing `agentlas` with no arguments resolves the current folder to an Agentlas project and starts its first ordered agent as the task controller. The controller may create task-scoped worker runs; users can inspect the real execution tree, but cannot replace the controller or address workers around it.
 
 ### REPL Slash Commands
 
@@ -187,14 +175,9 @@ Executing `agentlas` with no arguments starts an interactive REPL session. Foreg
 | `/help` | Display available commands and keybindings |
 | `/sessions` · `/tree` | View session table or parent-child process tree |
 | `/s <n>` · `/switch <n>` | Switch active session (replays tail logs & subscribes to live stream) |
-| `/spawn <agent> [task]` | Spawn subagent background session (executes task immediately if supplied) |
-| `/steer <n> <msg>` | Queue instruction for session `n`'s next turn |
 | `/kill <n>` | Interrupt active turn in session `n` |
 | `/rm <n>` | Remove session `n` |
-| `/broadcast <msg>` | Broadcast instruction to all running sessions |
-| `/use <agent>` | Change active agent in main session |
 | `/agents` · `/list` | List installed agents |
-| `/chats [n]` | View recent conversations |
 | `/mcp` | List active MCP servers |
 | `/doctor` | Run runtime & database diagnostics |
 | `/runtime <kind>` | Set runtime for new sessions (`claude-code` \| `codex` \| `gemini`) |
@@ -242,9 +225,9 @@ The launcher (`bin/agentlas.cjs`) runs system Node against `engine/`. The defaul
 | Windows | `%APPDATA%\Agentlas` |
 | Linux | `$XDG_CONFIG_HOME/Agentlas` (default `~/.config/Agentlas`) |
 
-The SQLite database file is `agentlas.sqlite` (`user_version=85`). When launched for the first time without an existing database, it bootstraps schemas using `engine/bootstrap-schema.sql`. Consequently, **projects, installed agents, task history, automation sessions, and MCP registrations are shared across Desktop and Terminal**. Subagent sessions spawned via `/spawn` are stored as scoped execution ledgers rather than new global Work conversations.
+The SQLite database file is `agentlas.sqlite` (`user_version=86`). When launched for the first time without an existing database, it bootstraps schemas using `engine/bootstrap-schema.sql`. Consequently, **projects, installed agents, task history, automation sessions, and MCP registrations are shared across Desktop and Terminal**. The first ordered project agent remains the controller; additional agents are task-scoped and are stored only as execution ledgers, never as global conversations or durable owners.
 
-SQLite Driver Fallback Ladder: `better-sqlite3` (optionalDependency native build) -> Node 22+ `node:sqlite`.
+SQLite driver priority: `better-sqlite3` (optional dependency native build), then Node 22+ `node:sqlite` when the first driver is unavailable.
 
 ### Hub Installation & Safety Policy
 

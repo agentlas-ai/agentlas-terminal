@@ -3,8 +3,8 @@
  * ui/palette — v2 슬래시 명령 정본 + readline 완성기.
  *
  * 왜 v1 input 모듈의 SLASH_COMMANDS를 쓰지 않는가: 그 목록은 v1 REPL 전용이라
- * v2에 없는 명령(/status /team /model /effort …)을 광고하고, v2의 오르카 명령
- * (/spawn /sessions /s /steer /kill /broadcast …)은 빠져 있었다. 팔레트가
+ * v2에 없는 명령(/status /team /model /effort …)을 광고한다. 프로젝트 Work에서는
+ * 컨트롤러만 서브에이전트를 배정하므로 사용자용 임의 spawn/steer/broadcast는 없다.
  * 거짓말하면 사용자는 없는 기능을 부른다(실사용 Tab 테스트에서 실증).
  * 경로 완성만 v1 모듈의 completePath를 재사용한다.
  */
@@ -17,15 +17,10 @@ const SLASH_COMMANDS = [
   { command: "/tree", args: "", ko: "세션 트리", en: "Session tree" },
   { command: "/s", args: "<n>", ko: "활성 세션 전환", en: "Switch active session" },
   { command: "/switch", args: "<n>", ko: "활성 세션 전환", en: "Switch active session" },
-  { command: "/spawn", args: "<agent> [task]", ko: "서브에이전트 세션 생성", en: "Spawn a subagent session" },
-  { command: "/steer", args: "<n> <msg>", ko: "해당 세션에 지시 큐잉", en: "Queue steering for a session" },
   { command: "/kill", args: "<n>", ko: "실행 중 턴 중단", en: "Interrupt a running turn" },
   { command: "/rm", args: "<n>", ko: "세션 제거", en: "Remove a session" },
-  { command: "/broadcast", args: "<msg>", ko: "모든 세션에 지시", en: "Send to every session" },
-  { command: "/use", args: "<agent>", ko: "메인 세션 에이전트 교체", en: "Switch the main agent" },
   { command: "/agents", args: "", ko: "설치 에이전트 목록", en: "List installed agents" },
   { command: "/list", args: "", ko: "설치 에이전트 목록", en: "List installed agents" },
-  { command: "/chats", args: "[n]", ko: "최근 대화", en: "Recent conversations" },
   { command: "/mcp", args: "", ko: "MCP 서버 목록", en: "MCP servers" },
   { command: "/doctor", args: "", ko: "런타임·데이터 점검", en: "Health check" },
   { command: "/runtime", args: "<kind>", ko: "새 세션 런타임 지정", en: "Set runtime for new sessions" },
@@ -99,8 +94,7 @@ const RUNTIME_KINDS = ["claude-code", "codex", "gemini"];
 const EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 const PERM_LEVELS = ["read", "write", "full"];
 // 세션 인자를 받는 명령 — 완성 후보를 살아있는 세션 키(s1, s2…)로 채운다.
-const SESSION_ARG_COMMANDS = new Set(["/s", "/switch", "/steer", "/kill", "/rm"]);
-const AGENT_ARG_COMMANDS = new Set(["/use", "/spawn"]);
+const SESSION_ARG_COMMANDS = new Set(["/s", "/switch", "/kill", "/rm"]);
 
 function uniqStartsWith(list, prefix) {
   const p = String(prefix || "");
@@ -137,9 +131,6 @@ function makeCompleter(ctx = {}) {
     if (cmd === "/effort") return [uniqStartsWith(EFFORT_LEVELS, last), last];
     if (cmd === "/permission") return [uniqStartsWith(PERM_LEVELS, last), last];
     if (SESSION_ARG_COMMANDS.has(cmd) && tokens.length === 2) return [uniqStartsWith(getSessions(), last), last];
-    if (AGENT_ARG_COMMANDS.has(cmd) && tokens.length === 2) {
-      return [uniqStartsWith(getAgents().concat(getFirms()), last), last];
-    }
     return [[], last];
   };
 }

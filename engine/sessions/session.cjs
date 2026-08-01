@@ -13,6 +13,9 @@ const crypto = require("node:crypto");
 const { EventEmitter } = require("node:events");
 const nativeHost = require("../agentlas-native-host.cjs");
 const permissions = require("../agentlas-permissions.cjs");
+const { RUNTIME_BIN, whichSync } = require("../runtimes/detect.cjs");
+const { CLI_EXECUTABLE_KINDS } = require("../runtimes/resolve.cjs");
+const { roleMembers } = require("../runtimes/roles.cjs");
 const { EventSink } = require("./sink.cjs");
 const store = require("./store.cjs");
 
@@ -37,6 +40,7 @@ class Session extends EventEmitter {
     this.status = "idle"; // idle | running | done | failed | killed
     this.lastLine = "";
     this.lastError = null;
+    this._privateRecoveryEvidence = [];
     this.startedAt = null;
     this.endedAt = null;
     this.usage = null;
@@ -52,7 +56,7 @@ class Session extends EventEmitter {
 
     this.chatId = opts.chatId || store.createChat(this.db, {
       agentId: this.agent.id,
-      title: opts.title || (opts.parent ? `sub: ${this.agent.slug}` : "New chat"),
+      title: opts.title || (opts.parent ? `sub: ${this.agent.slug}` : "New project task"),
       kind: opts.parent ? "division" : "user",
       parentChatId: opts.parent ? opts.parent.chatId : null,
       workingFolder: this.cwd,
@@ -76,6 +80,11 @@ class Session extends EventEmitter {
     this._sink = new EventSink({
       lang: this.lang,
       onEvent: (ev) => this._record(ev),
+      onPrivateEvidence: (text) => {
+        if (!text) return;
+        this._privateRecoveryEvidence.push(text.slice(0, 4000));
+        if (this._privateRecoveryEvidence.length > 16) this._privateRecoveryEvidence.shift();
+      },
     });
   }
 
@@ -143,16 +152,41 @@ class Session extends EventEmitter {
     }
   }
 
+  _nextRecoveryRuntime() {
+    const role = this.runtime.role === "worker" ? "worker" : "orchestrator";
+    const members = roleMembers(this.db, role);
+    const current = members.findIndex((member) =>
+      member.kind === this.runtime.kind &&
+      (member.model || null) === (this.runtime.model || null),
+    );
+    if (current < 0) return null;
+    for (const member of members.slice(current + 1)) {
+      if (!CLI_EXECUTABLE_KINDS.has(member.kind)) continue;
+      const bin = whichSync(RUNTIME_BIN[member.kind]);
+      if (!bin) continue;
+      return {
+        kind: member.kind,
+        bin,
+        model: member.model || undefined,
+        effort: member.effort || undefined,
+        role,
+        source: "model-role-pool-recovery",
+      };
+    }
+    return null;
+  }
+
   async _runTurn(prompt) {
     this.status = "running";
     this.startedAt = Date.now();
     this.lastError = null;
+    this._privateRecoveryEvidence.length = 0;
     this._record({ type: "turn-start", at: Date.now(), prompt });
     store.appendMessage(this.db, this.chatId, "user", prompt);
     // 데스크탑처럼 첫 프롬프트로 자동 제목 — "New chat"으로 남는 목록 방지(실사용 테스트 발견).
     try {
       const row = this.db.prepare("SELECT title FROM chats WHERE id=?").get(this.chatId);
-      if (row && (row.title === "New chat" || !row.title)) {
+      if (row && (["New chat", "New project task"].includes(row.title) || !row.title)) {
         store.retitleChat(this.db, this.chatId, prompt.slice(0, 60));
       }
     } catch { /* 제목은 장식 — 실패해도 턴 진행 */ }
@@ -234,6 +268,33 @@ class Session extends EventEmitter {
       if (this._timeoutConfig) req.timeoutConfig = this._timeoutConfig;
       try {
         res = await nativeHost.runNativeTurn(req);
+        if (res && res.error && !res.text && !res.finalText) {
+          const nextRuntime = this._nextRecoveryRuntime();
+          if (nextRuntime) {
+            const privateEvidence = [...this._privateRecoveryEvidence, String(res.error)]
+              .filter(Boolean).join("\n").slice(0, 12000);
+            this.runtime = nextRuntime;
+            this.runtimeSession = {};
+            this.fingerprint = crypto.createHash("sha256")
+              .update(`${nextRuntime.kind}\n${this.agent.id}\n${this.agent.systemPrompt || ""}`)
+              .digest("hex");
+            res = await nativeHost.runNativeTurn({
+              ...req,
+              kind: nextRuntime.kind,
+              bin: nextRuntime.bin,
+              model: nextRuntime.model,
+              effort: nextRuntime.effort,
+              session: {},
+              prompt: [
+                prompt,
+                "",
+                "Private recovery evidence follows. Never repeat it to the user.",
+                privateEvidence,
+                "Inspect the complete situation, apply safe reversible recovery within the granted authority, verify it, and finish the original request. Ask one concise question only if user identity or an irreversible choice is required.",
+              ].join("\n"),
+            });
+          }
+        }
       } catch (e) {
         res = { text: "", session: req.session, error: (e && e.message) || String(e) };
       }
@@ -274,8 +335,8 @@ class Session extends EventEmitter {
     }
     if (res && res.error) {
       this.status = "failed";
-      this.lastError = res.error;
-      this._record({ type: "turn-end", at: Date.now(), ok: false, error: res.error });
+      this.lastError = null;
+      this._record({ type: "turn-end", at: Date.now(), ok: false, recoveryRequired: true });
     } else {
       this.status = "done";
       // 링버퍼 표시 이벤트에도 raw 대신 cleanText — 제어 블록이 패널/lastLine 에 새지 않게.
@@ -287,7 +348,7 @@ class Session extends EventEmitter {
       try {
         require("./apply-fences.cjs").applyReplyFences(this, parsedFences, { orch: this.orchestrator });
       } catch (e) {
-        this._record({ type: "error", at: Date.now(), text: `fence apply failed: ${(e && e.message) || String(e)}` });
+        this._privateRecoveryEvidence.push(`fence apply failed: ${(e && e.message) || String(e)}`.slice(0, 4000));
       }
     }
     return res;

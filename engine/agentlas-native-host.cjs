@@ -964,7 +964,6 @@ function runNativeTurn(req) {
         return;
       }
       ui.stopSpinner();
-      ui.error(uiText(ui, "runtime.failed", kind, err.message));
       finish({ text: "", session: st.session, error: err.message });
     });
     child.on("close", (code) => {
@@ -976,39 +975,13 @@ function runNativeTurn(req) {
       ui.streamEnd();
       ui.stopSpinner();
       const text = (st.finalText || st.text || "").trim();
-      const errTail = stripAnsi(stderrBuf).replace(/\s+/g, " ").trim(); // ANSI 제거 + 한 줄로
-      if (st.error && !st.errorShown) {
-        // claude `result` is_error 등 — 이전에 표시되지 않은 에러를 노출
-        ui.error(String(st.error));
-      } else if (code !== 0) {
-        // Runtime Doctor — 아는 시스템 원인(미인증 OAuth MCP 플러그인 등)이면 즉시 수리하고
-        // 1회 자동 재시도한다(2026-07-08 notion@openai-curated가 codex 전멸시킨 사고).
-        if (!req._doctorRetried) {
-          try {
-            const { runRuntimeDoctor } = require("./agentlas-doctor.cjs");
-            const report = runRuntimeDoctor(`${kind} exited with code ${code}\n${stripAnsi(stderrBuf)}`);
-            if (report.repaired) {
-              ui.warn(uiText(ui, "runtime.doctor", report.summary));
-              for (const act of report.actions) ui.warn(`   ${act.title} — ${act.detail}`);
-              ui.warn(uiText(ui, "runtime.doctorRetry"));
-              settled = true;
-              cleanup();
-              resolve(runNativeTurn({ ...req, _doctorRetried: true }));
-              return;
-            }
-          } catch {
-            /* 닥터 실패는 원래 에러 표출을 막지 않는다 */
-          }
-        }
-        ui.error(uiText(ui, "runtime.exited", kind, String(code)) + (errTail ? `\n  ${errTail.slice(-400)}` : ""));
-      } else if (!text && !st.error) {
-        // 정상 종료인데 출력이 비어 있음(거부/차단 등) — 무음 실패 방지
-        ui.warn(uiText(ui, "runtime.noOutput", kind) + (errTail ? ` (${errTail.slice(-200)})` : ""));
-      }
       if (st.usage) ui.cost(st.usage);
       const exitError = code === 0
         ? st.error
-        : st.error || `${kind} exited with code ${code == null ? "unknown" : code}`;
+        : st.error || [
+            `${kind} exited with code ${code == null ? "unknown" : code}`,
+            stripAnsi(stderrBuf).slice(-4000),
+          ].filter(Boolean).join("\n");
       finish({ text, session: st.session, usage: st.usage, error: exitError });
     });
 

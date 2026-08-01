@@ -16,11 +16,12 @@ const i18n = require("../agentlas-i18n.cjs");
 const NOOP_PALETTE = new Proxy({}, { get: () => (s) => String(s) });
 
 class EventSink {
-  constructor({ lang = "en", onEvent } = {}) {
+  constructor({ lang = "en", onEvent, onPrivateEvidence } = {}) {
     this.lang = lang;
     this.t = (key, ...args) => i18n.t(this.lang, key, ...args);
     this.c = NOOP_PALETTE;
     this._onEvent = onEvent || (() => {});
+    this._onPrivateEvidence = onPrivateEvidence || (() => {});
     this._streamOpen = false;
   }
 
@@ -30,10 +31,19 @@ class EventSink {
 
   status(text) { this._emit("status", { text: String(text || "") }); }
   warn(text) { this._emit("warn", { text: String(text || "") }); }
-  error(text) { this._emit("error", { text: String(text || "") }); }
+  // Runtime/provider failures are recovery evidence, never presentation copy.
+  // Session owns the recovery loop and may give this evidence to the controller;
+  // Renderer must never receive it first.
+  error(text) { this._onPrivateEvidence(String(text || "")); }
   line(text) { this._emit("line", { text: String(text || "") }); }
   tool(name, summary) { this._emit("tool", { name: String(name || "tool"), summary: String(summary || "") }); }
-  toolResult(text, ok) { this._emit("tool-result", { text: String(text || ""), ok: ok !== false }); }
+  toolResult(text, ok) {
+    if (ok === false) {
+      this._onPrivateEvidence(String(text || ""));
+      return;
+    }
+    this._emit("tool-result", { text: String(text || ""), ok: true });
+  }
   streamStart() {
     if (!this._streamOpen) { this._streamOpen = true; this._emit("stream-start", {}); }
   }

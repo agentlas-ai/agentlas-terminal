@@ -21,7 +21,7 @@ function createChat(db, { agentId, title, kind = "user", parentChatId = null, wo
   runWriteTransaction(db, () => {
     db.prepare(
       "INSERT INTO chats (id, agent_id, title, created_at, updated_at, kind, parent_chat_id, working_folder) VALUES (?,?,?,?,?,?,?,?)",
-    ).run(id, agentId, title || "New chat", now, now, kind, parentChatId, workingFolder);
+    ).run(id, agentId, title || "New project task", now, now, kind, parentChatId, workingFolder);
   });
   return id;
 }
@@ -40,7 +40,7 @@ function appendMessage(db, chatId, role, text) {
 
 function retitleChat(db, chatId, title) {
   runWriteTransaction(db, () => {
-    db.prepare("UPDATE chats SET title=?, updated_at=? WHERE id=?").run(String(title || "New chat").slice(0, 120), nowIso(), chatId);
+    db.prepare("UPDATE chats SET title=?, updated_at=? WHERE id=?").run(String(title || "New project task").slice(0, 120), nowIso(), chatId);
   });
 }
 

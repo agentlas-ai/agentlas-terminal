@@ -594,7 +594,19 @@ class Ui {
   }
   error(msg) {
     this.stopSpinner();
-    this._message("✗ ", this.c.paw, this.c.text, msg);
+    // Last-resort presentation boundary for legacy/direct commands. Raw
+    // provider text, stack messages, paths and codes must never become UI.
+    // REPL/session paths route the private evidence to the controller before
+    // reaching this boundary; direct commands get a neutral recovery state.
+    void msg;
+    this._message(
+      "◆ ",
+      this.c.amber,
+      this.c.text,
+      this.lang === "ko"
+        ? "One이 상태를 확인하고 복구하고 있습니다."
+        : "One is checking and recovering this operation.",
+    );
   }
 
   // 최종 텍스트(비스트리밍 경로)에 가벼운 마크다운 강조 적용 후 출력.

@@ -136,11 +136,8 @@ function main() {
   }
 
   if (code === undefined) {
-    // 알 수 없는 토큰: 에이전트 이름이면 그 에이전트와의 REPL로 점프,
-    // 아니면 전체를 하나의 작업으로 보고 원샷 실행(run) — v1과 동일한 UX.
-    const { findAgent } = require("./agents/registry.cjs");
-    let agent = null;
-    try { agent = findAgent(ctx.db(), normalized[0]); } catch { /* db unavailable → run이 진단 */ }
+    // 알 수 없는 토큰은 프로젝트 작업으로 실행한다. 에이전트 이름 하나가
+    // 전역 대화 소유권으로 바뀌는 암묵 경로는 없다.
     /*
      * 오타 가드: 인자가 "공백 없는 한 단어" 하나뿐이고 명령도 에이전트도 아니면
      * 그건 작업 지시가 아니라 명령 오타일 가능성이 압도적이다. 그대로 프롬프트로
@@ -148,7 +145,7 @@ function main() {
      * 에서 ls -la 실행 실증). 가장 가까운 명령을 제안하고 정직하게 멈춘다.
      * 진짜 한 단어 작업은 따옴표+run -p 로 그대로 실행된다.
      */
-    if (!agent && normalized.length === 1 && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(normalized[0])) {
+    if (normalized.length === 1 && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(normalized[0])) {
       const token = normalized[0];
       const names = Object.keys(commands.COMMANDS)
         .concat(Object.keys(commands.COMMAND_ALIASES || {}))
@@ -162,13 +159,6 @@ function main() {
         ? `명령 목록: agentlas help  ·  한 단어를 그대로 실행하려면: agentlas run -p "${token}"`
         : `See: agentlas help  ·  to run it as a task: agentlas run -p "${token}"`);
       process.exit(1);
-    }
-    if (agent && normalized.length === 1) {
-      const { startRepl } = require("./ui/repl.cjs");
-      return startRepl(ctx, { agent: agent.slug }).then(
-        (replCode) => process.exit(replCode || 0),
-        (e) => { ctx.err(String((e && e.message) || e)); process.exit(1); },
-      );
     }
     code = commands.COMMANDS.run().run(ctx, normalized);
   }

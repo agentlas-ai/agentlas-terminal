@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.23 — 2026-08-01
+
+- **Semantic routing stays with the connected model.** Image-capability and
+  installed-agent routing no longer retain regex hints, keyword glossaries,
+  deterministic role vetoes, or caller-authored fallback labels. If the model
+  cannot return a valid judgment, the decision remains unavailable.
+- **Fresh Terminal databases match Desktop schema 86.** The retired
+  chat-level hired-agent roster is absent from the bootstrap schema; project
+  order and current-turn task-force targets own controller and helper binding.
+
 ## 1.0.22 — 2026-08-01
 
 - **Task classes no longer come from a fixed keyword dictionary.** An explicit

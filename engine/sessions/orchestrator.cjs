@@ -1,6 +1,6 @@
 "use strict";
 /*
- * sessions/orchestrator — 오르카 계층: 멀티세션 스폰/전환/스티어/킬/브로드캐스트.
+ * sessions/orchestrator — 프로젝트 Work의 컨트롤러/서브에이전트 실행 트리.
  *
  * 세션 번호는 s1, s2, … 로 붙는다(사람이 한 키로 지목할 수 있는 안정 번호).
  * 활성 세션 하나만 터미널에 스트리밍되고, 나머지는 백그라운드에서 이벤트를
@@ -67,14 +67,12 @@ class Orchestrator extends EventEmitter {
 
     session.on("event", (ev) => {
       this.emit("session-event", { key, session, ev });
-      if (ev.type === "turn-end" && this.activeKey !== key) {
+      if (ev.type === "turn-end" && ev.ok && this.activeKey !== key) {
         this.emit("notice", {
           key,
           session,
-          text: ev.ok
-            ? `${key} ${session.agent.slug}: done`
-            : `${key} ${session.agent.slug}: ${ev.error || "failed"}`,
-          ok: !!ev.ok,
+          text: `${key} ${session.agent.slug}: done`,
+          ok: true,
         });
       }
     });
@@ -157,21 +155,6 @@ class Orchestrator extends EventEmitter {
    * 그래서 실패는 세션 단위로 모으고, 실제 전달된 목록은 무슨 일이 있어도 반환한다.
    * (sendTo/spawn의 "상한 초과는 정직한 거부" 계약 자체는 그대로 둔다.)
    */
-  broadcast(prompt) {
-    const sent = [];
-    const skipped = [];
-    for (const [key, session] of this.sessions) {
-      if (session.status === "killed") continue;
-      try {
-        this.sendTo(key, prompt);
-        sent.push(key);
-      } catch (e) {
-        skipped.push({ key, error: String((e && e.message) || e) });
-      }
-    }
-    return { sent, skipped };
-  }
-
   /** 세션 표: [{key, active, agent, status, elapsed, lastLine, parentKey, depth}] */
   list() {
     const rows = [];
