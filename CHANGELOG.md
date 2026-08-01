@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.22 — 2026-08-01
+
+- **Task classes no longer come from a fixed keyword dictionary.** An explicit
+  user/project declaration remains authoritative; otherwise only the connected
+  model may classify the full request, and an unavailable or invalid judgment
+  stays unresolved.
+- Preserve an explicit `declaredTaskClasses` value across the Desktop loadout
+  boundary so removing the dictionary fallback does not discard user-owned
+  structured intent.
+
 ## 1.0.21 — 2026-08-01
 
 - Align the independent Terminal sentence with the exact cross-surface

@@ -137,6 +137,7 @@ function resolveRuntimeExperienceCli(agent, prompt, requested, cwd, overrides = 
     cwd,
     prompt,
     requested: prepared.requested || requested || {},
+    declaredTaskClasses: requested && requested.declaredTaskClasses,
     agent,
     agentRoot: agent ? (overrides.agentRoot || agentFolder(agent)) : null,
     ...(overrides.platform ? { platform: overrides.platform } : {}),

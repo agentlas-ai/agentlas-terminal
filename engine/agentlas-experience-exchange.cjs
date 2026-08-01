@@ -1469,41 +1469,6 @@ async function withdrawUpload(ref, options = {}) {
   return { receipt, authoritative: "server", publicActivation: false };
 }
 
-const TASK_CLASS_KEYWORDS = Object.freeze({
-  research: ["research", "investigate", "literature review", "market research", "리서치", "연구", "자료 조사"],
-  writing: ["writing", "write article", "write copy", "copywriting", "blog post", "essay", "글쓰기", "글 작성", "카피 작성", "원고 작성"],
-  coding: ["coding", "code implementation", "implement code", "write code", "source code", "코딩", "코드 구현", "코드 작성", "프로그래밍"],
-  debugging: ["debug", "debugging", "bug fix", "fix bug", "troubleshoot", "error", "exception", "failure", "failed", "디버깅", "버그 수정", "오류", "오류 수정", "실패"],
-  design: ["design", "ui design", "ux design", "wireframe", "디자인", "와이어프레임", "화면 설계"],
-  "image-generation": ["image generation", "generate image", "create image", "text to image", "이미지 생성", "그림 생성"],
-  "video-production": ["video production", "create video", "video editing", "영상 제작", "비디오 제작", "영상 편집"],
-  presentation: ["presentation", "slide deck", "powerpoint", "ppt", "프레젠테이션", "발표 자료", "슬라이드", "피피티"],
-  document: ["document", "docx", "pdf document", "document editing", "문서", "문서 작성", "문서 편집"],
-  "data-analysis": ["data analysis", "analyze data", "analytics", "데이터 분석", "통계 분석"],
-  "browser-automation": ["browser automation", "automate browser", "playwright", "브라우저 자동화", "웹 자동화"],
-  "social-publishing": ["social publishing", "publish social", "post to instagram", "post to tiktok", "sns 게시", "소셜 게시", "인스타 업로드", "틱톡 업로드"],
-  marketing: ["marketing", "campaign", "seo", "마케팅", "캠페인"],
-  sales: ["sales", "lead generation", "sales outreach", "영업", "리드 발굴"],
-  "customer-support": ["customer support", "customer service", "support ticket", "고객 지원", "고객 문의", "cs 응대"],
-  ecommerce: ["ecommerce", "e commerce", "online store", "shopify", "이커머스", "온라인 쇼핑몰", "스마트스토어"],
-  "legal-review": ["legal review", "contract review", "legal analysis", "법률 검토", "계약 검토", "법무 검토"],
-  finance: ["finance", "financial analysis", "investment analysis", "재무", "금융", "투자 분석"],
-  "project-planning": ["project planning", "project plan", "roadmap", "프로젝트 계획", "로드맵", "일정 계획"],
-  "agent-building": ["agent building", "build agent", "create agent", "에이전트 빌드", "에이전트 만들", "에이전트 생성"],
-  "workflow-automation": ["workflow automation", "automate workflow", "automation workflow", "워크플로 자동화", "업무 자동화"],
-  "file-operations": ["file operations", "move files", "rename files", "organize files", "파일 작업", "파일 이동", "파일 이름 변경", "파일 정리"],
-  translation: ["translation", "translate", "localization", "번역", "현지화"],
-});
-
-function normalizeClassificationText(value) {
-  return String(value || "")
-    .normalize("NFKC")
-    .toLowerCase()
-    .replace(/[^a-z0-9가-힣]+/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
 function normalizedTaxonomyAtom(value) {
   return typeof value === "string" ? value.normalize("NFKC").trim().toLowerCase() : "";
 }
@@ -1525,20 +1490,7 @@ function isCanonicalTaskId(value) {
   return typeof value === "string" && CANONICAL_TASK_ID_SET.has(value);
 }
 
-function keywordOccurs(normalizedPrompt, rawKeyword) {
-  const keyword = normalizeClassificationText(rawKeyword);
-  if (!keyword) return false;
-  if (/[가-힣]/.test(keyword)) {
-    // Korean has no word boundary, so a raw includes() matched inside longer compounds:
-    // 번역 hit 번역기, 금융 hit compound finance words, 영업 hit 영업일 (business day).
-    // Require the keyword not be glued to another Hangul syllable on either side.
-    const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return new RegExp(`(?<![가-힣])${escaped}(?![가-힣])`).test(normalizedPrompt);
-  }
-  return ` ${normalizedPrompt} `.includes(` ${keyword} `);
-}
-
-function deriveCanonicalTaskClasses(prompt, options = {}) {
+function deriveCanonicalTaskClasses(_prompt, options = {}) {
   const declaredRaw = options.declaredTaskClasses ?? options.declaredTaskClass;
   if (declaredRaw != null && (Array.isArray(declaredRaw) ? declaredRaw.length : String(declaredRaw).trim())) {
     const declared = (Array.isArray(declaredRaw) ? declaredRaw : [declaredRaw]).map(String);
@@ -1551,39 +1503,23 @@ function deriveCanonicalTaskClasses(prompt, options = {}) {
       invalidDeclaredCount: invalidDeclared.length,
     };
   }
-  const normalizedPrompt = normalizeClassificationText(prompt);
-  const matches = [];
-  for (const slug of CANONICAL_TASK_SLUGS) {
-    if ((TASK_CLASS_KEYWORDS[slug] || []).some((keyword) => keywordOccurs(normalizedPrompt, keyword))) {
-      matches.push(`${CANONICAL_TASK_PREFIX}${slug}`);
-    }
-  }
-  return { taskIds: matches, source: "deterministic-keyword-map", matchedTaskClasses: matches, invalidDeclaredCount: 0 };
+  return { taskIds: [], source: "unresolved", matchedTaskClasses: [], invalidDeclaredCount: 0 };
 }
 
 /**
- * Meaning-aware task classification. The resident judge decides; TASK_CLASS_KEYWORDS is
- * passed as reference hints only. This is what a keyword map cannot do: Korean compounds
- * (번역 inside 번역기), particle inflection (고객 문의를), dialect, slang, and any other
- * language all hinge on meaning, and no list enumerates them.
- *
- * An explicit declared task class still wins outright (it is data, not a guess), and with
- * no connected model the deterministic keyword prefilter is the fallback so classification
- * never stops working.
+ * Meaning-aware task classification. An explicit declared class is accepted as
+ * user/project data. Otherwise only the connected model may decide from the full
+ * request. No regex, keyword list, glossary, or default class substitutes for a
+ * missing or invalid model judgment.
  */
 async function resolveCanonicalTaskClasses(prompt, options = {}) {
   const declaredRaw = options.declaredTaskClasses ?? options.declaredTaskClass;
   if (declaredRaw != null && (Array.isArray(declaredRaw) ? declaredRaw.length : String(declaredRaw).trim())) {
     return deriveCanonicalTaskClasses(prompt, options);
   }
-  const prefilter = deriveCanonicalTaskClasses(prompt, options);
   const judgment = require("./agentlas-judgment.cjs");
-  if (!judgment.hasJudgmentRunner()) return prefilter;
-
-  const hints = {};
-  for (const slug of CANONICAL_TASK_SLUGS) {
-    const words = TASK_CLASS_KEYWORDS[slug];
-    if (Array.isArray(words) && words.length) hints[slug] = words;
+  if (!judgment.hasJudgmentRunner()) {
+    return { taskIds: [], source: "model-unavailable", matchedTaskClasses: [], invalidDeclaredCount: 0 };
   }
   const verdict = await judgment.judgeLabels({
     kind: "experience-task-class",
@@ -1595,11 +1531,11 @@ async function resolveCanonicalTaskClasses(prompt, options = {}) {
       "Return a label only when that kind of work is genuinely part of the request. A word inside an " +
       "unrelated compound or a different sense of the word does not count. Return an empty list for " +
       "content with no identifiable task (hashes, ids, random strings).",
-    hints,
-    fallback: [],
     signal: options.signal,
   });
-  if (verdict.source !== "llm") return prefilter;
+  if (verdict.source !== "llm") {
+    return { taskIds: [], source: "model-unavailable", matchedTaskClasses: [], invalidDeclaredCount: 0 };
+  }
   const taskIds = CANONICAL_TASK_IDS.filter((id) =>
     verdict.labels.some((slug) => id === `${CANONICAL_TASK_PREFIX}${slug}`));
   return {
