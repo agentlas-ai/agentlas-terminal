@@ -42,7 +42,9 @@ if (approximatePromptTokens(TERMINAL_MEMORY_CORE) > TERMINAL_MEMORY_CORE_MAX_TOK
 function memoryEmitterPromptFor(request, arch = loadArch(), turnId = null, permission = "write") {
   const stableId = String(turnId || "").replace(/[^A-Za-z0-9:._-]/g, "").slice(0, 160);
   let prompt = TERMINAL_MEMORY_CORE;
-  if (stableId) prompt += `\nUse turn_id=${stableId}. permission=${permission === "read" ? "receipt-only" : "curated-write"}.`;
+  if (stableId) {
+    prompt += `\nUse exactly this turn_id: ${stableId}\nPermission: ${permission === "read" ? "receipt-only" : "curated-write"}.`;
+  }
   if (!MEMORY_DETAIL_RE.test(String(request || ""))) return prompt;
   const kinds = Array.isArray(arch?.kinds) && arch.kinds.length ? arch.kinds.join("|") : "fact|decision|preference|risk|procedure";
   prompt += [

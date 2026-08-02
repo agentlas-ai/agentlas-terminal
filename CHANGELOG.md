@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.0.25 — 2026-08-02
+
+- **Every Terminal session now closes a governed learning episode.** Direct
+  agent runs, project sessions, automation, and firm orchestration share the
+  same turn receipt, Memory Ticket, curator, scoped-memory, and Experience
+  intake boundary instead of merely printing or discarding `Memory Events`.
+- Hidden control envelopes are removed from `run --print` and every downstream
+  consumer while firm-owned delegation remains available to the firm
+  orchestrator through a private control channel.
+- Successful exact-agent runs use a no-authority connected-model judgment for
+  canonical task classes. No keyword dictionary or default task class is used;
+  valid judgments create run receipts even when no durable memory candidate is
+  promoted.
+- Memory emitter turn IDs are separated from punctuation, and the Experience
+  bridge now accepts structured task signatures from both current sessions and
+  legacy runtime loadouts.
+
 ## 1.0.24 — 2026-08-02
 
 - **Firm runs now finish the real dependency chain.** Independent production

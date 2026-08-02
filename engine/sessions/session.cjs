@@ -18,6 +18,7 @@ const { CLI_EXECUTABLE_KINDS } = require("../runtimes/resolve.cjs");
 const { roleMembers } = require("../runtimes/roles.cjs");
 const { EventSink } = require("./sink.cjs");
 const store = require("./store.cjs");
+const memoryTurn = require("./memory-turn.cjs");
 
 const RING_LIMIT = 2000;
 
@@ -183,6 +184,12 @@ class Session extends EventEmitter {
     this._privateRecoveryEvidence.length = 0;
     this._record({ type: "turn-start", at: Date.now(), prompt });
     store.appendMessage(this.db, this.chatId, "user", prompt);
+    let governedTurn = null;
+    try {
+      governedTurn = memoryTurn.beginSessionMemoryTurn(this, prompt);
+    } catch (error) {
+      this._privateRecoveryEvidence.push(`memory turn begin failed: ${(error && error.message) || String(error)}`.slice(0, 4000));
+    }
     // 데스크탑처럼 첫 프롬프트로 자동 제목 — "New chat"으로 남는 목록 방지(실사용 테스트 발견).
     try {
       const row = this.db.prepare("SELECT title FROM chats WHERE id=?").get(this.chatId);
@@ -197,14 +204,12 @@ class Session extends EventEmitter {
     let systemPrompt = this.agent.systemPrompt || "";
     try {
       const { augmentSystem } = require("./prompt.cjs");
-      const fs = require("node:fs");
-      const path = require("node:path");
-      const projectPath = fs.existsSync(path.join(this.cwd, ".agentlas")) ? this.cwd : null;
+      const projectPath = governedTurn ? governedTurn.projectPath : memoryTurn.initializedProjectPath(this.cwd);
       systemPrompt = augmentSystem(this.db, systemPrompt, {
         lang: this.lang,
         projectPath,
         agentId: this.agent.id,
-        turnId: `${this.chatId}:${Date.now()}`,
+        turnId: governedTurn && governedTurn.memoryTurn.turnId,
         permission: this.permission,
       }, true, prompt);
     } catch { /* 프롬프트 증강 실패는 턴을 막지 않는다 — 원 프롬프트로 진행 */ }
@@ -311,15 +316,41 @@ class Session extends EventEmitter {
      * 사이클 방지.
      */
     let persistText = finalText;
+    let governedResult = null;
     let parsedFences = null;
     if (finalText && !(res && res.error) && this.status !== "killed") {
       try {
+        governedResult = await memoryTurn.completeSessionMemoryTurn(this, governedTurn, {
+          text: finalText,
+          prompt,
+          outcome: "succeeded",
+        });
+        // Parse the original once more for non-memory controls and legacy array
+        // memory envelopes. Governance owns the current object envelope; the
+        // old parser keeps backward compatibility for already-installed agents.
         parsedFences = require("./fences.cjs").parseReplyFences(finalText);
         persistText = parsedFences.cleanText;
       } catch {
         parsedFences = null;
-        persistText = finalText;
+        try {
+          parsedFences = require("./fences.cjs").parseReplyFences(finalText);
+          persistText = parsedFences.cleanText;
+        } catch {
+          persistText = finalText;
+        }
       }
+    } else if (governedTurn && this.status !== "killed") {
+      try {
+        governedResult = await memoryTurn.completeSessionMemoryTurn(this, governedTurn, {
+          text: finalText,
+          prompt,
+          outcome: "failed",
+          invokeCurator: false,
+        });
+        if (governedResult) {
+          persistText = String(governedResult.cleaned || "").replace(/<!--\s*$/u, "").trim();
+        }
+      } catch { /* original runtime failure remains authoritative */ }
     }
     if (persistText) store.appendMessage(this.db, this.chatId, "assistant", persistText);
     if (res && res.session && res.session.id) {
@@ -327,6 +358,51 @@ class Session extends EventEmitter {
       store.saveRuntimeSession(this.db, this.chatId, this.runtime.kind, this.runtimeSession, this.fingerprint);
     }
     if (res && res.usage) this.usage = res.usage;
+
+    // Experience intake is downstream of the governed episode receipt. It
+    // records the successful exact-agent run even when the curator correctly
+    // retains zero durable memories; promotion remains a separate policy.
+    if (governedResult && !(res && res.error) && this.status !== "killed") {
+      try {
+        const memoryContext = require("../project/memory-context.cjs");
+        const installedAgent = this.db.prepare("SELECT * FROM installed_agents WHERE id=?").get(this.agent.id);
+        const exactBase = installedAgent
+          ? memoryContext.exactAgentBaseForExecution(this.db, installedAgent, null)
+          : null;
+        if (exactBase) {
+          const taskSignatures = await memoryTurn.resolveSessionTaskSignatures(this, prompt);
+          memoryContext.finalizeExperienceExecutionCli(this.db, {
+          agentId: this.agent.id,
+          projectPath: governedTurn && governedTurn.projectPath,
+          cwd: this.cwd,
+          runtime: this.runtime.kind === "ollama"
+            ? { mode: "api", backend: "ollama", model: this.runtime.model }
+            : { mode: "cli", kind: this.runtime.kind, model: this.runtime.model },
+          permission: this.permission,
+          model: this.runtime.model,
+          mcpServers: this._consentedMcpServers(),
+          curatedMemories: governedResult.curatedMemories || [],
+          taskHint: prompt,
+          taskSignatures,
+          outcome: { status: "succeeded", failureCode: null },
+          usage: res && res.usage,
+          durationMs: Date.now() - this.startedAt,
+          runId: governedTurn.memoryTurn.turnId,
+          lang: this.lang,
+          });
+        }
+      } catch (error) {
+        this._privateRecoveryEvidence.push(`experience intake failed: ${(error && error.message) || String(error)}`.slice(0, 4000));
+      }
+    }
+
+    // Every consumer (run --print, automation, firms) receives the same clean
+    // result that was persisted. Never hand the raw control envelope back.
+    if (res && typeof res === "object") {
+      res.controlText = finalText;
+      res.text = persistText;
+      res.finalText = persistText;
+    }
 
     this.endedAt = Date.now();
     if (this.status === "killed") {

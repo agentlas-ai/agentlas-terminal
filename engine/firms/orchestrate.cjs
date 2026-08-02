@@ -260,7 +260,10 @@ function latestResultsAllOk(results) {
 }
 
 function turnText(res) {
-  return ((res && (res.finalText || res.text)) || "").trim();
+  // Session returns user-safe text by default. Firm owns its three-tier
+  // Delegate protocol, so it alone reads the private raw control text and
+  // parses the fence before producing the user-facing synthesis.
+  return ((res && (res.controlText || res.finalText || res.text)) || "").trim();
 }
 
 /**
