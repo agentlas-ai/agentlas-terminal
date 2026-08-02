@@ -13,6 +13,7 @@ credentials/
 
 # Development-only material. The npm package is built from runtime paths;
 # tests, fixtures, benchmarks, docs, receipts, and generated output stay local.
+/.internal/
 #
 # test/ is ignored again (오너 결정 2026-07-28). 오늘 낮에 이걸 잠깐 해제했는데,
 # 근거가 "CI 에서 못 도는 테스트는 게이트가 아니다" 였다. 그 전제가 틀렸다 — 이
