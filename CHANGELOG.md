@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.24 — 2026-08-02
+
+- **Firm runs now finish the real dependency chain.** Independent production
+  roles still run in parallel, integration waits for their files, and release
+  verification runs only after the integrated surface exists.
+- **A verification failure triggers one bounded repair and re-check.** Terminal
+  no longer ends with a truthful failure report while leaving a fixable product
+  defect unresolved, and the newest result for each role determines completion.
+- Firm names/slugs are directly callable from `agentlas list`, and final user
+  output removes orchestration fences, internal skill reports, and verification
+  control tags.
+
 ## 1.0.23 — 2026-08-01
 
 - **Semantic routing stays with the connected model.** Image-capability and

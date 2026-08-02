@@ -71,13 +71,21 @@ function loadDelegateParser() {
 /** 표시/전달용 텍스트에서 제어 펜스를 제거한다(파싱만 — 부작용 없음). 실패 시 원문. */
 function cleanFenceText(text) {
   const raw = String(text || "");
+  let cleaned;
   try {
     const fences = require("../sessions/fences.cjs");
     if (fences && typeof fences.parseReplyFences === "function") {
-      return fences.parseReplyFences(raw).cleanText;
+      cleaned = fences.parseReplyFences(raw).cleanText;
     }
   } catch { /* fences 미존재/파서 실패 — 원문 보존 */ }
-  return parseDelegationsLocal(raw).cleanedText;
+  if (cleaned == null) cleaned = parseDelegationsLocal(raw).cleanedText;
+  return cleaned
+    .replace(/<!--\s*[\s\S]*?## Memory Events[\s\S]*?-->/gi, "")
+    .replace(/^\s*(?:사용 스킬|Skills used)\s*:[^\n.!?]*[.!?]?\s*(?:(?:이유|Reason)\s*:[^.!?]*[.!?]\s*)?/i, "")
+    .replace(/^\s*I(?:'|’)m using (?:the )?`?[^`.\n]+`? skill because [^.]*\.\s*/i, "")
+    .replace(/^\s*Execution mode:\s*`?appbridge-ceo-orchestrator`?[^\n]*\n?/gim, "")
+    .replace(/<verification_verdict>\s*(?:PASS|FAIL)\s*<\/verification_verdict>/gi, "")
+    .trim();
 }
 
 /** 리더(CEO) 시스템 프롬프트에 주입할 위임 가이드 (데스크탑 buildDelegateProtocol 동형 축약). */
@@ -91,6 +99,9 @@ function buildDelegateProtocol(reports) {
     "You lead a team. For THIS task, engage ONLY the direct reports actually needed —",
     "never all of them. Give each a focused brief (goal + specifics). If none are needed,",
     "do the work yourself and emit no Delegate block.",
+    "This is the only delegation planning round. Include every role required to finish the request now,",
+    "including downstream independent QA or verification roles. State dependencies in their briefs;",
+    "the host will delay verification until production results exist. Never defer a needed role to synthesis.",
     "",
     "Your direct reports:",
     list,
@@ -102,7 +113,7 @@ function buildDelegateProtocol(reports) {
     '{ "delegations": [ { "target": "<report role or name above>", "brief": "<what they should do>" } ] }',
     "```",
     "",
-    "After delegating, STOP — their results come back to you to synthesize. Don't do their work yourself.",
+    "After delegating, STOP — their results come back to you to synthesize. Synthesis is final and cannot start new work.",
   ].join("\n");
 }
 
@@ -196,6 +207,58 @@ async function parallelCap(items, cap, fn) {
   return out;
 }
 
+function isVerificationDivision(node) {
+  const label = `${node && node.role || ""} ${node && node.name || ""} ${node && node.key || ""}`
+    .toLowerCase()
+    .replace(/[_-]+/g, " ");
+  return /\b(?:eval|qa|quality|test|verification|verifier)\b|policy\s+gate/.test(label);
+}
+
+function isIntegrationDivision(item, siblingProductionCount) {
+  if (!item || siblingProductionCount < 2 || isVerificationDivision(item.node)) return false;
+  const label = `${item.node && item.node.role || ""} ${item.node && item.node.name || ""}`
+    .toLowerCase()
+    .replace(/[_-]+/g, " ");
+  const brief = String(item.brief || "").toLowerCase();
+  if (/\bdesign\b/.test(label)) return false;
+  return /\b(?:web|frontend|integration|integrator|release)\b/.test(label)
+    || /\b(?:integrat(?:e|ion)|wire|combine|merge)\b/.test(brief)
+    || /\bafter\b[\s\S]{0,80}\b(?:game|design|production|upstream|implementation)\b/.test(brief)
+    || /\b(?:once|when)\b[\s\S]{0,80}\b(?:complete|ready|finish)/.test(brief);
+}
+
+function stageTargets(targets) {
+  const nonVerification = targets.filter((m) => !isVerificationDivision(m.node));
+  const integration = nonVerification.filter((m) => isIntegrationDivision(m, nonVerification.length));
+  const integrationKeys = new Set(integration.map((m) => m.node.key));
+  return {
+    production: nonVerification.filter((m) => !integrationKeys.has(m.node.key)),
+    integration,
+    verification: targets.filter((m) => isVerificationDivision(m.node)),
+  };
+}
+
+function resultStatusContext(results) {
+  return results.length
+    ? results.map((r) => `- ${r.name}: ${r.ok ? "completed" : "failed"}`).join("\n")
+    : "- No upstream production slot was selected; inspect the current folder honestly.";
+}
+
+function verificationResultOk(text, sessionOk) {
+  if (!sessionOk) return false;
+  const source = String(text || "").trim();
+  const explicit = source.match(/<verification_verdict>\s*(PASS|FAIL)\s*<\/verification_verdict>/i);
+  if (explicit) return explicit[1].toUpperCase() === "PASS";
+  const opening = source.slice(0, 900);
+  return !/(?:\bverdict\s*:\s*fail\b|\brelease[- ]blocking\b|\bnot complete\b|\bcannot truthfully\b|\bno[- ]go\b|\bblocking defect\b)/i.test(opening);
+}
+
+function latestResultsAllOk(results) {
+  const latest = new Map();
+  for (const result of results) latest.set(result.key || `${result.role}:${result.name}`, result.ok);
+  return [...latest.values()].every(Boolean);
+}
+
 function turnText(res) {
   return ((res && (res.finalText || res.text)) || "").trim();
 }
@@ -267,10 +330,13 @@ async function runFirmTurn(p) {
     };
   }
 
-  // 2) DELEGATE — 매칭된 본부만 병렬 실행. 본부 세션은 CEO 세션의 자식으로 스폰되어
-  // kind='division' + parent_chat_id(CEO 챗)로 영속된다. 한 본부의 실패는 격리한다.
+  // 2) DELEGATE — 구현/디자인은 병렬로 실행하되 독립 검증 본부는 그 결과가 실제
+  // 작업 폴더에 반영된 뒤 실행한다. QA를 구현과 동시에 시작하면 "코드 없음"을 정상
+  // 결과로 반환해 CEO가 뒤늦게 충돌을 수습하게 된다. 병렬성은 의존성이 없는 슬롯에만
+  // 적용하고, 검증 슬롯은 명시적인 2단계 WorkOrder로 보존한다.
   onEvent({ phase: "delegate", targets: matched.map((m) => ({ role: m.node.role, name: m.node.name, brief: m.brief })) });
-  const divisionResults = await parallelCap(matched, maxParallel(), async (m) => {
+  const initialStages = stageTargets(matched);
+  const runTargets = async (targets, stageContext, stageKind) => parallelCap(targets, maxParallel(), async (m) => {
     const divisionRuntime = typeof p.resolveWorkerRuntime === "function"
       ? p.resolveWorkerRuntime(m.node)
       : workerRuntime;
@@ -293,17 +359,61 @@ async function runFirmTurn(p) {
     let text = "";
     let ok = false;
     try {
-      const res = await session.send(m.brief || task);
+      const prompt = stageKind === "verification"
+        ? `${m.brief || task}\n\n[Independent verification stage]\nAll upstream production and integration WorkOrders have finished. Inspect and exercise the current project folder as it exists now. Do not rely on an earlier empty-workspace observation.\n${stageContext}\n\nEnd the response with exactly <verification_verdict>PASS</verification_verdict> only when every requested acceptance condition passes after fixes. Otherwise end with <verification_verdict>FAIL</verification_verdict> and identify the remaining blocker.`
+        : stageKind === "integration"
+          ? `${m.brief || task}\n\n[Integration stage]\nThe upstream production WorkOrders have finished. Inspect their actual files in the current project, integrate every relevant implementation and design deliverable into the runnable product, then verify the integrated launch surface before returning. Do not report a missing or late upstream package without re-reading the current folder.\n${stageContext}`
+          : stageKind === "repair"
+            ? `${m.brief || task}\n\n[Release-blocking repair stage]\nIndependent verification found the following failures in the current integrated product. Inspect the evidence and current files, repair the actual shipped experience, and rerun the relevant checks before returning. Do not merely describe the fix.\n${stageContext}`
+            : (m.brief || task);
+      const res = await session.send(prompt);
       text = cleanFenceText(turnText(res));
-      ok = session.status === "done";
+      ok = stageKind === "verification"
+        ? verificationResultOk(text, session.status === "done")
+        : session.status === "done";
       if (!ok && !text) text = session.lastError || "no response";
     } catch (e) {
       text = (e && e.message) || String(e);
       ok = false;
     }
     onEvent({ phase: "division-done", role: m.node.role, ok });
-    return { role: m.node.role, name: m.node.name, ok, text, chatId: session.chatId };
+    return { key: m.node.key, role: m.node.role, name: m.node.name, ok, text, chatId: session.chatId };
   });
+  const productionResults = await runTargets(initialStages.production, "", "production");
+  let integrationResults = [];
+  if (initialStages.integration.length) {
+    onEvent({ phase: "integrate", targets: initialStages.integration.map((m) => ({ role: m.node.role, name: m.node.name })) });
+    integrationResults = await runTargets(initialStages.integration, resultStatusContext(productionResults), "integration");
+  }
+  let verificationResults = [];
+  if (initialStages.verification.length) {
+    const upstreamResults = [...productionResults, ...integrationResults];
+    verificationResults = await runTargets(initialStages.verification, resultStatusContext(upstreamResults), "verification");
+  }
+  const divisionResults = [...productionResults, ...integrationResults, ...verificationResults];
+
+  // Verification is a release gate, not a terminal report. When it finds a
+  // blocker, run one bounded repair cycle with the implementation/integration
+  // slots that produced the build, then independently verify the repaired
+  // product again. This closes the common "QA says FAIL and the command ends"
+  // gap while keeping retries finite.
+  if (initialStages.verification.length && verificationResults.some((result) => !result.ok)) {
+    const repairContext = verificationResults
+      .filter((result) => !result.ok)
+      .map((result) => `## ${result.name} (${result.role})\n${result.text}`)
+      .join("\n\n");
+    const repairTargets = [...initialStages.production, ...initialStages.integration];
+    if (repairTargets.length) {
+      onEvent({ phase: "repair", targets: repairTargets.map((m) => ({ role: m.node.role, name: m.node.name })) });
+      const repairResults = await runTargets(repairTargets, repairContext, "repair");
+      divisionResults.push(...repairResults);
+      const recheckContext = resultStatusContext([...productionResults, ...integrationResults, ...repairResults]);
+      const recheckResults = await runTargets(initialStages.verification, recheckContext, "verification");
+      divisionResults.push(...recheckResults);
+    }
+  }
+  const usedDivisionKeys = new Set(matched.map((m) => m.node.key));
+  const divisionAttempts = new Map(matched.map((m) => [m.node.key, 1]));
 
   // 3) SYNTHESIZE — CEO 세션의 두 번째 턴. status:failed 표기로 오류 문자열이 산출물로
   // 오독되는 것을 막는다(데스크탑 CONFLICT_SYNTHESIS_GUIDANCE 계약).
@@ -314,15 +424,54 @@ async function runFirmTurn(p) {
     divisionResults
       .map((r) => `## ${r.name} (${r.role})\nstatus: ${r.ok ? "ok" : "failed"}\n${r.text}`)
       .join("\n\n");
-  const finalRes = await ceoSession.send(synthPrompt);
-  const finalText = cleanFenceText(turnText(finalRes));
+  let finalRes = await ceoSession.send(synthPrompt);
+  let finalRaw = turnText(finalRes);
+
+  // A controller may discover the next required role only after reading the
+  // first results (for example PM -> Game/Design -> Eval). Execute bounded,
+  // previously-unused follow-up delegations instead of printing "starting"
+  // prose and ending the command without doing the work.
+  for (let round = 0; round < divisions.length; round += 1) {
+    const followupParsed = parseDelegations(finalRaw);
+    const hasFailedResult = !latestResultsAllOk(divisionResults);
+    const followup = matchTargets(followupParsed.delegations, divisions)
+      .filter((m) => !usedDivisionKeys.has(m.node.key) || (hasFailedResult && (divisionAttempts.get(m.node.key) || 0) < 2));
+    if (!followup.length) break;
+    for (const item of followup) {
+      usedDivisionKeys.add(item.node.key);
+      divisionAttempts.set(item.node.key, (divisionAttempts.get(item.node.key) || 0) + 1);
+    }
+    onEvent({ phase: "delegate", targets: followup.map((m) => ({ role: m.node.role, name: m.node.name, brief: m.brief })) });
+    const followupStages = stageTargets(followup);
+    const followupProductionResults = await runTargets(followupStages.production, "", "production");
+    let followupIntegrationResults = [];
+    if (followupStages.integration.length) {
+      const upstream = [...divisionResults, ...followupProductionResults];
+      onEvent({ phase: "integrate", targets: followupStages.integration.map((m) => ({ role: m.node.role, name: m.node.name })) });
+      followupIntegrationResults = await runTargets(followupStages.integration, resultStatusContext(upstream), "integration");
+    }
+    let followupVerificationResults = [];
+    if (followupStages.verification.length) {
+      const upstream = [...divisionResults, ...followupProductionResults, ...followupIntegrationResults];
+      followupVerificationResults = await runTargets(followupStages.verification, resultStatusContext(upstream), "verification");
+    }
+    divisionResults.push(...followupProductionResults, ...followupIntegrationResults, ...followupVerificationResults);
+    onEvent({ phase: "synthesize" });
+    finalRes = await ceoSession.send(
+      `${task}\n\n[Updated results from your team — continue orchestration only if a still-unused required role is missing; otherwise return the final user result.]\n` +
+      `${CONFLICT_SYNTHESIS_GUIDANCE}\n\n` +
+      divisionResults.map((r) => `## ${r.name} (${r.role})\nstatus: ${r.ok ? "ok" : "failed"}\n${r.text}`).join("\n\n"),
+    );
+    finalRaw = turnText(finalRes);
+  }
+  const finalText = cleanFenceText(finalRaw);
   const finalOk = ceoSession.status === "done";
   onEvent({ phase: "final", delegated: true, ok: finalOk });
 
   // CEO 종합 턴의 성공은 팀의 성공이 아니다 — 자식 결과를 집계해 부분 완료가 성공으로
   // 둔갑하지 않게 한다(데스크탑 동일 수리).
   return {
-    ok: finalOk && divisionResults.every((r) => r.ok),
+    ok: finalOk && latestResultsAllOk(divisionResults),
     text: finalText,
     chatId: ceoSession.chatId,
     plan: { text: cleanedText, delegations },

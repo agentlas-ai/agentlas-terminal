@@ -12,7 +12,7 @@ const { rowToAgent } = require("../agents/registry.cjs");
 function findFirm(db, token) {
   const q = String(token || "").trim().toLowerCase();
   if (!q) return null;
-  return db.prepare("SELECT * FROM firms WHERE lower(slug)=? OR lower(name)=?").get(q, q)
+  return db.prepare("SELECT * FROM firms WHERE lower(id)=? OR lower(slug)=? OR lower(name)=?").get(q, q, q)
     || db.prepare("SELECT * FROM firms WHERE lower(slug) LIKE ? ORDER BY slug LIMIT 1").get(`%${q}%`)
     || null;
 }
@@ -158,6 +158,8 @@ async function run(ctx, args) {
       onEvent: (ev) => {
         if (ev.phase === "plan") ctx.err(dim(ko ? `${firm.name} · CEO가 작업을 분배하는 중…` : `${firm.name} · CEO is planning the work…`));
         else if (ev.phase === "delegate") ctx.err(dim((ko ? "위임 → " : "delegating → ") + ev.targets.map((t) => t.name || t.role).join(", ")));
+        else if (ev.phase === "repair") ctx.err(dim(ko ? "검증 결함 확인 → 수정 후 재검증" : "Verification blocker found → repairing before re-check"));
+        else if (ev.phase === "verify") ctx.err(dim(ko ? "구현 결과 준비 완료 → 독립 검증 시작" : "Implementation ready → starting independent verification"));
         else if (ev.phase === "division-done") ctx.err(dim(`  ${ev.role}: ${ev.ok ? "ok" : "failed"}`));
         else if (ev.phase === "synthesize") ctx.err(dim(ko ? "팀 결과를 종합하는 중…" : "Synthesizing team results…"));
       },

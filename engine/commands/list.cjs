@@ -31,7 +31,7 @@ function run(ctx) {
     slug: a.slug, name: a.name, name_en: a.nameEn, tagline: a.tagline, tagline_en: a.taglineEn, builtin: a.builtin,
   }));
   const firms = ctx.tableExists(db, "firms")
-    ? db.prepare("SELECT id, name FROM firms ORDER BY name").all()
+    ? db.prepare("SELECT id, slug, name FROM firms ORDER BY name").all()
     : [];
 
   const en = ctx.lang === "en";
@@ -47,7 +47,13 @@ function run(ctx) {
   if (firms.length) {
     ctx.out("");
     ctx.out(ctx.ui.bold(en ? "Companies" : "회사"));
-    for (const f of firms) ctx.out(`  ${ctx.ui.accent(String(f.id).padEnd(24))} ${f.name}`);
+    for (const f of firms) {
+      const callable = String(f.slug || f.id);
+      ctx.out(`  ${ctx.ui.accent(callable.padEnd(28))} ${f.name}`);
+    }
+    ctx.out(ctx.ui.dim(en
+      ? "  Run one with: agentlas firm <company-key> \"<task>\""
+      : "  실행: agentlas firm <회사 키> \"<작업>\""));
   }
 
   const active = activeRuntimeRow(db);
