@@ -44,7 +44,7 @@ ACCOUNT & OPS
   multimodal               image/video/audio provider settings
   doctor · setup · update  health check · first-run wizard · npm update check
   oberon | film <sub>      AI film render (scaffold|render|list|open)
-  hep <sub…> · netadmin    Hephaestus passthrough · local network admin
+  hep <sub…> · netadmin    Hephaestus passthrough · local agent network
   version · help
 
 IN-REPL (agentlas → interactive, Orca multi-session)

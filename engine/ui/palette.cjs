@@ -79,7 +79,9 @@ const SLASH_COMMANDS = [
   { command: "/oberon", args: "[sub]", ko: "AI 필름", en: "AI film" },
   { command: "/film", args: "<sub>", ko: "필름 렌더", en: "Film render" },
   { command: "/hep", args: "<sub…>", ko: "Hephaestus 패스스루", en: "Hephaestus passthrough" },
-  { command: "/netadmin", args: "[sub]", ko: "로컬 네트워크 관리", en: "Local network admin" },
+  // "네트워크"만 쓰면 WiFi·LAN 관리로 읽힌다. 이 명령이 다루는 것은 로컬
+  // 에이전트 네트워크(init|status|reindex|bench|add-source)다.
+  { command: "/netadmin", args: "[sub]", ko: "로컬 에이전트 네트워크 관리", en: "Local agent network" },
   { command: "/update", args: "", ko: "npm 업데이트 확인", en: "npm update check" },
   { command: "/version", args: "", ko: "버전", en: "Version" },
   { command: "/logout", args: "", ko: "로그아웃", en: "Sign out" },
