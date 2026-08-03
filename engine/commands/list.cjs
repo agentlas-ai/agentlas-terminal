@@ -39,10 +39,63 @@ function run(ctx) {
   if (!agents.length) {
     ctx.out("  " + (en ? "(none yet — try: agentlas search \"what you need\")" : "  (아직 없음 — agentlas search \"필요한 것\" 으로 찾아보세요)"));
   }
+  // padEnd alone does not align: a slug longer than the pad pushes that row's
+  // description out, and an unbounded tagline wraps and gets cut mid-word by the
+  // terminal with no marker, so the user cannot tell a short description from a
+  // truncated one. Clamp the slug column to the widest slug present (bounded),
+  // and truncate the tagline on a word boundary with an explicit ellipsis.
+  const SLUG_MAX = 32;
+  const slugWidth = Math.min(
+    SLUG_MAX,
+    agents.reduce((w, a) => Math.max(w, String(a.slug || "").length), 0) || 24,
+  );
+  const clampSlug = (slug) => {
+    const s = String(slug || "");
+    return s.length > slugWidth ? `${s.slice(0, slugWidth - 1)}…` : s.padEnd(slugWidth);
+  };
+  // CJK renders two columns wide while String.length counts one, so a Korean
+  // tagline measured by length overflows the terminal and gets cut by the
+  // terminal itself — exactly the unmarked mid-word break this fix removes.
+  const cellWidth = (ch) => {
+    const cp = ch.codePointAt(0);
+    return (cp >= 0x1100 && (
+      cp <= 0x115f
+      || (cp >= 0x2e80 && cp <= 0xa4cf && cp !== 0x303f)
+      || (cp >= 0xac00 && cp <= 0xd7a3)
+      || (cp >= 0xf900 && cp <= 0xfaff)
+      || (cp >= 0xfe30 && cp <= 0xfe6f)
+      || (cp >= 0xff00 && cp <= 0xff60)
+      || (cp >= 0xffe0 && cp <= 0xffe6)
+      || (cp >= 0x1f300 && cp <= 0x1f64f)
+      || (cp >= 0x20000 && cp <= 0x3fffd)
+    )) ? 2 : 1;
+  };
+  const displayWidth = (text) => [...String(text || "")].reduce((w, ch) => w + cellWidth(ch), 0);
+  const clampTag = (text, budget) => {
+    const t = String(text || "").replace(/\s+/g, " ").trim();
+    if (displayWidth(t) <= budget) return t;
+    let out = "";
+    let w = 0;
+    for (const ch of t) {
+      const next = w + cellWidth(ch);
+      if (next > budget - 1) break;
+      out += ch;
+      w = next;
+    }
+    const lastSpace = out.lastIndexOf(" ");
+    return `${(lastSpace > out.length * 0.6 ? out.slice(0, lastSpace) : out).trimEnd()}…`;
+  };
+  // Not a TTY (piped, redirected, CI) leaves process.stdout.columns undefined.
+  // Honour COLUMNS the way ordinary Unix tools do before falling back, so the
+  // output is reproducible and testable outside a terminal.
+  const cols = Number(process.stdout.columns) || Number(process.env.COLUMNS) || 100;
   for (const a of agents) {
     const name = en && a.name_en ? a.name_en : a.name;
     const tag = en && a.tagline_en ? a.tagline_en : a.tagline;
-    ctx.out(`  ${ctx.ui.accent(a.slug.padEnd(24))} ${name}${tag ? ctx.ui.dim(" — " + tag) : ""}`);
+    // 2 indent + slug + space + name + " — " + tagline must fit one line.
+    const budget = Math.max(20, cols - (2 + slugWidth + 1 + displayWidth(name) + 3));
+    const shown = tag ? clampTag(tag, budget) : "";
+    ctx.out(`  ${ctx.ui.accent(clampSlug(a.slug))} ${name}${shown ? ctx.ui.dim(" — " + shown) : ""}`);
   }
   if (firms.length) {
     ctx.out("");
