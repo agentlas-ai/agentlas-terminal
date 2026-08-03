@@ -644,13 +644,51 @@ function create(ctx, deps = {}) {
       process.stderr.write("Hephaestus failed: Python 3.9+ was not found.\n");
       return Promise.resolve(1);
     }
+    // Core writes nothing until its final payload. `hep search` measured 29.7s
+    // of complete silence on every stream — indistinguishable from a hang, and
+    // the command that takes longest is the one a newcomer tries first.
+    // stdout carries machine-readable JSON, so the heartbeat goes to stderr
+    // only, and only when stderr is a terminal: piping or redirecting must stay
+    // byte-identical for anything parsing this.
+    const stopHeartbeat = helpOnly ? null : startQuietChildHeartbeat(args);
     return new Promise((resolve) => {
       child.on("error", (e) => {
+        if (stopHeartbeat) stopHeartbeat();
         process.stderr.write(`Hephaestus failed: ${e.message}\n`);
         resolve(1);
       });
-      child.on("close", (code) => resolve(code == null ? 0 : code));
+      child.on("close", (code) => {
+        if (stopHeartbeat) stopHeartbeat();
+        resolve(code == null ? 0 : code);
+      });
     });
+  }
+
+  /**
+   * Report elapsed time on stderr while a passthrough child stays quiet.
+   * Returns a stop function; returns null when there is nothing safe to write to.
+   */
+  function startQuietChildHeartbeat(args) {
+    if (!process.stderr.isTTY) return null;
+    const label = args.filter((a) => !String(a).startsWith("-")).slice(0, 2).join(" ") || "hephaestus";
+    const started = Date.now();
+    let painted = false;
+    const paint = () => {
+      const secs = Math.round((Date.now() - started) / 1000);
+      process.stderr.write(`\r[2K${label} … ${secs}s`);
+      painted = true;
+    };
+    // Stay silent through the common fast case; only speak once it is slow
+    // enough that a user would start wondering.
+    const first = setTimeout(() => { paint(); }, 1500);
+    const timer = setInterval(paint, 1000);
+    if (typeof timer.unref === "function") timer.unref();
+    if (typeof first.unref === "function") first.unref();
+    return () => {
+      clearTimeout(first);
+      clearInterval(timer);
+      if (painted) process.stderr.write("\r[2K");
+    };
   }
 
   const HEP_USAGE = [
