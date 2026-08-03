@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.26 — 2026-08-03
+
+- **`agentlas list` stops letting the terminal cut its own output.** Slugs were
+  padded to a fixed width, so a longer one pushed that row's description out of
+  alignment, and the tagline had no bound at all — the terminal cut it mid-word
+  with no marker, so a short description and a truncated one looked identical.
+  Rows reached 109 display columns in an 80-column terminal. The slug column now
+  sizes to the widest slug present and the tagline is truncated on a word
+  boundary with an explicit ellipsis, measured in display cells so Korean and
+  other wide characters are counted at their real width. COLUMNS is honoured when
+  stdout is not a TTY.
+
 ## 1.0.25 — 2026-08-02
 
 - **Every Terminal session now closes a governed learning episode.** Direct
