@@ -62,7 +62,7 @@ const VALUE_OPS = new Set(["contains", "eq", "ne", "gt", "lt"]);
 const VAR_RE = /^[A-Za-z_][\w-]*$/;
 
 function startInterview(request) {
-  return { request: String(request || "").trim(), answers: [], asked: [], round: 0 };
+  return { request: String(request || "").trim(), answers: [], asked: [], round: 0, attempts: [] };
 }
 
 function recordAnswers(state, answers) {
@@ -162,6 +162,20 @@ function buildInterviewPrompt(state) {
   ];
   if (state.asked.length) {
     lines.push("", `Question ids already asked (do not repeat): ${state.asked.join(", ")}`);
+  }
+  // ★지난 시도가 왜 지어지지 못했는지를 모델 앞에 놓는다. 데스크탑과 같은 규율이다 —
+  //   없으면 같은 실수를 그대로 반복한다.
+  //   (패리티 게이트가 잡았다: 처음엔 이 블록이 `asked` 안에 들어가, 질문을 한 적 없는
+  //    첫 시도에서는 실패 사유가 아예 안 실렸다.)
+  const attempts = state.attempts || [];
+  if (attempts.length) {
+    lines.push(
+      "",
+      "Your previous blueprint could NOT be built. Fix exactly these problems and return a",
+      "corrected blueprint. Do not repeat the same mistake, and do not ask the person about it —",
+      "these are format problems on your side, not missing information:",
+    );
+    for (const a of attempts) for (const problem of a.problems) lines.push(`  · ${problem}`);
   }
   if (state.round >= MAX_INTERVIEW_ROUNDS - 1) {
     lines.push(
@@ -652,15 +666,18 @@ function parseInterviewTurn(text, state) {
   if (problems.length === 0) return { ok: true, turn: { kind: "blueprint", blueprint: normalized } };
   const questions = normalizeQuestions(problems.map((p) => p.ask).filter(Boolean), state);
   if (questions.length) return { ok: true, turn: { kind: "ask", questions } };
-  return {
-    ok: false, code: "INTERVIEW_BLUEPRINT_INVALID",
-    reason: problems.map((p) => p.reason).slice(0, 4).join(" "),
-    nextAction: "조금 더 구체적으로 적어 주시면 다시 시도합니다.",
-  };
+  // 물어서 채울 수 없는 문제 — 사람이 답을 안 준 게 아니라 **모델이 형식을 틀린** 것이다.
+  // 그걸 "구체적으로 적어 주세요"로 떠넘기면 막다른 길이 된다: 무엇이 틀렸는지 사람은
+  // 모르고, 우리는 안다. 무엇이 틀렸는지 돌려주고 스스로 고치게 한다.
+  return { ok: true, turn: { kind: "retry", problems: problems.map((p) => p.reason) } };
 }
+
+/** 모델이 스스로 고쳐 볼 기회의 상한. 데스크탑과 같은 값. */
+const MAX_SELF_CORRECTIONS = 2;
 
 module.exports = {
   BLUEPRINT_SCHEMA, MAX_QUESTIONS_PER_TURN, MAX_INTERVIEW_ROUNDS, MAX_REPEATS,
   startInterview, recordAnswers, buildInterviewPrompt, parseInterviewTurn, humanSchedule,
+  MAX_SELF_CORRECTIONS,
   validateBlueprint, buildGraphFromBlueprint, branchLabel, describeBranches,
 };

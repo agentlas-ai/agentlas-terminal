@@ -586,10 +586,34 @@ async function newGraph(ctx, request, flags) {
         ctx.err(ctx.ui.dim(parsed.nextAction));
         return 1;
       }
+      // ★모델이 형식을 틀렸다 — 사람이 답을 안 준 게 아니다. 무엇이 틀렸는지 돌려주고
+      //   정해진 횟수만큼 스스로 고치게 한다. "구체적으로 적어 주세요"로 떠넘기면
+      //   막다른 길이 된다: 무엇이 틀렸는지 사람은 모르고, 우리는 안다.
+      if (parsed.turn.kind === "retry") {
+        state.attempts = [...(state.attempts || []), { round, problems: parsed.turn.problems }];
+        if ((state.attempts || []).length > interview.MAX_SELF_CORRECTIONS) {
+          const tried = [...new Set(state.attempts.flatMap((a) => a.problems))].slice(0, 3);
+          ctx.err(en
+            ? `Tried ${interview.MAX_SELF_CORRECTIONS + 1} times and kept hitting the same wall: ${tried.join(" / ")}`
+            : `${interview.MAX_SELF_CORRECTIONS + 1}번 다시 만들어 봤지만 같은 자리에서 막혔습니다: ${tried.join(" / ")}`);
+          ctx.err(ctx.ui.dim(en
+            ? "Describe it differently, or build it on the desktop canvas."
+            : "만들고 싶은 것을 다른 말로 적어 주시거나, 데스크탑 캔버스에서 직접 만들어 보세요."));
+          return 1;
+        }
+        ctx.out(ctx.ui.dim(en ? "Fixing what didn't fit and trying again…" : "맞지 않는 부분을 고쳐 다시 만드는 중…"));
+        continue;
+      }
       if (parsed.turn.kind === "blueprint") {
         built = interview.buildGraphFromBlueprint(parsed.turn.blueprint);
         if (!built.ok) {
-          // 여기 오면 파서와 빌더가 어긋난 것이다. 조용히 넘어가지 않는다.
+          // 청사진 검증은 통과했는데 짓는 데서 걸렸다 — 이것도 형식 문제라 같은 규율.
+          state.attempts = [...(state.attempts || []), { round, problems: built.problems.map((p) => p.reason) }];
+          if ((state.attempts || []).length <= interview.MAX_SELF_CORRECTIONS) {
+            ctx.out(ctx.ui.dim(en ? "Fixing what didn't fit and trying again…" : "맞지 않는 부분을 고쳐 다시 만드는 중…"));
+            built = null;
+            continue;
+          }
           ctx.err(en ? "Could not build it after all:" : "끝내 만들지 못했습니다:");
           for (const p of built.problems) ctx.err(`  · ${p.reason}`);
           return 1;
