@@ -511,7 +511,9 @@ async function runGraph(ctx, needle, flags) {
  * 그래서 실행 시각·바깥으로 나가는지·반복 상한은 지어내지지 않는다.
  */
 async function newGraph(ctx, request, flags) {
-  const en = ctx.lang === "en";
+  // 인터뷰의 말은 저장된 언어 설정이 아니라 **사용자가 방금 쓴 말**을 따라간다.
+  // 설정만 따르면 한국어로 말한 사람에게 "for example"이 섞여 나온다(실측).
+  const en = /[\uac00-\ud7a3]/.test(String(request || "")) ? false : ctx.lang === "en";
   const db = ctx.db();
   if (!request) {
     ctx.err(en
@@ -519,17 +521,23 @@ async function newGraph(ctx, request, flags) {
       : '무엇을 자동으로 하고 싶은지 그냥 말씀하시면 됩니다.\n  agentlas graph new "매일 아침 블로그 글감 하나 뽑아줘"');
     return 1;
   }
-  if (!process.stdin.isTTY && !flags.answers) {
-    ctx.err(en
-      ? "Building an automation is a conversation — run this in a terminal where it can ask you questions."
-      : "자동화를 만드는 일은 몇 가지를 여쭤보며 진행합니다. 대화가 가능한 터미널에서 실행해 주세요.");
-    return 1;
-  }
+  // 파이프로 답을 넣어도 된다 — 답이 떨어지면 무엇이 더 필요했는지 말하고 멈춘다.
+  // (조용히 기본값으로 채우면, 사용자가 정한 적 없는 자동화가 만들어진다.)
+  const piped = !process.stdin.isTTY;
 
   const interview = require("../graph/interview.cjs");
   const { askModel } = require("../graph/ask-model.cjs");
   let state = interview.startInterview(request);
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+  // 파이프로 들어온 답은 **미리 전부 읽어 둔다.** readline은 입력 스트림이 끝나면 닫히므로,
+  // 질문마다 물으면 두 번째 질문에서 "readline was closed"로 죽는다(실측).
+  const queued = piped ? await readAllLines() : [];
+  let queueAt = 0;
+  const rl = piped ? null : readline.createInterface({ input: process.stdin, output: process.stdout });
+  const nextAnswer = async (promptText) => {
+    if (piped) return queueAt < queued.length ? queued[queueAt++] : "";
+    return ask(rl, promptText);
+  };
 
   try {
     ctx.out(ctx.ui.dim(en
@@ -563,19 +571,32 @@ async function newGraph(ctx, request, flags) {
       }
 
       // 질문 — 하나씩 묻는다. 한꺼번에 쏟으면 사람이 답을 포기한다.
+      // 끝이 안 보이면 도중에 그만두므로 몇 바퀴째인지 함께 보여준다.
       ctx.out("");
+      ctx.out(ctx.ui.dim(en
+        ? `A few things I should not decide for you (round ${round + 1} of ${interview.MAX_INTERVIEW_ROUNDS}):`
+        : `제가 대신 정하면 안 되는 것들입니다 (${round + 1}번째 / 최대 ${interview.MAX_INTERVIEW_ROUNDS}번):`));
       const given = [];
       for (const q of parsed.turn.questions) {
         ctx.out(ctx.ui.bold(`  ${q.question}`));
         if (q.why) ctx.out(ctx.ui.dim(`    ${q.why}`));
         if (q.choices && q.choices.length) {
-          ctx.out(ctx.ui.dim(`    ${en ? "for example" : "예를 들면"}: ${q.choices.join(" / ")}`));
+          ctx.out(ctx.ui.dim(`    ${en ? "for example" : "예를 들면"} — ${q.choices.join(" / ")}`));
         }
-        const text = await ask(rl, "  > ");
+        const text = await nextAnswer("  > ");
         if (!text) {
-          ctx.err(en ? "Stopped. Nothing was saved." : "여기서 멈췄습니다. 저장된 것은 없습니다.");
+          ctx.err("");
+          ctx.err(en
+            ? `Stopped without an answer to: ${q.question}`
+            : `이 질문에 답을 받지 못해 멈췄습니다: ${q.question}`);
+          ctx.err(ctx.ui.dim(en
+            ? "Nothing was saved. Answer \"you decide\" and I will pick for anything except the run time,\n"
+              + "whether a step goes outside, and repeat limits — those three I will keep asking about."
+            : "저장된 것은 없습니다. 잘 모르시면 \"알아서 해주세요\"라고 답하시면 제가 정합니다.\n"
+              + "다만 실행 시각·바깥으로 나가는지·반복 횟수 세 가지는 계속 여쭤봅니다."));
           return 1;
         }
+        if (piped) ctx.out(`  > ${text}`);
         given.push({ questionId: q.id, question: q.question, answer: text });
         ctx.out("");
       }
@@ -612,7 +633,7 @@ async function newGraph(ctx, request, flags) {
       : (en ? "Runs when you give it a value." : "값을 넣을 때마다 실행합니다."));
 
     if (!flags.yes) {
-      const confirm = await ask(rl, en ? "\nSave this? [Y/n] " : "\n이대로 저장할까요? [Y/n] ");
+      const confirm = await nextAnswer(en ? "\nSave this? [Y/n] " : "\n이대로 저장할까요? [Y/n] ");
       if (/^n(o)?$/i.test(confirm)) {
         ctx.out(en ? "Nothing was saved." : "저장하지 않았습니다.");
         return 0;
@@ -649,8 +670,19 @@ async function newGraph(ctx, request, flags) {
     ctx.out(`  agentlas automation on ${id}`);
     return 0;
   } finally {
-    rl.close();
+    if (rl) rl.close();
   }
+}
+
+/** 파이프로 들어온 답을 전부 읽는다. */
+function readAllLines() {
+  return new Promise((resolve) => {
+    let buf = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => { buf += chunk; });
+    process.stdin.on("end", () => resolve(buf.split(/\r?\n/).map((l) => l.trim())));
+    process.stdin.on("error", () => resolve([]));
+  });
 }
 
 /** 노드가 대상을 선언하지 않으면 자동화의 대상 에이전트를 상속한다. 없으면 기본 오케스트레이터. */
