@@ -517,8 +517,8 @@ async function newGraph(ctx, request, flags) {
   const db = ctx.db();
   if (!request) {
     ctx.err(en
-      ? 'Say what you want automated, in your own words.\n  agentlas graph new "every morning give me a blog topic"'
-      : '무엇을 자동으로 하고 싶은지 그냥 말씀하시면 됩니다.\n  agentlas graph new "매일 아침 블로그 글감 하나 뽑아줘"');
+      ? 'Say what you want run for you, in your own words.\n  agentlas graph new "weekday mornings at 8, pull three blog topics"'
+      : '자동으로 돌릴 일을 그대로 적어 주세요.\n  agentlas graph new "평일 아침 8시에 블로그 글감 세 개 뽑아줘"');
     return 1;
   }
   // 파이프로 답을 넣어도 된다 — 답이 떨어지면 무엇이 더 필요했는지 말하고 멈춘다.
@@ -541,8 +541,8 @@ async function newGraph(ctx, request, flags) {
 
   try {
     ctx.out(ctx.ui.dim(en
-      ? "Working out what to build. I will ask a few things I should not guess."
-      : "무엇을 만들지 정리하는 중입니다. 제가 함부로 정하면 안 되는 것들만 여쭤볼게요."));
+      ? "Working out what to build. I will ask only what is not mine to decide."
+      : "무엇을 만들지 정리합니다. 임의로 정하면 안 되는 것만 여쭙겠습니다."));
 
     let built = null;
     for (let round = 0; round < interview.MAX_INTERVIEW_ROUNDS; round += 1) {
@@ -574,8 +574,8 @@ async function newGraph(ctx, request, flags) {
       // 끝이 안 보이면 도중에 그만두므로 몇 바퀴째인지 함께 보여준다.
       ctx.out("");
       ctx.out(ctx.ui.dim(en
-        ? `A few things I should not decide for you (round ${round + 1} of ${interview.MAX_INTERVIEW_ROUNDS}):`
-        : `제가 대신 정하면 안 되는 것들입니다 (${round + 1}번째 / 최대 ${interview.MAX_INTERVIEW_ROUNDS}번):`));
+        ? `Not mine to decide (round ${round + 1} of ${interview.MAX_INTERVIEW_ROUNDS}):`
+        : `임의로 정하면 안 되는 항목입니다 (${round + 1}번째 / 최대 ${interview.MAX_INTERVIEW_ROUNDS}번):`));
       const given = [];
       for (const q of parsed.turn.questions) {
         ctx.out(ctx.ui.bold(`  ${q.question}`));
@@ -587,13 +587,14 @@ async function newGraph(ctx, request, flags) {
         if (!text) {
           ctx.err("");
           ctx.err(en
-            ? `Stopped without an answer to: ${q.question}`
-            : `이 질문에 답을 받지 못해 멈췄습니다: ${q.question}`);
+            ? `Stopped here without an answer to: ${q.question}`
+            : `답을 받지 못해 여기서 멈췄습니다: ${q.question}`);
           ctx.err(ctx.ui.dim(en
-            ? "Nothing was saved. Answer \"you decide\" and I will pick for anything except the run time,\n"
-              + "whether a step goes outside, and repeat limits — those three I will keep asking about."
-            : "저장된 것은 없습니다. 잘 모르시면 \"알아서 해주세요\"라고 답하시면 제가 정합니다.\n"
-              + "다만 실행 시각·바깥으로 나가는지·반복 횟수 세 가지는 계속 여쭤봅니다."));
+            ? "Nothing was saved. Answer \"you decide\" and I take the safest option and name what I chose.\n"
+              + "The run time, anything that goes outside, and repeat limits I keep asking about."
+            : "저장된 것은 없습니다. 판단이 서지 않으면 \"알아서 해주세요\"라고 답해 주시면\n"
+              + "가장 안전한 쪽으로 정하고 무엇을 골랐는지 알려 드립니다.\n"
+              + "다만 실행 시각, 바깥으로 나가는 동작, 반복 횟수는 계속 여쭙니다."));
           return 1;
         }
         if (piped) ctx.out(`  > ${text}`);
@@ -629,8 +630,8 @@ async function newGraph(ctx, request, flags) {
     }
     ctx.out("");
     ctx.out(built.triggerType === "schedule"
-      ? (en ? `Runs on: ${built.scheduleHuman}` : `실행 시각: ${built.scheduleHuman}`)
-      : (en ? "Runs when you give it a value." : "값을 넣을 때마다 실행합니다."));
+      ? scheduleSentence(built.scheduleHuman, en)
+      : (en ? "Runs only when you give it a value." : "값을 넣을 때만 실행합니다."));
 
     if (!flags.yes) {
       const confirm = await nextAnswer(en ? "\nSave this? [Y/n] " : "\n이대로 저장할까요? [Y/n] ");
@@ -657,16 +658,16 @@ async function newGraph(ctx, request, flags) {
     }
     ctx.out("");
     ctx.out(en
-      ? `Saved "${name}" — switched off, so nothing runs yet.`
-      : `"${name}"을(를) 저장했습니다 — 꺼진 상태라 아직 아무것도 돌지 않습니다.`);
+      ? `Saved "${name}". Switched off, so it does not run until you turn it on.`
+      : `"${name}" 저장했습니다. 꺼진 상태라 직접 켜기 전에는 돌지 않습니다.`);
     if (existing) {
       ctx.out(ctx.ui.dim(en
         ? `An automation named "${bp.name}" already existed, so this one was saved as "${name}".`
         : `"${bp.name}" 이름이 이미 있어서 "${name}"(으)로 저장했습니다.`));
     }
-    ctx.out(ctx.ui.dim(en ? "Look it over:" : "확인해 보세요:"));
+    ctx.out(ctx.ui.dim(en ? "Look it over:" : "내용 확인:"));
     ctx.out(`  agentlas graph show "${name}"`);
-    ctx.out(ctx.ui.dim(en ? "Turn it on when it looks right:" : "괜찮으면 켜세요:"));
+    ctx.out(ctx.ui.dim(en ? "Turn it on when it looks right:" : "확인 뒤 켜기:"));
     ctx.out(`  agentlas automation on ${id}`);
     return 0;
   } finally {
@@ -683,6 +684,20 @@ function readAllLines() {
     process.stdin.on("end", () => resolve(buf.split(/\r?\n/).map((l) => l.trim())));
     process.stdin.on("error", () => resolve([]));
   });
+}
+
+/** 실행 시각을 사람 말로. "daily-08:00"은 제품 내부 토큰이지 사용자가 읽을 말이 아니다. */
+function scheduleSentence(schedule, en) {
+  const daily = /^daily-(\d{2}):(\d{2})$/.exec(String(schedule || ""));
+  if (daily) return en ? `Runs daily at ${daily[1]}:${daily[2]}` : `매일 ${daily[1]}:${daily[2]}에 실행`;
+  const weekly = /^weekly-([a-z]{3})-(\d{2}):(\d{2})$/.exec(String(schedule || ""));
+  if (weekly) {
+    const days = { mon: "월", tue: "화", wed: "수", thu: "목", fri: "금", sat: "토", sun: "일" };
+    return en
+      ? `Runs every ${weekly[1]} at ${weekly[2]}:${weekly[3]}`
+      : `매주 ${days[weekly[1]] || weekly[1]}요일 ${weekly[2]}:${weekly[3]}에 실행`;
+  }
+  return en ? `Runs on: ${schedule}` : `실행 시점: ${schedule}`;
 }
 
 /** 노드가 대상을 선언하지 않으면 자동화의 대상 에이전트를 상속한다. 없으면 기본 오케스트레이터. */
