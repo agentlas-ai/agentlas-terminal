@@ -21,6 +21,9 @@ function graphRows(ctx, db) {
   const hasTriggerType = ctx.columnExists(db, "automations", "trigger_type");
   const hasTarget = ctx.columnExists(db, "automations", "target_id");
   const cols = [
+    // 실행 시각을 안 읽으면 내보낸 패키지의 매니페스트가 schedule: null이 되고,
+    // 설치하는 쪽이 기본값을 지어낸다 — 받는 사람 컴퓨터에서 **다른 시각에 도는** 자동화가 된다.
+    "schedule",
     "id", "name", "enabled", "next_run_at", "last_run_at",
     hasGraph ? "graph_json" : "NULL AS graph_json",
     hasTriggerType ? "trigger_type" : "NULL AS trigger_type",
@@ -92,6 +95,10 @@ function graphInputRequirement(graph, en) {
   return { varName, label };
 }
 
+function triggerKindOfManifest(manifest) {
+  return manifest?.trigger?.kind === "input" ? "input" : "cron";
+}
+
 function describe(ctx, row, graph, en) {
   const kind = triggerKind(row, graph);
   const nodeCount = graph?.nodes?.length ?? 0;
@@ -112,10 +119,22 @@ function describe(ctx, row, graph, en) {
 function findGraph(rows, needle) {
   const lowered = String(needle || "").trim().toLowerCase();
   if (!lowered) return null;
-  return rows.find((row) => row.name.toLowerCase() === lowered)
-    ?? rows.find((row) => row.id === needle)
-    ?? rows.find((row) => row.name.toLowerCase().includes(lowered))
-    ?? null;
+  const exact = rows.find((row) => row.name.toLowerCase() === lowered)
+    ?? rows.find((row) => row.id === needle);
+  if (exact) return exact;
+  const partial = rows.filter((row) => row.name.toLowerCase().includes(lowered));
+  // 여러 개가 걸리면 하나를 골라 주지 않는다. 조용히 고르면 사용자가 본 적 없는
+  // 비슷한 이름의 자동화가 실행된다(실측: "글 다듬기" → "(친구가 준 것)" 사본이 돌았다).
+  if (partial.length > 1) return { ambiguous: partial };
+  return partial[0] ?? null;
+}
+
+/** 이름이 여러 개 걸렸을 때, 고르지 말고 후보를 보여준다. */
+function reportAmbiguous(ctx, needle, matches, en) {
+  ctx.err(en
+    ? `"${needle}" matches ${matches.length} automations. Say which one:`
+    : `"${needle}"에 자동화 ${matches.length}개가 걸립니다. 어느 것인지 정확히 적어 주세요:`);
+  for (const row of matches) ctx.err(`  · ${row.name}`);
 }
 
 function listGraphs(ctx) {
@@ -144,6 +163,7 @@ function showGraph(ctx, needle) {
   const rows = graphRows(ctx, db);
   const en = ctx.lang === "en";
   const row = findGraph(rows, needle);
+  if (row?.ambiguous) { reportAmbiguous(ctx, needle, row.ambiguous, en); return 1; }
   if (!row) {
     ctx.err(en ? `No graph matches "${needle}".` : `"${needle}"와 맞는 그래프가 없습니다.`);
     return 1;
@@ -164,7 +184,95 @@ function showGraph(ctx, needle) {
   }
   ctx.out("");
   renderGraphTree(ctx, graph, en);
+  const problems = graphProblems(graph, en);
+  if (problems.length) {
+    ctx.out("");
+    ctx.out(ctx.ui.red(en
+      ? `This graph will stop when it runs (${problems.length}):`
+      : `이대로 실행하면 도중에 멈춥니다 (${problems.length}건):`));
+    for (const p of problems) {
+      ctx.out(`  ⚠ ${p.what}`);
+      ctx.out(`    ${ctx.ui.dim(p.fix)}`);
+    }
+  }
+  // 그대로 복사해 쓸 수 있는 명령. 예전에는 값이 필요한 그래프인지 화면에서만 알려주고
+  // **넣는 방법은 안 알려줘서**, 사용자가 실패한 뒤에야 --input을 알게 됐다.
+  ctx.out("");
+  ctx.out(ctx.ui.dim(en ? "Run it with:" : "실행하려면:"));
+  ctx.out(requirement
+    ? `  agentlas graph run "${row.name}" --input "<${requirement.label}>"`
+    : `  agentlas graph run "${row.name}"`);
   return 0;
+}
+
+/**
+ * 실행하기 전에 알 수 있는 결함을 찾는다.
+ * 예전에는 `show`가 결함을 하나도 표시하지 않아, **돌려서 실패시켜야만** 알 수 있었다.
+ * 자동화는 사람이 없는 동안 도는 것이라, 실패를 새벽에 발견하게 된다.
+ */
+function graphProblems(graph, en) {
+  const problems = [];
+  const nodes = new Map((graph.nodes ?? []).map((n) => [n.id, n]));
+  const out = new Map();
+  for (const edge of graph.edges ?? []) {
+    if (!out.has(edge.source)) out.set(edge.source, []);
+    out.get(edge.source).push(edge);
+  }
+  for (const node of graph.nodes ?? []) {
+    const label = node.label || node.id;
+    if (node.type === "condition") {
+      const edges = out.get(node.id) ?? [];
+      const undeclared = edges.filter((e) => e.sourceHandle !== "true" && e.sourceHandle !== "false");
+      if (undeclared.length) {
+        problems.push({
+          what: en
+            ? `Branch "${label}" has ${undeclared.length} outgoing link(s) that do not say yes or no.`
+            : `갈림길 "${label}"에서 나가는 연결 ${undeclared.length}개가 "예"인지 "아니오"인지 정해져 있지 않습니다.`,
+          fix: en
+            ? "Open it in the desktop app and reconnect from the yes / no outlets."
+            : "데스크탑 앱에서 열어 참·거짓 출구에서 다시 이으세요.",
+        });
+      }
+      if (!edges.length) {
+        problems.push({
+          what: en ? `Branch "${label}" leads nowhere.` : `갈림길 "${label}" 뒤에 아무것도 이어져 있지 않습니다.`,
+          fix: en ? "Connect what should happen on each side." : "각 갈래 뒤에 할 일을 이으세요.",
+        });
+      } else if (!edges.some((e) => e.sourceHandle === "true") || !edges.some((e) => e.sourceHandle === "false")) {
+        const missing = edges.some((e) => e.sourceHandle === "true")
+          ? (en ? "no" : "아니오") : (en ? "yes" : "예");
+        problems.push({
+          what: en
+            ? `Branch "${label}" has nothing on its "${missing}" side — it stops there when it goes that way.`
+            : `갈림길 "${label}"의 "${missing}" 쪽에 아무것도 없습니다 — 그쪽으로 가면 거기서 멈춥니다.`,
+          fix: en ? "Connect that side, or make it end there on purpose." : "그쪽에도 다음 단계를 잇거나, 거기서 끝나도 되게 두세요.",
+        });
+      }
+    }
+    // 되돌아가는 연결에 반복 횟수가 없으면 실행 자체가 거절된다.
+    for (const edge of out.get(node.id) ?? []) {
+      const target = nodes.get(edge.target);
+      if (!target) {
+        problems.push({
+          what: en ? `"${label}" links to a step that no longer exists.` : `"${label}"이(가) 없는 단계로 이어져 있습니다.`,
+          fix: en ? "Remove or repoint that link in the desktop app." : "데스크탑 앱에서 그 연결을 지우거나 다시 이으세요.",
+        });
+      }
+    }
+  }
+  // 밖에서 받아야 하는 값이 여럿이면 무엇을 넣어야 하는지 정할 수 없다.
+  const unproduced = unproducedVariables(graph);
+  if (unproduced.length > 1) {
+    problems.push({
+      what: en
+        ? `Nothing in this graph produces these values: ${unproduced.join(", ")}. Only one value can be supplied at the start.`
+        : `이 그래프 안에서 아무도 만들지 않는 값이 여럿입니다: ${unproduced.join(", ")}. 시작할 때 넣을 수 있는 값은 하나뿐입니다.`,
+      fix: en
+        ? "Make the earlier steps produce them, or reduce them to one."
+        : "앞 단계가 그 값들을 만들게 하거나, 시작 값을 하나로 줄이세요.",
+    });
+  }
+  return problems;
 }
 
 /** 노드 한 줄. 무엇인지, 바깥을 바꾸는지, 어떤 값을 만들고 쓰는지. */
@@ -179,8 +287,34 @@ function nodeLine(ctx, node, en) {
     node.config?.consumes ? `${en ? "uses" : "사용"} {{${node.config.consumes}}}` : null,
     node.config?.produces ? `${en ? "makes" : "생성"} {{${node.config.produces}}}` : null,
   ].filter(Boolean);
+  if (node.type === "condition") {
+    // 갈림길 이름은 만든 사람이 지은 것이라 실제 규칙과 다를 수 있다(실측: 이름은
+    // "길이가 충분한가?"인데 실제로는 어떤 단어가 들어 있는지를 봤다).
+    // 사람이 예측하려면 이름이 아니라 규칙을 봐야 한다.
+    const rule = conditionRule(node, en);
+    if (rule) marks.unshift(rule);
+  }
   return `${ctx.ui.accent(kindWord(node.type, en))}  ${node.label || node.id}`
     + (marks.length ? ctx.ui.dim(`  — ${marks.join(", ")}`) : "");
+}
+
+/** 갈림길이 실제로 무엇을 보는지 한 줄로. 모르는 연산은 지어내지 않고 그대로 보여준다. */
+function conditionRule(node, en) {
+  const cfg = node.config || {};
+  const v = cfg.var;
+  if (typeof v !== "string" || !v.trim()) return null;
+  const value = cfg.value;
+  const shown = typeof value === "string" ? `"${value}"` : String(value ?? "");
+  switch (cfg.op) {
+    case "contains": return en ? `yes when {{${v}}} contains ${shown}` : `{{${v}}}에 ${shown}이(가) 들어 있으면 예`;
+    case "truthy": return en ? `yes when {{${v}}} has a value` : `{{${v}}}에 값이 있으면 예`;
+    case "falsy": return en ? `yes when {{${v}}} is empty` : `{{${v}}}이(가) 비어 있으면 예`;
+    case "eq": return en ? `yes when {{${v}}} equals ${shown}` : `{{${v}}}이(가) ${shown}과 같으면 예`;
+    case "neq": return en ? `yes when {{${v}}} differs from ${shown}` : `{{${v}}}이(가) ${shown}과 다르면 예`;
+    case "gt": return en ? `yes when {{${v}}} > ${shown}` : `{{${v}}}이(가) ${shown}보다 크면 예`;
+    case "lt": return en ? `yes when {{${v}}} < ${shown}` : `{{${v}}}이(가) ${shown}보다 작으면 예`;
+    default: return en ? `checks {{${v}}} with "${cfg.op ?? "?"}"` : `{{${v}}}을(를) "${cfg.op ?? "?"}"(으)로 검사`;
+  }
 }
 
 /** 내부 타입 이름을 그대로 보여주지 않는다 — 사용자는 "condition"이 뭔지 알 이유가 없다. */
@@ -211,16 +345,20 @@ function renderGraphTree(ctx, graph, en) {
   const roots = graph.nodes.filter((n) => !hasIncoming.has(n.id));
   const seen = new Set();
 
-  const walk = (nodeId, depth, branchLabel) => {
+  const walk = (nodeId, depth, branchLabel, backEdge) => {
     const node = nodes.get(nodeId);
     if (!node) return;
     const indent = "  ".repeat(depth + 1);
     const prefix = branchLabel ? ctx.ui.dim(`${branchLabel} `) : "";
     if (seen.has(nodeId)) {
       // 되돌아가는 연결(루프). 다시 펼치면 끝나지 않으므로 되돌아간다는 사실만 말한다.
+      const cap = typeof backEdge?.maxIterations === "number" ? backEdge.maxIterations : null;
+      const capText = cap === null
+        ? (en ? " — no repeat limit set, so it will refuse to run" : " — 반복 횟수가 정해져 있지 않아 실행이 거절됩니다")
+        : (en ? ` — up to ${cap} more time(s)` : ` — 최대 ${cap}바퀴까지`);
       ctx.out(`${indent}${prefix}↩ ${ctx.ui.dim(en
-        ? `back to "${node.label || node.id}" (loop)`
-        : `"${node.label || node.id}"(으)로 되돌아감 (반복)`)}`);
+        ? `back to "${node.label || node.id}"${capText}`
+        : `"${node.label || node.id}"(으)로 되돌아감${capText}`)}`);
       return;
     }
     seen.add(nodeId);
@@ -233,18 +371,21 @@ function renderGraphTree(ctx, graph, en) {
         : handle === "false"
           ? (en ? "[no]" : "[아니오]")
           : "";
-      walk(edge.target, depth + 1, label);
+      walk(edge.target, depth + 1, label, edge);
     }
   };
 
-  for (const root of roots) walk(root.id, 0, "");
+  for (const root of roots) walk(root.id, 0, "", null);
   // 어디에서도 닿지 않는 노드는 조용히 숨기지 않는다 — 만들어 놓고 안 이어진 단계다.
   const orphans = graph.nodes.filter((n) => !seen.has(n.id));
   if (orphans.length) {
     ctx.out("");
+    // ★"실행되지 않는다"고 쓰면 안 된다. 들어오는 연결이 없는 단계는 **따로 시작되는 단계**로
+    // 실제로 실행된다(실측: "아무도 안 부르는 단계"가 done으로 끝났다).
+    // 화면이 실행되지 않는다고 말해 놓고 실행되면, 사용자는 그래프를 보고 결과를 예측할 수 없다.
     ctx.out("  " + ctx.ui.dim(en
-      ? "Not connected to the start — these never run:"
-      : "시작과 이어지지 않아 실행되지 않는 단계:"));
+      ? "Not wired to the start — each of these starts on its own, at the same time:"
+      : "시작과 이어져 있지 않은 단계 — 각각 따로, 시작과 동시에 실행됩니다:"));
     for (const node of orphans) ctx.out(`    ${nodeLine(ctx, node, en)}`);
   }
 }
@@ -275,6 +416,7 @@ async function runGraph(ctx, needle, flags) {
   const rows = graphRows(ctx, db);
   const en = ctx.lang === "en";
   const row = findGraph(rows, needle);
+  if (row?.ambiguous) { reportAmbiguous(ctx, needle, row.ambiguous, en); return 1; }
   if (!row) {
     ctx.err(en ? `No graph matches "${needle}".` : `"${needle}"와 맞는 그래프가 없습니다.`);
     ctx.err(en ? "See what is saved with: agentlas graph list" : "저장된 목록: agentlas graph list");
@@ -316,8 +458,11 @@ async function runGraph(ctx, needle, flags) {
   const requirement = graphInputRequirement(graph, en);
   if (requirement && !flags.input) {
     ctx.err(en
-      ? `"${row.name}" starts from a value you provide (${requirement.label}). Run it without -y so it can ask, or pass --input "<value>".`
-      : `"${row.name}"은(는) 시작할 값이 필요합니다(${requirement.label}). -y 없이 실행해 값을 입력하거나 --input "<값>" 으로 넘기세요.`);
+      ? `"${row.name}" starts from a value you provide — ${requirement.label}.`
+      : `"${row.name}"은(는) 시작할 때 값을 받습니다 — ${requirement.label}.`);
+    ctx.err(ctx.ui.dim(en
+      ? `Run it like this:\n  agentlas graph run "${row.name}" --input "<${requirement.label}>"`
+      : `이렇게 실행하세요:\n  agentlas graph run "${row.name}" --input "<${requirement.label}>"`));
     return 1;
   }
 
@@ -361,6 +506,7 @@ function exportGraph(ctx, needle, outPath) {
   const rows = graphRows(ctx, db);
   const en = ctx.lang === "en";
   const row = findGraph(rows, needle);
+  if (row?.ambiguous) { reportAmbiguous(ctx, needle, row.ambiguous, en); return 1; }
   if (!row) {
     ctx.err(en ? `No graph matches "${needle}".` : `"${needle}"와 맞는 그래프가 없습니다.`);
     return 1;
@@ -384,13 +530,30 @@ function exportGraph(ctx, needle, outPath) {
     }
     return 1;
   }
-  const target = outPath || `${built.package.manifest.slug || "graph"}.agentgraph.json`;
-  fs.writeFileSync(path.resolve(target), JSON.stringify(built.package, null, 2) + "\n", "utf8");
-  ctx.out(en ? `Wrote ${target}` : `${target} 파일로 저장했습니다.`);
+  // 기본 파일 이름은 자동화마다 달라야 한다. 예전에는 언제나 graph.agentgraph.json 이라
+  // 두 번째 내보내기가 **말없이 첫 번째를 덮어썼다**(실측: 먼저 뽑은 것이 사라졌다).
+  const safeName = String(built.package.manifest.name || "graph")
+    .replace(/[\\/:*?"<>|]+/g, "-").replace(/\s+/g, " ").trim().slice(0, 60) || "graph";
+  const target = path.resolve(outPath || `${safeName}.agentgraph.json`);
+  if (!outPath && fs.existsSync(target)) {
+    ctx.err(en
+      ? `${target} already exists. Pass a file name to write somewhere else:\n  agentlas graph export "<name>" <file>`
+      : `${target} 파일이 이미 있습니다. 덮어쓰지 않았습니다. 다른 이름을 주세요:\n  agentlas graph export "<이름>" <파일>`);
+    return 1;
+  }
+  fs.writeFileSync(target, JSON.stringify(built.package, null, 2) + "\n", "utf8");
+  // 전체 경로를 보여준다 — 어디에 저장됐는지 모르면 친구에게 보낼 수가 없다.
+  ctx.out(en ? `Wrote ${target}` : `저장했습니다: ${target}`);
   const findings = built.findings;
+  // 뽑을 때마다 "친구에게 보내도 되는가"에 답한다. 예전에는 파일을 직접 열어
+  // scrubReport 같은 영어 필드를 해독해야만 알 수 있었다(실측).
   if (findings.length) {
     ctx.out(ctx.ui.dim(en ? "Removed before packaging:" : "패키징 전에 지운 것:"));
     for (const f of findings) ctx.out(ctx.ui.dim(`  · ${f.nodeId}.${f.field} — ${f.rule} (${f.action})`));
+  } else {
+    ctx.out(ctx.ui.dim(en
+      ? "Checked for passwords, keys and personal paths — none were found in this graph."
+      : "비밀번호·키·개인 경로가 있는지 훑었고, 이 그래프에는 없었습니다."));
   }
   const blanks = built.package.manifest.vaultTemplate;
   if (blanks.length) {
@@ -411,6 +574,15 @@ function inspectPackage(ctx, filePath) {
   try {
     parsed = JSON.parse(fs.readFileSync(path.resolve(filePath), "utf8"));
   } catch (err) {
+    // 이름을 넣은 것이 거의 확실하면 ENOENT를 그대로 던지지 않는다. 사용자는
+    // show/run/export 를 전부 이름으로 썼기 때문에 여기도 이름일 거라고 생각한다(실측 3/4명).
+    const looksLikeName = !String(filePath).includes("/") && !/\.(json|agentgraph)$/i.test(String(filePath));
+    if (looksLikeName && err && err.code === "ENOENT") {
+      ctx.err(en
+        ? `This command reads a package file, not a saved automation. To look at "${filePath}" that is already saved, use:\n  agentlas graph show "${filePath}"`
+        : `이 명령은 저장된 자동화가 아니라 **패키지 파일**을 읽습니다. 이미 저장된 "${filePath}"을(를) 보려면:\n  agentlas graph show "${filePath}"`);
+      return 1;
+    }
     ctx.err(en ? `Could not read ${filePath}: ${err.message}` : `${filePath}을(를) 읽지 못했습니다: ${err.message}`);
     return 1;
   }
@@ -440,18 +612,27 @@ function inspectPackage(ctx, filePath) {
   }
   // 설치는 아직 데스크탑이 소유한다 — 여기서 "설치했다"고 말하지 않는다.
   ctx.out(ctx.ui.dim(en
-    ? "Installing a package is done in the desktop app; this command only reads it."
+    ? "This command only reads the file. Install it with: agentlas graph install <file>"
     : "패키지 설치는 데스크탑 앱에서 합니다. 이 명령은 읽기만 합니다."));
   return 0;
 }
 
-function installPackage(ctx, filePath) {
+function installPackage(ctx, filePath, flags = {}) {
   const en = ctx.lang === "en";
   const db = ctx.db();
   let parsed;
   try {
     parsed = JSON.parse(fs.readFileSync(path.resolve(filePath), "utf8"));
   } catch (err) {
+    // 이름을 넣은 것이 거의 확실하면 ENOENT를 그대로 던지지 않는다. 사용자는
+    // show/run/export 를 전부 이름으로 썼기 때문에 여기도 이름일 거라고 생각한다(실측 3/4명).
+    const looksLikeName = !String(filePath).includes("/") && !/\.(json|agentgraph)$/i.test(String(filePath));
+    if (looksLikeName && err && err.code === "ENOENT") {
+      ctx.err(en
+        ? `This command reads a package file, not a saved automation. To look at "${filePath}" that is already saved, use:\n  agentlas graph show "${filePath}"`
+        : `이 명령은 저장된 자동화가 아니라 **패키지 파일**을 읽습니다. 이미 저장된 "${filePath}"을(를) 보려면:\n  agentlas graph show "${filePath}"`);
+      return 1;
+    }
     ctx.err(en ? `Could not read ${filePath}: ${err.message}` : `${filePath}을(를) 읽지 못했습니다: ${err.message}`);
     return 1;
   }
@@ -462,11 +643,19 @@ function installPackage(ctx, filePath) {
     return 1;
   }
   const manifest = parsed.manifest;
-  const existing = graphRows(ctx, db).find((row) => row.name === manifest.name);
+  // --name 을 주면 그 이름으로 나란히 설치한다. 이 옵션이 없으면 사용자는 같은 자동화를
+  // 두 벌 가질 방법이 없어, JSON을 손으로 고치는 수밖에 없었다(실측).
+  const installName = typeof flags.name === "string" && flags.name.trim()
+    ? flags.name.trim()
+    : manifest.name;
+  const existing = graphRows(ctx, db).find((row) => row.name === installName);
   if (existing) {
     ctx.err(en
-      ? `An automation named "${manifest.name}" already exists. Rename or remove it first — this command never overwrites your work.`
-      : `"${manifest.name}" 이름의 자동화가 이미 있습니다. 이름을 바꾸거나 지운 뒤 다시 시도하세요 — 이 명령은 기존 작업을 덮어쓰지 않습니다.`);
+      ? `An automation named "${installName}" already exists, and this command never overwrites your work.`
+      : `"${installName}" 이름의 자동화가 이미 있습니다. 이 명령은 기존 작업을 덮어쓰지 않습니다.`);
+    ctx.err(ctx.ui.dim(en
+      ? `Install it alongside the existing one with a different name:\n  agentlas graph install <file> --name "${installName} (2)"`
+      : `다른 이름으로 나란히 설치하려면:\n  agentlas graph install <파일> --name "${installName} (2)"`));
     return 1;
   }
 
@@ -474,6 +663,11 @@ function installPackage(ctx, filePath) {
   // 빈 금고·없는 에이전트로 첫 스케줄에 바로 실패한다 — 꺼진 채로 들어온다(D14).
   const checklist = pkgLib.bindingChecklist(parsed);
   const target = manifest.dependencies?.agents?.[0];
+  // 실행 시각을 지어내면 보낸 사람과 **다른 시각에 도는** 자동화가 된다.
+  // 시각이 안 실려 온 패키지는 시각 없이 설치하고, 사람이 정하라고 말한다.
+  const packagedSchedule = typeof manifest.trigger?.schedule === "string" && manifest.trigger.schedule.trim()
+    ? manifest.trigger.schedule.trim()
+    : null;
   const now = new Date().toISOString();
   const id = `graph-${crypto.randomUUID()}`;
   try {
@@ -483,11 +677,11 @@ function installPackage(ctx, filePath) {
        VALUES (?, ?, ?, ?, ?, ?, 0, 'user', ?, NULL, ?)`,
     ).run(
       id,
-      manifest.name,
-      manifest.trigger?.schedule || "daily-09:00",
+      installName,
+      packagedSchedule ?? "unscheduled",
       target?.source === "hub" ? "hub" : "agent",
       target?.slug || "builtin-agentlas-orchestrator",
-      manifest.name,
+      installName,
       now,
       JSON.stringify(parsed.graph),
     );
@@ -497,15 +691,40 @@ function installPackage(ctx, filePath) {
   }
 
   ctx.out(en
-    ? `Installed "${manifest.name}" — switched off until it is bound.`
-    : `"${manifest.name}"을(를) 설치했습니다 — 연결이 끝날 때까지 꺼진 상태입니다.`);
-  if (checklist.length) {
-    ctx.out(en ? "Fill these in the desktop app, then switch it on:" : "데스크탑 앱에서 아래를 채운 뒤 켜세요:");
-    for (const item of checklist) {
+    ? `Installed "${installName}" — switched off, so nothing runs yet.`
+    : `"${installName}"을(를) 설치했습니다 — 꺼진 상태라 아직 아무것도 돌지 않습니다.`);
+  if (!packagedSchedule && triggerKindOfManifest(manifest) === "cron") {
+    ctx.out(en
+      ? "This package did not carry a run time, so none was set. Pick one in the desktop app before switching it on."
+      : "이 패키지에는 실행 시각이 실려 있지 않아 시각을 정하지 않았습니다. 데스크탑 앱에서 시각을 정한 뒤 켜세요.");
+  } else if (packagedSchedule) {
+    ctx.out(ctx.ui.dim(en ? `Runs on: ${packagedSchedule}` : `실행 시각: ${packagedSchedule}`));
+  }
+  // 이미 가진 것까지 "채우라"고 하면, 사용자는 채울 수 없는 항목을 앞에 두고 멈춘다.
+  // (실측: 원본과 똑같은 에이전트를 쓰는 사본인데도 그 에이전트를 채우라고 요구했고,
+  //  아무것도 안 채운 채 켜니 그냥 돌았다 — 요구 자체가 거짓이었다.)
+  const missing = checklist.filter((item) => {
+    if (item.kind !== "agent") return true;
+    try {
+      if (!ctx.tableExists(db, "installed_agents")) return true;
+      const owned = db.prepare("SELECT 1 FROM installed_agents WHERE id = ? OR slug = ? LIMIT 1")
+        .get(item.slug, item.slug);
+      return !owned;
+    } catch {
+      return true;
+    }
+  });
+  if (missing.length) {
+    ctx.out(en ? "Missing on this computer — add these in the desktop app, then switch it on:" : "이 컴퓨터에 없는 것 — 데스크탑 앱에서 아래를 채운 뒤 켜세요:");
+    for (const item of missing) {
       if (item.kind === "vault-key") ctx.out(`  · ${en ? "key" : "키"} ${item.key}`);
       else if (item.kind === "agent") ctx.out(`  · ${en ? "agent" : "에이전트"} ${item.slug}${item.source === "hub" ? ctx.ui.dim(en ? " (borrowed from the network — costs credits)" : " (네트워크에서 빌림 — 크레딧 소모)") : ""}`);
       else ctx.out(`  · MCP ${item.serverSlug}`);
     }
+  } else if (checklist.length) {
+    ctx.out(ctx.ui.dim(en
+      ? "Everything it needs is already on this computer."
+      : "이 자동화가 쓰는 것은 이미 이 컴퓨터에 다 있습니다."));
   }
   const mutations = manifest.permissionsSummary?.mutationNodes ?? [];
   if (mutations.length) {
@@ -516,8 +735,8 @@ function installPackage(ctx, filePath) {
       : "그 단계들은 자동 허용으로 바꾸지 않는 한 실행 전에 멈추고 묻습니다."));
   }
   ctx.out(ctx.ui.dim(en
-    ? "Nothing runs until you switch it on. Try a simulation first."
-    : "켜기 전에는 아무것도 실행되지 않습니다. 먼저 시뮬레이션으로 돌려보세요."));
+    ? "Nothing runs until you switch it on. The desktop app can simulate it first — the terminal cannot."
+    : "켜기 전에는 아무것도 실행되지 않습니다. 실제로 나가지 않는 시뮬레이션은 데스크탑 앱에서만 됩니다."));
   return 0;
 }
 
@@ -537,6 +756,20 @@ async function run(ctx, args = []) {
   const sub = (rest[0] || "list").toLowerCase();
   const target = rest.slice(1).join(" ").trim();
 
+  if (sub === "help" || sub === "--help" || sub === "-h" || sub === "?") {
+    ctx.out(ctx.ui.bold(en ? "agentlas graph — saved automations" : "agentlas graph — 저장된 자동화"));
+    ctx.out(en ? "  list                      what is saved" : "  list                      저장된 것 목록");
+    ctx.out(en ? "  show \"<name>\"             steps, wiring, and problems" : "  show \"<이름>\"             단계·배선·문제점");
+    ctx.out(en ? "  run \"<name>\" [--input \"<value>\"]  ask the desktop app to run it" : "  run \"<이름>\" [--input \"<값>\"]   데스크탑 앱에 실행을 요청");
+    ctx.out(en ? "  export \"<name>\" [file]    write a shareable package file" : "  export \"<이름>\" [파일]     남에게 줄 수 있는 파일로 저장");
+    ctx.out(en ? "  inspect <file>            read a package file before installing" : "  inspect <파일>            설치 전에 패키지 파일 확인");
+    ctx.out(en ? "  install <file> [--name \"<new name>\"]  install a package file" : "  install <파일> [--name \"<새 이름>\"]  패키지 파일 설치");
+    ctx.out("");
+    ctx.out(ctx.ui.dim(en
+      ? "-y skips the confirmation question. Graphs are built and edited in the desktop app."
+      : "-y 를 붙이면 확인 질문을 건너뜁니다. 그래프를 만들고 고치는 일은 데스크탑 앱에서 합니다."));
+    return 0;
+  }
   if (sub === "list" || sub === "ls") return listGraphs(ctx);
   if (sub === "show") {
     if (!target) {
@@ -559,7 +792,7 @@ async function run(ctx, args = []) {
       ctx.err(en ? "Usage: agentlas graph install <file>" : "사용법: agentlas graph install <파일>");
       return 1;
     }
-    return installPackage(ctx, target);
+    return installPackage(ctx, target, flags);
   }
   if (sub === "inspect") {
     if (!target) {
@@ -574,6 +807,22 @@ async function run(ctx, args = []) {
       return 1;
     }
     return runGraph(ctx, target, flags);
+  }
+  // 만들기·고치기를 시도한 경우에는 "그런 명령 없음"으로 끝내지 않는다. 사용자는
+  // 오타를 낸 게 아니라 **여기서 되는 일이 아니라는 사실**을 모르는 것이고,
+  // 어디로 가야 하는지 말해 주지 않으면 목록만 보다 포기한다.
+  const AUTHORING = new Set([
+    "create", "new", "add", "make", "edit", "update", "delete", "remove", "rename",
+    "enable", "disable", "on", "off", "만들기", "새로", "수정",
+  ]);
+  if (AUTHORING.has(sub)) {
+    ctx.err(en
+      ? `Graphs are built and edited in the Agentlas desktop app (Automation → the graph canvas). The terminal can only look at saved graphs and ask for a run.`
+      : `그래프를 만들고 고치는 일은 Agentlas 데스크탑 앱에서 합니다(자동화 → 그래프 화면). 터미널에서는 저장된 그래프를 보고 실행을 요청하는 것까지만 됩니다.`);
+    ctx.err(ctx.ui.dim(en
+      ? `Here you can: list, show <name>, run <name>, export <name>, inspect <file>, install <file>.`
+      : `여기서 되는 것: list, show <이름>, run <이름>, export <이름>, inspect <파일>, install <파일>.`));
+    return 1;
   }
   // 목록에 없는 하위 명령을 조용히 list로 처리하면, 오타가 성공처럼 보인다.
   ctx.err(en
