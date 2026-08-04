@@ -12,6 +12,7 @@
 const readline = require("node:readline");
 const fs = require("node:fs");
 const path = require("node:path");
+const crypto = require("node:crypto");
 const pkgLib = require("../graph/package.cjs");
 
 function graphRows(ctx, db) {
@@ -286,6 +287,82 @@ function inspectPackage(ctx, filePath) {
   return 0;
 }
 
+function installPackage(ctx, filePath) {
+  const en = ctx.lang === "en";
+  const db = ctx.db();
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(path.resolve(filePath), "utf8"));
+  } catch (err) {
+    ctx.err(en ? `Could not read ${filePath}: ${err.message}` : `${filePath}을(를) 읽지 못했습니다: ${err.message}`);
+    return 1;
+  }
+  const problems = pkgLib.verifyPackage(parsed);
+  if (problems.length) {
+    ctx.err(en ? "This package cannot be installed:" : "이 패키지는 설치할 수 없습니다:");
+    for (const problem of problems) ctx.err(`  · ${problem}`);
+    return 1;
+  }
+  const manifest = parsed.manifest;
+  const existing = graphRows(ctx, db).find((row) => row.name === manifest.name);
+  if (existing) {
+    ctx.err(en
+      ? `An automation named "${manifest.name}" already exists. Rename or remove it first — this command never overwrites your work.`
+      : `"${manifest.name}" 이름의 자동화가 이미 있습니다. 이름을 바꾸거나 지운 뒤 다시 시도하세요 — 이 명령은 기존 작업을 덮어쓰지 않습니다.`);
+    return 1;
+  }
+
+  // 받는 사람 계정에는 아직 아무것도 채워지지 않았다. 켜진 채로 설치하면
+  // 빈 금고·없는 에이전트로 첫 스케줄에 바로 실패한다 — 꺼진 채로 들어온다(D14).
+  const checklist = pkgLib.bindingChecklist(parsed);
+  const target = manifest.dependencies?.agents?.[0];
+  const now = new Date().toISOString();
+  const id = `graph-${crypto.randomUUID()}`;
+  try {
+    db.prepare(
+      `INSERT INTO automations
+         (id, name, schedule, target_type, target_id, prompt_template, enabled, created_by, created_at, next_run_at, graph_json)
+       VALUES (?, ?, ?, ?, ?, ?, 0, 'user', ?, NULL, ?)`,
+    ).run(
+      id,
+      manifest.name,
+      manifest.trigger?.schedule || "daily-09:00",
+      target?.source === "hub" ? "hub" : "agent",
+      target?.slug || "builtin-agentlas-orchestrator",
+      manifest.name,
+      now,
+      JSON.stringify(parsed.graph),
+    );
+  } catch (err) {
+    ctx.err(en ? `Install failed: ${err.message}` : `설치하지 못했습니다: ${err.message}`);
+    return 1;
+  }
+
+  ctx.out(en
+    ? `Installed "${manifest.name}" — switched off until it is bound.`
+    : `"${manifest.name}"을(를) 설치했습니다 — 연결이 끝날 때까지 꺼진 상태입니다.`);
+  if (checklist.length) {
+    ctx.out(en ? "Fill these in the desktop app, then switch it on:" : "데스크탑 앱에서 아래를 채운 뒤 켜세요:");
+    for (const item of checklist) {
+      if (item.kind === "vault-key") ctx.out(`  · ${en ? "key" : "키"} ${item.key}`);
+      else if (item.kind === "agent") ctx.out(`  · ${en ? "agent" : "에이전트"} ${item.slug}${item.source === "hub" ? ctx.ui.dim(en ? " (borrowed from the network — costs credits)" : " (네트워크에서 빌림 — 크레딧 소모)") : ""}`);
+      else ctx.out(`  · MCP ${item.serverSlug}`);
+    }
+  }
+  const mutations = manifest.permissionsSummary?.mutationNodes ?? [];
+  if (mutations.length) {
+    ctx.out(en ? "It changes things outside at:" : "바깥을 바꾸는 지점:");
+    for (const m of mutations) ctx.out(`  · ${m.label}`);
+    ctx.out(ctx.ui.dim(en
+      ? "Those steps stop and ask before they run unless you set them to automatic."
+      : "그 단계들은 자동 허용으로 바꾸지 않는 한 실행 전에 멈추고 묻습니다."));
+  }
+  ctx.out(ctx.ui.dim(en
+    ? "Nothing runs until you switch it on. Try a simulation first."
+    : "켜기 전에는 아무것도 실행되지 않습니다. 먼저 시뮬레이션으로 돌려보세요."));
+  return 0;
+}
+
 async function run(ctx, args = []) {
   const en = ctx.lang === "en";
   const rest = args.filter((a) => a !== "-y" && a !== "--yes");
@@ -310,6 +387,13 @@ async function run(ctx, args = []) {
     const outPath = parts.length > 1 && /\.json$/i.test(parts[parts.length - 1]) ? parts.pop() : null;
     return exportGraph(ctx, parts.join(" ").trim(), outPath);
   }
+  if (sub === "install") {
+    if (!target) {
+      ctx.err(en ? "Usage: agentlas graph install <file>" : "사용법: agentlas graph install <파일>");
+      return 1;
+    }
+    return installPackage(ctx, target);
+  }
   if (sub === "inspect") {
     if (!target) {
       ctx.err(en ? "Usage: agentlas graph inspect <file>" : "사용법: agentlas graph inspect <파일>");
@@ -326,8 +410,8 @@ async function run(ctx, args = []) {
   }
   // 목록에 없는 하위 명령을 조용히 list로 처리하면, 오타가 성공처럼 보인다.
   ctx.err(en
-    ? `Unknown subcommand "${sub}". Try: list, show, run, export, inspect.`
-    : `모르는 하위 명령 "${sub}"입니다. list, show, run, export, inspect 중에서 고르세요.`);
+    ? `Unknown subcommand "${sub}". Try: list, show, run, export, inspect, install.`
+    : `모르는 하위 명령 "${sub}"입니다. list, show, run, export, inspect, install 중에서 고르세요.`);
   return 1;
 }
 
