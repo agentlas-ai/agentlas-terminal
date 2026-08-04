@@ -5,6 +5,7 @@ const HELP = `agentlas — the operating system for agents, in your terminal
 
   agentlas                 open the terminal (REPL)
   agentlas "<task>"        run once with this project's controller
+  graph new "<what you want run for you>"   build an automation by talking it through
 
 PROJECT WORK
   run [agent] [prompt]     project-first one-shot; exact agent is an explicit advanced override
@@ -39,7 +40,7 @@ ACCOUNT & OPS
   login | logout | whoami  Agentlas Cloud sign-in (browser flow)
   cloud <sub>              cloud assets: save|publish|package|list|restore|field-test
   automation <sub>         list|add|on|off|remove|run <id>|runs|daemon
-  graph <sub>              graphs: list|show|run|export <name>|inspect|install <file>
+  graph <sub>              new "<what you want>"|list|show|run <name>|export|inspect|install
   creds <sub> · env        credentials and shared env keys
   usage · telegram · mcp   local usage · telegram bindings · MCP servers (mcp probe <id>)
   multimodal               image/video/audio provider settings
