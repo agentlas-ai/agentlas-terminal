@@ -638,6 +638,15 @@ async function newGraph(ctx, request, flags) {
       for (const n of mutations) ctx.out(`  · ${n.label}`);
     }
     ctx.out("");
+    // 갈림길 방향은 코드가 검증할 수 없다 — 사람이 읽고 답해야 한다.
+    // 실측: 만들어진 갈림길 3개가 전부 거꾸로였고, 그림을 안 보면 알 수 없었다.
+    const branchLines = interview.describeBranches(bp, en ? "en" : "ko");
+    if (branchLines.length) {
+      ctx.out("");
+      ctx.out(en ? "Check the branches — is this the right way round?" : "갈림길이 이 방향이 맞나요?");
+      for (const line of branchLines) ctx.out(`  ${line}`);
+    }
+    ctx.out("");
     ctx.out(built.triggerType === "schedule"
       ? (en ? `Runs ${interview.humanSchedule(built.scheduleHuman, "en")}` : `${interview.humanSchedule(built.scheduleHuman, "ko")}에 실행`)
       : (en ? "Runs only when you give it a value." : "값을 넣을 때만 실행합니다."));

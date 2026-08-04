@@ -18,8 +18,11 @@ const MAX_INTERVIEW_ROUNDS = 6;
 const MAX_STEPS = 20;
 const MAX_REPEATS = 20;
 
-const OPS = new Set(["contains", "truthy", "falsy", "eq", "neq", "gt", "lt"]);
-const VALUE_OPS = new Set(["contains", "eq", "neq", "gt", "lt"]);
+// 갈림길이 쓸 수 있는 판단 방법. **커널이 실제로 실행하는 것과 같아야 한다.**
+// 예전엔 "neq"가 있었는데 커널은 "ne"만 실행했다 — 제품이 자기가 못 읽는 자동화를 저장했다.
+const CONDITION_OPS = ["truthy", "falsy", "eq", "ne", "gt", "lt", "contains"];
+const OPS = new Set(CONDITION_OPS);
+const VALUE_OPS = new Set(["contains", "eq", "ne", "gt", "lt"]);
 const VAR_RE = /^[A-Za-z_][\w-]*$/;
 
 function startInterview(request) {
@@ -78,9 +81,12 @@ const RULES = [
   '  · effect:"mutation" for anything that leaves the machine or changes a file.',
   "",
   'branches[] entries (optional): {"afterStep":<0-based>,"var":"<one word>",',
-  '  "op":"contains|truthy|falsy|eq|neq|gt|lt","value":"...",',
-  '  "yesStep":<index>,"noStep":<index>,"repeatStep":<index>,"maxRepeats":<1-20>}.',
-  "  · repeatStep goes BACK to an earlier step and REQUIRES maxRepeats.",
+  '  "op":"contains|truthy|falsy|eq|ne|gt|lt","value":"...",',
+  '  "yesStep":<index>,"noStep":<index>,',
+  '  "repeatStep":<index>,"repeatOn":"yes"|"no","maxRepeats":<1-20>}.',
+  "  · repeatStep goes BACK to an earlier step. It REQUIRES repeatOn and maxRepeats.",
+  "  · repeatOn says which side loops. Write the condition the way the person said it and",
+  "    put the loop on the side they meant — do not flip either one to make it fit.",
   "",
   "Ask at most 3 questions per turn. Never repeat a question id you already asked.",
 ].join("\n");
@@ -212,9 +218,36 @@ function validateBlueprint(bp) {
         why: "비교할 것이 없으면 갈림길이 판단하지 못하고 거기서 멈춥니다.",
       });
     }
+    // 앞 단계로 가는 연결은 이름이 무엇이든 **반복**이다. 상한이 없으면 커널이 실행을 거절한다.
+    for (const pair of [["yesStep", branch.yesStep], ["noStep", branch.noStep]]) {
+      const target = pair[1];
+      if (typeof target !== "number") continue;
+      if (target <= branch.afterStep && branch.repeatStep === undefined) {
+        push(`${at}의 "${pair[0] === "yesStep" ? "예" : "아니오"}" 쪽이 앞 단계로 되돌아가는데 반복 횟수가 없습니다.`, {
+          id: `branch-${branch.afterStep}-repeats`,
+          question: `${at}에서 되돌아가는 반복, 최대 몇 번까지 할까요?`,
+          why: "사람이 보지 않는 사이에 도는 자동화라, 멈출 지점이 없으면 실행하지 않습니다.",
+          choices: ["2번", "3번", "5번"],
+        });
+      }
+    }
     if (branch.repeatStep !== undefined) {
+      if (branch.repeatOn !== "yes" && branch.repeatOn !== "no") {
+        // 막기만 하면 인터뷰가 막다른 길이 된다. 방향은 사람이 말해야 하는 것이다(실측 3/3 뒤집힘).
+        const back = (steps[branch.repeatStep] && steps[branch.repeatStep].title) || "앞 단계";
+        const rule = branchLabel(branch);
+        push(`${at}가 어느 쪽으로 갈 때 되돌아가는지 정해지지 않았습니다.`, {
+          id: `branch-${branch.afterStep}-direction`,
+          question: `"${rule}" — 어느 쪽일 때 "${back}"부터 다시 할까요?`,
+          why: "이 방향이 뒤집히면 원하는 것과 정반대로 도는 자동화가 됩니다.",
+          choices: ["그렇다면 다시", "아니라면 다시"],
+        });
+      }
       if (!steps[branch.repeatStep]) push(`${at}의 되돌아갈 단계가 없습니다.`);
       if (branch.repeatStep > branch.afterStep) push(`${at}는 뒤쪽 단계로 되돌아갈 수 없습니다.`);
+      if (branch.repeatOn === "yes" ? branch.noStep === branch.repeatStep : branch.yesStep === branch.repeatStep) {
+        push(`${at}의 양쪽이 모두 같은 단계로 갑니다 — 갈림길이 아무것도 가르지 않습니다.`);
+      }
       const cap = branch.maxRepeats;
       if (typeof cap !== "number" || !Number.isFinite(cap) || cap < 1 || cap > MAX_REPEATS) {
         push(`${at}의 반복 횟수가 정해져 있지 않습니다.`, {
@@ -232,6 +265,34 @@ function validateBlueprint(bp) {
   return problems;
 }
 
+
+/**
+ * 갈림길이 실제로 어떻게 갈라지는지 사람 말로. 저장 전에 이걸로 확인을 받는다.
+ * 실측: 만들어진 갈림길 3개가 전부 방향이 거꾸로였는데 그림을 안 보면 알 수 없었다.
+ */
+function describeBranches(bp, locale) {
+  const ko = locale !== "en";
+  const lines = [];
+  const title = (index) => (typeof index === "number" && bp.steps[index] ? bp.steps[index].title : (ko ? "끝" : "the end"));
+  for (const branch of bp.branches || []) {
+    const rule = branchLabel(branch);
+    const repeatText = branch.repeatStep !== undefined
+      ? (ko ? `"${title(branch.repeatStep)}"부터 다시 (최대 ${branch.maxRepeats}번)` : `back to "${title(branch.repeatStep)}" (up to ${branch.maxRepeats}x)`)
+      : null;
+    const yes = repeatText && branch.repeatOn === "yes"
+      ? repeatText
+      : branch.yesStep !== undefined ? title(branch.yesStep) : title(branch.afterStep + 1);
+    const no = repeatText && branch.repeatOn !== "yes"
+      ? repeatText
+      : branch.noStep !== undefined ? title(branch.noStep) : title(branch.afterStep + 1);
+    const quote = (text) => (String(text).charAt(0) === '"' ? String(text) : `"${text}"`);
+    lines.push(ko
+      ? `${rule} → 그렇다면 ${quote(yes || "끝")}, 아니라면 ${quote(no)}`
+      : `${rule} → yes: ${quote(yes || "the end")}, no: ${quote(no)}`);
+  }
+  return lines;
+}
+
 function branchLabel(branch) {
   const shown = typeof branch.value === "string" ? `"${branch.value}"` : String(branch.value ?? "");
   switch (branch.op) {
@@ -239,7 +300,7 @@ function branchLabel(branch) {
     case "truthy": return `${branch.var}에 값이 있나?`;
     case "falsy": return `${branch.var}이(가) 비었나?`;
     case "eq": return `${branch.var}이(가) ${shown}인가?`;
-    case "neq": return `${branch.var}이(가) ${shown}이 아닌가?`;
+    case "ne": return `${branch.var}이(가) ${shown}이 아닌가?`;
     case "gt": return `${branch.var}이(가) ${shown}보다 큰가?`;
     case "lt": return `${branch.var}이(가) ${shown}보다 작은가?`;
     default: return `${branch.var} 확인`;
@@ -354,10 +415,15 @@ function buildGraphFromBlueprint(bp) {
       config: { var: branch.var, op: branch.op, ...(branch.value !== undefined ? { value: branch.value } : {}) },
     });
     link(stepId(index), branchId);
-    if (branch.yesStep !== undefined && bp.steps[branch.yesStep]) link(branchId, stepId(branch.yesStep), "true");
+    // 되돌아가는 쪽은 선언(repeatOn)대로 잇는다 — 거짓 쪽으로 고정하면 사람이 말한
+    // 방향과 반대인 자동화가 만들어진다(실측 3/3).
+    const repeatSide = branch.repeatStep !== undefined ? branch.repeatOn : undefined;
+    if (repeatSide === "yes") link(branchId, stepId(branch.repeatStep), "true", branch.maxRepeats);
+    else if (branch.yesStep !== undefined && bp.steps[branch.yesStep]) link(branchId, stepId(branch.yesStep), "true");
     else if (bp.steps[index + 1]) link(branchId, stepId(index + 1), "true");
-    if (branch.repeatStep !== undefined) link(branchId, stepId(branch.repeatStep), "false", branch.maxRepeats);
+    if (repeatSide === "no") link(branchId, stepId(branch.repeatStep), "false", branch.maxRepeats);
     else if (branch.noStep !== undefined && bp.steps[branch.noStep]) link(branchId, stepId(branch.noStep), "false");
+    else if (repeatSide === "yes" && bp.steps[index + 1]) link(branchId, stepId(index + 1), "false");
   });
 
   return {
@@ -459,5 +525,5 @@ function parseInterviewTurn(text, state) {
 module.exports = {
   BLUEPRINT_SCHEMA, MAX_QUESTIONS_PER_TURN, MAX_INTERVIEW_ROUNDS, MAX_REPEATS,
   startInterview, recordAnswers, buildInterviewPrompt, parseInterviewTurn, humanSchedule,
-  validateBlueprint, buildGraphFromBlueprint, branchLabel,
+  validateBlueprint, buildGraphFromBlueprint, branchLabel, describeBranches,
 };
