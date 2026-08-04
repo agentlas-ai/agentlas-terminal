@@ -501,6 +501,173 @@ async function runGraph(ctx, needle, flags) {
 }
 
 
+
+/**
+ * graph new — 자연어 한 문장에서 시작해, 만들 수 있을 만큼 알아낼 때까지 되묻고 그래프를 만든다.
+ *
+ * 두 가지를 코드가 강제한다(프롬프트 문구가 아니라):
+ *  · 모델은 **청사진만** 말한다. 노드와 연결은 buildGraphFromBlueprint 가 짓는다.
+ *  · 청사진이 검증을 못 넘으면 "완성"이 아니라 **질문**으로 되돌아간다.
+ * 그래서 실행 시각·바깥으로 나가는지·반복 상한은 지어내지지 않는다.
+ */
+async function newGraph(ctx, request, flags) {
+  const en = ctx.lang === "en";
+  const db = ctx.db();
+  if (!request) {
+    ctx.err(en
+      ? 'Say what you want automated, in your own words.\n  agentlas graph new "every morning give me a blog topic"'
+      : '무엇을 자동으로 하고 싶은지 그냥 말씀하시면 됩니다.\n  agentlas graph new "매일 아침 블로그 글감 하나 뽑아줘"');
+    return 1;
+  }
+  if (!process.stdin.isTTY && !flags.answers) {
+    ctx.err(en
+      ? "Building an automation is a conversation — run this in a terminal where it can ask you questions."
+      : "자동화를 만드는 일은 몇 가지를 여쭤보며 진행합니다. 대화가 가능한 터미널에서 실행해 주세요.");
+    return 1;
+  }
+
+  const interview = require("../graph/interview.cjs");
+  const { askModel } = require("../graph/ask-model.cjs");
+  let state = interview.startInterview(request);
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+  try {
+    ctx.out(ctx.ui.dim(en
+      ? "Working out what to build. I will ask a few things I should not guess."
+      : "무엇을 만들지 정리하는 중입니다. 제가 함부로 정하면 안 되는 것들만 여쭤볼게요."));
+
+    let built = null;
+    for (let round = 0; round < interview.MAX_INTERVIEW_ROUNDS; round += 1) {
+      const answer = await askModel(ctx, interview.buildInterviewPrompt(state), {});
+      if (!answer.ok) {
+        ctx.err(answer.reason);
+        ctx.err(ctx.ui.dim(answer.nextAction));
+        return 1;
+      }
+      const parsed = interview.parseInterviewTurn(answer.text, state);
+      if (!parsed.ok) {
+        ctx.err(parsed.reason);
+        ctx.err(ctx.ui.dim(parsed.nextAction));
+        return 1;
+      }
+      if (parsed.turn.kind === "blueprint") {
+        built = interview.buildGraphFromBlueprint(parsed.turn.blueprint);
+        if (!built.ok) {
+          // 여기 오면 파서와 빌더가 어긋난 것이다. 조용히 넘어가지 않는다.
+          ctx.err(en ? "Could not build it after all:" : "끝내 만들지 못했습니다:");
+          for (const p of built.problems) ctx.err(`  · ${p.reason}`);
+          return 1;
+        }
+        built.blueprint = parsed.turn.blueprint;
+        break;
+      }
+
+      // 질문 — 하나씩 묻는다. 한꺼번에 쏟으면 사람이 답을 포기한다.
+      ctx.out("");
+      const given = [];
+      for (const q of parsed.turn.questions) {
+        ctx.out(ctx.ui.bold(`  ${q.question}`));
+        if (q.why) ctx.out(ctx.ui.dim(`    ${q.why}`));
+        if (q.choices && q.choices.length) {
+          ctx.out(ctx.ui.dim(`    ${en ? "for example" : "예를 들면"}: ${q.choices.join(" / ")}`));
+        }
+        const text = await ask(rl, "  > ");
+        if (!text) {
+          ctx.err(en ? "Stopped. Nothing was saved." : "여기서 멈췄습니다. 저장된 것은 없습니다.");
+          return 1;
+        }
+        given.push({ questionId: q.id, question: q.question, answer: text });
+        ctx.out("");
+      }
+      state = interview.recordAnswers(state, given);
+    }
+
+    if (!built) {
+      ctx.err(en
+        ? "I asked as much as I should and still could not pin it down."
+        : "여쭤볼 만큼 여쭤봤는데도 정하지 못했습니다.");
+      ctx.err(ctx.ui.dim(en
+        ? "Try describing it in smaller pieces, one automation at a time."
+        : "한 번에 하나씩, 더 작게 나눠서 말씀해 주시면 다시 해보겠습니다."));
+      return 1;
+    }
+
+    // 저장 전에 만든 것을 보여주고 확인을 받는다. 자동화는 사람이 없는 동안 도는 것이라
+    // "만들어 뒀습니다"로 끝내면 안 된다.
+    const bp = built.blueprint;
+    ctx.out("");
+    ctx.out(ctx.ui.bold(bp.name));
+    ctx.out(ctx.ui.dim(`  ${bp.goal}`));
+    ctx.out("");
+    renderGraphTree(ctx, built.graph, en);
+    const mutations = built.graph.nodes.filter((n) => n.config && n.config.effect === "mutation");
+    if (mutations.length) {
+      ctx.out("");
+      ctx.out(en ? "Steps that go outside (locked to ask first):" : "바깥으로 나가는 단계 (실행 전에 확인하도록 잠급니다):");
+      for (const n of mutations) ctx.out(`  · ${n.label}`);
+    }
+    ctx.out("");
+    ctx.out(built.triggerType === "schedule"
+      ? (en ? `Runs on: ${built.scheduleHuman}` : `실행 시각: ${built.scheduleHuman}`)
+      : (en ? "Runs when you give it a value." : "값을 넣을 때마다 실행합니다."));
+
+    if (!flags.yes) {
+      const confirm = await ask(rl, en ? "\nSave this? [Y/n] " : "\n이대로 저장할까요? [Y/n] ");
+      if (/^n(o)?$/i.test(confirm)) {
+        ctx.out(en ? "Nothing was saved." : "저장하지 않았습니다.");
+        return 0;
+      }
+    }
+
+    // 이름이 겹치면 덮어쓰지 않는다.
+    const existing = graphRows(ctx, db).find((row) => row.name === bp.name);
+    const name = existing ? `${bp.name} (2)` : bp.name;
+    const target = pickDefaultAgent(ctx, db);
+    const id = `graph-${crypto.randomUUID()}`;
+    try {
+      db.prepare(
+        `INSERT INTO automations
+           (id, name, schedule, target_type, target_id, prompt_template, enabled, created_by, created_at, next_run_at, graph_json)
+         VALUES (?, ?, ?, 'agent', ?, ?, 0, 'user', ?, NULL, ?)`,
+      ).run(id, name, built.scheduleHuman, target, name, new Date().toISOString(), JSON.stringify(built.graph));
+    } catch (err) {
+      ctx.err(en ? `Could not save: ${err.message}` : `저장하지 못했습니다: ${err.message}`);
+      return 1;
+    }
+    ctx.out("");
+    ctx.out(en
+      ? `Saved "${name}" — switched off, so nothing runs yet.`
+      : `"${name}"을(를) 저장했습니다 — 꺼진 상태라 아직 아무것도 돌지 않습니다.`);
+    if (existing) {
+      ctx.out(ctx.ui.dim(en
+        ? `An automation named "${bp.name}" already existed, so this one was saved as "${name}".`
+        : `"${bp.name}" 이름이 이미 있어서 "${name}"(으)로 저장했습니다.`));
+    }
+    ctx.out(ctx.ui.dim(en ? "Look it over:" : "확인해 보세요:"));
+    ctx.out(`  agentlas graph show "${name}"`);
+    ctx.out(ctx.ui.dim(en ? "Turn it on when it looks right:" : "괜찮으면 켜세요:"));
+    ctx.out(`  agentlas automation on ${id}`);
+    return 0;
+  } finally {
+    rl.close();
+  }
+}
+
+/** 노드가 대상을 선언하지 않으면 자동화의 대상 에이전트를 상속한다. 없으면 기본 오케스트레이터. */
+function pickDefaultAgent(ctx, db) {
+  try {
+    if (!ctx.tableExists(db, "installed_agents")) return "builtin-agentlas-orchestrator";
+    const row = db.prepare(
+      "SELECT id FROM installed_agents WHERE id = 'builtin-agentlas-orchestrator' LIMIT 1",
+    ).get();
+    if (row) return row.id;
+    const any = db.prepare("SELECT id FROM installed_agents ORDER BY installed_at LIMIT 1").get();
+    return (any && any.id) || "builtin-agentlas-orchestrator";
+  } catch {
+    return "builtin-agentlas-orchestrator";
+  }
+}
+
 function exportGraph(ctx, needle, outPath) {
   const db = ctx.db();
   const rows = graphRows(ctx, db);
@@ -758,6 +925,7 @@ async function run(ctx, args = []) {
 
   if (sub === "help" || sub === "--help" || sub === "-h" || sub === "?") {
     ctx.out(ctx.ui.bold(en ? "agentlas graph — saved automations" : "agentlas graph — 저장된 자동화"));
+    ctx.out(en ? '  new "<what you want>"     build one by talking it through' : '  new "<하고 싶은 일>"       말로 설명하면 만들어 줍니다');
     ctx.out(en ? "  list                      what is saved" : "  list                      저장된 것 목록");
     ctx.out(en ? "  show \"<name>\"             steps, wiring, and problems" : "  show \"<이름>\"             단계·배선·문제점");
     ctx.out(en ? "  run \"<name>\" [--input \"<value>\"]  ask the desktop app to run it" : "  run \"<이름>\" [--input \"<값>\"]   데스크탑 앱에 실행을 요청");
@@ -769,6 +937,9 @@ async function run(ctx, args = []) {
       ? "-y skips the confirmation question. Graphs are built and edited in the desktop app."
       : "-y 를 붙이면 확인 질문을 건너뜁니다. 그래프를 만들고 고치는 일은 데스크탑 앱에서 합니다."));
     return 0;
+  }
+  if (sub === "new" || sub === "create" || sub === "add" || sub === "만들기") {
+    return newGraph(ctx, target, flags);
   }
   if (sub === "list" || sub === "ls") return listGraphs(ctx);
   if (sub === "show") {
@@ -812,8 +983,8 @@ async function run(ctx, args = []) {
   // 오타를 낸 게 아니라 **여기서 되는 일이 아니라는 사실**을 모르는 것이고,
   // 어디로 가야 하는지 말해 주지 않으면 목록만 보다 포기한다.
   const AUTHORING = new Set([
-    "create", "new", "add", "make", "edit", "update", "delete", "remove", "rename",
-    "enable", "disable", "on", "off", "만들기", "새로", "수정",
+    "make", "edit", "update", "delete", "remove", "rename",
+    "enable", "disable", "on", "off", "수정",
   ]);
   if (AUTHORING.has(sub)) {
     ctx.err(en
