@@ -10,15 +10,23 @@
  * 여기서는 컬럼을 만들지 않고, 없는 컬럼은 없는 대로 다룬다.
  */
 const readline = require("node:readline");
+const fs = require("node:fs");
+const path = require("node:path");
+const pkgLib = require("../graph/package.cjs");
 
 function graphRows(ctx, db) {
   if (!ctx.tableExists(db, "automations")) return [];
   const hasGraph = ctx.columnExists(db, "automations", "graph_json");
   const hasTriggerType = ctx.columnExists(db, "automations", "trigger_type");
+  const hasTarget = ctx.columnExists(db, "automations", "target_id");
   const cols = [
     "id", "name", "enabled", "next_run_at", "last_run_at",
     hasGraph ? "graph_json" : "NULL AS graph_json",
     hasTriggerType ? "trigger_type" : "NULL AS trigger_type",
+    // 노드가 ref를 선언하지 않으면 자동화의 대상 에이전트를 상속한다 — 패키지의
+    // 가장 중요한 의존성이 여기 있으므로 반드시 함께 읽는다.
+    hasTarget ? "target_type" : "NULL AS target_type",
+    hasTarget ? "target_id" : "NULL AS target_id",
   ].join(", ");
   return db.prepare(`SELECT ${cols} FROM automations ORDER BY name`).all();
 }
@@ -188,6 +196,96 @@ async function runGraph(ctx, needle, flags) {
   return 0;
 }
 
+
+function exportGraph(ctx, needle, outPath) {
+  const db = ctx.db();
+  const rows = graphRows(ctx, db);
+  const en = ctx.lang === "en";
+  const row = findGraph(rows, needle);
+  if (!row) {
+    ctx.err(en ? `No graph matches "${needle}".` : `"${needle}"와 맞는 그래프가 없습니다.`);
+    return 1;
+  }
+  const graph = parseGraph(row);
+  if (!graph) {
+    ctx.err(en
+      ? "This automation has no visual graph to export yet."
+      : "이 자동화에는 아직 내보낼 시각 그래프가 없습니다.");
+    return 1;
+  }
+  const built = pkgLib.buildPackage({ automation: row, graph });
+  if (built.blocked) {
+    // 지울 수 없는 비밀이 남았는데 내보내면, 사용자는 빠진 줄 알고 공유한다.
+    ctx.err(en
+      ? `Export stopped: ${built.blockers.length} value(s) look like credentials and cannot be blanked automatically.`
+      : `내보내기를 멈췄습니다: 자격증명처럼 보이는 값 ${built.blockers.length}건을 자동으로 빈칸 처리할 수 없습니다.`);
+    for (const blocker of built.blockers) {
+      ctx.err(`  · ${blocker.nodeId}.${blocker.field} — ${blocker.reason}`);
+      ctx.err(`    ${blocker.nextAction}`);
+    }
+    return 1;
+  }
+  const target = outPath || `${built.package.manifest.slug || "graph"}.agentgraph.json`;
+  fs.writeFileSync(path.resolve(target), JSON.stringify(built.package, null, 2) + "\n", "utf8");
+  ctx.out(en ? `Wrote ${target}` : `${target} 파일로 저장했습니다.`);
+  const findings = built.findings;
+  if (findings.length) {
+    ctx.out(ctx.ui.dim(en ? "Removed before packaging:" : "패키징 전에 지운 것:"));
+    for (const f of findings) ctx.out(ctx.ui.dim(`  · ${f.nodeId}.${f.field} — ${f.rule} (${f.action})`));
+  }
+  const blanks = built.package.manifest.vaultTemplate;
+  if (blanks.length) {
+    ctx.out(en ? "Whoever installs this must fill:" : "받는 사람이 채워야 하는 것:");
+    for (const b of blanks) ctx.out(`  · ${b.key}`);
+  }
+  const mutations = built.package.manifest.permissionsSummary.mutationNodes;
+  if (mutations.length) {
+    ctx.out(en ? "Steps that change something outside:" : "바깥을 바꾸는 단계:");
+    for (const m of mutations) ctx.out(`  · ${m.label}`);
+  }
+  return 0;
+}
+
+function inspectPackage(ctx, filePath) {
+  const en = ctx.lang === "en";
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(path.resolve(filePath), "utf8"));
+  } catch (err) {
+    ctx.err(en ? `Could not read ${filePath}: ${err.message}` : `${filePath}을(를) 읽지 못했습니다: ${err.message}`);
+    return 1;
+  }
+  const problems = pkgLib.verifyPackage(parsed);
+  if (problems.length) {
+    ctx.err(en ? "This package cannot be used:" : "이 패키지는 사용할 수 없습니다:");
+    for (const problem of problems) ctx.err(`  · ${problem}`);
+    return 1;
+  }
+  const manifest = parsed.manifest;
+  ctx.out(`${ctx.ui.bold(manifest.name)}  ${ctx.ui.dim(`${manifest.version} · ${parsed.graph.nodes.length} ${en ? "steps" : "단계"}`)}`);
+  const checklist = pkgLib.bindingChecklist(parsed);
+  if (!checklist.length) {
+    ctx.out(en ? "Nothing to fill in — it can run as is." : "채울 것이 없습니다 — 그대로 실행할 수 있습니다.");
+  } else {
+    ctx.out(en ? "Before it can run, fill in:" : "실행하려면 먼저 채워야 합니다:");
+    for (const item of checklist) {
+      if (item.kind === "vault-key") ctx.out(`  · ${en ? "key" : "키"} ${item.key}`);
+      else if (item.kind === "agent") ctx.out(`  · ${en ? "agent" : "에이전트"} ${item.slug}${item.source === "hub" ? ctx.ui.dim(en ? " (borrowed from the network)" : " (네트워크에서 빌림)") : ""}`);
+      else ctx.out(`  · MCP ${item.serverSlug}`);
+    }
+  }
+  const mutations = manifest.permissionsSummary?.mutationNodes ?? [];
+  if (mutations.length) {
+    ctx.out(en ? "It changes things outside at:" : "바깥을 바꾸는 지점:");
+    for (const m of mutations) ctx.out(`  · ${m.label}`);
+  }
+  // 설치는 아직 데스크탑이 소유한다 — 여기서 "설치했다"고 말하지 않는다.
+  ctx.out(ctx.ui.dim(en
+    ? "Installing a package is done in the desktop app; this command only reads it."
+    : "패키지 설치는 데스크탑 앱에서 합니다. 이 명령은 읽기만 합니다."));
+  return 0;
+}
+
 async function run(ctx, args = []) {
   const en = ctx.lang === "en";
   const rest = args.filter((a) => a !== "-y" && a !== "--yes");
@@ -203,6 +301,22 @@ async function run(ctx, args = []) {
     }
     return showGraph(ctx, target);
   }
+  if (sub === "export") {
+    if (!target) {
+      ctx.err(en ? "Usage: agentlas graph export \"<name>\" [file]" : "사용법: agentlas graph export \"<이름>\" [파일]");
+      return 1;
+    }
+    const parts = rest.slice(1);
+    const outPath = parts.length > 1 && /\.json$/i.test(parts[parts.length - 1]) ? parts.pop() : null;
+    return exportGraph(ctx, parts.join(" ").trim(), outPath);
+  }
+  if (sub === "inspect") {
+    if (!target) {
+      ctx.err(en ? "Usage: agentlas graph inspect <file>" : "사용법: agentlas graph inspect <파일>");
+      return 1;
+    }
+    return inspectPackage(ctx, target);
+  }
   if (sub === "run") {
     if (!target) {
       ctx.err(en ? "Usage: agentlas graph run \"<name>\"" : "사용법: agentlas graph run \"<이름>\"");
@@ -212,8 +326,8 @@ async function run(ctx, args = []) {
   }
   // 목록에 없는 하위 명령을 조용히 list로 처리하면, 오타가 성공처럼 보인다.
   ctx.err(en
-    ? `Unknown subcommand "${sub}". Try: list, show, run.`
-    : `모르는 하위 명령 "${sub}"입니다. list, show, run 중에서 고르세요.`);
+    ? `Unknown subcommand "${sub}". Try: list, show, run, export, inspect.`
+    : `모르는 하위 명령 "${sub}"입니다. list, show, run, export, inspect 중에서 고르세요.`);
   return 1;
 }
 
