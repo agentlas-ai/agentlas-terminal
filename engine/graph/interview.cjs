@@ -640,6 +640,29 @@ function normalizeQuestions(candidates, state) {
  * 모델 출력을 읽는다.
  * ★핵심: 모델이 blueprint를 냈더라도 **검증을 통과하지 못하면 질문으로 되돌린다.**
  */
+/**
+ * 다시 만든 청사진이 앞 시도보다 작아졌는가. 데스크탑과 같은 계약.
+ * 프롬프트로 "지우지 마라"고 부탁하는 것만으로는 안 된다 — 검증 오류는 그 단계를
+ * 지우면 사라지고, 지워진 청사진은 검증을 통과한다.
+ */
+function weakenedAgainstLastAttempt(blueprint, state) {
+  const attempts = (state && state.attempts) || [];
+  const last = attempts[attempts.length - 1];
+  if (!last) return null;
+  const steps = Array.isArray(blueprint.steps) ? blueprint.steps.length : 0;
+  const complainedAboutSize = (last.problems || []).some((p) => p.includes("단계가") && p.includes("개입니다"));
+  if (typeof last.stepCount === "number" && steps < last.stepCount && !complainedAboutSize) {
+    return `앞서 만든 것에는 단계가 ${last.stepCount}개였는데 이번에는 ${steps}개입니다.`
+      + " 문제를 그 단계를 지워서 고치면, 부탁하신 일이 사라진 채로 만들어집니다.";
+  }
+  const trigger = blueprint.trigger && blueprint.trigger.kind;
+  if (last.triggerKind && trigger && trigger !== last.triggerKind) {
+    return `시작 방식이 "${last.triggerKind}"에서 "${trigger}"로 바뀌었습니다.`
+      + " 언제 시작할지는 말씀하신 대로 두어야 합니다.";
+  }
+  return null;
+}
+
 function parseInterviewTurn(text, state) {
   const raw = firstJsonObject(text);
   if (!raw) return unreadable();
@@ -663,13 +686,27 @@ function parseInterviewTurn(text, state) {
   if (!blueprint || typeof blueprint !== "object") return unreadable();
   const normalized = { ...blueprint, schema: BLUEPRINT_SCHEMA };
   const problems = validateBlueprint(normalized);
-  if (problems.length === 0) return { ok: true, turn: { kind: "blueprint", blueprint: normalized } };
+  if (problems.length === 0) {
+    // 검증은 통과했다. 그런데 **앞 시도보다 작아졌으면** 문제를 지워서 고친 것이다 —
+    // 지워진 청사진은 검증을 통과하고, 사람이 부탁한 일이 사라진 채로 만들어진다.
+    const weakened = weakenedAgainstLastAttempt(normalized, state);
+    if (weakened) return { ok: true, turn: { kind: "retry", problems: [weakened] } };
+    return { ok: true, turn: { kind: "blueprint", blueprint: normalized } };
+  }
   const questions = normalizeQuestions(problems.map((p) => p.ask).filter(Boolean), state);
   if (questions.length) return { ok: true, turn: { kind: "ask", questions } };
   // 물어서 채울 수 없는 문제 — 사람이 답을 안 준 게 아니라 **모델이 형식을 틀린** 것이다.
   // 그걸 "구체적으로 적어 주세요"로 떠넘기면 막다른 길이 된다: 무엇이 틀렸는지 사람은
   // 모르고, 우리는 안다. 무엇이 틀렸는지 돌려주고 스스로 고치게 한다.
-  return { ok: true, turn: { kind: "retry", problems: problems.map((p) => p.reason) } };
+  return {
+    ok: true,
+    turn: {
+      kind: "retry",
+      problems: problems.map((p) => p.reason),
+      stepCount: Array.isArray(normalized.steps) ? normalized.steps.length : 0,
+      triggerKind: normalized.trigger && normalized.trigger.kind,
+    },
+  };
 }
 
 /** 모델이 스스로 고쳐 볼 기회의 상한. 데스크탑과 같은 값. */
@@ -678,6 +715,6 @@ const MAX_SELF_CORRECTIONS = 2;
 module.exports = {
   BLUEPRINT_SCHEMA, MAX_QUESTIONS_PER_TURN, MAX_INTERVIEW_ROUNDS, MAX_REPEATS,
   startInterview, recordAnswers, buildInterviewPrompt, parseInterviewTurn, humanSchedule,
-  MAX_SELF_CORRECTIONS,
+  MAX_SELF_CORRECTIONS, weakenedAgainstLastAttempt,
   validateBlueprint, buildGraphFromBlueprint, branchLabel, describeBranches,
 };

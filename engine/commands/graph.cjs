@@ -590,7 +590,10 @@ async function newGraph(ctx, request, flags) {
       //   정해진 횟수만큼 스스로 고치게 한다. "구체적으로 적어 주세요"로 떠넘기면
       //   막다른 길이 된다: 무엇이 틀렸는지 사람은 모르고, 우리는 안다.
       if (parsed.turn.kind === "retry") {
-        state.attempts = [...(state.attempts || []), { round, problems: parsed.turn.problems }];
+        state.attempts = [...(state.attempts || []), {
+          round, problems: parsed.turn.problems,
+          stepCount: parsed.turn.stepCount, triggerKind: parsed.turn.triggerKind,
+        }];
         if ((state.attempts || []).length > interview.MAX_SELF_CORRECTIONS) {
           const tried = [...new Set(state.attempts.flatMap((a) => a.problems))].slice(0, 3);
           ctx.err(en
