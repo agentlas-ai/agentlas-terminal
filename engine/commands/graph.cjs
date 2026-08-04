@@ -318,16 +318,35 @@ function conditionRule(node, en) {
 }
 
 /** 내부 타입 이름을 그대로 보여주지 않는다 — 사용자는 "condition"이 뭔지 알 이유가 없다. */
+/**
+ * 노드 종류를 사람 말로.
+ *
+ * ★터미널은 데스크탑과 **같은 SQLite**를 읽는데 스키마 판이 뒤따라온다(터미널 부트스트랩
+ * v86 vs 데스크탑 v89). 그래서 이 버전이 모르는 노드 종류를 만나는 것은 **고장이 아니라
+ * 정상**이다. 실제로 `eval` 이 이 표에 빠져 있었고, 원문이 그대로 찍혀서 마치 아는 종류인
+ * 것처럼 보였다.
+ *
+ * 규칙(레지스트리 06 §2.5): 모르는 값은 **그 항목만** 강등하고 원문을 보존해 보여준다.
+ * 목록을 버리거나 에러로 올리지 않는다 — 이 플랫폼은 모르는 코드 1개에 후보집합을 통째로
+ * 폐기한 사고를 겪었다.
+ */
+const vocabulary = require("../graph/vocabulary.generated.cjs");
+
 function kindWord(type, en) {
   const ko = {
     trigger: "시작", agent: "에이전트", tool: "도구", action: "행동",
-    condition: "갈림길", transform: "변환", output: "출력",
+    condition: "갈림길", eval: "검증", transform: "변환", output: "출력",
   };
   const enWords = {
     trigger: "start", agent: "agent", tool: "tool", action: "action",
-    condition: "branch", transform: "transform", output: "output",
+    condition: "branch", eval: "check", transform: "transform", output: "output",
   };
-  return (en ? enWords[type] : ko[type]) || type;
+  const read = vocabulary.readEnum(type, vocabulary.GRAPH_NODE_KINDS);
+  if ("unknown" in read) {
+    // 이 버전이 모르는 종류 — 지어내지 않고 그렇다고 말한다(원문 보존).
+    return vocabulary.degradedLabel(read, en ? "en" : "ko");
+  }
+  return (en ? enWords[read.known] : ko[read.known]) || read.known;
 }
 
 /**
