@@ -21,6 +21,42 @@ const MAX_REPEATS = 20;
 // 갈림길이 쓸 수 있는 판단 방법. **커널이 실제로 실행하는 것과 같아야 한다.**
 // 예전엔 "neq"가 있었는데 커널은 "ne"만 실행했다 — 제품이 자기가 못 읽는 자동화를 저장했다.
 const CONDITION_OPS = ["truthy", "falsy", "eq", "ne", "gt", "lt", "contains"];
+
+// ── 도구 결합 ──────────────────────────────────────────────────────────────
+// 데스크탑 shared/graph-tool-binding.ts 와 **같은 명부**여야 한다. 어긋나면 터미널에서
+// 만든 그래프가 데스크탑에서 켜지지 않는다(요구가 다르게 읽히므로).
+const PROVIDER_CATALOG = [
+  { id: "google_calendar", label: "Google 캘린더", group: "google", capabilities: ["calendar.events.list", "calendar.events.create"] },
+  { id: "google_sheets", label: "Google 스프레드시트", group: "google", capabilities: ["sheets.rows.read", "sheets.rows.append"] },
+  { id: "gmail", label: "Gmail", group: "google", capabilities: ["mail.messages.list", "mail.messages.send"] },
+  { id: "outlook_calendar", label: "Outlook 캘린더", group: "microsoft", capabilities: ["calendar.events.list", "calendar.events.create"] },
+  { id: "outlook_mail", label: "Outlook 메일", group: "microsoft", capabilities: ["mail.messages.list", "mail.messages.send"] },
+  { id: "apple_calendar", label: "Apple 캘린더", group: "apple", capabilities: ["calendar.events.list", "calendar.events.create"] },
+  { id: "slack", label: "Slack", group: "slack", capabilities: ["chat.messages.post", "chat.messages.list"] },
+  { id: "notion", label: "Notion", group: "notion", capabilities: ["docs.pages.read", "docs.pages.create", "docs.database.query"] },
+  { id: "github", label: "GitHub", group: "github", capabilities: ["code.issues.list", "code.issues.create", "code.repo.read"] },
+  { id: "linear", label: "Linear", group: "atlassian", capabilities: ["tasks.issues.list", "tasks.issues.create"] },
+  { id: "local_files", label: "이 컴퓨터의 파일", group: "local", capabilities: ["files.read", "files.write"] },
+  { id: "web_search", label: "웹 검색", group: "other", capabilities: ["web.search"] },
+];
+const CAPABILITIES = [...new Set(PROVIDER_CATALOG.flatMap((p) => p.capabilities))].sort();
+const findProvider = (id) => (id ? PROVIDER_CATALOG.find((p) => p.id === id) || null : null);
+const providersFor = (capability) => PROVIDER_CATALOG.filter((p) => p.capabilities.includes(capability));
+
+const CAPABILITY_LABEL = {
+  "calendar.events.list": "캘린더 일정 읽기", "calendar.events.create": "캘린더에 일정 넣기",
+  "sheets.rows.read": "스프레드시트 읽기", "sheets.rows.append": "스프레드시트에 추가",
+  "mail.messages.list": "메일 읽기", "mail.messages.send": "메일 보내기",
+  "chat.messages.post": "채팅에 올리기", "chat.messages.list": "채팅 읽기",
+  "docs.pages.read": "문서 읽기", "docs.pages.create": "문서 만들기",
+  "docs.database.query": "문서 데이터베이스 조회",
+  "code.issues.list": "이슈 읽기", "code.issues.create": "이슈 만들기", "code.repo.read": "코드 읽기",
+  "tasks.issues.list": "할 일 읽기", "tasks.issues.create": "할 일 만들기",
+  "files.read": "이 컴퓨터 파일 읽기", "files.write": "이 컴퓨터에 파일 쓰기",
+  "web.search": "웹 검색",
+};
+const CAPABILITY_CHOICES = CAPABILITIES.map((id) => CAPABILITY_LABEL[id] || id);
+
 const OPS = new Set(CONDITION_OPS);
 const VALUE_OPS = new Set(["contains", "eq", "ne", "gt", "lt"]);
 const VAR_RE = /^[A-Za-z_][\w-]*$/;
@@ -79,16 +115,38 @@ const RULES = [
   "  · a step that reads {{x}} must list x in consumes, and some earlier step (or the input trigger)",
   '    must declare produces:"x".',
   '  · effect:"mutation" for anything that leaves the machine or changes a file.',
+  '  · uses: [{"capability":"<from the list below>","provider":"<id>"|null}] — the outside',
+  '    services this step needs. Pick the capability from the closed list; if the person named a',
+  '    service, put its id in provider, otherwise leave provider null and it will be asked later.',
+  '    A step that only writes text needs no `uses` at all.',
+  '  · Never invent a capability or provider id. If what they want is not in the list, say so',
+  '    in the step instruction and leave `uses` out rather than inventing one.',
+  '  · Do NOT ask whether an account is already connected, and do not mention API keys, tokens,',
+  '    logins, or authentication. The product checks connections itself and asks separately.',
+  '    Ask only WHICH service, and only when it genuinely changes what gets built.',
   "",
   'branches[] entries (optional): {"afterStep":<0-based>,"var":"<one word>",',
   '  "op":"contains|truthy|falsy|eq|ne|gt|lt","value":"...",',
   '  "yesStep":<index>,"noStep":<index>,',
   '  "repeatStep":<index>,"repeatOn":"yes"|"no","maxRepeats":<1-20>}.',
   "  · repeatStep goes BACK to an earlier step. It REQUIRES repeatOn and maxRepeats.",
+  "",
+  "checks[] (optional, but REQUIRED whenever a branch repeats):",
+  '  {"afterStep":<0-based>,"subject":"<a value some step produces>",',
+  '   "criteria":"<what makes it good enough, in the person\'s words>","produces":"<one word>"}',
+  "  · A check is a SEPARATE step that judges the result against the criteria and produces",
+  '    "pass" or "fail". A repeat must branch on that verdict — never on words inside the',
+  "    result itself. A step that grades its own output is not a check.",
+  "  · So: to repeat until good enough, add a check after the step, then branch on",
+  '    {"var":"<the check\'s produces>","op":"eq","value":"fail","repeatOn":"yes",...}.',
+  '  · Ask the person what "good enough" means for them. Do not invent the criteria.',
   "  · repeatOn says which side loops. Write the condition the way the person said it and",
   "    put the loop on the side they meant — do not flip either one to make it fit.",
   "",
   "Ask at most 3 questions per turn. Never repeat a question id you already asked.",
+  "",
+  `capability must be one of: ${CAPABILITIES.join(", ")}`,
+  `provider must be one of: ${PROVIDER_CATALOG.map((p) => p.id).join(", ")}`,
 ].join("\n");
 
 function buildInterviewPrompt(state) {
@@ -200,11 +258,65 @@ function validateBlueprint(bp) {
         });
       }
     }
+
+    for (const use of step.uses || []) {
+      if (!use || typeof use !== "object") { push(`${at}의 도구 선언을 읽지 못했습니다.`); continue; }
+      if (!CAPABILITIES.includes(use.capability)) {
+        push(`${at}가 이 제품이 모르는 도구("${use.capability}")를 쓰려고 합니다.`, {
+          id: `step-${index}-capability`,
+          question: `"${step.title || at}" 단계는 어떤 서비스를 씁니까?`,
+          why: "이 제품이 다룰 수 있는 것으로 골라야 실제로 연결할 수 있습니다.",
+          choices: CAPABILITY_CHOICES,
+        });
+        continue;
+      }
+      if (use.provider && !findProvider(use.provider)) {
+        push(`${at}가 이 제품이 모르는 서비스("${use.provider}")를 가리킵니다.`, {
+          id: `step-${index}-provider`,
+          question: `"${step.title || at}" 단계는 어느 서비스를 씁니까?`,
+          why: "서비스가 정해져야 어느 계정을 연결할지 알 수 있습니다.",
+          choices: providersFor(use.capability).map((p) => p.label),
+        });
+      }
+    }
     if (step.produces) {
       if (!VAR_RE.test(step.produces)) push(`${at}의 결과 이름 "${step.produces}"은(는) 쓸 수 없습니다.`);
       else produced.add(step.produces);
     }
   });
+
+
+  // 검증 단계
+  const checkVerdicts = new Set();
+  for (const check of bp.checks || []) {
+    const at = `${(check.afterStep ?? 0) + 1}번째 단계 뒤의 검증`;
+    if (!steps[check.afterStep]) { push(`${at}가 없는 단계를 가리킵니다.`); continue; }
+    if (!check.subject || !produced.has(check.subject)) {
+      push(`${at}가 볼 "${check.subject}" 값을 아무도 만들지 않습니다.`);
+    }
+    if (!String(check.criteria || "").trim()) {
+      push(`${at}의 통과 기준이 없습니다.`, {
+        id: `check-${check.afterStep}-criteria`,
+        question: `"${(steps[check.afterStep] && steps[check.afterStep].title) || at}" 결과가 어떤 상태여야 통과인가요?`,
+        why: "기준이 없으면 무엇을 보고 판정할지 정할 수 없습니다.",
+      });
+    }
+    const name = String(check.produces || "").trim() || `check${check.afterStep + 1}_verdict`;
+    produced.add(name);
+    checkVerdicts.add(name);
+  }
+
+  // 반복이 있는데 검증이 없으면 "마음에 들 때까지"를 글자 찾기로 흉내 내게 된다(실측).
+  for (const branch of bp.branches || []) {
+    if (branch.repeatStep === undefined) continue;
+    if (!checkVerdicts.has(branch.var)) {
+      push(`${(branch.afterStep ?? 0) + 1}번째 단계 뒤의 반복이 검증 결과가 아니라 "${branch.var}"의 내용을 보고 돌지 말지 정합니다.`, {
+        id: `branch-${branch.afterStep}-needs-check`,
+        question: `"${(steps[branch.repeatStep] && steps[branch.repeatStep].title) || "앞 단계"}"를 다시 할지 말지, 무엇을 보고 정할까요? 통과 기준을 한 문장으로 적어 주세요.`,
+        why: "만든 단계가 자기 결과에 붙인 글자를 보고 정하면, 자기가 자기를 채점하는 셈이 됩니다.",
+      });
+    }
+  }
 
   for (const branch of bp.branches || []) {
     const at = `${(branch.afterStep ?? 0) + 1}번째 단계 뒤의 갈림길`;
@@ -387,12 +499,22 @@ function buildGraphFromBlueprint(bp) {
         ...(step.effect === "mutation" ? { approval: "ask" } : {}),
         ...(step.produces ? { produces: step.produces } : {}),
         ...(step.consumes && step.consumes.length ? { consumes: step.consumes[0] } : {}),
+        ...(step.uses && step.uses.length
+          ? { needs: step.uses.map((use) => ({
+              capability: use.capability,
+              provider: use.provider && findProvider(use.provider) ? use.provider : null,
+              required: true,
+            })) }
+          : {}),
       },
     });
   });
 
   const branchAt = new Map();
   for (const branch of bp.branches || []) branchAt.set(branch.afterStep, branch);
+  const checkAt = new Map();
+  for (const check of bp.checks || []) checkAt.set(check.afterStep, check);
+  const checkId = (i) => `verify${i + 1}`;
   let seq = 0;
   const link = (source, target, handle, maxIterations) => {
     edges.push({
@@ -402,10 +524,25 @@ function buildGraphFromBlueprint(bp) {
     });
   };
   link("start", stepId(0));
+  for (const check of bp.checks || []) {
+    if (!bp.steps[check.afterStep]) continue;
+    nodes.push({
+      id: checkId(check.afterStep), type: "eval",
+      label: `검증: ${String(check.criteria).slice(0, 40)}`,
+      position: { x: column(check.afterStep + 1) + 70, y: 0 },
+      config: {
+        subject: check.subject, criteria: check.criteria,
+        produces: String(check.produces || "").trim() || `check${check.afterStep + 1}_verdict`,
+      },
+    });
+  }
   bp.steps.forEach((_step, index) => {
+    const check = checkAt.get(index);
     const branch = branchAt.get(index);
+    const afterStepId = check ? checkId(index) : stepId(index);
+    if (check) link(stepId(index), checkId(index));
     if (!branch) {
-      if (bp.steps[index + 1]) link(stepId(index), stepId(index + 1));
+      if (bp.steps[index + 1]) link(afterStepId, stepId(index + 1));
       return;
     }
     const branchId = `check${index + 1}`;
@@ -414,7 +551,7 @@ function buildGraphFromBlueprint(bp) {
       position: { x: column(index + 1) + 140, y: 0 },
       config: { var: branch.var, op: branch.op, ...(branch.value !== undefined ? { value: branch.value } : {}) },
     });
-    link(stepId(index), branchId);
+    link(afterStepId, branchId);
     // 되돌아가는 쪽은 선언(repeatOn)대로 잇는다 — 거짓 쪽으로 고정하면 사람이 말한
     // 방향과 반대인 자동화가 만들어진다(실측 3/3).
     const repeatSide = branch.repeatStep !== undefined ? branch.repeatOn : undefined;
