@@ -10,7 +10,12 @@
  * 조용히 빈 문자열을 주면 파서가 "읽지 못했습니다"로 바꿔 원인이 사라진다.
  */
 const nativeHost = require("../agentlas-native-host.cjs");
-const { resolveRuntime } = require("../runtimes/resolve.cjs");
+// ★resolveRuntime(resolve.cjs)이 아니라 resolveRuntimeForAgent를 쓴다.
+// resolveRuntime은 `role`을 **아예 읽지 않아서**, 사용자가 모델 역할에 gemini를 지정해 둬도
+// active_runtime(codex)으로 흘렀다(실측: 인터뷰가 사용자가 고르지 않은 런타임에서 돌았고,
+// 그쪽 사용 한도가 소진돼 있었다). 사용자가 정한 역할 사다리를 따르는 쪽이 정본이다.
+const { resolveRuntimeForAgent } = require("../runtimes/overrides.cjs");
+const { listAvailableCliRuntimes } = require("../runtimes/detect.cjs");
 
 /**
  * native-host가 부르는 이벤트 싱크 — 인터뷰 중에는 화면에 아무것도 흘리지 않는다.
@@ -35,67 +40,92 @@ function quietSink() {
 }
 
 /**
- * @returns {Promise<{ok:true,text:string}|{ok:false,reason:string,nextAction:string}>}
+ * 인터뷰 한 턴을 묻는다.
+ *
+ * 사용자가 정한 역할(orchestrator)을 **먼저** 쓴다. 그게 실패하면 조용히 포기하지 않고
+ * 이 컴퓨터에 있는 다른 런타임으로 이어서 물어보되, **어느 것이 답했는지 말한다** —
+ * 조용히 다른 모델로 바꾸면 사용자는 자기가 고른 모델이 돈 줄 안다.
+ * 전부 실패하면 각각의 사유를 그대로 돌려준다(하나로 뭉뚱그리면 원인이 사라진다).
+ *
+ * @returns {Promise<{ok:true,text:string,runtime:string,fellBackFrom?:string}
+ *                  |{ok:false,reason:string,nextAction:string}>}
  */
 async function askModel(ctx, prompt, opts = {}) {
-  let runtime;
+  const db = ctx.db();
+  let primary = null;
   try {
-    runtime = resolveRuntime({
-      db: ctx.db(),
+    primary = resolveRuntimeForAgent({
+      db,
       prefs: ctx.prefs,
       role: "orchestrator",
       ...(opts.runtime ? { explicit: opts.runtime } : {}),
+      ...(opts.model ? { model: opts.model } : {}),
     });
   } catch (err) {
-    return {
-      ok: false,
-      reason: `실행할 AI 런타임을 찾지 못했습니다: ${(err && err.message) || err}`,
-      nextAction: "`agentlas doctor`로 런타임 상태를 확인한 뒤 다시 시도해 주세요.",
-    };
+    primary = null;
+    var primaryError = (err && err.message) || String(err);
   }
-  if (!runtime || !runtime.kind || !runtime.bin) {
+
+  // 시도 순서: 사용자가 정한 것 먼저, 그다음 이 컴퓨터에 있는 나머지.
+  const candidates = [];
+  if (primary && primary.kind && primary.bin) candidates.push(primary);
+  if (!opts.runtime) {
+    // listAvailableCliRuntimes()는 문자열이 아니라 {kind, bin, path} 객체를 돌려준다.
+    // 문자열로 읽으면 후보가 하나도 안 쌓여 폴백이 통째로 죽는다(실측).
+    for (const found of listAvailableCliRuntimes()) {
+      if (!found || !found.kind || !found.path) continue;
+      if (candidates.some((c) => c.kind === found.kind)) continue;
+      candidates.push({ kind: found.kind, bin: found.path });
+    }
+  }
+  if (!candidates.length) {
     return {
       ok: false,
-      reason: "실행할 AI 런타임이 준비되지 않았습니다.",
+      reason: primaryError
+        ? `실행할 AI 런타임을 찾지 못했습니다: ${primaryError}`
+        : "이 컴퓨터에서 쓸 수 있는 AI 런타임이 없습니다.",
       nextAction: "`agentlas doctor`로 런타임 상태를 확인한 뒤 다시 시도해 주세요.",
     };
   }
 
-  let res;
-  try {
-    res = await nativeHost.runNativeTurn({
-      kind: runtime.kind,
-      bin: runtime.bin,
-      ui: quietSink(),
-      cwd: opts.cwd || process.cwd(),
-      prompt,
-      // 읽기 권한 — 인터뷰는 사람에게 묻고 형식을 만드는 일이라 파일을 바꿀 이유가 없다.
-      permission: "read",
-      session: {},
-      model: runtime.model,
-      effort: runtime.effort,
-      mcpServers: [],
-      mcpAllowlistMode: "exact",
-    });
-  } catch (err) {
-    return {
-      ok: false,
-      reason: `AI를 부르지 못했습니다: ${(err && err.message) || err}`,
-      nextAction: "잠시 뒤 다시 시도하거나 `agentlas doctor`로 상태를 확인해 주세요.",
-    };
+  const failures = [];
+  for (const runtime of candidates) {
+    let res;
+    try {
+      res = await nativeHost.runNativeTurn({
+        kind: runtime.kind,
+        bin: runtime.bin,
+        ui: quietSink(),
+        cwd: opts.cwd || process.cwd(),
+        prompt,
+        // 읽기 권한 — 인터뷰는 사람에게 묻고 형식을 만드는 일이라 파일을 바꿀 이유가 없다.
+        permission: "read",
+        session: {},
+        model: runtime.model,
+        effort: runtime.effort,
+        mcpServers: [],
+        mcpAllowlistMode: "exact",
+      });
+    } catch (err) {
+      failures.push(`${runtime.kind}: ${(err && err.message) || err}`);
+      continue;
+    }
+    const text = String((res && (res.finalText || res.text)) || "");
+    if (text.trim()) {
+      const out = { ok: true, text, runtime: runtime.kind };
+      if (candidates[0] !== runtime) out.fellBackFrom = candidates[0].kind;
+      return out;
+    }
+    failures.push(res && res.error
+      ? `${runtime.kind}: ${String(res.error).replace(/\s+/g, " ").slice(0, 200)}`
+      : `${runtime.kind}: 빈 답`);
   }
 
-  const text = String((res && (res.finalText || res.text)) || "");
-  if (!text.trim()) {
-    return {
-      ok: false,
-      reason: res && res.error
-        ? `AI가 답하지 못했습니다: ${String(res.error).slice(0, 300)}`
-        : "AI가 빈 답을 돌려줬습니다.",
-      nextAction: "다시 시도해 주세요. 계속되면 `agentlas doctor`로 런타임을 확인해 주세요.",
-    };
-  }
-  return { ok: true, text };
+  return {
+    ok: false,
+    reason: `AI가 답하지 못했습니다.\n  ${failures.join("\n  ")}`,
+    nextAction: "`agentlas doctor`로 런타임 상태를 확인하거나, 로그인이 필요한 런타임에 다시 로그인해 주세요.",
+  };
 }
 
 module.exports = { askModel };

@@ -246,9 +246,54 @@ function branchLabel(branch) {
   }
 }
 
+/**
+ * 실행 시점을 사람 말로. `0 8 * * 1-5`나 `daily-08:00`은 저장 형식이지 사람이 읽을 말이 아니다.
+ * 데스크탑 shared/graph-blueprint.ts 의 humanSchedule 과 같은 규칙이어야 한다.
+ */
+function humanSchedule(schedule, locale) {
+  const ko = locale !== "en";
+  const raw = String(schedule == null ? "" : schedule).trim();
+  if (!raw || raw === "manual") return ko ? "값을 넣을 때만" : "only when you start it";
+  const daily = /^daily-(\d{2}):(\d{2})$/.exec(raw);
+  if (daily) return ko ? `매일 ${hhmm(daily[1], daily[2], "ko")}` : `every day at ${daily[1]}:${daily[2]}`;
+  const parts = raw.split(/\s+/);
+  if (parts.length === 5) {
+    const min = parts[0], hour = parts[1], dom = parts[2], mon = parts[3], dow = parts[4];
+    if (/^\d+$/.test(min) && /^\d+$/.test(hour) && mon === "*") {
+      const at = hhmm(String(hour).padStart(2, "0"), String(min).padStart(2, "0"), ko ? "ko" : "en");
+      const when = dowPhrase(dow, dom, ko ? "ko" : "en");
+      return ko ? `${when} ${at}` : `${when} at ${String(hour).padStart(2, "0")}:${String(min).padStart(2, "0")}`;
+    }
+  }
+  return raw;
+}
+
+function hhmm(hour, minute, locale) {
+  if (locale !== "ko") return `${hour}:${minute}`;
+  const h = Number(hour);
+  const period = h < 12 ? "오전" : "오후";
+  const shown = h % 12 === 0 ? 12 : h % 12;
+  return minute === "00" ? `${period} ${shown}시` : `${period} ${shown}시 ${Number(minute)}분`;
+}
+
+const DOW_KO = { "0": "일", "1": "월", "2": "화", "3": "수", "4": "목", "5": "금", "6": "토", "7": "일" };
+
+function dowPhrase(dow, dom, locale) {
+  const ko = locale === "ko";
+  if (dow === "*" && dom === "*") return ko ? "매일" : "every day";
+  if (dow === "1-5") return ko ? "평일(월~금)" : "every weekday";
+  if (dow === "0,6" || dow === "6,0") return ko ? "주말" : "every weekend";
+  if (/^\d$/.test(dow)) return ko ? `매주 ${DOW_KO[dow]}요일` : `every week on day ${dow}`;
+  if (dow === "*" && /^\d+$/.test(dom)) return ko ? `매월 ${Number(dom)}일` : `on day ${dom} of each month`;
+  if (/^[\d,]+$/.test(dow)) {
+    const days = dow.split(",").map((d) => DOW_KO[d] || d).join("·");
+    return ko ? `매주 ${days}요일` : `on ${dow}`;
+  }
+  return ko ? "정해진 때" : "on schedule";
+}
+
 function scheduleLabel(schedule) {
-  const daily = /^daily-(\d{2}):(\d{2})$/.exec(String(schedule || ""));
-  return daily ? `매일 ${daily[1]}:${daily[2]}` : String(schedule || "");
+  return humanSchedule(schedule, "ko");
 }
 
 /** 청사진 → 그래프. **노드 id와 연결은 전부 여기서 만든다.** */
@@ -413,6 +458,6 @@ function parseInterviewTurn(text, state) {
 
 module.exports = {
   BLUEPRINT_SCHEMA, MAX_QUESTIONS_PER_TURN, MAX_INTERVIEW_ROUNDS, MAX_REPEATS,
-  startInterview, recordAnswers, buildInterviewPrompt, parseInterviewTurn,
+  startInterview, recordAnswers, buildInterviewPrompt, parseInterviewTurn, humanSchedule,
   validateBlueprint, buildGraphFromBlueprint, branchLabel,
 };

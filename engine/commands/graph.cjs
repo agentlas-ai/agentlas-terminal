@@ -545,12 +545,21 @@ async function newGraph(ctx, request, flags) {
       : "무엇을 만들지 정리합니다. 임의로 정하면 안 되는 것만 여쭙겠습니다."));
 
     let built = null;
+    let announcedFallback = false;
     for (let round = 0; round < interview.MAX_INTERVIEW_ROUNDS; round += 1) {
       const answer = await askModel(ctx, interview.buildInterviewPrompt(state), {});
       if (!answer.ok) {
         ctx.err(answer.reason);
         ctx.err(ctx.ui.dim(answer.nextAction));
         return 1;
+      }
+      // 고른 런타임이 안 돌아 다른 것으로 넘어갔으면 말한다 — 조용히 바꾸면
+      // 사용자는 자기가 고른 모델이 만든 줄 안다.
+      if (answer.fellBackFrom && !announcedFallback) {
+        announcedFallback = true;
+        ctx.out(ctx.ui.dim(en
+          ? `${answer.fellBackFrom} did not answer, so ${answer.runtime} is building this.`
+          : `${answer.fellBackFrom}이(가) 응답하지 않아 ${answer.runtime}(으)로 진행합니다.`));
       }
       const parsed = interview.parseInterviewTurn(answer.text, state);
       if (!parsed.ok) {
@@ -630,7 +639,7 @@ async function newGraph(ctx, request, flags) {
     }
     ctx.out("");
     ctx.out(built.triggerType === "schedule"
-      ? scheduleSentence(built.scheduleHuman, en)
+      ? (en ? `Runs ${interview.humanSchedule(built.scheduleHuman, "en")}` : `${interview.humanSchedule(built.scheduleHuman, "ko")}에 실행`)
       : (en ? "Runs only when you give it a value." : "값을 넣을 때만 실행합니다."));
 
     if (!flags.yes) {
@@ -684,20 +693,6 @@ function readAllLines() {
     process.stdin.on("end", () => resolve(buf.split(/\r?\n/).map((l) => l.trim())));
     process.stdin.on("error", () => resolve([]));
   });
-}
-
-/** 실행 시각을 사람 말로. "daily-08:00"은 제품 내부 토큰이지 사용자가 읽을 말이 아니다. */
-function scheduleSentence(schedule, en) {
-  const daily = /^daily-(\d{2}):(\d{2})$/.exec(String(schedule || ""));
-  if (daily) return en ? `Runs daily at ${daily[1]}:${daily[2]}` : `매일 ${daily[1]}:${daily[2]}에 실행`;
-  const weekly = /^weekly-([a-z]{3})-(\d{2}):(\d{2})$/.exec(String(schedule || ""));
-  if (weekly) {
-    const days = { mon: "월", tue: "화", wed: "수", thu: "목", fri: "금", sat: "토", sun: "일" };
-    return en
-      ? `Runs every ${weekly[1]} at ${weekly[2]}:${weekly[3]}`
-      : `매주 ${days[weekly[1]] || weekly[1]}요일 ${weekly[2]}:${weekly[3]}에 실행`;
-  }
-  return en ? `Runs on: ${schedule}` : `실행 시점: ${schedule}`;
 }
 
 /** 노드가 대상을 선언하지 않으면 자동화의 대상 에이전트를 상속한다. 없으면 기본 오케스트레이터. */
@@ -912,7 +907,8 @@ function installPackage(ctx, filePath, flags = {}) {
       ? "This package did not carry a run time, so none was set. Pick one in the desktop app before switching it on."
       : "이 패키지에는 실행 시각이 실려 있지 않아 시각을 정하지 않았습니다. 데스크탑 앱에서 시각을 정한 뒤 켜세요.");
   } else if (packagedSchedule) {
-    ctx.out(ctx.ui.dim(en ? `Runs on: ${packagedSchedule}` : `실행 시각: ${packagedSchedule}`));
+    const sched = require("../graph/interview.cjs").humanSchedule;
+    ctx.out(ctx.ui.dim(en ? `Runs ${sched(packagedSchedule, "en")}` : `${sched(packagedSchedule, "ko")}에 실행`));
   }
   // 이미 가진 것까지 "채우라"고 하면, 사용자는 채울 수 없는 항목을 앞에 두고 멈춘다.
   // (실측: 원본과 똑같은 에이전트를 쓰는 사본인데도 그 에이전트를 채우라고 요구했고,
