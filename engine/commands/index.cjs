@@ -12,6 +12,7 @@ const path = require("node:path");
 const COMMANDS = {
   version: () => require("./version.cjs"),
   list: () => require("./list.cjs"),
+  graph: () => require("./graph.cjs"),
   doctor: () => require("./doctor.cjs"),
   mcp: () => require("./mcp.cjs"),
   help: () => require("./help.cjs"),

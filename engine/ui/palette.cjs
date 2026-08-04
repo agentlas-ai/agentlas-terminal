@@ -21,6 +21,7 @@ const SLASH_COMMANDS = [
   { command: "/rm", args: "<n>", ko: "세션 제거", en: "Remove a session" },
   { command: "/agents", args: "", ko: "설치 에이전트 목록", en: "List installed agents" },
   { command: "/list", args: "", ko: "설치 에이전트 목록", en: "List installed agents" },
+  { command: "/graph", args: "[run <이름>]", ko: "저장된 자동화 그래프", en: "Saved automation graphs" },
   { command: "/mcp", args: "", ko: "MCP 서버 목록", en: "MCP servers" },
   { command: "/doctor", args: "", ko: "런타임·데이터 점검", en: "Health check" },
   { command: "/runtime", args: "<kind>", ko: "새 세션 런타임 지정", en: "Set runtime for new sessions" },
