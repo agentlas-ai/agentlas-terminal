@@ -15,6 +15,8 @@ const RESET = "\x1b[0m";
 
 function colorEnabled() {
   if (process.env.NO_COLOR != null && process.env.NO_COLOR !== "") return false;
+  // clig.dev: TERM=dumb 인 터미널(에디터 내장 셸, 일부 CI)은 ANSI를 렌더하지 못한다.
+  if (process.env.TERM === "dumb") return false;
   if (process.env.FORCE_COLOR === "1" || process.env.FORCE_COLOR === "true") return true;
   if (process.env.AGENTLAS_NO_COLOR === "1") return false;
   return !!process.stdout.isTTY;

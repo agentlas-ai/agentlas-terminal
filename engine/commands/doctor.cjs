@@ -24,8 +24,27 @@ function roleDetail(selection, role, en) {
   ].filter(Boolean).join(" · ");
 }
 
-function run(ctx) {
+function run(ctx, args = []) {
   const en = ctx.lang === "en";
+  // clig.dev: 스크립트 소비자를 위한 기계 계약. 사람용 줄과 같은 사실만 담는다.
+  if (args.includes("--json")) {
+    const db = ctx.db();
+    const clis = listAvailableCliRuntimes().map((c) => ({ kind: c.kind, path: c.path, authEvidence: runtimeAuthEvidence(c.kind).status }));
+    const active = activeRuntimeRow(db);
+    return (() => {
+      ctx.out(JSON.stringify({
+        database: { path: dbPath(), exists: fs.existsSync(dbPath()) },
+        runtimes: clis,
+        activeRuntime: active ? { ...active, authEvidence: runtimeAuthEvidence(active.kind).status } : null,
+        modelRoles: {
+          orchestrator: resolvedModelRole(db, "orchestrator"),
+          worker: resolvedModelRole(db, "worker"),
+        },
+        cloudSession: Boolean(process.env.AGENTLAS_SESSION) || fs.existsSync(path.join(userDataDir(), "auth", "cli-session.v1.json")),
+      }, null, 2));
+      return 0;
+    })();
+  }
   let failures = 0;
   let warnings = 0;
   const ok = (label, detail) => ctx.out(`  ${ctx.ui.green("✓")} ${label}${detail ? ctx.ui.dim(" — " + detail) : ""}`);

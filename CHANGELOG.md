@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.30 — 2026-08-06
+
+CLI-conventions hardening, measured against clig.dev and first-class CLIs.
+
+- A closed pipe is a reader saying stop: `agentlas … | head` no longer crashes with EPIPE.
+- Unexpected crashes now print a one-line summary and a pre-filled GitHub issue URL, not just a raw stack.
+- `TERM=dumb` disables ANSI colors (editor shells, some CI).
+- Secrets stop landing in shell history: `creds save --value -` reads the secret from stdin;
+  passing it via argv now prints an exposure notice.
+- `list --json`, `doctor --json`, `roles --json` — machine contracts for scripts.
+- Workforce staffing survives transient API failures: a typed transient error
+  (connection closed mid-response, timeouts, overload) on a no-authority/read-only stage
+  is retried exactly once; write-capable stages are never retried. A 40-minute, 2.1M-token
+  live run previously died on the final re-verification call for exactly this.
+- New gate: clig-conventions-contract; retry contract added to the workforce runtime gate.
+
 ## 1.0.29 — 2026-08-05
 
 Terminal-wide audit release. Every command was executed for real; what follows fixes what that audit found.

@@ -2120,6 +2120,27 @@ function create(deps = {}) {
     tokenLedger.push({ role: role || "stage", runtime: runtimeKind || "?", model: modelPin || null, input, output, cached });
   }
 
+  /*
+   * 일시 API 오류 1회 재시도 (실측 2026-08-05: 4슬롯·2.1M 토큰 편성이 마지막
+   * 재검증 호출의 "Connection closed mid-response" 하나로 전멸).
+   * 재시도의 근거는 부수효과 부재가 아니라 **일시 오류의 기계 표식**이고,
+   * 부수효과가 가능한 write 권한 단계는 표식이 있어도 재시도하지 않는다
+   * (자동화 스케줄러와 같은 원칙). D.runModel 주입·CLI 캡처·API 백엔드
+   * 세 경로 모두 이 관문을 지난다 — 하니스가 단위로 검증할 수 있는 이유.
+   */
+  const TRANSIENT_MODEL_ERROR_RE = /Connection closed mid-response|"terminal_reason":"api_error"|ECONNRESET|ETIMEDOUT|socket hang up|overloaded_error/;
+  async function withTransientModelRetry(authorityMode, invoke) {
+    try {
+      return await invoke();
+    } catch (error) {
+      const replaySafeAuthority = authorityMode === "no-authority" || authorityMode === "read-only";
+      const transient = TRANSIENT_MODEL_ERROR_RE.test(String((error && error.message) || error));
+      if (!replaySafeAuthority || !transient) throw error;
+      process.stderr.write(`workforce: transient api error on a ${authorityMode} stage — retrying once\n`);
+      return invoke();
+    }
+  }
+
   async function runModel(runtime, system, prompt, context) {
     const invocation = stageInvocation(runtime, context);
     const executionRuntime = invocation.executionRuntime;
@@ -2134,7 +2155,7 @@ function create(deps = {}) {
       ? `${system}\n\n${localContextSlice}`
       : system;
     if (typeof D.runModel === "function") {
-      return normalizeModelResult(await D.runModel({
+      return withTransientModelRetry(context.authorityMode || "no-authority", async () => normalizeModelResult(await D.runModel({
         runtime: executionRuntime,
         system: effectiveSystem,
         prompt,
@@ -2145,7 +2166,7 @@ function create(deps = {}) {
           modelPin: invocation.modelPin,
           effortPin: invocation.effort,
         },
-      }));
+      })));
     }
     if (executionRuntime.mode === "cli") {
       const authorityMode = context.authorityMode || "no-authority";
@@ -2174,7 +2195,7 @@ function create(deps = {}) {
         }
         noteIsolationWeakness(executionRuntime.kind, invocation.role);
       }
-      const captured = normalizeModelResult(await D.captureRuntime(executionRuntime.kind, effectiveSystem, prompt, {
+      const captureOnce = async () => normalizeModelResult(await D.captureRuntime(executionRuntime.kind, effectiveSystem, prompt, {
         cwd: context.cwd,
         env: context.env,
         permission: context.permission,
@@ -2187,16 +2208,17 @@ function create(deps = {}) {
         outputLimitBytes: authorityMode === "read-only" ? 24 * 1024 * 1024 : undefined,
         envelope: true,
       }));
+      const captured = await withTransientModelRetry(authorityMode, captureOnce);
       recordStageTokens(invocation.role, executionRuntime.kind, invocation.modelPin, captured.usage);
       return captured;
     }
-    const viaApi = normalizeModelResult(await D.runApi(
+    const viaApi = await withTransientModelRetry(context.authorityMode || "no-authority", async () => normalizeModelResult(await D.runApi(
       executionRuntime.backend,
       invocation.modelPin,
       effectiveSystem,
       prompt,
       { effort: invocation.effort, envelope: true },
-    ));
+    )));
     recordStageTokens(invocation.role, executionRuntime.backend, invocation.modelPin, viaApi.usage);
     return viaApi;
   }

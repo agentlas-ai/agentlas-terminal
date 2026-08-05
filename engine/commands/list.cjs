@@ -24,7 +24,7 @@ function roleRuntimeLabel(selection, role, en) {
   return bits.join(" ");
 }
 
-function run(ctx) {
+function run(ctx, args = []) {
   const db = ctx.db();
   // 프라이버시 정책(웹 전용/백그라운드 제외)은 registry가 소유한다 — 직접 SQL 금지.
   const agents = listAgents(db).map((a) => ({
@@ -33,6 +33,15 @@ function run(ctx) {
   const firms = ctx.tableExists(db, "firms")
     ? db.prepare("SELECT id, slug, name FROM firms ORDER BY name").all()
     : [];
+
+  // clig.dev: 스크립트 소비자는 사람용 표를 파싱하게 두지 말 것 — --json 은
+  // 사람용 출력과 같은 사실을 기계 계약으로 준다.
+  if (args.includes("--json")) {
+    const orchestrator = resolvedModelRole(db, "orchestrator");
+    const worker = resolvedModelRole(db, "worker");
+    ctx.out(JSON.stringify({ agents, firms, modelRoles: { orchestrator, worker } }, null, 2));
+    return 0;
+  }
 
   const en = ctx.lang === "en";
   ctx.out(ctx.ui.bold(en ? "Installed agents" : "설치된 에이전트"));

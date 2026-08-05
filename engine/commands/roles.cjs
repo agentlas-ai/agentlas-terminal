@@ -35,9 +35,17 @@ function fmt(selection, en) {
   return bits.filter(Boolean).join(" ");
 }
 
-function show(ctx) {
+function show(ctx, args = []) {
   const en = ctx.lang === "en";
   const db = ctx.db();
+  if (args.includes("--json")) {
+    ctx.out(JSON.stringify({
+      orchestrator: resolvedModelRole(db, "orchestrator"),
+      worker: resolvedModelRole(db, "worker"),
+      pools: { orchestrator: roleMembers(db, "orchestrator"), worker: roleMembers(db, "worker") },
+    }, null, 2));
+    return 0;
+  }
   ctx.out(ctx.ui.bold(en ? "Model roles" : "모델 역할"));
   for (const role of ["orchestrator", "worker"]) {
     const resolved = resolvedModelRole(db, role);
@@ -170,7 +178,7 @@ function set(ctx, args) {
 function run(ctx, args = []) {
   const en = ctx.lang === "en";
   const [sub, ...rest] = args;
-  if (!sub || sub === "show" || sub === "list") return show(ctx);
+  if (!sub || sub === "show" || sub === "list" || sub === "--json") return show(ctx, sub === "--json" ? ["--json"] : rest);
   if (sub === "set") return set(ctx, rest);
   if (sub === "help" || sub === "--help" || sub === "-h") {
     // SELF_HELP_COMMANDS 계약: --help 는 스텁이 아니라 실제 안내여야 한다.

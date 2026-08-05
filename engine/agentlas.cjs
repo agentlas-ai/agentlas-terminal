@@ -29,6 +29,31 @@ for (const stream of [process.stdout, process.stderr]) {
   });
 }
 
+/*
+ * 예상 못 한 크래시의 마지막 예의 (clig.dev: unexpected error에는 디버그 정보와
+ * 버그 리포트 경로를, 리포트는 미리 채워진 URL로 손쉽게).
+ * 예전에는 Node 기본 동작(원시 스택트레이스)이 그대로 사용자에게 쏟아졌다 —
+ * EPIPE 크래시(1.0.29 실측)가 정확히 그 모습이었다. 스택은 진단에 필요하므로
+ * 숨기지 않되, 한 줄 요약과 이슈 URL(제목 미리 채움)을 함께 준다.
+ * 종료 코드는 관례대로 1. 여기서 복구를 시도하지 않는다(crash-only).
+ */
+function reportCrash(kind, error) {
+  const message = String((error && error.stack) || error);
+  const title = encodeURIComponent(`crash: ${String((error && error.message) || error).slice(0, 100)}`);
+  process.stderr.write([
+    "",
+    `agentlas hit an unexpected error (${kind}).`,
+    message,
+    "",
+    `Report it (pre-filled): https://github.com/agentlas-ai/agentlas-terminal/issues/new?title=${title}`,
+    `Include: your command, agentlas ${(() => { try { return require("./agentlas-banner.cjs").readVersion(); } catch { return "?"; } })()}, node ${process.version}, ${process.platform}.`,
+    "",
+  ].join("\n"));
+  process.exit(1);
+}
+process.on("uncaughtException", (error) => reportCrash("uncaughtException", error));
+process.on("unhandledRejection", (error) => reportCrash("unhandledRejection", error));
+
 const { openDb, seedBuiltins, tableExists, columnExists } = require("./core/db.cjs");
 const { userDataDir } = require("./core/paths.cjs");
 const { loadPrefs } = require("./agentlas-config.cjs");

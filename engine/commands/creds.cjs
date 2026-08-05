@@ -191,8 +191,22 @@ async function run(ctx, args) {
   }
   const f = parseCredFlags(args.slice(1));
   const key = typeof f.key === "string" ? f.key.trim() : "";
-  const value = f.value === undefined || f.value === true ? "" : String(f.value);
-  if (!key || !value) return fail("creds save requires --key and --value");
+  let value = f.value === undefined || f.value === true ? "" : String(f.value);
+  /*
+   * 비밀은 argv에 실리면 안 된다(clig.dev: never read secrets from flags) —
+   * 셸 히스토리와 `ps` 출력에 평문으로 남는다. `--value -` 는 stdin에서 읽는다:
+   *   printf '%s' "$SECRET" | agentlas creds save --key X --value -
+   * argv로 직접 준 경우는 기존 사용을 깨지 않되, 노출 사실을 그 자리에서 알린다.
+   */
+  if (value === "-") {
+    value = fs.readFileSync(0, "utf8").replace(/\r?\n$/, "");
+    if (!value) return fail("creds save --value - expected the secret on stdin, but stdin was empty");
+  } else if (value) {
+    ctx.err(ctx.lang === "ko"
+      ? "참고: --value 로 준 비밀은 셸 히스토리·ps 에 남습니다. 다음부터는 stdin 을 쓰세요: printf '%s' \"$SECRET\" | agentlas creds save --key X --value -"
+      : "Note: a secret passed via --value lands in shell history and `ps`. Prefer stdin next time: printf '%s' \"$SECRET\" | agentlas creds save --key X --value -");
+  }
+  if (!key || !value) return fail("creds save requires --key and --value (use `--value -` to read the secret from stdin)");
   const provider = typeof f.provider === "string" && f.provider ? f.provider : key;
   const project = typeof f.project === "string" && f.project ? f.project : activeProjectPath(ctx.db());
   const targets = [];
