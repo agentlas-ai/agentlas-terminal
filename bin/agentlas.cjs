@@ -18,6 +18,21 @@
  */
 "use strict";
 
+/*
+ * EPIPE 방어 — 발행본 실설치 검증에서 발견(2026-08-06): `agentlas version | head -1`
+ * 처럼 파이프 소비자가 먼저 닫히면 stdout write가 EPIPE를 던져 스택트레이스로
+ * 크래시했다. `| head` `| less` `| grep -m1`은 CLI의 일상 사용 패턴이다.
+ * 파이프 단절은 오류가 아니라 "그만 읽겠다"는 신호 — 조용히 성공 종료한다.
+ * (시나리오 게이트가 못 잡았던 이유: spawnSync는 파이프를 끝까지 읽는다.
+ *  test/user-scenarios-contract.cjs 의 파이프 시나리오가 이 계약을 잠근다.)
+ */
+for (const stream of [process.stdout, process.stderr]) {
+  stream.on("error", (error) => {
+    if (error && error.code === "EPIPE") process.exit(0);
+    throw error;
+  });
+}
+
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");

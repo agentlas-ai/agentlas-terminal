@@ -14,6 +14,21 @@
  *   ctx.out/err       stdout/stderr 한 줄 출력
  *   ctx.tableExists / ctx.columnExists
  */
+/*
+ * EPIPE 방어 — 발행본 1.0.29 실설치 검증에서 발견(2026-08-06):
+ * `agentlas version | head -1` 처럼 파이프 소비자가 먼저 닫히면 stdout write가
+ * EPIPE를 던져 스택트레이스로 크래시했다(실측: version.cjs → ctx.out → EPIPE).
+ * `| head` `| less` `| grep -m1` 은 CLI의 일상 사용 패턴이고, 파이프 단절은
+ * 오류가 아니라 "그만 읽겠다"는 신호다 — 조용히 성공 종료한다. 런처(bin)는
+ * 엔진을 stdio:"inherit" 로 spawn 하므로 이 방어는 엔진 프로세스에 있어야 한다.
+ */
+for (const stream of [process.stdout, process.stderr]) {
+  stream.on("error", (error) => {
+    if (error && error.code === "EPIPE") process.exit(0);
+    throw error;
+  });
+}
+
 const { openDb, seedBuiltins, tableExists, columnExists } = require("./core/db.cjs");
 const { userDataDir } = require("./core/paths.cjs");
 const { loadPrefs } = require("./agentlas-config.cjs");
