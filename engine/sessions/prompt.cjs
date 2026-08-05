@@ -190,6 +190,22 @@ function augmentSystem(db, baseSystem, ctx, withEmitter, request = "") {
   if (connectionSkill) sys += "\n\n" + connectionSkill;
   const mem = cliMemoryContext(db, ctx && ctx.projectPath, ctx && ctx.agentId, request);
   if (mem) sys += "\n\n" + mem;
+  // 도구 접근 고지 — 터미널에는 이게 아예 없었다. 도구가 붙지 않은 턴에서 CLI는 아무
+  // 말도 하지 않았고, 에이전트는 "이 기계엔 도구가 없다"고 단정하거나 없는 도구를
+  // 불렀다. Desktop `shared/tool-access-notice.ts`와 같은 문장을 낸다(패리티 테스트로 고정).
+  //
+  // ★메모리 블록보다 **앞**에 둔다. 메모리 코어 예산은 `## Memory` 이후를 잘라서 재므로
+  // (test/memory-prompt-budget.cjs), 뒤에 붙이면 도구 고지가 메모리 예산으로 잘못 계산된다.
+  // 고지는 메모리 블록의 일부가 아니다.
+  try {
+    const { buildToolAccessNotice } = require("../tools/access-notice.cjs");
+    sys += "\n\n" + buildToolAccessNotice({
+      availableTools: (ctx && Array.isArray(ctx.availableTools)) ? ctx.availableTools : [],
+      // 터미널은 Hub 카탈로그를 hephaestus-network MCP로만 본다. 그 서버가 이번 턴에
+      // 붙지 않았으면 "찾아보라"고 말하면 안 된다 — 부를 수 없는 도구를 안내하는 셈이다.
+      hubCatalogAvailable: Boolean(ctx && ctx.hubCatalogAvailable),
+    });
+  } catch { /* 고지 실패가 턴을 막지 않는다 */ }
   if (withEmitter) {
     sys += "\n\n" + memoryEmitterPromptFor(request, arch, ctx && ctx.turnId, ctx && ctx.permission);
     const credentialReminder = credentialIndexReminderFor(request);

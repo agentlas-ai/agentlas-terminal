@@ -205,12 +205,21 @@ class Session extends EventEmitter {
     try {
       const { augmentSystem } = require("./prompt.cjs");
       const projectPath = governedTurn ? governedTurn.projectPath : memoryTurn.initializedProjectPath(this.cwd);
+      // 이번 턴에 실제로 붙는 도구를 고지에 넘긴다. 권한이 낮아 목록을 읽지 않는 턴은
+      // 빈 배열이 되고, 고지는 "붙은 도구가 없다"고 정확히 말한다 — 침묵하지 않는다.
+      const consentedServers = this._consentedMcpServers();
+      const toolNames = consentedServers
+        .map((server) => String((server && (server.name || server.id)) || "").trim())
+        .filter(Boolean);
       systemPrompt = augmentSystem(this.db, systemPrompt, {
         lang: this.lang,
         projectPath,
         agentId: this.agent.id,
         turnId: governedTurn && governedTurn.memoryTurn.turnId,
         permission: this.permission,
+        availableTools: toolNames,
+        // Hub 카탈로그는 hephaestus-network MCP를 통해서만 보인다.
+        hubCatalogAvailable: toolNames.some((name) => /hephaestus[-_]?network|agentlas/i.test(name)),
       }, true, prompt);
     } catch { /* 프롬프트 증강 실패는 턴을 막지 않는다 — 원 프롬프트로 진행 */ }
 

@@ -8,7 +8,8 @@
   "scripts": {
     "smoke": "sh test/smoke.sh",
     "test:release-contracts": "npm run smoke",
-    "sync:architecture": "node scripts/sync-architecture-from-desktop.cjs"
+    "sync:architecture": "node scripts/sync-architecture-from-desktop.cjs",
+    "test:tool-access-notice-parity": "node test/tool-access-notice-parity.cjs"
   },
   "engines": {
     "node": ">=20"
