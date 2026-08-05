@@ -48,8 +48,9 @@ ACCOUNT & OPS
   version · help
 
 IN-REPL (agentlas → interactive, Orca multi-session)
-  /spawn <agent> [task] · /sessions · /tree · /s <n> · /steer <n> <msg> ·
-  /kill <n> · /rm <n> · /broadcast <msg> · /runtime · /model · /effort · /permission
+  /sessions · /tree · /s <n> | /switch <n> · /kill <n> · /rm <n>
+  /runtime <kind> · /model <id> · /effort <level> · /permission <level>   (applies to new sessions)
+  every command above also works as a slash command (/graph, /search, /automation, …) — /help lists them all
   typing during a running turn queues steering; ctrl-c interrupts the turn
 
 Options: -p|--print · --runtime claude-code|codex|gemini · --model <exact-id> ·
