@@ -53,62 +53,64 @@ function computeDepths(graph) {
   return depth;
 }
 
-/** 한 띠(band)에 넣을 컬럼 수 — 데스크탑 columnsPerBand와 같은 식. */
-function columnsPerBand(totalCols) {
-  if (totalCols <= 4) return totalCols;
-  return Math.max(4, Math.ceil(Math.sqrt(totalCols * 2)));
+/** 한 줄기(strip)에 넣을 **행** 수 — 데스크탑 rowsPerStrip과 같은 식. */
+function rowsPerStrip(totalRows) {
+  if (totalRows <= 5) return totalRows;
+  return Math.max(5, Math.ceil(Math.sqrt(totalRows * 2)));
 }
 
+/** @deprecated 가로 배치 시절 이름. */
+const columnsPerBand = rowsPerStrip;
+
 /**
- * 그래프를 결정적 사행(蛇行) 배치로 재배치한 새 노드 배열.
- * 긴 사슬은 띠로 접어 좌→우 / 우→좌로 번갈아 흐르고(뱀 모양), 같은 컬럼은 세로 분산.
- * (일직선은 14단계에서 폭 4,000px가 되어 아무도 못 읽었다 — 실측 항목 3.)
+ * 그래프를 결정적 **세로 사행(蛇行)** 배치로 재배치한 새 노드 배열(데스크탑과 같은 규칙).
+ * 위→아래로 흐르다 줄기가 차면 오른쪽으로 접고, 다음 줄기는 아래→위로 올라간다.
+ * (오너 결정 2026-08-06: 사람이 순서를 읽는 방향이 위→아래다.)
  */
 function layoutGraph(graph) {
   const depth = computeDepths(graph);
-  const byCol = new Map();
+  const byRow = new Map();
   for (const n of graph.nodes) {
     const d = depth.get(n.id) || 0;
-    if (!byCol.has(d)) byCol.set(d, []);
-    byCol.get(d).push(n);
+    if (!byRow.has(d)) byRow.set(d, []);
+    byRow.get(d).push(n);
   }
-  const cols = [...byCol.keys()].sort((a, b) => a - b);
-  const colOrder = new Map(cols.map((c, i) => [c, i]));
-  const totalCols = cols.length;
-  const perBand = columnsPerBand(totalCols);
+  const rows = [...byRow.keys()].sort((a, b) => a - b);
+  const rowOrder = new Map(rows.map((r, i) => [r, i]));
+  const totalRows = rows.length;
+  const perStrip = rowsPerStrip(totalRows);
 
-  const bandCount = Math.ceil(totalCols / perBand);
-  const bandHeight = [];
-  for (let b = 0; b < bandCount; b += 1) {
-    let maxRows = 1;
-    for (const [c, i] of colOrder) {
-      if (Math.floor(i / perBand) === b) maxRows = Math.max(maxRows, byCol.get(c).length);
+  const stripCount = Math.ceil(totalRows / perStrip);
+  const stripWidth = [];
+  for (let b = 0; b < stripCount; b += 1) {
+    let maxCols = 1;
+    for (const [r, i] of rowOrder) {
+      if (Math.floor(i / perStrip) === b) maxCols = Math.max(maxCols, byRow.get(r).length);
     }
-    bandHeight.push(maxRows * ROW_H + ROW_H);
+    stripWidth.push(maxCols * COL_W + COL_W);
   }
-  const bandTop = [];
+  const stripLeft = [];
   let acc = 0;
-  for (let b = 0; b < bandCount; b += 1) { bandTop.push(acc); acc += bandHeight[b]; }
+  for (let b = 0; b < stripCount; b += 1) { stripLeft.push(acc); acc += stripWidth[b]; }
 
   const out = [];
-  for (const [col, nodes] of byCol) {
-    const i = colOrder.get(col) || 0;
-    const band = Math.floor(i / perBand);
-    let c = i % perBand;
-    if (band % 2 === 1) c = perBand - 1 - c;
+  for (const [row, nodes] of byRow) {
+    const i = rowOrder.get(row) || 0;
+    const strip = Math.floor(i / perStrip);
+    let r = i % perStrip;
+    if (strip % 2 === 1) r = perStrip - 1 - r;
     const count = nodes.length;
-    nodes.forEach((n, row) => {
-      const offset = (row - (count - 1) / 2) * ROW_H;
+    nodes.forEach((n, col) => {
+      const offset = (col - (count - 1) / 2) * COL_W;
       out.push({
         ...n,
         position: {
-          x: NODE_ORIGIN_X + c * COL_W,
-          y: NODE_ORIGIN_Y + bandTop[band] + (bandHeight[band] - ROW_H) / 2 + offset,
+          x: NODE_ORIGIN_X + stripLeft[strip] + (stripWidth[strip] - COL_W) / 2 + offset,
+          y: NODE_ORIGIN_Y + r * ROW_H,
         },
       });
     });
   }
-  // 원래 순서 보존(렌더러 key 안정).
   const orderIndex = new Map(graph.nodes.map((n, i) => [n.id, i]));
   out.sort((a, b) => (orderIndex.get(a.id) || 0) - (orderIndex.get(b.id) || 0));
   return out;
@@ -134,4 +136,4 @@ function needsLayout(graph) {
   return false;
 }
 
-module.exports = { layoutGraph, needsLayout, columnsPerBand, COL_W, ROW_H, NODE_W, NODE_H };
+module.exports = { layoutGraph, needsLayout, rowsPerStrip, columnsPerBand, COL_W, ROW_H, NODE_W, NODE_H };
