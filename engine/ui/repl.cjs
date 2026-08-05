@@ -252,10 +252,37 @@ async function startRepl(ctx, opts = {}) {
       },
     });
     const PROMPT = "› ";
+    /*
+     * 빈 입력 고스트 힌트 (2026-08-06, 레퍼런스 REPL 대조에서 나온 유도 격차).
+     * claude-code류 REPL은 빈 입력줄에 무엇을 칠 수 있는지 흐리게 보여준다 —
+     * 우리는 `› ` 뿐이라 첫 사용자가 / 팔레트·@ 멘션·? 도움의 존재를 알 길이
+     * 없었다. 커서 "뒤"에 dim 힌트를 쓰고 커서를 되돌린다. 어떤 키든 처음
+     * 눌리는 순간 커서-뒤 지우기(CSI K)로 걷어내므로 readline 의 echo·팔레트
+     * 오버레이와 겹치지 않는다. 비TTY·바쁜 세션에서는 그리지 않는다.
+     */
+    const { visWidth } = require("../agentlas-composer.cjs");
+    const GHOST_HINT = en
+      ? "type a task · / commands · @ files · ? shortcuts"
+      : "할 일을 문장으로 · / 명령 · @ 파일 · ? 단축키";
+    let ghostVisible = false;
+    const drawGhost = () => {
+      if (!process.stdout.isTTY || rl.line) return;
+      const width = visWidth(GHOST_HINT);
+      const room = (process.stdout.columns || 80) - visWidth(PROMPT) - 2;
+      if (width > room) return; // 좁은 터미널에서는 유도보다 입력이 우선이다
+      ui.write(ui.c.faint(GHOST_HINT) + `\x1b[${width}D`);
+      ghostVisible = true;
+    };
+    const clearGhost = () => {
+      if (!ghostVisible) return;
+      ghostVisible = false;
+      if (process.stdout.isTTY) ui.write("\x1b[K");
+    };
     const prompt = () => {
       if (!renderer.session || !renderer.session.isBusy()) {
         rl.setPrompt(PROMPT);
         rl.prompt();
+        drawGhost();
       }
     };
 
@@ -289,6 +316,8 @@ async function startRepl(ctx, opts = {}) {
       },
     });
     const onShortcutKey = (str, key) => {
+      // 고스트 힌트는 어떤 키가 와도 readline 이 echo 하기 전에 걷어낸다.
+      clearGhost();
       if (!permissionShortcut.handleKey(str, key)) return;
       swallowCompletion = true;
       setImmediate(() => { swallowCompletion = false; });
@@ -329,10 +358,62 @@ async function startRepl(ctx, opts = {}) {
       }
     };
 
+    let emptyEnters = 0;
     rl.on("line", (line) => {
       sigints = 0;
       const input = line.trim();
-      if (!input) { prompt(); return; }
+      if (!input) {
+        /*
+         * 빈 Enter 유도 (2026-08-06 레퍼런스 대조): 1회는 조용히 — 실수로 친
+         * Enter 마다 잔소리하면 소음이다. 연달아 두 번이면 길을 잃은 것이므로
+         * 다음 행선지를 한 줄로 보여준다.
+         */
+        emptyEnters += 1;
+        if (emptyEnters >= 2) {
+          emptyEnters = 0;
+          ui.line(ui.c.dim(en
+            ? "Type a task in plain words, / for commands, ? for shortcuts."
+            : "할 일을 그냥 문장으로 치세요. / 는 명령, ? 는 단축키입니다."));
+        }
+        prompt();
+        return;
+      }
+      emptyEnters = 0;
+
+      /*
+       * `?` 단축키 도움 (2026-08-06): 첫 화면 어디에도 키 조작법이 없었다 —
+       * Shift-Tab 권한 순환·조종 큐·@멘션은 아는 사람만 썼다. 한 글자로 요약을
+       * 준다(claude-code 의 ? 관례).
+       */
+      if (input === "?") {
+        const rowsHelp = en ? [
+          ["/", "command palette (type to filter, ↑↓ pick, Tab complete, Esc close)"],
+          ["Tab", "complete commands, agent names, @file paths, session keys"],
+          ["@path", "mention a file anywhere in your sentence"],
+          ["↑ / ↓", "input history (kept across sessions)"],
+          ["Shift-Tab", "cycle permission read → write (twice for full)"],
+          ["Ctrl-C", "interrupt the running turn · press twice to quit"],
+          ["typing while running", "queues steering for the current turn"],
+          ["/sessions · /s <n>", "list · switch parallel sessions"],
+        ] : [
+          ["/", "명령 팔레트 (입력=검색, ↑↓ 선택, Tab 완성, Esc 닫기)"],
+          ["Tab", "명령·에이전트 이름·@파일 경로·세션 키 완성"],
+          ["@경로", "문장 어디서든 파일 멘션"],
+          ["↑ / ↓", "입력 히스토리 (세션 넘어 유지)"],
+          ["Shift-Tab", "권한 순환 read → write (두 번이면 full)"],
+          ["Ctrl-C", "실행 중 턴 중단 · 두 번이면 종료"],
+          ["실행 중 타이핑", "현재 턴에 조종 지시로 쌓임"],
+          ["/sessions · /s <n>", "병렬 세션 목록 · 전환"],
+        ];
+        // 한글 키 라벨은 전각 폭 — padEnd(코드포인트 수)로 맞추면 열이 어긋난다.
+        const keyWidth = Math.max(...rowsHelp.map(([k]) => visWidth(k)));
+        ui.line(ui.c.bold(en ? "Shortcuts" : "단축키"));
+        for (const [k, desc] of rowsHelp) {
+          ui.line("  " + ui.c.blue(k) + " ".repeat(keyWidth - visWidth(k)) + "  " + ui.c.dim(desc));
+        }
+        prompt();
+        return;
+      }
 
       if (input.startsWith("/")) {
         try {

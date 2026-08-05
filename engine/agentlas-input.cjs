@@ -704,7 +704,16 @@ function attachSlashPalette(rl, opts = {}) {
     const list = rows();
     if (!list.length) return false;
     if (state.selected < 0 || state.selected >= list.length) state.selected = 0;
-    state.selectedCommand = list[state.selected].command;
+    const row = list[state.selected];
+    /*
+     * 인자를 받는 명령은 확정 즉시 스페이스까지 넣는다 (2026-08-06, 레퍼런스
+     * 대조): Tab 후 바로 인자를 타이핑하게 — 스페이스를 손으로 넣는 한 박자가
+     * 모든 인자형 명령에서 반복되는 마찰이었다. 인자 없는 명령(/help 등)은
+     * 그대로 — Enter 로 즉시 실행하는 흐름을 깨지 않는다.
+     */
+    const takesArgs = Boolean(String(row.usage || row.args || "").trim())
+      && String(row.usage || `${row.command} ${row.args || ""}`).trim() !== row.command;
+    state.selectedCommand = row.command + (takesArgs ? " " : "");
     replaceLine(state.selectedCommand);
     clear();
     return true;
