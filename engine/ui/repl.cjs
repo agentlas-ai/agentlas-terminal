@@ -132,6 +132,30 @@ async function startRepl(ctx, opts = {}) {
   let effortOverride = opts.effort || null;
 
   const recoverPresentation = (operation, error) => {
+    /*
+     * 정직 정지(honestStop)는 복구 대상이 아니다 (2026-08-06 실사용 실측).
+     * 실제 REPL에 자연어 지시를 하면 "이 프로젝트에 팀이 없다"는 정직한 안내가
+     * "One이 복구 중" 한 줄로 삼켜졌다 — 사용자는 무엇이 왜 안 되는지, 무엇을
+     * 하면 되는지 전혀 못 봤다(빈 답보다 나쁜 침묵). 정직 정지는 그 사유를
+     * 그대로 보여주고, 어떻게 실행하는지까지 덧붙인다. One 복구는 예상 못 한
+     * 실패에만 쓴다. (사람용 문장과 기계 판단은 다른 필드 — 스케줄러와 같은 원칙.)
+     */
+    if (error && (error.honestStop || error.code)) {
+      // 공유 controller 모듈은 lang을 모른다 — 기계 code로 여기서 현지화한다.
+      const KO_REASON = {
+        project_team_empty: "이 프로젝트에 에이전트 팀이 없습니다. Agentlas Desktop의 Work에서 에이전트를 넣고 다시 시도하세요.",
+        project_not_connected: "이 폴더는 Agentlas 프로젝트에 연결돼 있지 않습니다. Desktop Work에서 연결하거나, 특정 에이전트를 지정해 바로 실행하세요.",
+        project_ambiguous: "이 폴더에 Agentlas 프로젝트가 둘 이상 연결돼 있습니다. 소스 연결을 하나만 남기고 다시 시도하세요.",
+        project_team_unreadable: "이 프로젝트의 에이전트 팀을 읽을 수 없습니다. Agentlas Desktop에서 프로젝트를 열어 팀을 다시 저장하세요.",
+        project_teams_unsupported: "이 Agentlas 데이터 저장소는 아직 프로젝트 팀을 지원하지 않습니다. 최신 Agentlas Desktop을 한 번 실행한 뒤 다시 시도하세요.",
+      };
+      const reason = (!en && error.code && KO_REASON[error.code]) || String(error.message || error);
+      ui.line(ui.c.amber("✖ ") + reason);
+      ui.line(ui.c.dim(en
+        ? "Run a specific agent directly: agentlas run <agent> \"<task>\"  ·  list agents: /list  ·  connect a project in Agentlas Desktop."
+        : "특정 에이전트로 바로 실행: agentlas run <에이전트> \"<할 일>\"  ·  에이전트 목록: /list  ·  프로젝트 연결은 Agentlas Desktop에서."));
+      return;
+    }
     const active = orch.active();
     const evidence = String((error && error.message) || error || "").slice(0, 8000);
     if (active && !active.isBusy()) {

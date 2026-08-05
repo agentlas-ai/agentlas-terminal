@@ -31,10 +31,10 @@ function parseAgentPool(raw) {
   try {
     parsed = JSON.parse(raw || "[]");
   } catch {
-    throw new Error("This project's agent team cannot be read. Open the project in Agentlas Desktop and save its team again.");
+    throw Object.assign(new Error("This project's agent team cannot be read. Open the project in Agentlas Desktop and save its team again."), { code: "project_team_unreadable", honestStop: true });
   }
   if (!Array.isArray(parsed)) {
-    throw new Error("This project's agent team cannot be read. Open the project in Agentlas Desktop and save its team again.");
+    throw Object.assign(new Error("This project's agent team cannot be read. Open the project in Agentlas Desktop and save its team again."), { code: "project_team_unreadable", honestStop: true });
   }
   return parsed.filter((member) => member && typeof member === "object"
     && typeof member.agentId === "string" && member.agentId.trim()
@@ -45,7 +45,7 @@ function parseAgentPool(raw) {
 function resolveProjectForCwd(db, cwd) {
   const columns = projectColumns(db);
   if (!columns.has("folder_path") || !columns.has("agent_pool_json")) {
-    throw new Error("This Agentlas data store does not support project teams yet. Open the latest Agentlas Desktop once, then retry.");
+    throw Object.assign(new Error("This Agentlas data store does not support project teams yet. Open the latest Agentlas Desktop once, then retry."), { code: "project_teams_unsupported", honestStop: true });
   }
   const rows = db.prepare(
     `SELECT id, name, system_prompt, agent_pool_json, source_type, source_ref, folder_path
@@ -57,12 +57,12 @@ function resolveProjectForCwd(db, cwd) {
     .filter(({ root }) => pathContains(root, target))
     .sort((a, b) => b.root.length - a.root.length);
   if (!matches.length) {
-    throw new Error("This folder is not connected to an Agentlas project. Connect it in Desktop Work, or pass an exact agent for an advanced direct invocation.");
+    throw Object.assign(new Error("This folder is not connected to an Agentlas project. Connect it in Desktop Work, or pass an exact agent for an advanced direct invocation."), { code: "project_not_connected", honestStop: true });
   }
   const bestLength = matches[0].root.length;
   const best = matches.filter((entry) => entry.root.length === bestLength);
   if (best.length !== 1) {
-    throw new Error("More than one Agentlas project is connected to this folder. Keep one source connection, then retry.");
+    throw Object.assign(new Error("More than one Agentlas project is connected to this folder. Keep one source connection, then retry."), { code: "project_ambiguous", honestStop: true });
   }
   return { ...best[0].row, rootPath: best[0].root, agentPool: parseAgentPool(best[0].row.agent_pool_json) };
 }
@@ -70,15 +70,15 @@ function resolveProjectForCwd(db, cwd) {
 function resolveProjectController(db, cwd) {
   const project = resolveProjectForCwd(db, cwd);
   if (!project.agentPool.length) {
-    throw new Error("This project has no agent team. Drag agents into the project in Desktop Work, then retry.");
+    throw Object.assign(new Error("This project has no agent team. Drag agents into the project in Desktop Work, then retry."), { code: "project_team_empty", honestStop: true });
   }
   const controllerRef = project.agentPool[0];
   if (controllerRef.source !== "local") {
-    throw new Error(`The project controller “${controllerRef.nameSnapshot}” is not installed locally for Terminal execution. Install that exact release locally or reorder the project team.`);
+    throw Object.assign(new Error(`The project controller “${controllerRef.nameSnapshot}” is not installed locally for Terminal execution. Install that exact release locally or reorder the project team.`), { code: "controller_not_installed", honestStop: true });
   }
   const controller = listRoutableAgents(db).find((agent) => agent.id === controllerRef.agentId) || null;
   if (!controller) {
-    throw new Error(`The project controller “${controllerRef.nameSnapshot}” is unavailable. Restore that agent or explicitly choose a new first agent in Desktop Work.`);
+    throw Object.assign(new Error(`The project controller “${controllerRef.nameSnapshot}” is unavailable. Restore that agent or explicitly choose a new first agent in Desktop Work.`), { code: "controller_unavailable", honestStop: true });
   }
   return { project, controller };
 }
