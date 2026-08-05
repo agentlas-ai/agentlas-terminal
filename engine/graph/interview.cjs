@@ -155,6 +155,10 @@ const RULES = [
   "    Write items that are atomic and checkable — 'The CSV has a numeric price column',",
   "    not 'The data looks good'. Vague items produce noisy judging.",
   "    The person will see and can edit every item before saving — propose, don't ask.",
+  "  · A factual item (\"the price matches the real value\") cannot be judged from the result",
+  "    alone — the judge would guess. Split it: add a read step BEFORE the check that re-fetches",
+  "    the fact (kind:\"code\" or a read step with uses) into its own produces, then set the",
+  "    check's evidence:\"<that name>\". The check then compares result against evidence.",
   "    Only ask when the goal itself is too vague to know what the result even is.",
   "  · repeatOn says which side loops. Write the condition the way the person said it and",
   "    put the loop on the side they meant — do not flip either one to make it fit.",
@@ -337,6 +341,13 @@ function validateBlueprint(bp) {
         id: `check-${check.afterStep}-criteria`,
         question: `"${(steps[check.afterStep] && steps[check.afterStep].title) || at}" 결과가 어떤 상태여야 통과인가요?`,
         why: "기준이 없으면 무엇을 보고 판정할지 정할 수 없습니다.",
+      });
+    }
+    if (check.evidence && !produced.has(check.evidence)) {
+      push(`${at}가 근거로 삼는 "${check.evidence}" 값을 아무도 만들지 않습니다.`, {
+        id: `check-${check.afterStep}-evidence`,
+        question: `검증 근거 "${check.evidence}"은(는) 어느 단계가 가져오나요?`,
+        why: "근거 없는 사실 확인은 판정자가 지어내게 됩니다 — 재조회 단계가 먼저 필요합니다.",
       });
     }
     const name = String(check.produces || "").trim() || `check${check.afterStep + 1}_verdict`;
@@ -592,6 +603,7 @@ function buildGraphFromBlueprint(bp) {
           subject: check.subject,
           ...(String(check.criteria || "").trim() ? { criteria: check.criteria } : {}),
           ...(itemRows.length ? { items: itemRows } : {}),
+          ...(typeof check.evidence === "string" && check.evidence.trim() ? { evidence: check.evidence.trim() } : {}),
           produces: String(check.produces || "").trim()
             || (ordinal === 0 ? `check${afterStep + 1}_verdict` : `check${afterStep + 1}_${ordinal + 1}_verdict`),
         },
