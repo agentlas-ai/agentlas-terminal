@@ -1,4 +1,5 @@
 "use strict";
+const { layoutGraph, needsLayout } = require("./layout.cjs");
 /*
  * 그래프 인터뷰(터미널) — 데스크탑 shared/graph-blueprint.ts + electron/workflow/graph-interview.ts
  * 와 **같은 계약**이어야 한다. 어긋나면 표면마다 다른 그래프가 만들어진다.
@@ -110,8 +111,13 @@ const RULES = [
   'or {"kind":"input","label":"<what to ask the person>","varName":"<one word, a-z>"}.',
   "",
   'steps[] entries: {"title":"...","instruction":"...","effect":"read"|"mutation",',
-  '  "produces":"<one word>","consumes":["<one word>"]}.',
+  '  "produces":"<one word>","consumes":["<one word>"],"role":"<kind of worker>"}.',
   "  · instruction is what the agent is told. Write it so it can act with no further questions.",
+  "  · role: what KIND of worker this step needs, in the person's language",
+  '    ("한국어 마케팅 글쓰기", "web game coding", "data analysis"). Add it to every',
+  "    agent/action step. Write the role, NEVER an agent name or id — the product searches",
+  "    the real catalog and fills the slot itself. A name you invent does not exist and the",
+  "    graph dies at run time. Steps that need the same kind of worker get the same role text.",
   "  · kind:\"code\" when the step is an EXACT computation or data-shaping that a chat model would",
   "    get quietly wrong: number math, currency/percent, parsing HTML/CSV/JSON, spreadsheet cells,",
   "    date arithmetic, calling a data library (e.g. yfinance). For those, add kind:\"code\", a short",
@@ -124,6 +130,9 @@ const RULES = [
   "  · a step that reads {{x}} must list x in consumes, and some earlier step (or the input trigger)",
   '    must declare produces:"x".',
   '  · effect:"mutation" for anything that leaves the machine or changes a file.',
+  '  · approval:"auto" ONLY when the person explicitly said the step may go out without',
+  '    their review ("검토 없이", "바로 올려", "no review needed"). Never lower it yourself,',
+  '    never infer it from convenience. Omit the field otherwise — outward steps stay locked.',
   '  · uses: [{"capability":"<from the list below>","provider":"<id>"|null}] — the outside',
   '    services this step needs. Pick the capability from the closed list; if the person named a',
   '    service, put its id in provider, otherwise leave provider null and it will be asked later.',
@@ -549,7 +558,13 @@ function buildGraphFromBlueprint(bp) {
           ? { code: step.code || "", codeLang: step.codeLang === "js" ? "js" : "python", note: step.instruction }
           : { prompt: step.instruction }),
         effect: step.effect,
-        ...(step.effect === "mutation" ? { approval: "ask" } : {}),
+        // 기본은 잠김. 사람이 명시로 "검토 없이"라고 했을 때만 auto(데스크탑과 같은 규칙).
+        ...(step.effect === "mutation"
+          ? { approval: step.approval === "auto" ? "auto" : "ask" }
+          : {}),
+        // ★역할은 저장돼야 한다 — 묻기만 하고 버리면 편성이 채울 슬롯 자체가 없다
+        //   (데스크탑 shared/graph-blueprint.ts와 같은 자리, 같은 규칙).
+        ...(typeof step.role === "string" && step.role.trim() ? { role: step.role.trim() } : {}),
         ...(step.produces ? { produces: step.produces } : {}),
         ...(step.consumes && step.consumes.length ? { consumes: step.consumes[0] } : {}),
         ...(step.uses && step.uses.length
@@ -657,9 +672,12 @@ function buildGraphFromBlueprint(bp) {
     }
   });
 
+  // ★겹치지 않게 배치한 뒤 돌려준다(데스크탑 shared/graph-blueprint.ts와 같은 규칙·같은 상수).
+  const built = { version: 1, nodes, edges };
+  const laidOut = needsLayout(built) ? layoutGraph(built) : nodes;
   return {
     ok: true,
-    graph: { version: 1, nodes, edges },
+    graph: { version: 1, nodes: laidOut, edges },
     scheduleHuman: trigger.kind === "cron" ? trigger.schedule : "manual",
     triggerType: trigger.kind === "cron" ? "schedule" : "manual",
   };

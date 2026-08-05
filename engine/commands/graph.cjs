@@ -220,20 +220,7 @@ function graphProblems(graph, en) {
   }
   for (const node of graph.nodes ?? []) {
     const label = node.label || node.id;
-    if (node.type === "eval") {
-    // ★채점표는 판정 기준 그 자체다. 캔버스 없는 표면에서 이게 안 보이면
-    //   사용자는 무엇으로 채점되는지 모른 채 그래프를 켠다.
-    const items = Array.isArray(node.config?.items) ? node.config.items : [];
-    if (items.length) {
-      marks.unshift(en ? `checklist ${items.length} item(s)` : `채점표 ${items.length}칸`);
-    } else if (node.config?.criteria) {
-      marks.unshift(en ? "one-line criteria" : "기준 한 문장");
-    }
-  }
-  if (node.type === "code") {
-    marks.unshift(node.config?.codeLang === "js" ? "javascript" : "python");
-  }
-  if (node.type === "condition") {
+    if (node.type === "condition") {
       const edges = out.get(node.id) ?? [];
       const undeclared = edges.filter((e) => e.sourceHandle !== "true" && e.sourceHandle !== "false");
       if (undeclared.length) {
@@ -300,6 +287,19 @@ function nodeLine(ctx, node, en) {
     node.config?.consumes ? `${en ? "uses" : "사용"} {{${node.config.consumes}}}` : null,
     node.config?.produces ? `${en ? "makes" : "생성"} {{${node.config.produces}}}` : null,
   ].filter(Boolean);
+  if (node.type === "eval") {
+    // ★채점표는 판정 기준 그 자체다. 캔버스 없는 표면에서 이게 안 보이면
+    //   사용자는 무엇으로 채점되는지 모른 채 그래프를 켠다.
+    const items = Array.isArray(node.config?.items) ? node.config.items : [];
+    if (items.length) {
+      marks.unshift(en ? `checklist ${items.length} item(s)` : `채점표 ${items.length}칸`);
+    } else if (node.config?.criteria) {
+      marks.unshift(en ? "one-line criteria" : "기준 한 문장");
+    }
+  }
+  if (node.type === "code") {
+    marks.unshift(node.config?.codeLang === "js" ? "javascript" : "python");
+  }
   if (node.type === "condition") {
     // 갈림길 이름은 만든 사람이 지은 것이라 실제 규칙과 다를 수 있다(실측: 이름은
     // "길이가 충분한가?"인데 실제로는 어떤 단어가 들어 있는지를 봤다).
