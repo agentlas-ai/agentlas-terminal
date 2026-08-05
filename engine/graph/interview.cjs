@@ -158,7 +158,9 @@ const RULES = [
   '  "repeatStep":<index>,"repeatOn":"yes"|"no","maxRepeats":<1-20>}.',
   "  · repeatStep goes BACK to an earlier step. It REQUIRES repeatOn and maxRepeats.",
   "",
-  "checks[] (optional, but REQUIRED whenever a branch repeats):",
+  "checks[] (REQUIRED whenever a branch repeats, and whenever a step that changes things",
+  "  outside sends out a value an earlier step computed — an unattended run must not ship",
+  "  an empty or invented result):",
   '  {"afterStep":<0-based>,"subject":"<a value some step produces>",',
   '   "criteria":"<one-line summary of what passing means>","produces":"<one word>",',
   '   "items":[{"text":"<atomic, checkable>","kind":"must"|"mustNot"}]}',
@@ -375,6 +377,32 @@ function validateBlueprint(bp) {
     checkVerdicts.add(name);
   }
 
+  /*
+   * ★계산한 값이 그대로 **바깥으로 나가면** 검증이 있어야 한다(데스크탑과 같은 규칙).
+   * 실사용 실측(2026-08-06, 주간 매출 요약): 증감률이 전부 null인데 아무도 안 보고
+   * 요약 엑셀로 저장될 뻔했다 — 검증을 "반복이 있을 때만" 요구했기 때문이다.
+   */
+  {
+    const checkedSubjects = new Set(
+      (bp.checks || []).map((check) => (check.subject || "").trim()).filter(Boolean),
+    );
+    steps.forEach((step, index) => {
+      if (step.effect !== "mutation") return;
+      const consumes = Array.isArray(step.consumes) ? step.consumes : [];
+      for (const value of consumes) {
+        const name = String(value == null ? "" : value).trim();
+        if (!name || checkedSubjects.has(name)) continue;
+        const madeByAStep = steps.some((s, i) => i < index && (s.produces || "").trim() === name);
+        if (!madeByAStep) continue;
+        push(
+          `"${step.title || `${index + 1}번째 단계`}"는 바깥으로 나가는데, 그 앞에서 만든 `
+          + `"${name}" 값이 쓸 만한지 확인하는 단계가 없습니다. `
+          + `checks[]에 {"afterStep":<그 값을 만든 단계>,"subject":"${name}",…}를 넣어 주세요.`,
+        );
+      }
+    });
+  }
+
   // 반복이 있는데 검증이 없으면 "마음에 들 때까지"를 글자 찾기로 흉내 내게 된다(실측).
   for (const branch of bp.branches || []) {
     if (branch.repeatStep === undefined) continue;
@@ -539,7 +567,16 @@ function scheduleLabel(schedule) {
 }
 
 /** 청사진 → 그래프. **노드 id와 연결은 전부 여기서 만든다.** */
-function buildGraphFromBlueprint(bp) {
+/** 길이를 넘으면 마지막 온전한 낱말까지만 — 데스크탑 clipAtWord와 같은 규칙. */
+function clipAtWord(text, max) {
+  if (text.length <= max) return text;
+  const cut = text.slice(0, max);
+  const lastSpace = cut.lastIndexOf(" ");
+  const body = lastSpace > max * 0.5 ? cut.slice(0, lastSpace) : cut;
+  return `${body.trimEnd()}…`;
+}
+
+function buildGraphFromBlueprint(bp, locale = "ko") {
   const problems = validateBlueprint(bp);
   if (problems.length) return { ok: false, problems };
 
@@ -621,7 +658,10 @@ function buildGraphFromBlueprint(bp) {
       const firstItem = Array.isArray(check.items)
         ? check.items.find((item) => item && typeof item.text === "string" && item.text.trim())
         : null;
-      const label = String((check.criteria || "").trim() || (firstItem && firstItem.text) || "채점표").slice(0, 40);
+      // ★접두어는 제품 언어를 따르고, 자를 때 낱말을 쪼개지 않는다(데스크탑과 같은 규칙).
+      const rawLabel = String((check.criteria || "").trim() || (firstItem && firstItem.text)
+        || (locale === "en" ? "Checklist" : "채점표")).trim();
+      const label = clipAtWord(rawLabel, 40);
       const itemRows = Array.isArray(check.items)
         ? check.items
           .filter((item) => item && typeof item.text === "string" && item.text.trim())
@@ -629,7 +669,7 @@ function buildGraphFromBlueprint(bp) {
         : [];
       nodes.push({
         id: checkId(afterStep, ordinal), type: "eval",
-        label: `검증: ${label}`,
+        label: `${locale === "en" ? "Check" : "검증"}: ${label}`,
         position: { x: column(afterStep + 1) + 70 + ordinal * 60, y: 0 },
         config: {
           subject: check.subject,

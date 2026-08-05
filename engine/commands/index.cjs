@@ -38,19 +38,20 @@ const COMMANDS = {
   workforce: () => require("./workforce.cjs"),
   network: () => require("./workforce.cjs"),
   taskforce: () => require("./workforce.cjs"),
+  // 소스 스코프 편성 4종 — 2026-08-05 네이티브 배선(경위는 workforce.cjs 참조).
+  // 별칭이 아니라 1급인 이유는 여전하다: 별칭은 스코프를 전달하지 못한다.
+  "hep-network": () => require("./hep-network.cjs"),
+  "hep-local": () => require("./hep-local.cjs"),
+  "hep-cloud": () => require("./hep-cloud.cjs"),
+  "hep-hub": () => require("./hep-hub.cjs"),
   oberon: () => require("./oberon.cjs"),
   film: () => require("./film.cjs"),
   experience: () => require("./experience.cjs"),
   memory: () => require("./memory.cjs"),
   evolve: () => require("./evolve.cjs"),
   variant: () => require("./variant.cjs"),
+  roles: () => require("./roles.cjs"),
   hep: () => require("./hep.cjs"),
-  // 소스 스코프 스태핑 3종은 1급 명령이다 — 별칭으로 접으면 스코프가 사라진다.
-  // (아래 COMMAND_ALIASES 주석의 2026-07-28 수리 참조.)
-  "hep-network": () => require("./hep-network.cjs"),
-  "hep-local": () => require("./hep-local.cjs"),
-  "hep-cloud": () => require("./hep-cloud.cjs"),
-  "hep-hub": () => require("./hep-hub.cjs"),
   build: () => require("./build.cjs"),
   connect: () => require("./connect.cjs"),
   call: () => require("./call.cjs"),
@@ -59,7 +60,6 @@ const COMMANDS = {
   research: () => require("./research.cjs"),
   netadmin: () => require("./netadmin.cjs"),
   journal: () => require("./journal.cjs"),
-  "legacy-network": () => require("./legacy-network.cjs"),
   cloud: () => require("./cloud.cjs"),
   upload: () => require("./upload.cjs"),
   storm: () => require("./storm.cjs"),
@@ -102,6 +102,18 @@ const DESKTOP_ONLY_SURFACES = {
   one: "Agentlas One is a separate Desktop/Mobile product surface.",
 };
 
+/*
+ * (2026-08-05 이력) hep-* 편성 이름들은 하루 동안 세 상태를 지났다:
+ *   ① 외부 CLI 스텁에 배선돼 exit 3 JSON만 뱉는 죽은 메뉴 → 삭제
+ *   ② 삭제 직후 "알 수 없는 토큰"이 되어 프롬프트로 낙하, 에이전트가 실제 기동
+ *      (상위 오타 가드는 한 단어 전용) → HOST_LLM_ONLY_SURFACES fail-closed 가드
+ *   ③ 같은 날 재조사에서 편성 세 조각(4,578줄 루프·로컬 Core MCP·D.callHubTool
+ *      주입 지점)이 전부 이 머신에 있음이 확인됨 → 네이티브 배선으로 복원,
+ *      가드 폐기. 전선 계약 실측과 배선은 workforce.cjs·local-core-transport.cjs.
+ * 남는 교훈: 이름을 지울 때는 반드시 낙하 경로까지 막고, "계층이 없다"는 판정은
+ * rg 로 확인한 뒤에 한다.
+ */
+
 // 무인자 호출이 프롬프트로 오라우팅되면 안 되는 명령 (smoke 가드 대상)
 const GUARDED_NO_ARG = new Set(["search", "install", "upload"]);
 
@@ -109,24 +121,16 @@ const GUARDED_NO_ARG = new Set(["search", "install", "upload"]);
 // 스킬명과 터미널 명령이 서로 다르면 사용자가 어느 표면에 있는지에 따라 이름을
 // 바꿔 써야 한다. 같은 기능은 어디서든 같은 이름으로 부른다.
 //
-// 불변식(2026-07-28 수리): 별칭은 "같은 기능"에만 건다. 소스 스코프를 이름에
-// 달고 있는 hep-local / hep-cloud / hep-hub 는 여기 넣으면 안 된다 — 별칭은
-// 이름만 바꿔주고 스코프는 어디에도 전달되지 않기 때문이다. 실제로 그랬다:
-//   hep-cloud → cloud      : 자산 보관함 명령. 과제 문자열을 서브커맨드로 읽어
-//                            `usage: agentlas cloud <save|…>` + exit 1.
-//   hep-local → workforce  : cmdWorkforce 는 스코프 플래그를 받지 않는다(전량
-//                            공개 Hub 메뉴 스태핑). "로컬 전용"이 조용히 넓어짐.
-//   hep-hub   → search     : 디렉터리 나열만 하고 아무것도 실행하지 않음.
-// 세 명령은 스코프를 실제로 지키는 Hephaestus 네이티브 표면으로 가는 1급 명령
-// (COMMANDS 의 hep-local/hep-cloud/hep-hub)으로 승격했다.
-//
-// 같은 이유로 hep-network 도 별칭에서 뺐다(2026-07-28). 이름은 "Local + owner
-// Cloud + public Hub"인데 cmdWorkforce 는 스코프를 어디에도 싣지 않고
-// agentlas.cloud/api/mcp/v1 을 직접 친다. 그 서버는 sourceScope 가 없으면 "hub"
-// 로 기본값을 잡으므로(agentlas/.../lib/mcp/workforce.ts:228) 로컬·클라우드
-// 에이전트는 후보에 들어간 적이 없는데 결과는 네트워크 전량을 본 것처럼 남았다.
-// 연합은 Core 가 소유한다 — 네이티브 표면으로 넘긴다.
+// 불변식: 별칭은 "같은 기능"에만 건다. 이름이 소스 스코프를 약속하는데 별칭이
+// 스코프를 버리면 제품이 거짓말을 한다 — 2026-07-28 에 실제로 그랬다
+// (hep-cloud→cloud 자산 보관함, hep-local→workforce 전량 Hub, hep-hub→search).
+// hep-network/hep-local/hep-cloud/hep-hub 는 그래서 여기 없다 — 스코프를 실제로
+// 관통시키는 1급 명령(COMMANDS)이다. 경위(스텁→삭제→네이티브 배선)는 위
+// 2026-08-05 이력 주석 참조.
 const COMMAND_ALIASES = {
+  // legacy-network는 역사적으로 hep-network를 뜻했다(v1 호환 탈출구). 이제
+  // hep-network가 네이티브이므로 같은 기능 별칭이 성립한다 — 스코프도 동일(network).
+  "legacy-network": "hep-network",
   "hep-build": "build",
   "hep-call": "call",
   "hep-search": "search",
@@ -139,6 +143,20 @@ const COMMAND_ALIASES = {
 function resolveCommandName(cmd) {
   return COMMAND_ALIASES[cmd] || cmd;
 }
+
+/**
+ * 자기 도움말을 직접 가진 명령들 — `<명령> --help` 는 이들에게 그대로 넘어간다.
+ *
+ * ★배경(실사용 실측 2026-08-06): 라우터가 `--help`를 가로채 도움말 표에서 한 줄을
+ *   긁어 보여줘서, `agentlas graph --help` 는 "Usage: agentlas graph [options]" 두 줄이
+ *   전부였다. 정작 `graph help` 에는 하위 명령 8개를 설명하는 제대로 된 안내가 있는데
+ *   **사용자가 가장 먼저 치는 철자(`--help`)로는 영원히 닿지 못했다.**
+ *
+ * 목록으로 두는 이유: 모든 명령에 "help"를 넘기면, 자기 도움말이 없는 명령은 그것을
+ * 인자로 읽는다(`agentlas run --help` 가 "help"라는 이름을 찾는 식). 추측하지 않는다.
+ * `test/command-help-contract.cjs` 가 이 목록과 실제 분기를 대조한다.
+ */
+const SELF_HELP_COMMANDS = new Set(["graph", "plugin", "billing", "roles", "native"]);
 
 function dispatch(ctx, argv) {
   const [rawCmd, ...rest] = argv;
@@ -165,6 +183,11 @@ function dispatch(ctx, argv) {
    * 이라 이 경로를 못 받는다. 여기가 유일한 차단 지점이므로 arity를 보지 않는다.
    * 진짜 작업이면 안내대로 따옴표로 묶어 하나의 프롬프트로 넘긴다.
    */
+  // (2026-08-05) HOST_LLM_ONLY_SURFACES 가드가 여기 있었다 — hep-* 네이티브
+  // 배선으로 표가 비면서 분기도 제거했다. 등록 명령을 지울 일이 다시 생기면
+  // 낙하 가드부터 만들 것: 상위 오타 가드는 한 단어 전용이라 인자가 붙은
+  // 삭제 이름은 프롬프트로 흘러 에이전트를 기동한다(실측·토큰 소모).
+
   if (DESKTOP_ONLY_SURFACES[cmd]) {
     const asTask = [rawCmd, ...rest].join(" ");
     ctx.err(`${DESKTOP_ONLY_SURFACES[cmd]}\nIt was not run as a prompt — rerun with quotes if you meant a task: agentlas "${asTask}"`);
@@ -183,4 +206,4 @@ function dispatch(ctx, argv) {
   return undefined; // 알 수 없는 토큰 — 엔진이 에이전트 이름/프롬프트로 해석 시도
 }
 
-module.exports = { dispatch, COMMANDS, COMMAND_ALIASES, resolveCommandName, NOT_YET_PORTED, GUARDED_NO_ARG, DESKTOP_ONLY_SURFACES };
+module.exports = { dispatch, COMMANDS, COMMAND_ALIASES, resolveCommandName, SELF_HELP_COMMANDS, NOT_YET_PORTED, GUARDED_NO_ARG, DESKTOP_ONLY_SURFACES };

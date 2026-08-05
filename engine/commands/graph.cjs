@@ -417,7 +417,12 @@ function renderGraphTree(ctx, graph, en) {
         : handle === "false"
           ? (en ? "[no]" : "[아니오]")
           : "";
-      walk(edge.target, depth + 1, label, edge);
+      // ★들여쓰기는 **갈라질 때만** 깊어진다.
+      //   예전에는 한 줄로 이어지는 사슬에서도 매 단계 두 칸씩 밀려, 14단계짜리
+      //   그래프가 28칸 들여쓰기로 화면을 넘어갔다(실사용 실측 2026-08-06).
+      //   갈림길·실패 출구처럼 **실제로 나뉘는** 곳에서만 계층이 생겨야 사람이 읽는다.
+      const branches = edges.length > 1 || Boolean(handle);
+      walk(edge.target, branches ? depth + 1 : depth, label, edge);
     }
   };
 
@@ -557,9 +562,19 @@ async function runGraph(ctx, needle, flags) {
  * 그래서 실행 시각·바깥으로 나가는지·반복 상한은 지어내지지 않는다.
  */
 async function newGraph(ctx, request, flags) {
-  // 인터뷰의 말은 저장된 언어 설정이 아니라 **사용자가 방금 쓴 말**을 따라간다.
-  // 설정만 따르면 한국어로 말한 사람에게 "for example"이 섞여 나온다(실측).
-  const en = /[\uac00-\ud7a3]/.test(String(request || "")) ? false : ctx.lang === "en";
+  /*
+   * 산출 언어는 **제품 언어 설정**이 정한다.
+   *
+   * 예전에는 요청에 한글이 한 글자라도 있으면 설정을 무시하고 한국어로 강제했다
+   * ("한국어로 말한 사람에게 for example이 섞이지 않게"가 의도였다). 그 결과
+   * 언어를 English로 둔 사용자가 한국어 파일명 하나만 섞어 말해도 **인터뷰만**
+   * 한국어로 뒤집히고 `graph show`·목록·오류는 영어로 남아, 같은 CLI 안에서
+   * 화면 언어가 갈렸다(실사용 실측 2026-08-06: 설정 en인데 질문 3개가 전부 한국어).
+   *
+   * 섞임을 막는 자리는 여기가 아니라 인터뷰 지시문의 PRODUCT LANGUAGE 계약이다 —
+   * 그쪽이 모델의 모든 산출 문구를 한 언어로 고정한다.
+   */
+  const en = ctx.lang === "en";
   const db = ctx.db();
   if (!request) {
     ctx.err(en
@@ -635,7 +650,7 @@ async function newGraph(ctx, request, flags) {
         continue;
       }
       if (parsed.turn.kind === "blueprint") {
-        built = interview.buildGraphFromBlueprint(parsed.turn.blueprint);
+        built = interview.buildGraphFromBlueprint(parsed.turn.blueprint, en ? "en" : "ko");
         if (!built.ok) {
           // 청사진 검증은 통과했는데 짓는 데서 걸렸다 — 이것도 형식 문제라 같은 규율.
           state.attempts = [...(state.attempts || []), { round, problems: built.problems.map((p) => p.reason) }];
@@ -1043,6 +1058,11 @@ async function run(ctx, args = []) {
     if (arg === "-y" || arg === "--yes") { flags.yes = true; continue; }
     if (arg === "--input" || arg === "-i") { flags.input = String(args[i + 1] ?? "").trim(); i += 1; continue; }
     if (arg.startsWith("--input=")) { flags.input = arg.slice("--input=".length).trim(); continue; }
+    // ★--name 도 값을 하나 받는 플래그다. 걷어내지 않으면 그 값이 파일 경로에 붙어
+    //   "그런 파일 없음"으로 죽는다 — `graph help`가 문법으로 광고하는 옵션인데
+    //   실제로는 한 번도 동작한 적이 없었다(실사용 실측 2026-08-06).
+    if (arg === "--name" || arg === "-n") { flags.name = String(args[i + 1] ?? "").trim(); i += 1; continue; }
+    if (arg.startsWith("--name=")) { flags.name = arg.slice("--name=".length).trim(); continue; }
     rest.push(arg);
   }
   const sub = (rest[0] || "list").toLowerCase();

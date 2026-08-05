@@ -107,7 +107,13 @@ function main() {
   if (helpRequested && helpCommand) {
     const ctx = buildCtx();
     const command = commands.resolveCommandName(helpCommand);
-    const code = require("./commands/help.cjs").runForCommand(ctx, command);
+    // ★명령이 자기 도움말을 갖고 있으면 그것을 보여준다.
+    //   예전에는 무조건 표 한 줄을 긁어(`runForCommand`) "Usage: agentlas graph [options]"
+    //   두 줄만 나왔다 — `graph help`에는 8줄짜리 제대로 된 안내가 있는데도 `--help`로는
+    //   영원히 닿지 못했다(사용자가 가장 먼저 치는 것이 `--help`다).
+    const code = commands.SELF_HELP_COMMANDS.has(command)
+      ? commands.dispatch(ctx, [command, "help"])
+      : require("./commands/help.cjs").runForCommand(ctx, command);
     process.exit(typeof code === "number" ? code : 0);
   }
   // 옵션 정규화: -h/--help/-V/--version 은 하위 명령으로 변환
