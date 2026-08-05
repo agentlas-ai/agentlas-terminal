@@ -19,6 +19,19 @@ Terminal-wide audit release. Every command was executed for real; what follows f
 - The graph command group ships in the npm package for the first time (it landed after 1.0.28 was published).
 - New gates: user-scenarios (93 real CLI invocations), local-core transport wire contract,
   doctor auth-evidence, roles round-trip, onboarding guidance, EN/KO help sync.
+- `agentlas <command> --help` reaches the command's own help. It printed a two-line stub
+  scraped from the help table, so `graph --help` never showed the eight lines `graph help` has —
+  and that is the spelling people try first. (The gate had pinned the stub as correct; its
+  contract now asks whether real help was shown.)
+- `graph install --name "<new name>"` works. The documented flag had never worked: its value was
+  appended to the file path, so the install died with "no such file".
+- `graph show` stops indenting a straight chain deeper at every step — fourteen steps meant
+  twenty-eight columns. Depth now marks real branches (a fork, a failure exit).
+- Building a graph follows your language setting. One Korean character anywhere in the request
+  forced the interview to Korean while `graph show`, the list, and errors stayed English.
+- Graph steps written as code declare the pip packages they import, and a verification step is
+  now required whenever a step that changes something outside sends out a value an earlier step
+  computed — an unattended run must not ship an empty or invented result.
 
 ## 1.0.26 — 2026-08-03
 
