@@ -35,7 +35,8 @@ KNOWLEDGE
   memory import · evolve   memory & prompt-evolution proposals
   ontology · career-graph  project knowledge & source routing
   journal <sub>            Stormbreaker run journal
-  project [status|init]    private .agentlas project state (init is explicit)
+  project <sub>            connect this folder + set an ordered team, standalone
+                           (status · init · use <agent> · team <agent>…)
   context <sub>            dependency map: refresh|locate|refs|slice|impact|verify
 
 ACCOUNT & OPS
@@ -102,7 +103,8 @@ KNOWLEDGE
   memory import · evolve   메모리·프롬프트 진화 제안
   ontology · career-graph  프로젝트 지식·소스 라우팅
   journal <sub>            Stormbreaker 런 저널
-  project [status|init]    비공개 .agentlas 프로젝트 상태 (init은 명시적)
+  project <sub>            이 폴더를 프로젝트로 연결 + 순서 팀 편성 (독립)
+                           (status · init · use <에이전트> · team <에이전트>…)
   context <sub>            의존성 지도: refresh|locate|refs|slice|impact|verify
 
 ACCOUNT & OPS

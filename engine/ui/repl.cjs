@@ -151,9 +151,15 @@ async function startRepl(ctx, opts = {}) {
       };
       const reason = (!en && error.code && KO_REASON[error.code]) || String(error.message || error);
       ui.line(ui.c.amber("✖ ") + reason);
+      // 데스크탑을 강제하지 않는다 — 터미널에서 바로 프로젝트를 연결한다(오너 원칙).
+      const connectHint = (error.code === "project_not_connected" || error.code === "project_team_empty");
       ui.line(ui.c.dim(en
-        ? "Run a specific agent directly: agentlas run <agent> \"<task>\"  ·  list agents: /list  ·  connect a project in Agentlas Desktop."
-        : "특정 에이전트로 바로 실행: agentlas run <에이전트> \"<할 일>\"  ·  에이전트 목록: /list  ·  프로젝트 연결은 Agentlas Desktop에서."));
+        ? (connectHint
+          ? "Connect this folder standalone: agentlas project use <agent>  ·  list agents: /list  ·  or run one directly: agentlas run <agent> \"<task>\"."
+          : "Run a specific agent directly: agentlas run <agent> \"<task>\"  ·  list agents: /list.")
+        : (connectHint
+          ? "이 폴더를 바로 연결: agentlas project use <에이전트>  ·  에이전트 목록: /list  ·  또는 하나만 바로 실행: agentlas run <에이전트> \"<할 일>\"."
+          : "특정 에이전트로 바로 실행: agentlas run <에이전트> \"<할 일>\"  ·  에이전트 목록: /list.")));
       return;
     }
     const active = orch.active();
