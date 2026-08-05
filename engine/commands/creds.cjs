@@ -134,12 +134,60 @@ async function cmdCredsFile(ctx, args) {
   return 0;
 }
 
+/** KEY=value 파일에서 KEY 이름만 뽑는다 — 값은 절대 읽어 돌려주지 않는다. */
+function envKeyNames(filePath) {
+  try {
+    return fs.readFileSync(filePath, "utf8")
+      .split(/\r?\n/)
+      .map((line) => line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/))
+      .filter(Boolean)
+      .map((m) => m[1]);
+  } catch {
+    return null; // 파일 없음/읽기 불가 — 목록에서 침묵이 아니라 부재로 표시
+  }
+}
+
+/*
+ * creds list — 어떤 자격증명 "이름"이 어디에 저장돼 있는지.
+ * 배경(2026-08-05 감사, 결함 H): save/file만 있어 저장한 것을 확인할 방법이
+ * 없었다. 계약은 상단과 동일 — 값은 어떤 경로로도 출력하지 않는다. 키 이름과
+ * 저장 위치까지만. (키체인 vault는 standalone에서 keytar를 부르면 무한 대기하는
+ * v1 실사고가 있어 조회조차 하지 않는다 — 부재가 아니라 "미조회"로 표시.)
+ */
+function cmdCredsList(ctx) {
+  const ko = ctx.lang !== "en";
+  const project = activeProjectPath(ctx.db());
+  const stores = [];
+  if (project) stores.push({ label: (ko ? "프로젝트 .env — " : "project .env — ") + path.join(project, ".env"), keys: envKeyNames(path.join(project, ".env")) });
+  stores.push({ label: (ko ? "전역 credentials.env — " : "global credentials.env — ") + path.join(userDataDir(), "credentials.env"), keys: envKeyNames(path.join(userDataDir(), "credentials.env")) });
+  stores.push({ label: "~/.agentlas/credentials.env", keys: envKeyNames(path.join(os.homedir(), ".agentlas", "credentials.env")) });
+
+  let any = false;
+  for (const store of stores) {
+    if (store.keys === null) continue; // 파일 자체가 없으면 줄을 만들지 않는다
+    any = true;
+    ctx.out(ctx.ui.bold(store.label));
+    if (!store.keys.length) ctx.out(ctx.ui.dim(ko ? "  (비어 있음)" : "  (empty)"));
+    for (const key of store.keys) ctx.out(`  ${key}${ctx.ui.dim("=•••")}`);
+  }
+  if (isElectronRuntime()) {
+    ctx.out(ctx.ui.dim(ko ? "키체인 vault: 데스크탑에서 확인" : "keychain vault: inspect in Desktop"));
+  } else {
+    ctx.out(ctx.ui.dim(ko
+      ? "키체인 vault는 standalone 터미널에서 조회하지 않습니다(서명 없는 keytar 호출은 키체인에 막혀 멈춥니다)."
+      : "The keychain vault is not queried from the standalone terminal (unsigned keytar calls hang on the OS keychain)."));
+  }
+  if (!any) ctx.out(ko ? "저장된 자격증명 파일이 없습니다. agentlas creds save 로 추가하세요." : "No credential files yet. Add one with: agentlas creds save");
+  return 0;
+}
+
 async function run(ctx, args) {
   const fail = (msg) => { ctx.err(msg); return 1; };
   const sub = args[0];
   if (sub === "file") return cmdCredsFile(ctx, args.slice(1));
+  if (sub === "list" || sub === "ls") return cmdCredsList(ctx);
   if (sub !== "save") {
-    return fail('usage: agentlas creds save --provider <name> --key <ENV_NAME> --value <value> [--project <path>] OR agentlas creds file --source <path> [--env <ENV_NAME>]');
+    return fail('usage: agentlas creds save --provider <name> --key <ENV_NAME> --value <value> [--project <path>] OR agentlas creds file --source <path> [--env <ENV_NAME>] OR agentlas creds list');
   }
   const f = parseCredFlags(args.slice(1));
   const key = typeof f.key === "string" ? f.key.trim() : "";

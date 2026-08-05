@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.0.29 — 2026-08-05
+
+Terminal-wide audit release. Every command was executed for real; what follows fixes what that audit found.
+
+- Native federated staffing: `hep-network` / `hep-local` / `hep-cloud` / `hep-hub` now run this
+  terminal's own workforce loop with the local Agentlas-OS core federating the declared source scope.
+  (They previously passed through to an external CLI stub that always answered exit 3.)
+  Honest stop with install guidance when the local core is missing — no silent fallback to the public Hub.
+- `workforce` now declares its sourceScope ("hub") explicitly instead of relying on the server default.
+- `doctor` distinguishes installed from signed-in: local sign-in evidence per runtime, a warning
+  (not "all clear") when the active runtime has none.
+- New `roles` command: view and set orchestrator/worker model roles from the terminal
+  (`roles set <role> <runtime> [--model id] [--effort lv]`, `roles set worker --inherit`).
+  REPL `/model`·`/runtime` now say they are session-scoped and point to `agentlas roles`.
+- Setup wizard prints install/sign-in guidance when the chosen runtime is missing or unauthenticated.
+- `creds list` (names and stores only — values never printed), `mcp list`, Korean `help` body.
+- The graph command group ships in the npm package for the first time (it landed after 1.0.28 was published).
+- New gates: user-scenarios (93 real CLI invocations), local-core transport wire contract,
+  doctor auth-evidence, roles round-trip, onboarding guidance, EN/KO help sync.
+
 ## 1.0.26 — 2026-08-03
 
 - **`agentlas list` stops letting the terminal cut its own output.** Slugs were

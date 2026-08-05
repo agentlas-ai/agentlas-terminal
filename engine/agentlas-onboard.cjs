@@ -142,6 +142,26 @@ async function runOnboard({ ui, rl, helpers, persist }) {
   rtOpts.forEach((o, i) => optionLine(i + 1, o.label, i === 0));
   const ri = await pickNum(rtOpts.length);
   const runtime = rtOpts[ri - 1].value;
+  // missing인 런타임을 골라도 저장은 한다(미리 설정) — 하지만 조용히 저장하면
+  // 첫 실행 실패가 배신이 된다(2026-08-05 감사 결함 A). 설치 명령을 그 자리에서
+  // 알려주고, 로그인 흔적이 없으면 로그인 절차까지 말한다.
+  if (runtime !== "auto") {
+    const installHint = {
+      "claude-code": "npm i -g @anthropic-ai/claude-code",
+      codex: "npm i -g @openai/codex",
+      gemini: "npm i -g @google/gemini-cli",
+    }[runtime];
+    if (!H.which(H.RUNTIME_BIN[runtime])) {
+      if (installHint) printIndented(ui.t("wiz.runtimeInstallHint", installHint), c.dim);
+    } else {
+      try {
+        const { runtimeAuthEvidence } = require("./runtimes/auth-evidence.cjs");
+        if (runtimeAuthEvidence(runtime).status === "none") {
+          printIndented(ui.t("wiz.runtimeLoginHint", H.RUNTIME_BIN[runtime]), c.dim);
+        }
+      } catch { /* evidence unavailable — say nothing rather than guess */ }
+    }
+  }
 
   // Step 3 — default permission
   ui.line("");

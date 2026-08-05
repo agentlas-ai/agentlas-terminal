@@ -40,9 +40,10 @@ const SLASH_COMMANDS = [
   { command: "/network", args: "<request>", ko: "Workforce 라우트", en: "Workforce route" },
   { command: "/workforce", args: "<request>", ko: "Workforce 라우트", en: "Workforce route" },
   { command: "/taskforce", args: "<request>", ko: "임시 태스크포스 편성", en: "Assemble a task force" },
-  // 소스 스코프가 이름에 붙은 스태핑 3종. 스코프를 문장에 적는다 — 예전에는
-  // 별칭이 스코프를 버려 /hep-cloud 가 자산 보관함으로, /hep-hub 가 검색으로
-  // 갔다(2026-07-28 수리). 팔레트 문구가 곧 사용자에게 하는 약속이다.
+  // 소스 스코프 편성 4종 — 2026-08-05 같은 날 삭제 후 네이티브 배선으로 복원.
+  // 이전에는 외부 CLI 스텁(exit 3)이라 죽은 메뉴였다. 지금은 이 터미널의 편성
+  // 루프가 직접 돌고 로컬 Agentlas-OS Core가 선언된 스코프의 메뉴를 연합한다.
+  // 팔레트 문구가 곧 사용자에게 하는 약속이다 — 스코프를 문장에 적는다.
   { command: "/hep-network", args: "\"<request>\"", ko: "로컬+오너 클라우드+공개 Hub 연합 편성", en: "Staff across Local + owner Cloud + public Hub" },
   { command: "/hep-local", args: "\"<request>\"", ko: "등록된 로컬 에이전트만으로 편성", en: "Staff from registered Local agents only" },
   { command: "/hep-cloud", args: "\"<request>\"", ko: "오너 Agent Cloud만으로 편성", en: "Staff from owner Agent Cloud only" },
@@ -76,6 +77,7 @@ const SLASH_COMMANDS = [
   { command: "/creds", args: "<sub>", ko: "자격증명", en: "Credentials" },
   { command: "/env", args: "", ko: "공유 환경 키", en: "Shared env keys" },
   { command: "/multimodal", args: "", ko: "이미지·영상·음성 설정", en: "Image/video/audio providers" },
+  { command: "/roles", args: "[set <role> <runtime>]", ko: "오케스트레이터·워커 모델 역할 조회/설정", en: "Show or set orchestrator/worker model roles" },
   { command: "/telegram", args: "[sub]", ko: "텔레그램 연결", en: "Telegram bindings" },
   { command: "/oberon", args: "[sub]", ko: "AI 필름", en: "AI film" },
   { command: "/film", args: "<sub>", ko: "필름 렌더", en: "Film render" },

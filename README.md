@@ -94,10 +94,13 @@ agentlas variant resolve --base-release <id> # Preview local variant compatibili
 ```sh
 agentlas storm "<goal>"          # Goal + UltraCode harness: plan -> assign -> execute -> verify [--research]
 agentlas swarm "<goal>"          # Emergent multi-agent swarm [--parallel N]
-agentlas workforce "<prompt>"    # Route through Agent Workforce Ontology
+agentlas workforce "<prompt>"    # Route through Agent Workforce Ontology (public Hub menu)
 agentlas network "<prompt>"      # Alias for workforce
 agentlas taskforce "<prompt>"    # Alias for workforce
-agentlas legacy-network "<prompt>" # Legacy Hephaestus solver (explicit invocation only)
+agentlas hep-network "<prompt>"  # Staff across Local + owner Cloud + public Hub (local Core federation)
+agentlas hep-local "<prompt>"    # Same staffing, registered Local agents only
+agentlas hep-cloud "<prompt>"    # Same staffing, owner Agent Cloud only
+agentlas hep-hub "<prompt>"      # Same staffing, public Hub only
 agentlas call "a,b" "<context>"  # Call explicitly named Hub or Cloud agents
 agentlas browser [...]           # Real browser hardpoint launcher
 agentlas route "<prompt>" [--json] # Preview routing decisions without execution

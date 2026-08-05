@@ -40,16 +40,12 @@ const USAGE = Object.freeze({
   call: 'usage: agentlas call "<agent-slugs>" "<context>"',
   connect: "usage: agentlas connect [status|telegram|help]",
   hep: "usage: agentlas hep <subcommand> [args]",
-  // 소스 스코프를 지키는 스태핑 표면 3종. 이름이 곧 계약이라 usage 도 스코프를
-  // 문장으로 적는다 — 이전에는 별칭이 스코프를 버려 hep-cloud 가 자산 보관함
-  // usage 를, hep-hub 가 검색 목록을 뱉었다(2026-07-28 수리).
-  "hep-network": 'usage: agentlas hep-network "<request>"  # Local + owner Cloud + public Hub, federated by Core',
-  "hep-local": 'usage: agentlas hep-local "<request>"   # registered Local agents only',
-  "hep-cloud": 'usage: agentlas hep-cloud "<request>"   # owner Agent Cloud agents only',
-  "hep-hub": 'usage: agentlas hep-hub "<request>"     # public Agentlas Hub agents only',
+  // 소스 스코프 스태핑(hep-network/hep-local/hep-cloud/hep-hub)과 legacy-network 의
+  // usage 는 2026-08-05 에 삭제했다. 네이티브가 편성을 수행하지 않고 exit 3 +
+  // host_llm_required 만 반환하므로, 여기에 usage 를 두면 "쓸 수 있는 명령"으로
+  // 읽힌다. 차단과 안내는 commands/index.cjs 의 HOST_LLM_ONLY_SURFACES 가 한다.
   hephaestus: "usage: agentlas hephaestus <subcommand> [args]",
   journal: "usage: agentlas journal <status|verify|repair|gate> --run-id <id> | --journal <path>",
-  "legacy-network": 'usage: agentlas legacy-network "<request>"',
   netadmin: "usage: agentlas netadmin <init|status|reindex|bench|add-source> [args]",
   research: "usage: agentlas research <status|gather|search|read|plan> [args]",
   route: 'usage: agentlas route "<request>" [--json]',

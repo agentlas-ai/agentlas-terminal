@@ -585,8 +585,12 @@ function handleSlash(ctx, cmdline, api) {
 
     case "runtime": {
       if (!rest[0]) throw new Error("Usage: /runtime claude-code|codex|gemini");
+      // 세션 오버라이드는 저장되지 않는다 — 고지 없이는 사용자가 영구 설정으로
+      // 믿는다(2026-08-05 감사 결함 C). 영구 경로를 같은 줄에서 알려준다.
       api.setRuntime(rest[0]);
-      ctx.out(ui.c.dim(`runtime: ${rest[0]} (${en ? "applies to new sessions" : "새 세션부터 적용"})`));
+      ctx.out(ui.c.dim(`runtime: ${rest[0]} (${en
+        ? "new sessions in this REPL only — persist with: agentlas roles set orchestrator " + rest[0]
+        : "이 REPL의 새 세션 한정 — 영구 설정: agentlas roles set orchestrator " + rest[0]})`));
       return;
     }
     case "model": {
@@ -595,7 +599,9 @@ function handleSlash(ctx, cmdline, api) {
       const next = ["default", "inherit"].includes(model.toLowerCase()) ? null : model;
       api.setModel(next);
       ctx.out(ui.c.dim(
-        `model: ${next || "default"} (${en ? "applies to new sessions" : "새 세션부터 적용"})`,
+        `model: ${next || "default"} (${en
+          ? "new sessions in this REPL only — persist with: agentlas roles set"
+          : "이 REPL의 새 세션 한정 — 영구 설정: agentlas roles set"})`,
       ));
       return;
     }

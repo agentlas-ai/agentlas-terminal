@@ -8,9 +8,25 @@ function run(ctx, args) {
   const sub = String(args[0] || "help");
   const query = args[1];
   if (sub === "help" || sub === "--help" || sub === "-h") {
+    // SELF_HELP_COMMANDS 계약: --help 는 스텁이 아니라 실제 안내여야 한다 —
+    // 무엇이 만들어지고 언제 필요한지까지 말한다.
     ctx.out(ko
-      ? "사용법: agentlas native prepare <에이전트>  ·  네이티브 CLI 문맥 파일을 명시적으로 생성"
-      : "usage: agentlas native prepare <agent>  ·  explicitly create native CLI context files");
+      ? [
+        "agentlas native — 네이티브 CLI 문맥 파일 관리",
+        "  native prepare <에이전트>   에이전트 폴더에 CLAUDE.md·AGENTS.md 등",
+        "                             네이티브 CLI 문맥 파일을 명시적으로 생성",
+        "",
+        "  보통은 실행 시 자동 준비됩니다. 파일을 직접 확인·수정하고 싶을 때 쓰세요.",
+        "  에이전트 이름은 agentlas list 에서 확인합니다.",
+      ].join("\n")
+      : [
+        "agentlas native — native CLI context files",
+        "  native prepare <agent>     explicitly create the native CLI context files",
+        "                             (CLAUDE.md, AGENTS.md, …) in the agent folder",
+        "",
+        "  Normally these are prepared automatically on run. Use this when you want",
+        "  to inspect or edit the files directly. Find agent names via: agentlas list",
+      ].join("\n"));
     return 0;
   }
   if (sub !== "prepare" || !query) {

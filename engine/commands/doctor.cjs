@@ -9,6 +9,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { dbPath, userDataDir } = require("../core/paths.cjs");
 const { listAvailableCliRuntimes, activeRuntimeRow } = require("../runtimes/detect.cjs");
+const { runtimeAuthEvidence } = require("../runtimes/auth-evidence.cjs");
 const { resolvedModelRole } = require("../runtimes/roles.cjs");
 
 function roleDetail(selection, role, en) {
@@ -26,8 +27,10 @@ function roleDetail(selection, role, en) {
 function run(ctx) {
   const en = ctx.lang === "en";
   let failures = 0;
+  let warnings = 0;
   const ok = (label, detail) => ctx.out(`  ${ctx.ui.green("✓")} ${label}${detail ? ctx.ui.dim(" — " + detail) : ""}`);
   const bad = (label, detail) => { failures += 1; ctx.out(`  ${ctx.ui.red("✗")} ${label}${detail ? ctx.ui.dim(" — " + detail) : ""}`); };
+  const warn = (label, detail) => { warnings += 1; ctx.out(`  ${ctx.ui.yellow ? ctx.ui.yellow("!") : "!"} ${label}${detail ? ctx.ui.dim(" — " + detail) : ""}`); };
 
   // 1) 데이터
   const p = dbPath();
@@ -43,10 +46,28 @@ function run(ctx) {
     bad(en ? "database" : "데이터베이스", (en ? "missing: " : "없음: ") + p);
   }
 
-  // 2) 런타임
+  // 2) 런타임 — 설치 여부와 인증 흔적은 다른 축이다. which()만 보면 로그아웃
+  // 상태에서도 all clear가 나간다(2026-08-05 실측). 각 CLI가 로그인 시 남기는
+  // 로컬 산출물을 증거로 관측하고, 증거≠증명이므로 문구도 단정하지 않는다.
   const clis = listAvailableCliRuntimes();
   if (clis.length) {
-    ok(en ? "runtimes" : "런타임", clis.map((c) => `${c.kind}`).join(", "));
+    const evidences = clis.map((c) => ({ kind: c.kind, evidence: runtimeAuthEvidence(c.kind) }));
+    const annotated = evidences.map(({ kind, evidence }) => {
+      if (evidence.status === "none") return `${kind}(${en ? "no sign-in evidence" : "로그인 흔적 없음"})`;
+      return kind; // evidence 또는 unknown — 검사법이 없는 런타임을 미로그인으로 표시하지 않는다
+    });
+    ok(en ? "runtimes" : "런타임", annotated.join(", "));
+    // 신규 설치 상태: 검사 가능한 런타임 전부가 흔적 없음이면 첫 실행이 거의
+    // 확실히 실패한다 — 활성 런타임 행이 아직 없어도 여기서 경고한다.
+    const checkable = evidences.filter(({ evidence }) => evidence.status !== "unknown");
+    if (checkable.length && checkable.every(({ evidence }) => evidence.status === "none")) {
+      warn(
+        en ? "runtime sign-in" : "런타임 로그인",
+        en
+          ? "no detected runtime has local sign-in evidence — sign in to one before running (e.g. claude / codex login / gemini)"
+          : "감지된 어떤 런타임에도 로그인 흔적이 없습니다 — 실행 전에 하나는 로그인하세요 (예: claude / codex login / gemini)",
+      );
+    }
   } else {
     bad(en ? "runtimes" : "런타임", en
       ? "no agent CLI on PATH (claude / codex / gemini / kimi / grok / cursor-agent)"
@@ -57,7 +78,23 @@ function run(ctx) {
   try {
     const db = ctx.db();
     const active = activeRuntimeRow(db);
-    if (active) ok(en ? "active runtime" : "활성 런타임", `${active.kind}${active.model ? ` (${active.model})` : ""}`);
+    if (active) {
+      const detail = `${active.kind}${active.model ? ` (${active.model})` : ""}`;
+      // 활성 런타임은 모든 실행이 지나는 문이다 — 로그인 흔적이 없으면 all clear
+      // 가 아니라 경고다. 흔적 없음 = 미로그인 "가능성"이므로 단정하지 않는다.
+      const evidence = runtimeAuthEvidence(active.kind);
+      if (evidence.status === "none") {
+        const bin = { "claude-code": "claude", codex: "codex", gemini: "gemini" }[active.kind] || active.kind;
+        warn(
+          en ? "active runtime" : "활성 런타임",
+          en
+            ? `${detail} — no local sign-in evidence; runs may fail until you sign in (try: ${bin} login)`
+            : `${detail} — 로그인 흔적이 없습니다. 로그인 전에는 실행이 실패할 수 있습니다 (시도: ${bin} login)`,
+        );
+      } else {
+        ok(en ? "active runtime" : "활성 런타임", detail);
+      }
+    }
     const orchestrator = resolvedModelRole(db, "orchestrator");
     const worker = resolvedModelRole(db, "worker");
     if (orchestrator && worker) {
@@ -82,6 +119,12 @@ function run(ctx) {
   if (failures) {
     ctx.out(en ? `doctor: ${failures} problem(s) found` : `doctor: 문제 ${failures}건`);
     return 1;
+  }
+  if (warnings) {
+    // 경고가 있으면 "이상 없음"이라고 말하지 않는다 — 그 문구가 첫 실행 실패를
+    // 배신으로 만든다. 경고는 실행을 막지 않으므로 exit 0.
+    ctx.out(en ? `doctor: ${warnings} warning(s) — runnable, but check the lines above` : `doctor: 경고 ${warnings}건 — 실행은 가능하나 위 항목을 확인하세요`);
+    return 0;
   }
   ctx.out(en ? "doctor: all clear" : "doctor: 이상 없음");
   return 0;

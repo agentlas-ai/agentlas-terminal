@@ -26,6 +26,9 @@ function usage(ko) {
       ? "  구독 계좌(A)와 렌트수익 계좌(B) 잔액을 표시합니다."
       : "  Shows the subscription account (A) and rental-earnings account (B) balances.",
     ko
+      ? "  크레딧은 Hub 에이전트 호출(공개 에이전트 3·팀 10, 활성 리스는 0)에 쓰입니다."
+      : "  Credits pay for Hub agent calls (public agent 3 · team 10; active leases cost 0).",
+    ko
       ? "  참고: 렌트수익(B) → 구독(A) 전송은 Agentlas Desktop 에서만 가능합니다 (터미널 전송 명령 없음)."
       : "  Note: earnings (B) → subscription (A) transfer is Desktop-only (no transfer command in the terminal).",
   ].join("\n");

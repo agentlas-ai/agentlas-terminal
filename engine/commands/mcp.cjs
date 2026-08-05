@@ -80,11 +80,15 @@ async function probe(ctx, args) {
 function run(ctx, args = []) {
   const [sub, ...rest] = args;
   if (!sub) return list(ctx);
+  // 무인자 기본 동작이 목록인데 이름으로 부르면 거부되는 비대칭이 있었다
+  // (2026-08-05 감사 결함 G): 다른 명령들(cloud list, plugin list)이 만든
+  // "list를 붙이는" 습관이 여기서만 usage 오류가 됐다.
+  if (sub === "list" || sub === "ls") return list(ctx);
   if (sub === "probe") return probe(ctx, rest);
   const en = ctx.lang === "en";
   ctx.err(en
-    ? `unknown mcp subcommand: ${sub} (available: probe)`
-    : `알 수 없는 mcp 하위 명령: ${sub} (사용 가능: probe)`);
+    ? `unknown mcp subcommand: ${sub} (available: list · probe)`
+    : `알 수 없는 mcp 하위 명령: ${sub} (사용 가능: list · probe)`);
   return 1;
 }
 

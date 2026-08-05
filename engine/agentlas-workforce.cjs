@@ -1097,10 +1097,15 @@ function validateWorkOrder(value) {
 function validateCandidateSet(value, workOrder, now = new Date(), options = {}) {
   const set = assertObject(value, "candidateSet");
   assertNoForbiddenFitSignals(set);
-  assertExactKeys(set, [
+  // projection은 로컬 Core(연합) 응답에만 있는 메뉴 투영 메타데이터다(실측
+  // 2026-08-05, reference-first: fullDossier=false). 원격 서버는 보내지 않는다.
+  // 없애고 되돌려 보내면 Core 쪽 다이제스트 대조가 위험하므로 선택 키로 허용한다.
+  const exactKeys = [
     "schemaVersion", "selectionSessionId", "workOrderId", "ontologyVersion",
     "candidateSetDigest", "decisionOwner", "historyInfluence", "slots", "issuedAt", "expiresAt",
-  ], "candidateSet", "candidate_set_invalid");
+  ];
+  if (Object.prototype.hasOwnProperty.call(set, "projection")) exactKeys.push("projection");
+  assertExactKeys(set, exactKeys, "candidateSet", "candidate_set_invalid");
   if (set.schemaVersion !== "agentlas.workforce-candidate-set.v1") fail("candidate_set_invalid", "unsupported candidate set schema");
   assertId(set.selectionSessionId, "candidateSet.selectionSessionId");
   if (set.workOrderId !== workOrder.workOrderId) fail("candidate_set_invalid", "candidate set workOrderId mismatch");
@@ -1126,11 +1131,15 @@ function validateCandidateSet(value, workOrder, now = new Date(), options = {}) 
     const releases = new Set();
     for (const candidate of assertArray(slotResult.candidates, `candidateSet.${slotId}.candidates`, 100)) {
       assertObject(candidate, "candidate");
-      assertExactKeys(candidate, [
+      // missingMandatory는 로컬 Core(연합) 응답에만 있는 미충족 필수 표식이다
+      // (실측 2026-08-05, fullDossier=true에도 동봉). 원격 서버는 보내지 않는다.
+      const candidateKeys = [
         "agentDefinitionId", "agentReleaseId", "releaseVersion", "packageHash", "contentDigest",
         "entityKind", "name", "communities", "fitEvidence", "qualificationEvidence", "optionalGaps",
         "semanticSnapshot", "operational",
-      ], "candidate", "candidate_set_invalid");
+      ];
+      if (Object.prototype.hasOwnProperty.call(candidate, "missingMandatory")) candidateKeys.push("missingMandatory");
+      assertExactKeys(candidate, candidateKeys, "candidate", "candidate_set_invalid");
       assertId(candidate.agentDefinitionId, "candidate.agentDefinitionId");
       const releaseId = assertId(candidate.agentReleaseId, "candidate.agentReleaseId");
       if (releases.has(releaseId)) fail("candidate_set_invalid", `duplicate release ${releaseId} in ${slotId}`);
@@ -1151,10 +1160,19 @@ function validateCandidateSet(value, workOrder, now = new Date(), options = {}) 
       if (typeof operational.callable !== "boolean" || typeof operational.installable !== "boolean") fail("candidate_set_invalid", "candidate operational flags are invalid");
       assertIds(operational.unavailableReasons || [], "candidate.operational.unavailableReasons");
       const semantic = assertObject(candidate.semanticSnapshot, "candidate.semanticSnapshot");
-      assertExactKeys(semantic, [
+      // knowledge·modalities는 로컬 Core 스냅샷에만 있는 확장 어휘다(실측 2026-08-05).
+      // 원격 서버는 보내지 않는다 — missingMandatory·projection과 같은 규칙으로
+      // "있으면 검증하고 허용", 원격 계약의 exact-keys는 그대로 둔다.
+      const semanticKeys = [
         "summaries", "roles", "skills", "toolCapabilities", "consumes", "produces",
         "authorities", "runtimes", "languages",
-      ], "candidate.semanticSnapshot", "candidate_set_invalid");
+      ];
+      for (const optional of ["knowledge", "modalities"]) {
+        if (Object.prototype.hasOwnProperty.call(semantic, optional)) semanticKeys.push(optional);
+      }
+      assertExactKeys(semantic, semanticKeys, "candidate.semanticSnapshot", "candidate_set_invalid");
+      if (semantic.knowledge !== undefined) assertIds(semantic.knowledge, "candidate.semanticSnapshot.knowledge");
+      if (semantic.modalities !== undefined) assertStrings(semantic.modalities, "candidate.semanticSnapshot.modalities");
       assertStrings(semantic.summaries, "candidate.semanticSnapshot.summaries");
       assertIds(semantic.roles, "candidate.semanticSnapshot.roles");
       assertLeveledConcepts(semantic.skills, "candidate.semanticSnapshot.skills");
@@ -2393,6 +2411,16 @@ function create(deps = {}) {
 
   async function workforceRun(db, rawTask, ctx = {}) {
     const task = assertString(rawTask, "task", 20_000);
+    // 이 표면이 보는 후보 메뉴의 소스 스코프. 원격 MCP 경로의 정직한 기본은 "hub"
+    // (터미널 workforce = 공개 Hub 메뉴 스태핑). 다른 값은 로컬 Core 전송을 가진
+    // 호출자만 넘길 수 있다 — 여기서 조용히 넓히지 않는다.
+    const sourceScope = (() => {
+      const value = ctx.sourceScope === undefined ? "hub" : ctx.sourceScope;
+      if (!["network", "local", "cloud", "hub"].includes(value)) {
+        fail("source_scope_invalid", `sourceScope must be network|local|cloud|hub, got: ${String(value)}`);
+      }
+      return value;
+    })();
     const ui = ctx.ui || newUi();
     const runtime = ctx.runtime || D.resolveRuntime(db, ctx.runtimeOverride);
     const cwd = ctx.cwd || (typeof D.projectCwd === "function" ? D.projectCwd() : process.cwd());
@@ -2744,7 +2772,9 @@ function create(deps = {}) {
     };
 
     const supersedeCandidateSearch = (workOrder, refinementNumber, triggerKind) => {
-      const requestDigest = sha256({ workOrder });
+      // hubStage가 저장한 requestDigest와 같은 인자 모양이어야 행을 찾는다 —
+      // search 인자에 sourceScope가 실리므로(2026-08-05) 여기서도 함께 계산한다.
+      const requestDigest = sha256({ workOrder, sourceScope });
       for (const row of receipt.hubTools) {
         if (row.tool !== "workforce.search_candidates" || row.requestDigest !== requestDigest || row.authoritativeChain !== true) continue;
         row.authoritativeChain = false;
@@ -3065,7 +3095,10 @@ function create(deps = {}) {
 
       let refinementsUsed = 0;
       const searchCurrentWorkOrder = async () => {
-        const candidateRaw = await hubStage("workforce.search_candidates", { workOrder });
+        // sourceScope는 MCP 스키마상 required다. 예전에는 싣지 않아 서버 기본값
+        // ("hub")에 의존했다 — 기본값이 바뀌면 이 표면의 실제 스코프가 조용히
+        // 넓어지거나 좁아진다. 이 표면이 보는 메뉴를 스스로 선언한다.
+        const candidateRaw = await hubStage("workforce.search_candidates", { workOrder, sourceScope });
         candidateSet = validateCandidateSet(
           candidateRaw,
           workOrder,

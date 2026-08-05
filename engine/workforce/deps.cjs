@@ -579,9 +579,22 @@ function workforceRuntime(ctx = {}) {
   return _workforce;
 }
 
+/*
+ * 로컬 Core 전송을 실은 1회용 런타임 (2026-08-05, hep-* 네이티브 배선).
+ * 싱글턴을 쓰지 않는 이유: D.callHubTool은 명령 수명의 stdio 프로세스와 validate
+ * 계보 상태를 붙잡는다 — 공유하면 다음 편성이 앞 편성의 계보를 이어받는다.
+ * 원격 기본 경로(workforceRuntime)는 여기서 아무것도 바뀌지 않는다.
+ */
+function createLocalCoreWorkforceRuntime(ctx, transport) {
+  const deps = buildWorkforceDeps(ctx);
+  deps.callHubTool = transport.callHubTool;
+  return require("../agentlas-workforce.cjs").create(deps);
+}
+
 module.exports = {
   buildWorkforceDeps,
   workforceRuntime,
+  createLocalCoreWorkforceRuntime,
   resolveWorkforceRuntime,
   receiptFile,
   appendReceipt,

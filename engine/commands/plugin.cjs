@@ -159,6 +159,28 @@ async function runPluginList(ctx, args) {
 
 function run(ctx, args) {
   const action = args[0];
+  // SELF_HELP_COMMANDS 계약(index.cjs): `plugin --help` 는 여기로 ["help"] 가 되어
+  // 들어온다. help 분기가 없으면 unknown action → usage exit 1 이라, 도움말을
+  // 요청한 사용자가 오류 코드를 받는다.
+  if (action === "help" || action === "--help" || action === "-h") {
+    const ko = ctx.lang !== "en";
+    ctx.out(ko
+      ? [
+        "agentlas plugin — Hub 플러그인(MCP 서버)",
+        "  plugin list [--project <경로>]   설치 가능/설치된 플러그인 목록",
+        "  plugin add <slug>               플러그인 설치 (slug는 list에서 확인)",
+        "",
+        "  연결 확인: agentlas mcp probe <server-id>",
+      ].join("\n")
+      : [
+        "agentlas plugin — Hub plugins (MCP servers)",
+        "  plugin list [--project <path>]   list available/installed plugins",
+        "  plugin add <slug>               install a plugin (find slugs via list)",
+        "",
+        "  Check a connection with: agentlas mcp probe <server-id>",
+      ].join("\n"));
+    return 0;
+  }
   if (action === "add") {
     if (args.length !== 2) {
       ctx.err("usage: agentlas plugin add <slug>   (run agentlas plugin list first)");
