@@ -101,7 +101,10 @@ const RULES = [
   "default over a fourth round of questions about the same thing.",
   "",
   "Write questions the way a helpful shop assistant would: short, concrete, one thing at a time,",
-  "with examples when a choice is not obvious. Write them in the same language the person used.",
+  "with examples when a choice is not obvious. Write every question, choice, name, goal, label,",
+  "and note in the PRODUCT LANGUAGE stated at the end of this prompt — even when the person",
+  "writes in another language. The person chose the product language in settings; drifting to",
+  "the input language makes the product look broken. (Their own words quoted back are fine.)",
   "",
   "Return ONLY compact JSON, one of these two shapes:",
   '  {"ask":[{"id":"<stable-id>","question":"...","why":"...","choices":["...","..."]}]}',
@@ -118,12 +121,18 @@ const RULES = [
   "    agent/action step. Write the role, NEVER an agent name or id — the product searches",
   "    the real catalog and fills the slot itself. A name you invent does not exist and the",
   "    graph dies at run time. Steps that need the same kind of worker get the same role text.",
+  "    Alongside role, add roleEn: the same role faithfully translated to English. The catalog",
+  "    is English — searching with a non-English role buries the right worker (measured: the",
+  "    same query ranked its target 1st in English and 144th in Korean).",
   "  · kind:\"code\" when the step is an EXACT computation or data-shaping that a chat model would",
   "    get quietly wrong: number math, currency/percent, parsing HTML/CSV/JSON, spreadsheet cells,",
   "    date arithmetic, calling a data library (e.g. yfinance). For those, add kind:\"code\", a short",
   "    codeLang (\"python\" default, or \"js\"), and code:\"<the script>\". The script gets the upstream",
   "    values as `vars` (a dict/object) and must set `result` to what the next step reads.",
   "    Read consumes[] the same way. YOU write the code — the person only describes what they want.",
+  "    If the script imports anything outside the Python standard library, declare the pip names in",
+  '    packages:["yfinance"] on that step — the product installs them before the run. Prefer the',
+  "    standard library when it can do the job; an undeclared import dies on the user's machine.",
   "  · kind:\"agent\" (the default, omit it) for judgement, writing, summarizing, deciding — anything",
   "    where being approximately right is fine. Split a step: fetch+compute in a code step, then",
   "    judge/write in an agent step. Do not put exact math inside an agent instruction.",
@@ -178,7 +187,7 @@ const RULES = [
   `provider must be one of: ${PROVIDER_CATALOG.map((p) => p.id).join(", ")}`,
 ].join("\n");
 
-function buildInterviewPrompt(state) {
+function buildInterviewPrompt(state, locale = "ko") {
   const known = state.answers.length
     ? state.answers.map((a) => `Q(${a.questionId}): ${a.question}\nA: ${a.answer}`).join("\n\n")
     : "(nothing yet)";
@@ -192,6 +201,8 @@ function buildInterviewPrompt(state) {
   if (state.asked.length) {
     lines.push("", `Question ids already asked (do not repeat): ${state.asked.join(", ")}`);
   }
+  // ★산출 언어는 입력 언어가 아니라 **제품 설정**이 정한다(데스크탑과 같은 규칙).
+  lines.push("", `PRODUCT LANGUAGE: ${locale === "ko" ? "Korean" : "English"}. Every user-facing string you emit is in this language.`);
   // ★지난 시도가 왜 지어지지 못했는지를 모델 앞에 놓는다. 데스크탑과 같은 규율이다 —
   //   없으면 같은 실수를 그대로 반복한다.
   //   (패리티 게이트가 잡았다: 처음엔 이 블록이 `asked` 안에 들어가, 질문을 한 적 없는
@@ -555,7 +566,12 @@ function buildGraphFromBlueprint(bp) {
       position: { x: column(index + 1), y: 0 },
       config: {
         ...(isCode
-          ? { code: step.code || "", codeLang: step.codeLang === "js" ? "js" : "python", note: step.instruction }
+          ? {
+            code: step.code || "", codeLang: step.codeLang === "js" ? "js" : "python", note: step.instruction,
+            ...(Array.isArray(step.packages) && step.packages.length
+              ? { packages: step.packages.map((v) => String(v).trim()).filter(Boolean) }
+              : {}),
+          }
           : { prompt: step.instruction }),
         effect: step.effect,
         // 기본은 잠김. 사람이 명시로 "검토 없이"라고 했을 때만 auto(데스크탑과 같은 규칙).
@@ -565,6 +581,7 @@ function buildGraphFromBlueprint(bp) {
         // ★역할은 저장돼야 한다 — 묻기만 하고 버리면 편성이 채울 슬롯 자체가 없다
         //   (데스크탑 shared/graph-blueprint.ts와 같은 자리, 같은 규칙).
         ...(typeof step.role === "string" && step.role.trim() ? { role: step.role.trim() } : {}),
+        ...(typeof step.roleEn === "string" && step.roleEn.trim() ? { roleEn: step.roleEn.trim() } : {}),
         ...(step.produces ? { produces: step.produces } : {}),
         ...(step.consumes && step.consumes.length ? { consumes: step.consumes[0] } : {}),
         ...(step.uses && step.uses.length

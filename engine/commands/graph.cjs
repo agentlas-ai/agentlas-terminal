@@ -593,7 +593,7 @@ async function newGraph(ctx, request, flags) {
     let built = null;
     let announcedFallback = false;
     for (let round = 0; round < interview.MAX_INTERVIEW_ROUNDS; round += 1) {
-      const answer = await askModel(ctx, interview.buildInterviewPrompt(state), {});
+      const answer = await askModel(ctx, interview.buildInterviewPrompt(state, en ? "en" : "ko"), {});
       if (!answer.ok) {
         ctx.err(answer.reason);
         ctx.err(ctx.ui.dim(answer.nextAction));

@@ -53,7 +53,17 @@ function computeDepths(graph) {
   return depth;
 }
 
-/** 그래프를 결정적 좌→우 배치로 재배치한 새 노드 배열. 같은 컬럼은 세로로 균등 분산. */
+/** 한 띠(band)에 넣을 컬럼 수 — 데스크탑 columnsPerBand와 같은 식. */
+function columnsPerBand(totalCols) {
+  if (totalCols <= 4) return totalCols;
+  return Math.max(4, Math.ceil(Math.sqrt(totalCols * 2)));
+}
+
+/**
+ * 그래프를 결정적 사행(蛇行) 배치로 재배치한 새 노드 배열.
+ * 긴 사슬은 띠로 접어 좌→우 / 우→좌로 번갈아 흐르고(뱀 모양), 같은 컬럼은 세로 분산.
+ * (일직선은 14단계에서 폭 4,000px가 되어 아무도 못 읽었다 — 실측 항목 3.)
+ */
 function layoutGraph(graph) {
   const depth = computeDepths(graph);
   const byCol = new Map();
@@ -62,14 +72,39 @@ function layoutGraph(graph) {
     if (!byCol.has(d)) byCol.set(d, []);
     byCol.get(d).push(n);
   }
+  const cols = [...byCol.keys()].sort((a, b) => a - b);
+  const colOrder = new Map(cols.map((c, i) => [c, i]));
+  const totalCols = cols.length;
+  const perBand = columnsPerBand(totalCols);
+
+  const bandCount = Math.ceil(totalCols / perBand);
+  const bandHeight = [];
+  for (let b = 0; b < bandCount; b += 1) {
+    let maxRows = 1;
+    for (const [c, i] of colOrder) {
+      if (Math.floor(i / perBand) === b) maxRows = Math.max(maxRows, byCol.get(c).length);
+    }
+    bandHeight.push(maxRows * ROW_H + ROW_H);
+  }
+  const bandTop = [];
+  let acc = 0;
+  for (let b = 0; b < bandCount; b += 1) { bandTop.push(acc); acc += bandHeight[b]; }
+
   const out = [];
   for (const [col, nodes] of byCol) {
+    const i = colOrder.get(col) || 0;
+    const band = Math.floor(i / perBand);
+    let c = i % perBand;
+    if (band % 2 === 1) c = perBand - 1 - c;
     const count = nodes.length;
     nodes.forEach((n, row) => {
       const offset = (row - (count - 1) / 2) * ROW_H;
       out.push({
         ...n,
-        position: { x: NODE_ORIGIN_X + col * COL_W, y: NODE_ORIGIN_Y + offset },
+        position: {
+          x: NODE_ORIGIN_X + c * COL_W,
+          y: NODE_ORIGIN_Y + bandTop[band] + (bandHeight[band] - ROW_H) / 2 + offset,
+        },
       });
     });
   }
@@ -99,4 +134,4 @@ function needsLayout(graph) {
   return false;
 }
 
-module.exports = { layoutGraph, needsLayout, COL_W, ROW_H, NODE_W, NODE_H };
+module.exports = { layoutGraph, needsLayout, columnsPerBand, COL_W, ROW_H, NODE_W, NODE_H };
