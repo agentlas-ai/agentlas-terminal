@@ -220,7 +220,20 @@ function graphProblems(graph, en) {
   }
   for (const node of graph.nodes ?? []) {
     const label = node.label || node.id;
-    if (node.type === "condition") {
+    if (node.type === "eval") {
+    // ★채점표는 판정 기준 그 자체다. 캔버스 없는 표면에서 이게 안 보이면
+    //   사용자는 무엇으로 채점되는지 모른 채 그래프를 켠다.
+    const items = Array.isArray(node.config?.items) ? node.config.items : [];
+    if (items.length) {
+      marks.unshift(en ? `checklist ${items.length} item(s)` : `채점표 ${items.length}칸`);
+    } else if (node.config?.criteria) {
+      marks.unshift(en ? "one-line criteria" : "기준 한 문장");
+    }
+  }
+  if (node.type === "code") {
+    marks.unshift(node.config?.codeLang === "js" ? "javascript" : "python");
+  }
+  if (node.type === "condition") {
       const edges = out.get(node.id) ?? [];
       const undeclared = edges.filter((e) => e.sourceHandle !== "true" && e.sourceHandle !== "false");
       if (undeclared.length) {
@@ -388,6 +401,14 @@ function renderGraphTree(ctx, graph, en) {
     }
     seen.add(nodeId);
     ctx.out(`${indent}${prefix}${nodeLine(ctx, node, en)}`);
+    if (node.type === "eval") {
+      const items = Array.isArray(node.config?.items) ? node.config.items : [];
+      for (const item of items) {
+        if (!item || typeof item.text !== "string" || !item.text.trim()) continue;
+        const mark = item.kind === "mustNot" ? (en ? "must not" : "하면 안 됨") : (en ? "must" : "있어야 함");
+        ctx.out(`${indent}  ${ctx.ui.dim(`· [${mark}] ${item.text.trim()}`)}`);
+      }
+    }
     const edges = outgoing.get(nodeId) ?? [];
     for (const edge of edges) {
       const handle = edge.sourceHandle;
