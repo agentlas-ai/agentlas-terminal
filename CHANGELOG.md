@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.31 — 2026-08-06
+
+Interactive UX, measured against first-class REPLs with a real PTY.
+
+- The empty prompt now guides: a dim ghost hint ("type a task · / commands · @ files
+  · ? shortcuts"), `?` prints a shortcuts card, a second empty Enter points the way.
+- Tab-completing a command that takes arguments appends the space, so you can type the
+  argument immediately; no-arg commands are unchanged.
+- A plain-language task in a folder with no connected project now says exactly why and how
+  to run anyway (localized), instead of a single "recovering…" line that hid the reason.
+  Every controller honest-stop carries a machine code so this can never be swallowed again.
+- New PTY-driven gates (repl-guidance, honest-stop-not-swallowed) — these paths live inside
+  the readline session and are invisible to spawnSync tests.
+
 ## 1.0.30 — 2026-08-06
 
 CLI-conventions hardening, measured against clig.dev and first-class CLIs.
