@@ -336,10 +336,16 @@ function kindWord(type, en) {
   const ko = {
     trigger: "시작", agent: "에이전트", tool: "도구", action: "행동",
     condition: "갈림길", eval: "검증", transform: "변환", output: "출력",
+    // ★커널이 아는 종류는 여기 다 있어야 한다. 빠지면 화면에 내부 이름이 그대로 찍혀,
+    //   사용자는 "subgraph"가 뭔지 모른 채 그래프를 읽게 된다(eval이 정확히 그랬다).
+    subgraph: "다른 자동화 부르기",
+    code: "코드",
   };
   const enWords = {
     trigger: "start", agent: "agent", tool: "tool", action: "action",
     condition: "branch", eval: "check", transform: "transform", output: "output",
+    subgraph: "call another automation",
+    code: "code",
   };
   const read = vocabulary.readEnum(type, vocabulary.GRAPH_NODE_KINDS);
   if ("unknown" in read) {

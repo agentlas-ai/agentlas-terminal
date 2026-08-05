@@ -112,6 +112,15 @@ const RULES = [
   'steps[] entries: {"title":"...","instruction":"...","effect":"read"|"mutation",',
   '  "produces":"<one word>","consumes":["<one word>"]}.',
   "  · instruction is what the agent is told. Write it so it can act with no further questions.",
+  "  · kind:\"code\" when the step is an EXACT computation or data-shaping that a chat model would",
+  "    get quietly wrong: number math, currency/percent, parsing HTML/CSV/JSON, spreadsheet cells,",
+  "    date arithmetic, calling a data library (e.g. yfinance). For those, add kind:\"code\", a short",
+  "    codeLang (\"python\" default, or \"js\"), and code:\"<the script>\". The script gets the upstream",
+  "    values as `vars` (a dict/object) and must set `result` to what the next step reads.",
+  "    Read consumes[] the same way. YOU write the code — the person only describes what they want.",
+  "  · kind:\"agent\" (the default, omit it) for judgement, writing, summarizing, deciding — anything",
+  "    where being approximately right is fine. Split a step: fetch+compute in a code step, then",
+  "    judge/write in an agent step. Do not put exact math inside an agent instruction.",
   "  · a step that reads {{x}} must list x in consumes, and some earlier step (or the input trigger)",
   '    must declare produces:"x".',
   '  · effect:"mutation" for anything that leaves the machine or changes a file.',
@@ -133,13 +142,20 @@ const RULES = [
   "",
   "checks[] (optional, but REQUIRED whenever a branch repeats):",
   '  {"afterStep":<0-based>,"subject":"<a value some step produces>",',
-  '   "criteria":"<what makes it good enough, in the person\'s words>","produces":"<one word>"}',
+  '   "criteria":"<one-line summary of what passing means>","produces":"<one word>",',
+  '   "items":[{"text":"<atomic, checkable>","kind":"must"|"mustNot"}]}',
   "  · A check is a SEPARATE step that judges the result against the criteria and produces",
   '    "pass" or "fail". A repeat must branch on that verdict — never on words inside the',
   "    result itself. A step that grades its own output is not a check.",
   "  · So: to repeat until good enough, add a check after the step, then branch on",
   '    {"var":"<the check\'s produces>","op":"eq","value":"fail","repeatOn":"yes",...}.',
-  '  · Ask the person what "good enough" means for them. Do not invent the criteria.',
+  "  · YOU propose the checklist (items): 2-5 \"must\" items (what must exist in the result)",
+  "    plus 1-3 \"mustNot\" items (common failure modes for THIS task: invented numbers,",
+  "    placeholder text, copying the input verbatim, missing the asked comparison...).",
+  "    Write items that are atomic and checkable — 'The CSV has a numeric price column',",
+  "    not 'The data looks good'. Vague items produce noisy judging.",
+  "    The person will see and can edit every item before saving — propose, don't ask.",
+  "    Only ask when the goal itself is too vague to know what the result even is.",
   "  · repeatOn says which side loops. Write the condition the way the person said it and",
   "    put the loop on the side they meant — do not flip either one to make it fit.",
   "",
@@ -308,7 +324,15 @@ function validateBlueprint(bp) {
     if (!check.subject || !produced.has(check.subject)) {
       push(`${at}가 볼 "${check.subject}" 값을 아무도 만들지 않습니다.`);
     }
-    if (!String(check.criteria || "").trim()) {
+    const checkItems = Array.isArray(check.items)
+      ? check.items.filter((item) => item && typeof item.text === "string" && item.text.trim())
+      : [];
+    for (const item of Array.isArray(check.items) ? check.items : []) {
+      if (!item || typeof item.text !== "string" || !item.text.trim()) {
+        push(`${at}의 채점표 항목 하나가 비어 있습니다.`);
+      }
+    }
+    if (checkItems.length === 0 && !String(check.criteria || "").trim()) {
       push(`${at}의 통과 기준이 없습니다.`, {
         id: `check-${check.afterStep}-criteria`,
         question: `"${(steps[check.afterStep] && steps[check.afterStep].title) || at}" 결과가 어떤 상태여야 통과인가요?`,
@@ -502,13 +526,17 @@ function buildGraphFromBlueprint(bp) {
   });
   const stepId = (i) => `step${i + 1}`;
   bp.steps.forEach((step, index) => {
+    const isCode = step.kind === "code";
     nodes.push({
       id: stepId(index),
-      type: step.effect === "mutation" ? "action" : "agent",
+      // 코드 스텝은 code 노드로(데스크탑 shared/graph-blueprint.ts와 같은 규칙).
+      type: isCode ? "code" : (step.effect === "mutation" ? "action" : "agent"),
       label: step.title,
       position: { x: column(index + 1), y: 0 },
       config: {
-        prompt: step.instruction,
+        ...(isCode
+          ? { code: step.code || "", codeLang: step.codeLang === "js" ? "js" : "python", note: step.instruction }
+          : { prompt: step.instruction }),
         effect: step.effect,
         ...(step.effect === "mutation" ? { approval: "ask" } : {}),
         ...(step.produces ? { produces: step.produces } : {}),
@@ -526,9 +554,15 @@ function buildGraphFromBlueprint(bp) {
 
   const branchAt = new Map();
   for (const branch of bp.branches || []) branchAt.set(branch.afterStep, branch);
+  // ★한 단계 뒤에 검증 여럿(데스크탑 shared/graph-blueprint.ts와 같은 규칙).
   const checkAt = new Map();
-  for (const check of bp.checks || []) checkAt.set(check.afterStep, check);
-  const checkId = (i) => `verify${i + 1}`;
+  for (const check of bp.checks || []) {
+    const list = checkAt.get(check.afterStep) || [];
+    list.push(check);
+    checkAt.set(check.afterStep, list);
+  }
+  const checkId = (i, ordinal = 0) =>
+    ordinal === 0 ? `verify${i + 1}` : `verify${i + 1}-${ordinal + 1}`;
   let seq = 0;
   const link = (source, target, handle, maxIterations) => {
     edges.push({
@@ -538,23 +572,39 @@ function buildGraphFromBlueprint(bp) {
     });
   };
   link("start", stepId(0));
-  for (const check of bp.checks || []) {
-    if (!bp.steps[check.afterStep]) continue;
-    nodes.push({
-      id: checkId(check.afterStep), type: "eval",
-      label: `검증: ${String(check.criteria).slice(0, 40)}`,
-      position: { x: column(check.afterStep + 1) + 70, y: 0 },
-      config: {
-        subject: check.subject, criteria: check.criteria,
-        produces: String(check.produces || "").trim() || `check${check.afterStep + 1}_verdict`,
-      },
+  for (const [afterStep, list] of checkAt) {
+    if (!bp.steps[afterStep]) continue;
+    list.forEach((check, ordinal) => {
+      const firstItem = Array.isArray(check.items)
+        ? check.items.find((item) => item && typeof item.text === "string" && item.text.trim())
+        : null;
+      const label = String((check.criteria || "").trim() || (firstItem && firstItem.text) || "채점표").slice(0, 40);
+      const itemRows = Array.isArray(check.items)
+        ? check.items
+          .filter((item) => item && typeof item.text === "string" && item.text.trim())
+          .map((item) => ({ text: item.text.trim(), kind: item.kind === "mustNot" ? "mustNot" : "must" }))
+        : [];
+      nodes.push({
+        id: checkId(afterStep, ordinal), type: "eval",
+        label: `검증: ${label}`,
+        position: { x: column(afterStep + 1) + 70 + ordinal * 60, y: 0 },
+        config: {
+          subject: check.subject,
+          ...(String(check.criteria || "").trim() ? { criteria: check.criteria } : {}),
+          ...(itemRows.length ? { items: itemRows } : {}),
+          produces: String(check.produces || "").trim()
+            || (ordinal === 0 ? `check${afterStep + 1}_verdict` : `check${afterStep + 1}_${ordinal + 1}_verdict`),
+        },
+      });
     });
   }
   bp.steps.forEach((_step, index) => {
-    const check = checkAt.get(index);
+    const checkList = checkAt.get(index) || [];
     const branch = branchAt.get(index);
-    const afterStepId = check ? checkId(index) : stepId(index);
-    if (check) link(stepId(index), checkId(index));
+    const afterStepId = checkList.length ? checkId(index, checkList.length - 1) : stepId(index);
+    checkList.forEach((_check, ordinal) => {
+      link(ordinal === 0 ? stepId(index) : checkId(index, ordinal - 1), checkId(index, ordinal));
+    });
     if (!branch) {
       if (bp.steps[index + 1]) link(afterStepId, stepId(index + 1));
       return;
@@ -575,6 +625,24 @@ function buildGraphFromBlueprint(bp) {
     if (repeatSide === "no") link(branchId, stepId(branch.repeatStep), "false", branch.maxRepeats);
     else if (branch.noStep !== undefined && bp.steps[branch.noStep]) link(branchId, stepId(branch.noStep), "false");
     else if (repeatSide === "yes" && bp.steps[index + 1]) link(branchId, stepId(index + 1), "false");
+    // ★빠져나가는 쪽이 비어 있으면 끝나는 자리를 만들어 준다 (데스크탑 shared/graph-blueprint.ts와 같은 규칙).
+    //   "마음에 들 때까지 다시 써"를 마지막 단계에 걸면 되돌아가는 쪽만 이어지고 빠져나가는 쪽이 빈다.
+    //   그러면 커널은 NO_MATCHING_EDGE로 멈춘다 — **드디어 통과한 순간에**. 실패하는 동안은 잘 돌다가
+    //   성공하자마자 죽는 가장 나쁜 타이밍이고, 말로 만든 사람은 뭘 빠뜨렸는지 알 수도 없다.
+    const exitSide = repeatSide === "yes" ? "false" : repeatSide === "no" ? "true" : null;
+    if (exitSide && !edges.some((e) => e.source === branchId && e.sourceHandle === exitSide)) {
+      const doneId = `${branchId}-done`;
+      const produced = bp.steps[branch.repeatStep !== undefined ? branch.repeatStep : index]
+        && bp.steps[branch.repeatStep !== undefined ? branch.repeatStep : index].produces;
+      nodes.push({
+        id: doneId,
+        type: "output",
+        position: { x: 0, y: 0 },
+        label: "끝",
+        config: { effect: "read", text: produced ? `{{${produced}}}` : "완료했습니다." },
+      });
+      link(branchId, doneId, exitSide);
+    }
   });
 
   return {
