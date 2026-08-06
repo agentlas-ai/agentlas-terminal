@@ -111,6 +111,19 @@ async function askModel(ctx, prompt, opts = {}) {
       continue;
     }
     const text = String((res && (res.finalText || res.text)) || "");
+    /*
+     * ★런타임이 "답"이 아니라 **거절 고지문**을 돌려줬을 수 있다.
+     *
+     * 실측 2026-08-06: claude-code가 `You've hit your weekly limit · resets Aug 8 at 6pm`을
+     * 돌려줬는데, 빈 답이 아니라는 이유로 성공으로 세어졌다. 그래서 **멀쩡히 살아 있는
+     * codex로 넘어가지 않고** 인터뷰가 통째로 죽었다 — 폴백 장치는 있는데 이 경우에만
+     * 안 걸린 셈이다. 한 줄짜리 고지문은 산출물이 아니다. 실패로 세고 다음 런타임을 쓴다.
+     */
+    const notice = runtimeRefusal(text);
+    if (notice) {
+      failures.push(`${runtime.kind}: ${notice}`);
+      continue;
+    }
     if (text.trim()) {
       const out = { ok: true, text, runtime: runtime.kind };
       if (candidates[0] !== runtime) out.fellBackFrom = candidates[0].kind;
@@ -126,6 +139,18 @@ async function askModel(ctx, prompt, opts = {}) {
     reason: `AI가 답하지 못했습니다.\n  ${failures.join("\n  ")}`,
     nextAction: "`agentlas doctor`로 런타임 상태를 확인하거나, 로그인이 필요한 런타임에 다시 로그인해 주세요.",
   };
+}
+
+/**
+ * 한 줄짜리 거절 고지문인가 — 한도 소진·로그인 필요·요금 문제 같은 것.
+ * 산출물(JSON·본문)은 길거나 구조가 있다. 짧고 구조가 없고 거절 단어가 있으면 고지문이다.
+ */
+const REFUSAL_WORDS = /\b(limit|quota|rate.?limit|usage|credits?|billing|sign in|log in|unauthorized|forbidden|expired|subscription)\b/i;
+function runtimeRefusal(text) {
+  const t = String(text || "").trim();
+  if (!t || t.length > 240) return null;
+  if (t.includes("{") || t.includes("\n\n")) return null;
+  return REFUSAL_WORDS.test(t) ? t : null;
 }
 
 module.exports = { askModel };

@@ -629,9 +629,28 @@ async function newGraph(ctx, request, flags) {
       }
       const parsed = interview.parseInterviewTurn(answer.text, state);
       if (!parsed.ok) {
-        ctx.err(parsed.reason);
-        ctx.err(ctx.ui.dim(parsed.nextAction));
-        return 1;
+        /*
+         * ★모델이 형식을 틀린 것과 사람이 답을 안 준 것은 다르다.
+         *
+         * 출력이 JSON으로 안 읽히면 지금까지는 그 자리에서 인터뷰가 죽고 **사람이 준
+         * 답까지 전부 사라졌다.** 화면에는 "자동으로 돌릴 일을 한 문장으로 다시 적어
+         * 주세요"가 떴다 — 사람 문장이 틀린 것처럼(실측 2026-08-06, 연속 3회 재현).
+         * 형식 문제는 이미 스스로 고치게 하는 장치가 있다. 같은 예산 안에서 그쪽으로 보낸다.
+         */
+        const correctable = parsed.code === "INTERVIEW_OUTPUT_UNREADABLE"
+          && (state.attempts || []).length < interview.MAX_SELF_CORRECTIONS;
+        if (!correctable) {
+          ctx.err(parsed.reason);
+          ctx.err(ctx.ui.dim(parsed.nextAction));
+          return 1;
+        }
+        state.attempts = [...(state.attempts || []), {
+          round,
+          problems: [en
+            ? "The last answer did not read as a single JSON object. Return one JSON object and nothing else."
+            : "지난 답이 JSON 하나로 읽히지 않았습니다. 설명 없이 JSON 객체 하나만 내보내세요."],
+        }];
+        continue;
       }
       // ★모델이 형식을 틀렸다 — 사람이 답을 안 준 게 아니다. 무엇이 틀렸는지 돌려주고
       //   정해진 횟수만큼 스스로 고치게 한다. "구체적으로 적어 주세요"로 떠넘기면

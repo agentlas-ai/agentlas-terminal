@@ -523,7 +523,7 @@ function describeBranches(bp, locale) {
   const lines = [];
   const title = (index) => (typeof index === "number" && bp.steps[index] ? bp.steps[index].title : (ko ? "끝" : "the end"));
   for (const branch of bp.branches || []) {
-    const rule = branchLabel(branch);
+    const rule = branchLabel(branch, locale);
     const repeatText = branch.repeatStep !== undefined
       ? (ko ? `"${title(branch.repeatStep)}"부터 다시 (최대 ${branch.maxRepeats}번)` : `back to "${title(branch.repeatStep)}" (up to ${branch.maxRepeats}x)`)
       : null;
@@ -541,8 +541,25 @@ function describeBranches(bp, locale) {
   return lines;
 }
 
-function branchLabel(branch) {
+/*
+ * ★언어를 받는다(데스크탑 shared/graph-blueprint.ts 미러). 예전에는 무조건 한국어라
+ * 영어로 만든 그래프에도 `verdict이(가) "fail"인가?`가 박혔고, 그 라벨이 공개
+ * 설명문에 실려 Hub 발행이 통째로 거절됐다("descriptionEn contains Hangul").
+ */
+function branchLabel(branch, locale = "ko") {
   const shown = typeof branch.value === "string" ? `"${branch.value}"` : String(branch.value ?? "");
+  if (locale === "en") {
+    switch (branch.op) {
+      case "contains": return `Does ${branch.var} contain ${shown}?`;
+      case "truthy": return `Does ${branch.var} have a value?`;
+      case "falsy": return `Is ${branch.var} empty?`;
+      case "eq": return `Is ${branch.var} ${shown}?`;
+      case "ne": return `Is ${branch.var} not ${shown}?`;
+      case "gt": return `Is ${branch.var} greater than ${shown}?`;
+      case "lt": return `Is ${branch.var} less than ${shown}?`;
+      default: return `Check ${branch.var}`;
+    }
+  }
   switch (branch.op) {
     case "contains": return `${branch.var}에 ${shown}이(가) 있나?`;
     case "truthy": return `${branch.var}에 값이 있나?`;
@@ -739,7 +756,7 @@ function buildGraphFromBlueprint(bp, locale = "ko", ctx = {}) {
     }
     const branchId = `check${index + 1}`;
     nodes.push({
-      id: branchId, type: "condition", label: branchLabel(branch),
+      id: branchId, type: "condition", label: branchLabel(branch, locale),
       position: { x: column(index + 1) + 140, y: 0 },
       config: { var: branch.var, op: branch.op, ...(branch.value !== undefined ? { value: branch.value } : {}) },
     });
@@ -806,11 +823,35 @@ function firstJsonObject(text) {
   return null;
 }
 
-const unreadable = () => ({
-  ok: false, code: "INTERVIEW_OUTPUT_UNREADABLE",
-  reason: "만들 내용을 읽지 못했습니다.",
-  nextAction: "자동으로 돌릴 일을 한 문장으로 다시 적어 주세요.",
-});
+/**
+ * ★런타임이 JSON 대신 **사람에게 하는 말**을 돌려줬을 수 있다.
+ *
+ * 실측 2026-08-06: 모델이 `You've hit your weekly limit · resets Aug 8 at 6pm (Asia/Seoul)`을
+ * 돌려줬는데, 제품은 그 문장을 삼키고 "만들 내용을 읽지 못했습니다 / 한 문장으로 다시
+ * 적어 주세요"라고 말했다. 사람은 자기 문장이 틀린 줄 알고 몇 번이고 다시 쓴다 —
+ * 아무리 잘 써도 안 된다. 무엇이 막혔는지 아는 쪽은 제품인데, 그것을 지우고 있었다.
+ *
+ * 짧고 JSON이 아니면 잘린 청사진이 아니라 **고지문**이다. 그대로 보여준다.
+ */
+const RUNTIME_NOTICE_MAX = 240;
+const unreadable = (rawText) => {
+  const text = typeof rawText === "string" ? rawText.trim() : "";
+  const looksLikeNotice = text.length > 0 && text.length <= RUNTIME_NOTICE_MAX && !text.includes("{");
+  if (looksLikeNotice) {
+    return {
+      ok: false, code: "INTERVIEW_MODEL_UNAVAILABLE",
+      reason: `AI가 만들지 못했습니다 — ${text}`,
+      nextAction: "다른 모델을 연결하거나, 안내에 적힌 시각 이후에 다시 시도해 주세요.",
+      // 재시도로 해결되지 않는다 — 형식 문제가 아니다.
+      terminal: true,
+    };
+  }
+  return {
+    ok: false, code: "INTERVIEW_OUTPUT_UNREADABLE",
+    reason: "만들 내용을 읽지 못했습니다.",
+    nextAction: "자동으로 돌릴 일을 한 문장으로 다시 적어 주세요.",
+  };
+};
 
 function normalizeQuestions(candidates, state) {
   const seen = new Set(state.asked);
@@ -864,10 +905,10 @@ function weakenedAgainstLastAttempt(blueprint, state) {
 
 function parseInterviewTurn(text, state) {
   const raw = firstJsonObject(text);
-  if (!raw) return unreadable();
+  if (!raw) return unreadable(text);
   let parsed;
-  try { parsed = JSON.parse(raw); } catch { return unreadable(); }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return unreadable();
+  try { parsed = JSON.parse(raw); } catch { return unreadable(text); }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return unreadable(text);
 
   if (Array.isArray(parsed.ask) && parsed.ask.length > 0) {
     const questions = normalizeQuestions(parsed.ask, state);
@@ -882,7 +923,7 @@ function parseInterviewTurn(text, state) {
   }
 
   const blueprint = parsed.blueprint;
-  if (!blueprint || typeof blueprint !== "object") return unreadable();
+  if (!blueprint || typeof blueprint !== "object") return unreadable(text);
   const normalized = { ...blueprint, schema: BLUEPRINT_SCHEMA };
   const problems = validateBlueprint(normalized);
   if (problems.length === 0) {
