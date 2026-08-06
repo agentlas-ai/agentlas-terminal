@@ -15,7 +15,7 @@ AGENTS & HUB
   search "<what you need>" discover agents in the Hub
   install <slug>           install an agent from the Hub
   plugin add <slug> · plugin list      Hub plugins (MCP servers)
-  build "<request>"        build/repair/package an agent or team
+  build "<request>"        build an installable agent locally (auto-installs)
   upload <path>            save owner-private in Agent Cloud (--visibility marketplace to publish)
   import <path> · cd · native prepare  local folder agents
   list                     installed agents/companies + orchestrator/worker runtimes
@@ -83,7 +83,7 @@ AGENTS & HUB
   search "<필요한 것>"     Hub에서 에이전트 찾기
   install <slug>           Hub 에이전트 설치
   plugin add <slug> · plugin list      Hub 플러그인 (MCP 서버)
-  build "<요청>"           에이전트·팀 제작/수리/패키징
+  build "<요청>"           에이전트를 로컬에서 만들고 바로 설치
   upload <path>            Agent Cloud에 소유자 비공개 저장 (--visibility marketplace 로 발행)
   import <path> · cd · native prepare  로컬 폴더 에이전트
   list                     설치 에이전트/회사 + 오케스트레이터·워커 런타임
