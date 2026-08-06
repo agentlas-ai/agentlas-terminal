@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.34 — 2026-08-06
+
+Telegram, standalone. The terminal can now connect a Telegram bot with no desktop app.
+
+- `connect telegram <agent|firm>` reads a bot token from stdin (never argv), verifies it
+  against api.telegram.org, stores it 0600, polls getUpdates and pairs the first private
+  chat, then sends a confirmation.
+- `connect test <id>` / `connect remove <id>` / `connect status`. The connection core is
+  plain HTTPS ported from the desktop; no Electron, no plugin, no raw JSON dump.
+
+Not yet standalone: auto-creating the bot by piloting BotFather in a browser (the CDP
+browser hardpoint makes this a tractable next layer; it needs a live Telegram web session).
+
 ## 1.0.33 — 2026-08-06
 
 Defect sweep: ran every command with a real prompt and fixed what dumped or stalled.
