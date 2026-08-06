@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.32 — 2026-08-06
+
+Standalone: the terminal no longer requires Desktop or the plugin for its core flows.
+(They share artifacts and settings; they are not a prerequisite.)
+
+- `project use <agent>` / `project team <agent>…` connect the current folder as a
+  project and set an ordered team, entirely from the terminal — so `run "<task>"` and
+  plain REPL input work without ever opening Desktop. `project status` shows the team.
+- `build "<request>"` now builds locally: the terminal runtime produces an installable
+  agent package (AGENTS.md + manifest.md + README.md) and auto-installs it, instead of
+  printing "open the Claude Code / Codex plugin and run /hep-build".
+- Honest-stops in a project-less folder point at `project use`, not "open Desktop".
+
+Verified standalone end-to-end: project use → run answered correctly; build produced and
+installed an agent that then ran correctly.
+
 ## 1.0.31 — 2026-08-06
 
 Interactive UX, measured against first-class REPLs with a real PTY.
