@@ -399,7 +399,15 @@ function create(ctx, deps = {}) {
     if (raw) return runHephaestusInteractive(cleanArgs, { ...opts, human: false });
     if (!hephaestusBin()) return runHephaestusInteractive(cleanArgs, { ...opts, human: false });
     const ui = opts.ui || newUi();
-    const result = await captureHephaestus(cleanArgs, opts);
+    // route는 Hub 왕복이라 실측 ~13s 걸린다 — research처럼 진행 표시를 준다.
+    // (clig.dev: 몇 초 넘는 작업엔 진행 인디케이터. 예전엔 그 시간 내내 침묵했다.)
+    if (typeof ui.startSpinner === "function") ui.startSpinner(ui.lang === "ko" ? "라우팅 미리보기 계산 중…" : "Previewing routing…");
+    let result;
+    try {
+      result = await captureHephaestus(cleanArgs, opts);
+    } finally {
+      if (typeof ui.stopSpinner === "function") ui.stopSpinner();
+    }
     let json = null;
     try {
       const start = result.stdout.indexOf("{");
