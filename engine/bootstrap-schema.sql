@@ -412,50 +412,12 @@ CREATE TABLE automation_runs (
       , last_activity_at TEXT, occurrence_id TEXT, graph_digest TEXT, checkpoint_json TEXT, resume_of_run_id TEXT);
 CREATE INDEX idx_automation_runs_auto
         ON automation_runs(automation_id, started_at);
-CREATE TRIGGER agentlas_auto_cua_social_insert
-AFTER INSERT ON automations
-WHEN NEW.tool_mode = 'auto' AND (
-  lower(coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'')) LIKE '%reddit%'
-  OR lower(coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'')) LIKE '%instagram%'
-  OR lower(coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'')) LIKE '%threads%'
-  OR lower(coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'')) LIKE '%twitter%'
-  OR lower(coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'')) LIKE '%x.com%'
-  OR lower(coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'')) LIKE '%linkedin%'
-  OR lower(coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'')) LIKE '%facebook%'
-  OR lower(coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'')) LIKE '%tiktok%'
-  OR (lower(coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'')) LIKE '%browser%' AND lower(coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'')) LIKE '%post%')
-  OR (lower(coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'')) LIKE '%web%' AND lower(coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'')) LIKE '%login%')
-  OR coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'') LIKE '%레딧%'
-  OR coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'') LIKE '%인스타%'
-  OR coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'') LIKE '%댓글%'
-  OR coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'') LIKE '%게시%'
-  OR coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'') LIKE '%로그인%'
-)
-BEGIN
-  UPDATE automations SET tool_mode = 'computer-use' WHERE id = NEW.id;
-END;
-CREATE TRIGGER agentlas_auto_cua_social_update
-AFTER UPDATE OF name, prompt_template, tool_mode ON automations
-WHEN NEW.tool_mode = 'auto' AND (
-  lower(coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'')) LIKE '%reddit%'
-  OR lower(coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'')) LIKE '%instagram%'
-  OR lower(coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'')) LIKE '%threads%'
-  OR lower(coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'')) LIKE '%twitter%'
-  OR lower(coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'')) LIKE '%x.com%'
-  OR lower(coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'')) LIKE '%linkedin%'
-  OR lower(coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'')) LIKE '%facebook%'
-  OR lower(coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'')) LIKE '%tiktok%'
-  OR (lower(coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'')) LIKE '%browser%' AND lower(coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'')) LIKE '%post%')
-  OR (lower(coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'')) LIKE '%web%' AND lower(coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'')) LIKE '%login%')
-  OR coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'') LIKE '%레딧%'
-  OR coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'') LIKE '%인스타%'
-  OR coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'') LIKE '%댓글%'
-  OR coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'') LIKE '%게시%'
-  OR coalesce(NEW.name,'') || ' ' || coalesce(NEW.prompt_template,'') LIKE '%로그인%'
-)
-BEGIN
-  UPDATE automations SET tool_mode = 'computer-use' WHERE id = NEW.id;
-END;
+-- (제거됨 2026-08-06) agentlas_auto_cua_social_insert/update 트리거가 여기 있었다.
+-- 소셜 키워드 목록("twitter/인스타/댓글/게시/로그인"…)으로 tool_mode를 computer-use로
+-- 강제 되돌리던 DB 차원 단어목록 판정 — 코드의 단어목록을 LLM 판정으로 대체할 때
+-- 이 트리거만 살아남아, 코드 리뷰가 볼 수 없는 곳에서 toolMode 도출 규칙을 무효화했다
+-- (실측: UPDATE tool_mode='auto'가 같은 연결에서 즉시 되돌아왔다). 판정을 DB 트리거로
+-- 만들지 않는다 — 판정은 코드·게이트가 보는 곳에만 산다.
 CREATE TABLE agent_evolution_proposals (
         id TEXT PRIMARY KEY,
         agent_id TEXT NOT NULL,

@@ -97,8 +97,8 @@ function layoutGraph(graph) {
   for (const [row, nodes] of byRow) {
     const i = rowOrder.get(row) || 0;
     const strip = Math.floor(i / perStrip);
-    let r = i % perStrip;
-    if (strip % 2 === 1) r = perStrip - 1 - r;
+    const r = i % perStrip;
+    // ★모든 줄기는 위→아래(사행 뒤집기 폐기 — 데스크탑 graph-layout.ts와 동일, 2026-08-06).
     const count = nodes.length;
     nodes.forEach((n, col) => {
       const offset = (col - (count - 1) / 2) * COL_W;
