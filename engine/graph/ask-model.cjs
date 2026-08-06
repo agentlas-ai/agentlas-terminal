@@ -72,8 +72,13 @@ async function askModel(ctx, prompt, opts = {}) {
   if (!opts.runtime) {
     // listAvailableCliRuntimes()는 문자열이 아니라 {kind, bin, path} 객체를 돌려준다.
     // 문자열로 읽으면 후보가 하나도 안 쌓여 폴백이 통째로 죽는다(실측).
+    // ★그리고 **실행 드라이버가 있는 종류만** 후보다 — detect는 grok/kimi/cursor도
+    //   광고하는데 native host에 드라이버가 없어, 후보 슬롯 하나가 "unknown runtime"으로
+    //   낭비됐다(실측 2026-08-06). 판별 기준은 목록 복제가 아니라 resolve의 정본을 쓴다.
+    const { CLI_EXECUTABLE_KINDS } = require("../runtimes/resolve.cjs");
     for (const found of listAvailableCliRuntimes()) {
       if (!found || !found.kind || !found.path) continue;
+      if (!CLI_EXECUTABLE_KINDS.has(found.kind)) continue;
       if (candidates.some((c) => c.kind === found.kind)) continue;
       candidates.push({ kind: found.kind, bin: found.path });
     }
@@ -110,7 +115,7 @@ async function askModel(ctx, prompt, opts = {}) {
       failures.push(`${runtime.kind}: ${(err && err.message) || err}`);
       continue;
     }
-    const text = String((res && (res.finalText || res.text)) || "");
+    const text = String((res && res.text) || "");
     /*
      * ★런타임이 실패를 **이미 표식으로 말하고 있었다** — 우리가 안 읽었을 뿐이다.
      *
@@ -123,10 +128,12 @@ async function askModel(ctx, prompt, opts = {}) {
      * codex로 넘어가지도 않았다.
      *
      * 그래서 판별은 문구 추측이 아니라 **표식**으로 한다. 표식이 있으면 그 런타임은 실패다.
-     * (`runtimeRefusal`은 표식조차 없는 런타임을 위한 마지막 그물로만 남긴다.)
+     * (표식조차 없는 런타임을 위한 마지막 그물은 runtime-refusal.cjs 한 곳뿐이다.)
      */
     const marked = res && res.error ? String(res.error).replace(/\s+/g, " ").slice(0, 240) : null;
-    const notice = marked || runtimeRefusal(text);
+    const { detectRuntimeRefusal } = require("../runtime-refusal.cjs");
+    const heur = marked ? null : detectRuntimeRefusal(text);
+    const notice = marked || (heur && heur.message);
     if (notice) {
       failures.push(`${runtime.kind}: ${notice}`);
       continue;
@@ -148,16 +155,5 @@ async function askModel(ctx, prompt, opts = {}) {
   };
 }
 
-/**
- * 한 줄짜리 거절 고지문인가 — 한도 소진·로그인 필요·요금 문제 같은 것.
- * 산출물(JSON·본문)은 길거나 구조가 있다. 짧고 구조가 없고 거절 단어가 있으면 고지문이다.
- */
-const REFUSAL_WORDS = /\b(limit|quota|rate.?limit|usage|credits?|billing|sign in|log in|unauthorized|forbidden|expired|subscription)\b/i;
-function runtimeRefusal(text) {
-  const t = String(text || "").trim();
-  if (!t || t.length > 240) return null;
-  if (t.includes("{") || t.includes("\n\n")) return null;
-  return REFUSAL_WORDS.test(t) ? t : null;
-}
 
 module.exports = { askModel };

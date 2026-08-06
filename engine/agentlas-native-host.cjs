@@ -13,6 +13,7 @@
  * 스키마는 실측으로 확인됨 (cli/agentlas.cjs 상단 주석 참고).
  */
 const { execFileSync, spawn } = require("node:child_process");
+const { detectRuntimeRefusal } = require("./runtime-refusal.cjs");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -421,11 +422,26 @@ function handleClaudeLine(line, st, ui) {
         cost_usd: obj.total_cost_usd,
         duration_ms: obj.duration_ms,
       };
-      if (obj.is_error) st.error = obj.result || "claude error";
+      if (obj.is_error) {
+        st.error = obj.result || "claude error";
+        // api_error_status:429·error:"rate_limit"이 실려 오는 실측 형태 — 한도는 quota.
+        st.errorKind = obj.api_error_status === 429 || obj.terminal_reason === "api_error"
+          ? "quota" : "exit";
+        st.errorSource = "marker";
+      }
       return;
     case "rate_limit_event":
+      /*
+       * ★한도 거절은 **표식이다** — 경고만 찍고 버리면 안 된다.
+       * 실측(2026-08-06): 이 이벤트가 왔는데도 error가 비어 있어, 뒤따르는 거절문
+       * ("You've hit your weekly limit")이 정상 답으로 세어졌다. 살아 있는 다른
+       * 런타임으로 폴백이 안 걸린 진범. status:rejected면 그 자체로 실패다.
+       */
       if (obj.rate_limit_info && obj.rate_limit_info.status === "rejected") {
         ui.warn(uiText(ui, "runtime.rateLimit", "Claude"));
+        if (!st.error) st.error = "claude rate limit rejected";
+        st.errorKind = "quota";
+        st.errorSource = "marker";
       }
       return;
     default:
@@ -501,6 +517,8 @@ function handleCodexLine(line, st, ui) {
     case "turn.failed":
     case "error":
       st.error = (obj.error && (obj.error.message || obj.error)) || "codex error";
+      st.errorKind = "exit";
+      st.errorSource = "marker";
       ui.error(String(st.error));
       st.errorShown = true;
       return;
@@ -756,9 +774,24 @@ function handleGeminiLine(line, st, ui) {
         duration_ms: s.duration_ms,
       };
       st.finalText = st.text;
-      if (obj.status && obj.status !== "success") st.error = `gemini ${obj.status}`;
+      // error 이벤트가 이미 구체 사유를 남겼으면 뭉뚱그린 상태 문자열로 덮지 않는다.
+      if (obj.status && obj.status !== "success" && !st.error) {
+        st.error = `gemini ${obj.status}`;
+        st.errorKind = "exit";
+        st.errorSource = "marker";
+      }
       return;
     }
+    case "error":
+      /*
+       * ★프로토콜이 선언하는 이벤트인데 핸들러가 없어 조용히 버려졌다
+       * (capture.cjs는 목록에 적어 두고도 안 읽었다). 인증 실패("IneligibleTierError")
+       * 같은 것이 여기로 온다 — 버리면 빈 성공이 된다.
+       */
+      st.error = (obj.error && (obj.error.message || obj.error)) || "gemini error";
+      st.errorKind = /auth|login|credential|tier|eligib/i.test(String(st.error)) ? "auth" : "exit";
+      st.errorSource = "marker";
+      return;
     default:
       return;
   }
@@ -807,7 +840,7 @@ function runNativeTurn(req) {
       args = geminiArgs(launchReq);
       lineHandler = (l) => handleGeminiLine(l, st, ui);
     } else {
-      return Promise.resolve({ text: "", session: st.session, error: `unknown runtime: ${kind}` });
+      return Promise.resolve({ text: "", session: st.session, error: `unknown runtime: ${kind}`, errorKind: "unsupported", errorSource: "marker" });
     }
   } catch (error) {
     const message = error && error.message ? error.message : String(error);
@@ -883,6 +916,8 @@ function runNativeTurn(req) {
         session: st.session,
         usage: st.usage,
         error: termination ? termination.message : "native runtime stopped",
+        errorKind: "timeout",
+        errorSource: "marker",
         terminationVerified: Boolean(termination?.verified),
       });
     };
@@ -976,13 +1011,31 @@ function runNativeTurn(req) {
       ui.stopSpinner();
       const text = (st.finalText || st.text || "").trim();
       if (st.usage) ui.cost(st.usage);
+      /*
+       * ★표식 없이 완주했는데 산출물이 거절 고지문인 경우 — 실측: codex 한도는
+       * 거절문이 agent_message로 오고 turn.completed로 끝난다(표식 0, exit 0).
+       * 이 한 자리에서만 텍스트 판별을 허용하고, 출처를 heuristic으로 남긴다
+       * (판별 규칙은 runtime-refusal.cjs 한 곳 — 여기서 정규식을 다시 쓰지 않는다).
+       */
+      if (code === 0 && !st.error) {
+        const refusal = detectRuntimeRefusal(text);
+        if (refusal) {
+          st.error = refusal.message;
+          st.errorKind = refusal.kind;
+          st.errorSource = "heuristic";
+        }
+      }
       const exitError = code === 0
         ? st.error
         : st.error || [
             `${kind} exited with code ${code == null ? "unknown" : code}`,
             stripAnsi(stderrBuf).slice(-4000),
           ].filter(Boolean).join("\n");
-      finish({ text, session: st.session, usage: st.usage, error: exitError });
+      if (exitError && !st.errorKind) { st.errorKind = "exit"; st.errorSource = st.errorSource || "exit"; }
+      finish({
+        text, session: st.session, usage: st.usage, error: exitError,
+        ...(exitError ? { errorKind: st.errorKind, errorSource: st.errorSource } : {}),
+      });
     });
 
     armIdle();

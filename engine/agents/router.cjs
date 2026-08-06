@@ -49,8 +49,14 @@ function ensureJudgeRunner(db, runtime) {
           model: resolved.model || undefined,
           signal,
         });
-      } catch {
-        return "";
+      } catch (error) {
+        /*
+         * ★사유를 ""로 지우지 않는다 — 여기서 지우면 판정 서비스는 "no connected model
+         * reached a valid judgment"라는 거짓 문장만 남긴다(모델은 닿았고, 한도라고
+         * 말했다). 러너 계약은 문자열이므로 예외를 그대로 올려 judgeLabels가 사유를
+         * 싣게 한다.
+         */
+        throw error;
       }
     });
     return judgment;

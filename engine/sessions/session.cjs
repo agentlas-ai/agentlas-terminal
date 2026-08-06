@@ -282,7 +282,13 @@ class Session extends EventEmitter {
       if (this._timeoutConfig) req.timeoutConfig = this._timeoutConfig;
       try {
         res = await nativeHost.runNativeTurn(req);
-        if (res && res.error && !res.text && !res.finalText) {
+        /*
+         * ★복구 게이트는 **표식**으로 연다 — `!res.text`를 조건에 끼우면 안 된다.
+         * 실측(2026-08-06): claude 한도 거절은 error와 함께 거절문이 text에도 실려 온다.
+         * 그래서 `!res.text`가 영원히 거짓이 되어, 예비 런타임이 등록돼 있는데도
+         * 복구가 한 번도 발화하지 않았다. 실패는 error가 말하고, text는 표시용이다.
+         */
+        if (res && res.error) {
           const nextRuntime = this._nextRecoveryRuntime();
           if (nextRuntime) {
             const privateEvidence = [...this._privateRecoveryEvidence, String(res.error)]
@@ -420,7 +426,14 @@ class Session extends EventEmitter {
     }
     if (res && res.error) {
       this.status = "failed";
-      this.lastError = null;
+      /*
+       * ★사유를 버리지 않는다. 예전에는 여기서 null로 지워서, daemon이 run_history에
+       * "runtime turn failed"라는 고정 문자열만 남기고 run/build는 아무 말 없이 exit 1이었다
+       * — 사람이 알아야 고칠 수 있는 것(한도 리셋 시각, 로그인 필요)을 아는 쪽이 지웠다.
+       * 렌더러 완곡 문구는 Ui 계층이 따로 지킨다(recovery-presentation-contract) —
+       * 기록과 화면은 다른 문제다.
+       */
+      this.lastError = String(res.error).slice(0, 2000);
       this._record({ type: "turn-end", at: Date.now(), ok: false, recoveryRequired: true });
     } else {
       this.status = "done";

@@ -18,6 +18,7 @@
  *    프로젝트 .env가 보호 키(타임아웃/캡처 상한 포함)를 덮지 못한다
  */
 const fs = require("node:fs");
+const { detectRuntimeRefusal } = require("../runtime-refusal.cjs");
 const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
@@ -309,6 +310,48 @@ function capturedRuntimeUsage(kind, raw) {
   return null;
 }
 
+
+/**
+ * ★캡처된 스트림에서 **실패 표식**을 걷는다 — 종료코드만 보면 exit 0 거절이 산출물이 된다.
+ *
+ * 실측(2026-08-06): claude 한도는 rate_limit_event(status:rejected)·result(is_error:true)를
+ * 보내고, codex 한도는 표식 없이 거절문을 agent_message로 싣고 turn.completed로 끝난다.
+ * 이 파일은 이벤트 종류 목록에 rate_limit_event를 적어 두고도 한 번도 읽지 않았다 —
+ * 거절문이 그대로 워커 핸드오프가 되어 종합(synthesis)에 섞였다.
+ */
+function capturedRuntimeFailure(kind, raw, text) {
+  const events = raw.split(/\r?\n/).map((line) => {
+    try { return JSON.parse(line); } catch { return null; }
+  }).filter(Boolean);
+  for (const event of events) {
+    if (!event || typeof event !== "object") continue;
+    if (kind === "claude-code") {
+      if (event.type === "result" && event.is_error) {
+        return { message: typeof event.result === "string" ? event.result : "claude error", source: "marker" };
+      }
+      if (event.type === "rate_limit_event" && event.rate_limit_info && event.rate_limit_info.status === "rejected") {
+        return { message: "claude rate limit rejected", source: "marker" };
+      }
+    }
+    if (kind === "codex" && (event.type === "turn.failed" || event.type === "error")) {
+      const msg = (event.error && (event.error.message || event.error)) || "codex error";
+      return { message: String(msg), source: "marker" };
+    }
+    if (kind === "gemini") {
+      if (event.type === "error") {
+        const msg = (event.error && (event.error.message || event.error)) || "gemini error";
+        return { message: String(msg), source: "marker" };
+      }
+      if (event.type === "result" && event.status && event.status !== "success") {
+        return { message: `gemini ${event.status}`, source: "marker" };
+      }
+    }
+  }
+  // 표식이 전혀 없는 케이스(codex 한도) — 휴리스틱 최후 그물, 출처 표기.
+  const refusal = detectRuntimeRefusal(text);
+  return refusal ? { message: refusal.message, source: "heuristic" } : null;
+}
+
 function capturedRuntimeAgentText(kind, raw) {
   const text = String(raw || "");
   const events = [];
@@ -377,7 +420,8 @@ function captureRuntime(kind, systemPrompt, prompt, opts) {
     ? captureOutputLimit(opts.env || process.env)
     : directCaptureOutputLimit(opts.outputLimitBytes);
   return new Promise((resolve, reject) => {
-    const bin = which(RUNTIME_BIN[kind]) || RUNTIME_BIN[kind];
+    // 계약 테스트용 실행 파일 주입(가짜 CLI가 픽스처를 cat) — 프로덕션 경로에선 없음.
+    const bin = opts.binOverride || which(RUNTIME_BIN[kind]) || RUNTIME_BIN[kind];
     let child;
     try {
       const spawnImpl = opts.spawn || spawn;
@@ -522,6 +566,12 @@ function captureRuntime(kind, systemPrompt, prompt, opts) {
         text = capturedRuntimeAgentText(kind, raw);
       } else {
         text = raw;
+      }
+      // ★거절 고지문은 산출물이 아니다 — 성공으로 돌려주면 워커 핸드오프가 오염된다.
+      const failure = capturedRuntimeFailure(kind, raw, text);
+      if (failure) {
+        finishReject(new Error(`${kind} runtime refused (${failure.source}): ${failure.message}`));
+        return;
       }
       finishResolve(opts.envelope
         ? { text, usage: capturedRuntimeUsage(kind, raw) }

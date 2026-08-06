@@ -2128,7 +2128,8 @@ function create(deps = {}) {
    * (자동화 스케줄러와 같은 원칙). D.runModel 주입·CLI 캡처·API 백엔드
    * 세 경로 모두 이 관문을 지난다 — 하니스가 단위로 검증할 수 있는 이유.
    */
-  const TRANSIENT_MODEL_ERROR_RE = /Connection closed mid-response|"terminal_reason":"api_error"|ECONNRESET|ETIMEDOUT|socket hang up|overloaded_error/;
+  // 한도·429는 재시도 분류에 들어가야 한다 — 빠져 있으면 같은 막힌 런타임에 즉시 재도전만 한다.
+const TRANSIENT_MODEL_ERROR_RE = /Connection closed mid-response|"terminal_reason":"api_error"|ECONNRESET|ETIMEDOUT|socket hang up|overloaded_error|rate.?limit|quota|\b429\b|usage limit|weekly limit/i;
   async function withTransientModelRetry(authorityMode, invoke) {
     try {
       return await invoke();
