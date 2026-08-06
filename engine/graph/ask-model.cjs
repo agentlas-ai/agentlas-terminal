@@ -112,14 +112,21 @@ async function askModel(ctx, prompt, opts = {}) {
     }
     const text = String((res && (res.finalText || res.text)) || "");
     /*
-     * ★런타임이 "답"이 아니라 **거절 고지문**을 돌려줬을 수 있다.
+     * ★런타임이 실패를 **이미 표식으로 말하고 있었다** — 우리가 안 읽었을 뿐이다.
      *
-     * 실측 2026-08-06: claude-code가 `You've hit your weekly limit · resets Aug 8 at 6pm`을
-     * 돌려줬는데, 빈 답이 아니라는 이유로 성공으로 세어졌다. 그래서 **멀쩡히 살아 있는
-     * codex로 넘어가지 않고** 인터뷰가 통째로 죽었다 — 폴백 장치는 있는데 이 경우에만
-     * 안 걸린 셈이다. 한 줄짜리 고지문은 산출물이 아니다. 실패로 세고 다음 런타임을 쓴다.
+     * 실측 2026-08-06: claude-code가 한도 소진 시 `--output-format stream-json`으로
+     * `{"type":"rate_limit_event",...,"status":"rejected"}` → `"error":"rate_limit"` →
+     * 최종 `{"is_error":true,"api_error_status":429}`를 보내고 종료코드 1로 끝난다.
+     * 네이티브 호스트는 그것을 읽어 `res.error`까지 정확히 채워 놓았다. 그런데 여기서
+     * **`text.trim()`을 먼저 보고 ok를 반환**하는 바람에 그 error는 한 번도 읽히지 않았고,
+     * `You've hit your weekly limit`이라는 사람용 문장이 산출물 행세를 했다. 살아 있는
+     * codex로 넘어가지도 않았다.
+     *
+     * 그래서 판별은 문구 추측이 아니라 **표식**으로 한다. 표식이 있으면 그 런타임은 실패다.
+     * (`runtimeRefusal`은 표식조차 없는 런타임을 위한 마지막 그물로만 남긴다.)
      */
-    const notice = runtimeRefusal(text);
+    const marked = res && res.error ? String(res.error).replace(/\s+/g, " ").slice(0, 240) : null;
+    const notice = marked || runtimeRefusal(text);
     if (notice) {
       failures.push(`${runtime.kind}: ${notice}`);
       continue;
