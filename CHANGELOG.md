@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.33 — 2026-08-06
+
+Defect sweep: ran every command with a real prompt and fixed what dumped or stalled.
+
+- `connect telegram` / `connect status` no longer dump the raw Hephaestus router JSON —
+  they show the local Telegram binding table and honestly note that bot issuance/pairing
+  still live in Desktop Connect.
+- `route "<request>"` shows a progress spinner during its ~13s Hub round-trip instead of
+  sitting silent.
+
 ## 1.0.32 — 2026-08-06
 
 Standalone: the terminal no longer requires Desktop or the plugin for its core flows.

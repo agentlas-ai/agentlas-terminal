@@ -1,6 +1,6 @@
 {
   "name": "agentlas",
-  "version": "1.0.32",
+  "version": "1.0.33",
   "description": "Agentlas project terminal \u2014 run project controllers and task-scoped agent teams from the terminal. Standalone: no desktop app process required.",
   "bin": {
     "agentlas": "bin/agentlas.cjs"
