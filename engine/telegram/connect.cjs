@@ -150,9 +150,53 @@ function removeBinding(db, id) {
   deleteToken(id);
 }
 
+/*
+ * 브라우저 조종으로 BotFather 토큰을 자동 포착 (2026-08-06).
+ * 데스크탑 electron/telegram/connect.ts 의 readTelegramWebState 와 같은 방식:
+ * 페이지 innerText 에서 봇 토큰 정규식을 읽는다. 데스크탑은 Electron
+ * executeJavaScript, 여기서는 CDP Runtime.evaluate — 동형. 봇 생성(/newbot)은
+ * 열린 Agentlas Chrome 에서 사용자가 하거나 이미 만든 봇을 열면 되고, 토큰은
+ * 터미널이 페이지에서 직접 읽어 복붙을 없앤다.
+ *
+ * 반환: 포착한 토큰 문자열 또는 null(시간초과). 브라우저(CDP)가 없으면
+ * cdp_unavailable 로 던진다 — 호출자가 수동 토큰 경로로 안내.
+ */
+const BOTFATHER_WEB_URL = "https://web.telegram.org/k/#@BotFather";
+const TOKEN_RE_SRC = "\\b\\d{8,12}:[A-Za-z0-9_-]{30,}\\b";
+
+async function captureBotTokenViaBrowser({ timeoutMs = 180_000, onWait } = {}) {
+  const cdp = require("../browser/cdp.cjs");
+  if (!(await cdp.cdpReady())) {
+    const err = new Error("Agentlas browser (CDP) is not running");
+    err.code = "cdp_unavailable";
+    throw err;
+  }
+  const page = await cdp.attachPage();
+  try {
+    await page.navigate(BOTFATHER_WEB_URL, { waitMs: 2500 });
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (typeof onWait === "function") onWait();
+      // 페이지 텍스트에서 마지막 토큰을 읽는다(가장 최근 발급).
+      let token = null;
+      try {
+        token = await page.evalExpr(
+          "(document.body && document.body.innerText ? document.body.innerText : '').match(/" + TOKEN_RE_SRC + "/g)?.slice(-1)[0] || null",
+        );
+      } catch { token = null; }
+      if (token) return token;
+      await new Promise((r) => setTimeout(r, 1200));
+    }
+    return null;
+  } finally {
+    page.close();
+  }
+}
+
 module.exports = {
   telegramApi, verifyBotToken,
   startConnection, pairByPolling, sendTest, removeBinding,
   listBindings, getBinding,
   saveToken, readToken, deleteToken, tokenFingerprint,
+  captureBotTokenViaBrowser, BOTFATHER_WEB_URL,
 };

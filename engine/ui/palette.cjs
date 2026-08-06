@@ -77,6 +77,7 @@ const SLASH_COMMANDS = [
   { command: "/creds", args: "<sub>", ko: "자격증명", en: "Credentials" },
   { command: "/env", args: "", ko: "공유 환경 키", en: "Shared env keys" },
   { command: "/multimodal", args: "", ko: "이미지·영상·음성 설정", en: "Image/video/audio providers" },
+  { command: "/document", args: "pdf <html|url>", ko: "문서 PDF 내보내기", en: "Export a document to PDF" },
   { command: "/roles", args: "[set <role> <runtime>]", ko: "오케스트레이터·워커 모델 역할 조회/설정", en: "Show or set orchestrator/worker model roles" },
   { command: "/telegram", args: "[sub]", ko: "텔레그램 연결", en: "Telegram bindings" },
   { command: "/oberon", args: "[sub]", ko: "AI 필름", en: "AI film" },

@@ -36,7 +36,7 @@ const { CONTEXT_MAP_MIN_CORE_VERSION } = coreHarness;
 // ── 명령 usage 문자열 (v1 TOP_LEVEL_COMMAND_USAGE에서 hephaestus 클러스터만 발췌) ──
 const USAGE = Object.freeze({
   build: 'usage: agentlas build "<request>"',
-  browser: "usage: agentlas browser <url-or-query|subcommand>",
+  browser: "usage: agentlas browser <url-or-query> | status | sites | add <site> | login <site> | mark <site> <valid|expired|none> | go <url> | rm <site>",
   call: 'usage: agentlas call "<agent-slugs>" "<context>"',
   connect: "usage: agentlas connect [status|telegram|help]",
   hep: "usage: agentlas hep <subcommand> [args]",

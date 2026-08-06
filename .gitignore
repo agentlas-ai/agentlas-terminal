@@ -2,6 +2,13 @@ node_modules/
 *.tgz
 .DS_Store
 
+# 그래프 실행 엔진(데스크탑 코어 재사용, engine/core/desktop-core.cjs) — 코덱스 CLI 패턴:
+# 무거운 산출물(52MB 원본/11MB 압축)은 git에 안 넣고 npm run vendor:core 로 로컬 생성하거나
+# 처음 graph 실행 때 GitHub Release 자산에서 내려받아 캐시한다. 매니페스트(.manifest.json)는
+# 작아서 커밋 대상 — 그건 여기서 안 지운다.
+/engine/vendor/desktop-core/
+/engine/vendor/desktop-core.tar.gz
+
 # Agentlas local credentials
 .env
 .env.local

@@ -2,6 +2,9 @@
 /*
  * automation — 자동화 등록/목록/토글/삭제/실행 (v1 cmdAutomation 의 v2 포팅).
  *   list (기본) | add | on <id> | off <id> | remove <id> | run <id> | runs | daemon
+ *   tick            1회 due 스윕 후 종료(launchd/cron 이 poke 하는 진입점)
+ *   install         macOS launchd 상주 켜기 — 앱/창이 꺼져 있어도 발동(opt-in)
+ *   uninstall       상주 끄기 · status  상주 상태
  *
  * 스케줄 계산은 automation/schedule, DB는 automation/store, 실행은
  * automation/daemon(세션 계층)만 쓴다. run <id> 는 스케줄을 건드리지 않는다
@@ -196,7 +199,40 @@ async function run(ctx, args) {
     return daemon.automationDaemon(ctx, db, { intervalSec: interval, runtimeOverride });
   }
 
-  ctx.err(usage("list|add|on <id>|off <id>|remove <id>|run <id>|runs|daemon"));
+  // 1회 due 스윕 후 종료 — launchd/cron 이 poke 하는 진입점(상주 루프 아님).
+  if (sub === "tick") {
+    await daemon.daemonTick(ctx, db, {});
+    return 0;
+  }
+
+  // 앱/창이 꺼져 있어도 자동화가 발동하도록 macOS launchd 로 상주시킨다(opt-in).
+  if (sub === "install" || sub === "uninstall" || sub === "status") {
+    const launchd = require("../automation/launchd.cjs");
+    if (sub === "status") {
+      const st = launchd.launchdStatus();
+      if (!st.supported) { ctx.out(ko ? "launchd 상주는 macOS 전용입니다. 다른 OS 는 `agentlas automation daemon` 을 켜 두세요." : "launchd persistence is macOS-only. On other systems keep `agentlas automation daemon` running."); return 0; }
+      ctx.out(`${st.loaded ? ctx.ui.green("✓") : ctx.ui.dim("○")} ${ko ? "상주(launchd)" : "persistence (launchd)"}: ${st.loaded ? (ko ? "실행 중" : "loaded") : st.installed ? (ko ? "설치됨(미로드)" : "installed (not loaded)") : (ko ? "미설치" : "not installed")}`);
+      ctx.out(ctx.ui.dim(`plist: ${st.plistPath}`));
+      if (!st.loaded) ctx.out(ctx.ui.dim(ko ? "켜기: agentlas automation install" : "Enable: agentlas automation install"));
+      return 0;
+    }
+    if (sub === "install") {
+      let interval = 300;
+      for (let i = 1; i < args.length; i++) if (args[i] === "--interval") interval = Math.max(30, Number(args[++i]) || 300);
+      const st = launchd.enableLaunchd({ intervalSec: interval });
+      if (st.error) { ctx.err(`${ctx.ui.red("✖")} ${st.error}`); return 1; }
+      ctx.out(`${ctx.ui.green("✓")} ${ko ? "상주를 켰습니다 — 앱/창이 꺼져 있어도 자동화가 발동합니다" : "persistence on — automations fire even with the app/window closed"} (${interval}s)`);
+      ctx.out(ctx.ui.dim(ko ? `${Math.max(30, interval)}초마다 due 를 확인합니다. 끄기: agentlas automation uninstall` : `checks due automations every ${Math.max(30, interval)}s. Disable: agentlas automation uninstall`));
+      return 0;
+    }
+    // uninstall
+    const st = launchd.disableLaunchd();
+    if (st.error) { ctx.err(`${ctx.ui.red("✖")} ${st.error}`); return 1; }
+    ctx.out(`${ctx.ui.green("✓")} ${ko ? "상주를 껐습니다. 자동화는 포그라운드 daemon 을 켜 둘 때만 발동합니다." : "persistence off. Automations fire only while a foreground daemon runs."}`);
+    return 0;
+  }
+
+  ctx.err(usage("list|add|on <id>|off <id>|remove <id>|run <id>|runs|daemon|tick|install|uninstall|status"));
   return 1;
 }
 

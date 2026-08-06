@@ -839,6 +839,18 @@ function runNativeTurn(req) {
     } else if (kind === "gemini") {
       args = geminiArgs(launchReq);
       lineHandler = (l) => handleGeminiLine(l, st, ui);
+    } else if (kind === "agy") {
+      /*
+       * Antigravity CLI — stream-json이 없다(실측 1.1.10). 평문 stdout을 그대로 텍스트로.
+       * ★--prompt는 값 플래그가 아니라 --print의 별칭이다(실측: 프롬프트가 조용히 유실됐던
+       * 사고) — 프롬프트는 반드시 위치 인자로 넘긴다. 시스템 프롬프트는 본문에 앞세운다.
+       */
+      const agyPrompt = launchReq.systemPrompt
+        ? `${launchReq.systemPrompt}\n\n---\n\n${launchReq.prompt}`
+        : launchReq.prompt;
+      args = ["--print", agyPrompt, ...(launchReq.model ? ["--model", launchReq.model] : [])];
+      plainStream = true;
+      lineHandler = null;
     } else {
       return Promise.resolve({ text: "", session: st.session, error: `unknown runtime: ${kind}`, errorKind: "unsupported", errorSource: "marker" });
     }

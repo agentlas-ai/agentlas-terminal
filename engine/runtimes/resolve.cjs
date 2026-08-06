@@ -10,7 +10,7 @@ const { RUNTIME_BIN, whichSync, listAvailableCliRuntimes, activeRuntimeRow } = r
 // Session이 실제 드라이버를 갖춘 런타임만 실행 대상으로 삼는다.
 // CLI는 native-host, Ollama는 로컬 API loop를 쓴다. 다른 드라이버가 포팅되면
 // 해당 집합에 추가한다(조용한 오폭 방지).
-const CLI_EXECUTABLE_KINDS = new Set(["claude-code", "codex", "gemini"]);
+const CLI_EXECUTABLE_KINDS = new Set(["claude-code", "codex", "gemini", "agy"]);
 const API_EXECUTABLE_KINDS = new Set(["ollama"]);
 const EXECUTABLE_KINDS = new Set([
   ...CLI_EXECUTABLE_KINDS,

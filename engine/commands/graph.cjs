@@ -777,11 +777,27 @@ async function newGraph(ctx, request, flags) {
     const target = pickDefaultAgent(ctx, db);
     const id = `graph-${crypto.randomUUID()}`;
     try {
-      db.prepare(
-        `INSERT INTO automations
-           (id, name, schedule, target_type, target_id, prompt_template, enabled, created_by, created_at, next_run_at, graph_json)
-         VALUES (?, ?, ?, 'agent', ?, ?, 0, 'user', ?, NULL, ?)`,
-      ).run(id, name, built.scheduleHuman, target, name, new Date().toISOString(), JSON.stringify(built.graph));
+      /*
+       * ★목적 문장(goal)을 함께 싣는다 — 빼면 "이 그래프가 무엇인지"를 아는 유일한 문장이
+       * 저장 순간 사라진다. 실측(2026-08-06): 터미널로 만든 그래프의 goal이 null이라
+       * Hub 발행 tagline이 한국어 하드코딩 폴백("N단계 자동화 그래프")으로 떨어졌고,
+       * 그 문장이 영문 칸에 실려 발행이 거절됐다. goal 칸은 데스크탑 스키마 백스톱이
+       * 보장하지만, 옛 DB 방어로 columnExists 가드를 둔다.
+       */
+      const hasGoal = ctx.columnExists(db, "automations", "goal");
+      if (hasGoal) {
+        db.prepare(
+          `INSERT INTO automations
+             (id, name, schedule, target_type, target_id, prompt_template, enabled, created_by, created_at, next_run_at, graph_json, goal)
+           VALUES (?, ?, ?, 'agent', ?, ?, 0, 'user', ?, NULL, ?, ?)`,
+        ).run(id, name, built.scheduleHuman, target, name, new Date().toISOString(), JSON.stringify(built.graph), (bp.goal || "").trim() || null);
+      } else {
+        db.prepare(
+          `INSERT INTO automations
+             (id, name, schedule, target_type, target_id, prompt_template, enabled, created_by, created_at, next_run_at, graph_json)
+           VALUES (?, ?, ?, 'agent', ?, ?, 0, 'user', ?, NULL, ?)`,
+        ).run(id, name, built.scheduleHuman, target, name, new Date().toISOString(), JSON.stringify(built.graph));
+      }
     } catch (err) {
       ctx.err(en ? `Could not save: ${err.message}` : `저장하지 못했습니다: ${err.message}`);
       return 1;

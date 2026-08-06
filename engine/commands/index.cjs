@@ -35,6 +35,7 @@ const COMMANDS = {
   automation: () => require("./automation.cjs"),
   native: () => require("./native.cjs"),
   multimodal: () => require("./multimodal.cjs"),
+  document: () => require("./document.cjs"),
   workforce: () => require("./workforce.cjs"),
   network: () => require("./workforce.cjs"),
   taskforce: () => require("./workforce.cjs"),

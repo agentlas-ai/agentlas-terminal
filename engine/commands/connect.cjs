@@ -23,8 +23,8 @@ const readline = require("node:readline");
 
 function usage(ko) {
   return ko
-    ? "사용법: agentlas connect [ status | telegram <agent|firm> | test <id> | remove <id> ]"
-    : "Usage: agentlas connect [ status | telegram <agent|firm> | test <id> | remove <id> ]";
+    ? "사용법: agentlas connect [ status | telegram <agent|firm> [--auto] | test <id> | remove <id> ]"
+    : "Usage: agentlas connect [ status | telegram <agent|firm> [--auto] | test <id> | remove <id> ]";
 }
 
 function resolveTarget(db, token) {
@@ -57,7 +57,7 @@ async function readTokenFromStdin(ctx, ko) {
   });
 }
 
-async function connectTelegram(ctx, targetToken) {
+async function connectTelegram(ctx, targetToken, { auto = false } = {}) {
   const ko = ctx.lang === "ko";
   const db = ctx.db();
   const target = resolveTarget(db, targetToken);
@@ -66,8 +66,37 @@ async function connectTelegram(ctx, targetToken) {
     ctx.err(ctx.ui.dim(ko ? "에이전트·회사 목록: agentlas list" : "list agents and companies: agentlas list"));
     return 1;
   }
-  const token = await readTokenFromStdin(ctx, ko);
-  if (!token) { ctx.err(ko ? "토큰이 필요합니다." : "a bot token is required."); return 1; }
+
+  let token;
+  if (auto) {
+    // --auto: 터미널이 Agentlas 브라우저(CDP)로 BotFather 를 열고 토큰을 직접 읽는다.
+    ctx.out(ko
+      ? "Agentlas 브라우저에서 BotFather 를 엽니다. 필요하면 로그인(QR)한 뒤, `/newbot` 으로 봇을 만드세요 — 토큰은 제가 화면에서 읽어옵니다."
+      : "Opening BotFather in the Agentlas browser. Log in (QR) if needed, then create a bot with `/newbot` — I'll read the token off the page.");
+    try {
+      if (typeof ctx.ui.startSpinner === "function") ctx.ui.startSpinner(ko ? "BotFather 토큰 대기 중…" : "Waiting for a BotFather token…");
+      token = await require("../telegram/connect.cjs").captureBotTokenViaBrowser({ timeoutMs: 180_000 });
+    } catch (e) {
+      if (typeof ctx.ui.stopSpinner === "function") ctx.ui.stopSpinner();
+      if (e && e.code === "cdp_unavailable") {
+        ctx.err(ko
+          ? "Agentlas 브라우저가 실행 중이 아닙니다. 먼저 `agentlas browser https://web.telegram.org` 로 브라우저를 띄운 뒤 다시 --auto 하거나, --auto 없이 토큰을 직접 붙여넣으세요."
+          : "The Agentlas browser is not running. Start it with `agentlas browser https://web.telegram.org`, then retry --auto, or paste the token without --auto.");
+        return 1;
+      }
+      ctx.err(`${ctx.ui.red("✖")} ${String((e && e.message) || e)}`);
+      return 1;
+    }
+    if (typeof ctx.ui.stopSpinner === "function") ctx.ui.stopSpinner();
+    if (!token) {
+      ctx.err(ko ? "시간 내 토큰을 못 읽었습니다(3분). 다시 시도하거나 --auto 없이 붙여넣으세요." : "No token captured in time (3 min). Retry, or paste it without --auto.");
+      return 1;
+    }
+    ctx.out(ctx.ui.dim(ko ? "토큰을 읽었습니다." : "Captured the token."));
+  } else {
+    token = await readTokenFromStdin(ctx, ko);
+    if (!token) { ctx.err(ko ? "토큰이 필요합니다." : "a bot token is required."); return 1; }
+  }
 
   let started;
   try {
@@ -117,8 +146,11 @@ async function run(ctx, args) {
   if (!sub || sub === "help" || sub === "--help" || sub === "-h") { ctx.out(usage(ko)); return 0; }
   if (sub === "status") return renderTelegram(ctx);
   if (sub === "telegram") {
-    if (!args[1]) { ctx.err(usage(ko)); return 1; }
-    return connectTelegram(ctx, args[1]);
+    const rest = args.slice(1);
+    const auto = rest.includes("--auto");
+    const targetToken = rest.find((a) => a && !String(a).startsWith("-"));
+    if (!targetToken) { ctx.err(usage(ko)); return 1; }
+    return connectTelegram(ctx, targetToken, { auto });
   }
   if (sub === "test") {
     if (!args[1]) { ctx.err(ko ? "사용법: agentlas connect test <id>" : "Usage: agentlas connect test <id>"); return 1; }

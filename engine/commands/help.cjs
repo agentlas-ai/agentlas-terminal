@@ -29,7 +29,7 @@ EXECUTE
   workforce | network <request>   Agent Workforce Ontology route (public Hub menu)
   hep-network "<request>"  staff across Local + owner Cloud + public Hub (local Core federation)
   hep-local | hep-cloud | hep-hub "<request>"   same, restricted to one source scope
-  call "a,b" "<ctx>" · browser · route "<req>" [--json] · research <sub>
+  call "a,b" "<ctx>" · browser <url|status|sites|login> · route "<req>" [--json] · research <sub>
 
 KNOWLEDGE
   memory import · evolve   memory & prompt-evolution proposals
@@ -97,7 +97,7 @@ EXECUTE
   workforce | network <request>   Agent Workforce Ontology 편성 (공개 Hub 메뉴)
   hep-network "<request>"  로컬+오너 클라우드+공개 Hub 연합 편성 (로컬 Core 연합)
   hep-local | hep-cloud | hep-hub "<request>"   같은 편성, 한 소스 스코프로 제한
-  call "a,b" "<ctx>" · browser · route "<req>" [--json] · research <sub>
+  call "a,b" "<ctx>" · browser <url|status|sites|login> · route "<req>" [--json] · research <sub>
 
 KNOWLEDGE
   memory import · evolve   메모리·프롬프트 진화 제안
