@@ -62,8 +62,10 @@ const OPS = new Set(CONDITION_OPS);
 const VALUE_OPS = new Set(["contains", "eq", "ne", "gt", "lt"]);
 const VAR_RE = /^[A-Za-z_][\w-]*$/;
 
-function startInterview(request) {
-  return { request: String(request || "").trim(), answers: [], asked: [], round: 0, attempts: [] };
+function startInterview(request, { knownGraphs = [], selfId = null } = {}) {
+  // knownGraphs: 이 사람이 이미 가진 저장된 자동화들(id·name). runGraph 단계가 이 중에서만
+  //   고르게 하려고 인터뷰 프롬프트와 검증에 함께 흐른다(데스크탑과 같은 규칙).
+  return { request: String(request || "").trim(), answers: [], asked: [], round: 0, attempts: [], knownGraphs, selfId };
 }
 
 function recordAnswers(state, answers) {
@@ -133,6 +135,11 @@ const RULES = [
   "    If the script imports anything outside the Python standard library, declare the pip names in",
   '    packages:["yfinance"] on that step — the product installs them before the run. Prefer the',
   "    standard library when it can do the job; an undeclared import dies on the user's machine.",
+  "  · kind:\"runGraph\" when the person wants an automation they ALREADY have to run as one",
+  "    step of this one (\"then run my weekly report\"). Add graphRef:\"<id>\" chosen from the",
+  "    list of saved automations at the end of this prompt — never invent an id, and never use",
+  "    the name (names change, ids do not). If nothing in that list matches, do not guess:",
+  "    write the work as ordinary steps instead.",
   "  · kind:\"agent\" (the default, omit it) for judgement, writing, summarizing, deciding — anything",
   "    where being approximately right is fine. Split a step: fetch+compute in a code step, then",
   "    judge/write in an agent step. Do not put exact math inside an agent instruction.",
@@ -203,6 +210,11 @@ function buildInterviewPrompt(state, locale = "ko") {
   if (state.asked.length) {
     lines.push("", `Question ids already asked (do not repeat): ${state.asked.join(", ")}`);
   }
+  // ★부를 수 있는 자동화 목록을 그 순간 실물로 싣는다(데스크탑과 같은 규칙). 이것이 없으면
+  //   모델은 id를 지어내고, 그 그래프는 실행 때 죽는다.
+  if (state.knownGraphs && state.knownGraphs.length) {
+    lines.push("", "Saved automations you may call with kind:\"runGraph\" (use the id exactly):", ...state.knownGraphs.slice(0, 40).map((g) => `  ${g.id} — ${g.name}`));
+  }
   // ★산출 언어는 입력 언어가 아니라 **제품 설정**이 정한다(데스크탑과 같은 규칙).
   lines.push("", `PRODUCT LANGUAGE: ${locale === "ko" ? "Korean" : "English"}. Every user-facing string you emit is in this language.`);
   // ★지난 시도가 왜 지어지지 못했는지를 모델 앞에 놓는다. 데스크탑과 같은 규율이다 —
@@ -239,7 +251,7 @@ function triggerQuestion() {
 }
 
 /** 청사진이 그래프로 지어질 수 있는지. 모자란 곳은 기본값이 아니라 질문으로 돌려준다. */
-function validateBlueprint(bp) {
+function validateBlueprint(bp, ctx = {}) {
   const problems = [];
   const push = (reason, ask = null) => problems.push({ reason, ask });
   if (!bp || typeof bp !== "object") { push("만들 내용을 읽지 못했습니다."); return problems; }
@@ -304,6 +316,33 @@ function validateBlueprint(bp) {
         why: "바깥을 바꾸는 단계는 실행 전에 확인받도록 잠가 둡니다.",
         choices: ["아니요, 만들기만 합니다", "네, 바깥으로 나갑니다"],
       });
+    }
+    // ★부를 자동화는 실재해야 한다(데스크탑 shared/graph-blueprint.ts와 같은 규칙). 이름이
+    //   아니라 id로 가리키는 이유도 같다 — 이름은 바뀌고 지어낸 id는 실행에서 죽는다.
+    //   목록을 모르는 호출부에서는 형식만 본다(ctx.knownGraphs 없으면 건너뜀).
+    if (step.kind === "runGraph") {
+      const ref = String(step.graphRef || "").trim();
+      if (!ref) {
+        push(`${at}가 어느 자동화를 부를지 정하지 않았습니다.`);
+      } else if (ctx.selfId && ref === ctx.selfId) {
+        push(`${at}가 자기 자신을 부릅니다 — 끝나지 않습니다.`);
+      } else if (ctx.knownGraphs && ctx.knownGraphs.length && !ctx.knownGraphs.some((g) => g.id === ref)) {
+        push(`${at}가 부르려는 자동화("${ref}")가 없습니다. 저장된 자동화 중에서 골라야 합니다.`);
+      }
+    }
+    // ★코드 스텝은 스크립트가 있어야 한다. 없으면 "코드로 하겠다"고 해 놓고 빈 채로 저장돼
+    //   실행에서 CODE_NODE_EMPTY로 죽는다(데스크탑과 같은 규칙, 저작 시점에 막는다).
+    if (step.kind === "code") {
+      if (!String(step.code || "").trim()) {
+        push(`${at}는 코드로 실행한다고 했는데 스크립트가 비어 있습니다.`, {
+          id: `step-${index}-code`,
+          question: `"${step.title || at}" 단계에서 무엇을 계산·가공하나요? (AI가 스크립트를 채웁니다)`,
+          why: "코드 단계는 스크립트가 없으면 실행되지 않습니다.",
+        });
+      }
+      if (step.codeLang && step.codeLang !== "python" && step.codeLang !== "js") {
+        push(`${at}의 코드 언어 "${step.codeLang}"을(를) 이 제품이 모릅니다(python 또는 js).`);
+      }
     }
     for (const name of step.consumes || []) {
       if (!produced.has(name)) {
@@ -576,8 +615,8 @@ function clipAtWord(text, max) {
   return `${body.trimEnd()}…`;
 }
 
-function buildGraphFromBlueprint(bp, locale = "ko") {
-  const problems = validateBlueprint(bp);
+function buildGraphFromBlueprint(bp, locale = "ko", ctx = {}) {
+  const problems = validateBlueprint(bp, ctx);
   if (problems.length) return { ok: false, problems };
 
   const nodes = [];
@@ -595,14 +634,19 @@ function buildGraphFromBlueprint(bp, locale = "ko") {
   const stepId = (i) => `step${i + 1}`;
   bp.steps.forEach((step, index) => {
     const isCode = step.kind === "code";
+    // 다른 자동화를 한 단계로 부른다(데스크탑 커넥터 C46 subgraph). 캔버스엔 있는데
+    //   말로는 못 만들던 구멍 — 데스크탑 스케줄러가 이 노드를 재귀 실행한다.
+    const isSub = step.kind === "runGraph";
     nodes.push({
       id: stepId(index),
-      // 코드 스텝은 code 노드로(데스크탑 shared/graph-blueprint.ts와 같은 규칙).
-      type: isCode ? "code" : (step.effect === "mutation" ? "action" : "agent"),
+      // 코드 스텝은 code 노드로, subgraph 는 subgraph 노드로(데스크탑 shared/graph-blueprint.ts와 같은 규칙).
+      type: isSub ? "subgraph" : isCode ? "code" : (step.effect === "mutation" ? "action" : "agent"),
       label: step.title,
       position: { x: column(index + 1), y: 0 },
       config: {
-        ...(isCode
+        ...(isSub
+          ? { graphRef: step.graphRef || "", note: step.instruction }
+          : isCode
           ? {
             code: step.code || "", codeLang: step.codeLang === "js" ? "js" : "python", note: step.instruction,
             ...(Array.isArray(step.packages) && step.packages.length

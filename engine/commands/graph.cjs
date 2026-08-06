@@ -588,7 +588,12 @@ async function newGraph(ctx, request, flags) {
 
   const interview = require("../graph/interview.cjs");
   const { askModel } = require("../graph/ask-model.cjs");
-  let state = interview.startInterview(request);
+  // 이미 저장된 자동화들을 인터뷰에 싣는다 — runGraph 단계가 이 중에서만 고르게 하려는 것.
+  //   목록이 없으면 모델이 id를 지어내고, 그 그래프는 실행 때 죽는다(데스크탑과 같은 규칙).
+  const knownGraphs = (() => {
+    try { return graphRows(ctx, db).map((r) => ({ id: r.id, name: r.name })); } catch { return []; }
+  })();
+  let state = interview.startInterview(request, { knownGraphs });
 
   // 파이프로 들어온 답은 **미리 전부 읽어 둔다.** readline은 입력 스트림이 끝나면 닫히므로,
   // 질문마다 물으면 두 번째 질문에서 "readline was closed"로 죽는다(실측).
@@ -650,7 +655,7 @@ async function newGraph(ctx, request, flags) {
         continue;
       }
       if (parsed.turn.kind === "blueprint") {
-        built = interview.buildGraphFromBlueprint(parsed.turn.blueprint, en ? "en" : "ko");
+        built = interview.buildGraphFromBlueprint(parsed.turn.blueprint, en ? "en" : "ko", { knownGraphs });
         if (!built.ok) {
           // 청사진 검증은 통과했는데 짓는 데서 걸렸다 — 이것도 형식 문제라 같은 규율.
           state.attempts = [...(state.attempts || []), { round, problems: built.problems.map((p) => p.reason) }];
