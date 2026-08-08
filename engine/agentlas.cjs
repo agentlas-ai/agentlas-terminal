@@ -58,6 +58,7 @@ const { openDb, seedBuiltins, tableExists, columnExists } = require("./core/db.c
 const { userDataDir } = require("./core/paths.cjs");
 const { loadPrefs } = require("./agentlas-config.cjs");
 const { Ui } = require("./agentlas-ui.cjs");
+const { parseOutputFlags, render, renderError, isRichUi } = require("./cli-output.cjs");
 const commands = require("./commands/index.cjs");
 
 const SUPPORTED_LANGS = new Set(["ko", "en"]);
@@ -101,6 +102,22 @@ function buildCtx() {
     },
     out: (s = "") => process.stdout.write(s + "\n"),
     err: (s = "") => process.stderr.write(s + "\n"),
+    /*
+     * 출력 계약 — 명령은 문자열이 아니라 {데이터+스키마}를 준다(cli-output.cjs).
+     * 형식(--json/--yaml/--quiet/--no-headers/--no-color) 해석은 여기 한 곳이라,
+     * 명령마다 --json 유무가 갈리거나 에러 형식이 달라지는 일이 없다.
+     */
+    output: { ...require("./cli-output.cjs").DEFAULT_OPTIONS },
+    emit(result) {
+      const text = render(result, this.output);
+      if (text) process.stdout.write(text + "\n");
+    },
+    fail(error) {
+      process.stderr.write(renderError(error, this.output) + "\n");
+    },
+    get richUi() {
+      return isRichUi(this.output);
+    },
     db: () => {
       if (_db) return _db;
       _db = openDb();
@@ -163,12 +180,17 @@ function main() {
     return a;
   });
 
+  // 전역 출력 플래그는 명령에 닿기 전에 한 곳에서 뜯어낸다 —
+  // 명령마다 --json 유무가 갈리던 것을 구조로 막는다.
+  const { options: outputOptions, rest: commandArgv } = parseOutputFlags(normalized);
   const ctx = buildCtx();
+  ctx.output = outputOptions;
   let code;
   try {
-    code = commands.dispatch(ctx, normalized);
+    code = commands.dispatch(ctx, commandArgv);
   } catch (e) {
-    ctx.err(String((e && e.message) || e));
+    // 에러도 같은 형식 규율을 따른다: --json 이면 {"error":{code,message}}.
+    ctx.fail(e);
     process.exit(1);
   }
 
