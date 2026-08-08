@@ -199,6 +199,14 @@ function main() {
   console.log(`✓ Packaged ${path.relative(process.cwd(), tarPath)}  (${(sizeBytes / 1024 / 1024).toFixed(1)} MB, sha256 ${sha256.slice(0, 16)}…)`);
   console.log(`  Next: upload this asset to a GitHub Release, then run`);
   console.log(`    node scripts/write-desktop-core-manifest.cjs --version <n> --url <release-asset-url>`);
+
+  // 벤더 갱신 직후가 구조 상수 쌍둥이(manifest.ts ↔ architecture.data.json)가
+  // 갈라질 수 있는 유일한 순간이다 — 값 대조 게이트를 여기서 강제한다.
+  const parity = spawnSync("node", [path.join(__dirname, "verify-architecture-parity.cjs")], { stdio: "inherit" });
+  if (parity.status !== 0) {
+    console.error("✖ architecture parity failed — vendored core and engine/architecture.data.json disagree");
+    process.exit(1);
+  }
 }
 
 main();
