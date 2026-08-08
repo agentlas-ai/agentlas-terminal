@@ -38,10 +38,18 @@ const NOTICE_PATTERNS = [
   /\bnot logged in\b/i,
   /\b(login|session|token) (expired|invalid)\b/i,
   /\bsubscription (required|expired)\b/i,
+  // ── 모델이 쓴 기계 자기보고 (2026-08-08 ollama 실측) ──
+  // "The system encountered a timeout error while processing a request. No further
+  // function calls are required. Please retry the operation..." — 도구 왕복이 무너진 뒤
+  // 로컬 모델이 뱉은 문장이 최종 답으로 저장됐다. 사람에게 하는 답이 아니라 프로토콜 잡담.
+  /\bno further (function|tool) calls?\b/i,
+  /\bsystem encountered (a|an) [a-z]+ error\b/i,
+  /\bretry the (operation|request)\b/i,
 ];
 
 /** 종류 추정 — 표식이 없으니 문구에서. 조율은 여기 한 곳. */
 function kindOf(text) {
+  if (/\btimed? ?out\b|\btimeout\b/i.test(text)) return "timeout";
   if (/\b(log ?in|sign ?in|logged in|expired|unauthorized|subscription)\b/i.test(text)) return "auth";
   if (/\b(limit|quota|credits?|resets?|try again)\b/i.test(text)) return "quota";
   return "refused";
@@ -49,7 +57,7 @@ function kindOf(text) {
 
 /**
  * 텍스트가 산출물이 아니라 거절 고지문인가.
- * @returns {{ kind: "quota"|"auth"|"refused", message: string } | null}
+ * @returns {{ kind: "quota"|"auth"|"refused"|"timeout", message: string } | null}
  */
 function detectRuntimeRefusal(text) {
   const t = String(text || "").trim();
