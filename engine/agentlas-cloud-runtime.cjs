@@ -38,11 +38,56 @@ function collectFiles(root) {
   return files.sort((a, b) => a.path.localeCompare(b.path));
 }
 
+// Local sourcePackage identity — the wizard manifest's `packageHash`.
+//
+// This is NOT the delivered Agent Cloud artifact hash. That one is
+// `path-sha256-executable-v2` and lives in engine/cloud-assets/package.cjs,
+// byte-identical with Desktop's hashPackage and Agentlas-OS upload.py. The two
+// are separate contracts on purpose (upload.py: "distinct from agentlas.json's
+// local sourcePackage hash contract").
+//
+// The canonical definition of THIS hash is the kernel's
+// `canonical_package_hash_hex` in Agentlas-OS/agentlas_cloud/runtime.py. This
+// file mirrors it and must produce the same digest for the same folder; the
+// two used to disagree on every input because this copy had no version prefix
+// and skipped only agentlas.json. Keep the three constants below in step with
+// the kernel: PACKAGE_HASH_VERSION, PACKAGE_HASH_EXCLUDED_PATHS, and the
+// experience-lineage rule.
+const PACKAGE_HASH_VERSION = "agentlas-package-hash/v2";
+const LOCAL_EXPERIENCE_LINEAGE_PATH = ".agentlas/experience-relations.jsonl";
+const PACKAGE_HASH_EXCLUDED_PATHS = new Set([
+  "agentlas.json",
+  ".agentlas/brief.json",
+  ".agentlas/security-scan.json",
+  ".agentlas/security-llm-judgment.json",
+  ".agentlas/field-test-report.json",
+  LOCAL_EXPERIENCE_LINEAGE_PATH,
+]);
+
+function isLocalExperienceLineagePath(filePath) {
+  const normalized = String(filePath || "").replaceAll("\\", "/");
+  return (
+    normalized === LOCAL_EXPERIENCE_LINEAGE_PATH ||
+    normalized.startsWith(`${LOCAL_EXPERIENCE_LINEAGE_PATH}.`) ||
+    normalized.startsWith(".agentlas/.experience-relations.jsonl.")
+  );
+}
+
+function packageHashIncludes(filePath) {
+  const normalized = String(filePath || "").replaceAll("\\", "/");
+  return !PACKAGE_HASH_EXCLUDED_PATHS.has(normalized) && !isLocalExperienceLineagePath(normalized);
+}
+
 function hashPackage(files) {
   const h = crypto.createHash("sha256");
-  for (const file of files) {
-    if (file.path === "agentlas.json") continue;
-    h.update(file.path);
+  h.update(PACKAGE_HASH_VERSION);
+  h.update("\0");
+  // Codepoint order, not localeCompare: the kernel sorts by raw string order.
+  const ordered = [...files].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  for (const file of ordered) {
+    const normalized = String(file.path || "").replaceAll("\\", "/");
+    if (!packageHashIncludes(normalized)) continue;
+    h.update(normalized);
     h.update("\0");
     h.update(file.content);
     h.update("\0");
@@ -55,9 +100,14 @@ function inferEntry(files) {
   return ["AGENTS.md", "agent.md", "CLAUDE.md", "README.md"].find((candidate) => paths.has(candidate)) || files[0]?.path || "AGENTS.md";
 }
 
+// Skills actually present in the package. An empty result stays empty.
+// A package with no skills used to be given a literal placeholder skill id.
+// Once skills live outside the core that placeholder fires on every modular
+// agent and fills the Workforce index with a skill nobody has.
+// An absent value is an empty list, never a stand-in.
 function inferSkills(files) {
   const skills = files.map((file) => file.path.match(/(?:^|\/)skills\/([^/]+)\/SKILL\.md$/)?.[1]).filter(Boolean);
-  return [...new Set(skills)].sort().length ? [...new Set(skills)].sort() : ["agentlas-package"];
+  return [...new Set(skills)].sort();
 }
 
 function buildManifest(root, options = {}) {

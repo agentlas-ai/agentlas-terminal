@@ -591,10 +591,14 @@ function cloudRoutingCardProblem(card) {
   if (!workforce || typeof workforce !== "object" || Array.isArray(workforce)) {
     return "workforce must be a complete semantic resume";
   }
+  // `skills` has a floor of 0, not 1. Skills are modules and live outside the
+  // core, so a fully modular agent legitimately declares none. Requiring one
+  // here would block publishing every modular package. Kept identical in
+  // agentlas_desktop/electron/cloud-agents/package.ts — the two must not drift.
   const semanticLists = [
     ["communities", /^community:[a-z0-9][a-z0-9-]*$/, 1, 5],
     ["roles", /^role:[a-z0-9][a-z0-9-]*$/, 0, 4],
-    ["skills", /^skill:[a-z0-9][a-z0-9-]*$/, 1, 12],
+    ["skills", /^skill:[a-z0-9][a-z0-9-]*$/, 0, 12],
     ["knowledge", /^knowledge:[a-z0-9][a-z0-9-]*$/, 0, 256],
   ];
   for (const [field, pattern, minimum, maximum] of semanticLists) {
