@@ -73,6 +73,8 @@ function modelRoutingReceiptPath() {
 function buildStormDeps(ctx = {}) {
   return {
     prefsLang: () => ctx.lang || "en",
+    // Phase 1-2: 주입 Ui 관통 (자체 생성 방지)
+    uiInstance: ctx.uiInstance || null,
     out: typeof ctx.out === "function" ? ctx.out : (s) => process.stdout.write(`${s}\n`),
     resolveRuntime: resolveWorkforceRuntime,
     listAvailableRuntimes,

@@ -5,7 +5,7 @@
 const path = require("node:path");
 const os = require("node:os");
 const permissions = require("./agentlas-permissions.cjs");
-const { truncateWidth, visWidth } = require("./agentlas-composer.cjs");
+const { truncateWidth, visWidth } = require("./ui/width.cjs");
 
 // AGENTLAS wordmark (block letters). Rendered with a brand gradient across columns.
 const WORDMARK = [

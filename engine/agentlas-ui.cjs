@@ -574,7 +574,7 @@ class Ui {
     this.updateSpinner(msg);
   }
   _message(prefix, prefixPaint, messagePaint, msg) {
-    const { wrapWidth } = require("./agentlas-composer.cjs");
+    const { wrapWidth } = require("./ui/width.cjs");
     const columns = Math.max(8, Number(this.out.columns) || 80);
     const prefixWidth = visibleWidth(prefix);
     const lines = wrapWidth(stripAnsi(String(msg ?? "")), Math.max(2, columns - prefixWidth));

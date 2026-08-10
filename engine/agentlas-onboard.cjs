@@ -5,7 +5,7 @@
  */
 const i18n = require("./agentlas-i18n.cjs");
 const banner = require("./agentlas-banner.cjs");
-const { visWidth, wrapWidth } = require("./agentlas-composer.cjs");
+const { visWidth, wrapWidth } = require("./ui/width.cjs");
 
 /*
  * req = { ui, rl, helpers, persist } → Promise<{ onboarded, saved, saveError, lang, runtime, permission }>

@@ -27,7 +27,7 @@ const path = require("node:path");
 const fs = require("node:fs");
 const { spawn } = require("node:child_process");
 const { Ui } = require("../agentlas-ui.cjs");
-const { truncateWidth, visWidth, wrapWidth } = require("../agentlas-composer.cjs");
+const { truncateWidth, visWidth, wrapWidth } = require("../ui/width.cjs");
 const coreHarness = require("../agentlas-core-harness.cjs");
 const { userDataDir } = require("../core/paths.cjs");
 
@@ -194,7 +194,13 @@ function create(ctx, deps = {}) {
   const spawnCoreModule = deps.spawnCoreModule || coreHarness.spawnCoreModule;
   const lang = () => (ctx && ctx.lang) || "en";
 
+  /*
+   * pi-tui 이행 정지작업 (D3 Phase 1-2, 2026-08-11): ctx가 준 Ui가 있으면 그것을
+   * 쓴다. 자체 생성 Ui는 렌더러 교체 시 구 코드가 stdout에 직접 써 프레임을
+   * 찢는 병렬 경로였다. 생성은 주입이 없을 때의 폴백으로만 남긴다.
+   */
   function newUi(uiLang) {
+    if (ctx && ctx.uiInstance) return ctx.uiInstance;
     return new Ui({ lang: uiLang || lang() });
   }
 

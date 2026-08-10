@@ -13,7 +13,7 @@
     "test:tool-access-notice-parity": "node test/tool-access-notice-parity.cjs"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.19"
   },
   "optionalDependencies": {
     "better-sqlite3": "^11.3.0",

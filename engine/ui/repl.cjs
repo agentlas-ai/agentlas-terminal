@@ -295,7 +295,7 @@ async function startRepl(ctx, opts = {}) {
      * 눌리는 순간 커서-뒤 지우기(CSI K)로 걷어내므로 readline 의 echo·팔레트
      * 오버레이와 겹치지 않는다. 비TTY·바쁜 세션에서는 그리지 않는다.
      */
-    const { visWidth } = require("../agentlas-composer.cjs");
+    const { visWidth } = require("./width.cjs");
     const GHOST_HINT = en
       ? "type a task · / commands · @ files · ? shortcuts"
       : "할 일을 문장으로 · / 명령 · @ 파일 · ? 단축키";

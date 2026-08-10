@@ -75,7 +75,7 @@ async function dispatch(ctx, command, args) {
         permission,
         `terminal-${command}`,
       ) || cwd;
-      const runtime = workforceRuntime({ lang: ctx.lang, out: ctx.out });
+      const runtime = workforceRuntime({ lang: ctx.lang, out: ctx.out, uiInstance: ctx.uiInstance });
       const result = await runtime.cmdWorkforce(db, rest, runtimeOverride, {
         cwd,
         projectPath,

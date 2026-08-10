@@ -543,6 +543,8 @@ function buildWorkforceDeps(ctx = {}) {
   return {
     now: () => new Date(),
     out: typeof ctx.out === "function" ? ctx.out : (s) => process.stdout.write(`${s}\n`),
+    // Phase 1-2: 엔진 ctx의 Ui를 관통시킨다 — 워크포스가 자체 Ui를 만들지 않게.
+    uiInstance: ctx.uiInstance || null,
     prefsLang: () => ctx.lang || "en",
     userDataDir,
     projectCwd: capture.projectCwd,
