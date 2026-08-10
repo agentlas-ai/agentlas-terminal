@@ -938,7 +938,9 @@ function parseInterviewTurn(text, state) {
     // 검증은 통과했다. 그런데 **앞 시도보다 작아졌으면** 문제를 지워서 고친 것이다 —
     // 지워진 청사진은 검증을 통과하고, 사람이 부탁한 일이 사라진 채로 만들어진다.
     const weakened = weakenedAgainstLastAttempt(normalized, state);
-    if (weakened) return { ok: true, turn: { kind: "retry", problems: [weakened] } };
+    // 약화됐어도 이 청사진은 **검증을 통과했다** — 지을 수 있고 돌아간다. 그대로 실어 보내
+    // 자가교정이 끝내 수렴 못 하면 막다른 길 대신 이 "단순화된 작동본"으로 폴백하게 한다.
+    if (weakened) return { ok: true, turn: { kind: "retry", problems: [weakened], blueprint: normalized } };
     return { ok: true, turn: { kind: "blueprint", blueprint: normalized } };
   }
   const questions = normalizeQuestions(problems.map((p) => p.ask).filter(Boolean), state);

@@ -612,6 +612,10 @@ async function newGraph(ctx, request, flags) {
 
     let built = null;
     let announcedFallback = false;
+    // 자가교정이 끝내 수렴 못 해도 **막다른 길로 보내지 않는다** — 진동 중 검증을 통과한
+    //   (단순화된) 청사진을 기억해 뒀다가, 소진 시 그걸 저장한다. 일반인은 캔버스에서 check
+    //   노드를 손으로 못 만든다 — 안 도는 것보다 도는 단순본이 낫다.
+    let lastGood = null;
     for (let round = 0; round < interview.MAX_INTERVIEW_ROUNDS; round += 1) {
       const answer = await askModel(ctx, interview.buildInterviewPrompt(state, en ? "en" : "ko"), {});
       if (!answer.ok) {
@@ -656,11 +660,25 @@ async function newGraph(ctx, request, flags) {
       //   정해진 횟수만큼 스스로 고치게 한다. "구체적으로 적어 주세요"로 떠넘기면
       //   막다른 길이 된다: 무엇이 틀렸는지 사람은 모르고, 우리는 안다.
       if (parsed.turn.kind === "retry") {
+        // 약화-retry는 검증을 통과한 청사진을 함께 싣는다 — 폴백용으로 기억한다.
+        if (parsed.turn.blueprint) lastGood = parsed.turn.blueprint;
         state.attempts = [...(state.attempts || []), {
           round, problems: parsed.turn.problems,
           stepCount: parsed.turn.stepCount, triggerKind: parsed.turn.triggerKind,
         }];
         if ((state.attempts || []).length > interview.MAX_SELF_CORRECTIONS) {
+          // ★막다른 길 금지: 지을 수 있는 유효본을 하나라도 봤으면 그걸 저장한다.
+          if (lastGood) {
+            const b = interview.buildGraphFromBlueprint(lastGood, en ? "en" : "ko", { knownGraphs });
+            if (b.ok) {
+              b.blueprint = lastGood;
+              built = b;
+              ctx.out(ctx.ui.dim(en
+                ? "Couldn't perfect the result-checks, so I saved a simpler version that RUNS. Open it on the desktop canvas to refine."
+                : "결과 검증 단계까지 완벽히는 못 맞춰서, 일단 도는 더 단순한 버전으로 저장합니다. 데스크탑 캔버스에서 다듬을 수 있어요."));
+              break;
+            }
+          }
           const tried = [...new Set(state.attempts.flatMap((a) => a.problems))].slice(0, 3);
           ctx.err(en
             ? `Tried ${interview.MAX_SELF_CORRECTIONS + 1} times and kept hitting the same wall: ${tried.join(" / ")}`
