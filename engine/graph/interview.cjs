@@ -255,6 +255,39 @@ function triggerQuestion() {
   };
 }
 
+/**
+ * ★출력값 검증 check를 **코드가 채운다**(데스크탑 graph-blueprint.ts autofillOutputChecks와 동일).
+ * 바깥으로 나가는 단계가 소비하는 '앞에서 만든 값'에 check가 없으면, 검증기가 아는 그대로
+ * 표준 check를 넣어 **완전한 그래프를 완성**한다. 모델에 되물어 진동시키지 않고, 단계를 깎거나
+ * 캔버스로 떠넘기지도 않는다. 사람은 저장 확인 화면에서 항목을 보고 고칠 수 있다.
+ */
+function autofillOutputChecks(bp) {
+  if (!bp || !Array.isArray(bp.steps)) return bp;
+  const checks = Array.isArray(bp.checks) ? [...bp.checks] : [];
+  const checked = new Set(checks.map((c) => (c.subject || "").trim()).filter(Boolean));
+  bp.steps.forEach((step, index) => {
+    if (step.effect !== "mutation") return;
+    for (const value of Array.isArray(step.consumes) ? step.consumes : []) {
+      const name = String(value == null ? "" : value).trim();
+      if (!name || checked.has(name)) continue;
+      const madeAt = bp.steps.findIndex((s, i) => i < index && (s.produces || "").trim() === name);
+      if (madeAt < 0) continue;
+      checks.push({
+        afterStep: madeAt,
+        subject: name,
+        criteria: `${name}이(가) 비어있지 않고 요청대로 채워졌다`,
+        produces: `${name}_ok`,
+        items: [
+          { text: `${name}이(가) 실제 내용으로 채워졌다`, kind: "must" },
+          { text: "빈 값·자리표시자·지어낸 값이 아니다", kind: "mustNot" },
+        ],
+      });
+      checked.add(name);
+    }
+  });
+  return { ...bp, checks };
+}
+
 /** 청사진이 그래프로 지어질 수 있는지. 모자란 곳은 기본값이 아니라 질문으로 돌려준다. */
 function validateBlueprint(bp, ctx = {}) {
   const problems = [];
@@ -932,15 +965,14 @@ function parseInterviewTurn(text, state) {
 
   const blueprint = parsed.blueprint;
   if (!blueprint || typeof blueprint !== "object") return unreadable(text);
-  const normalized = { ...blueprint, schema: BLUEPRINT_SCHEMA };
+  // ★출력값 검증 check는 코드가 채운다 — 부탁받은 완전한 그래프를 완성한다(깎지도 떠넘기지도 않음).
+  const normalized = autofillOutputChecks({ ...blueprint, schema: BLUEPRINT_SCHEMA });
   const problems = validateBlueprint(normalized);
   if (problems.length === 0) {
     // 검증은 통과했다. 그런데 **앞 시도보다 작아졌으면** 문제를 지워서 고친 것이다 —
     // 지워진 청사진은 검증을 통과하고, 사람이 부탁한 일이 사라진 채로 만들어진다.
     const weakened = weakenedAgainstLastAttempt(normalized, state);
-    // 약화됐어도 이 청사진은 **검증을 통과했다** — 지을 수 있고 돌아간다. 그대로 실어 보내
-    // 자가교정이 끝내 수렴 못 하면 막다른 길 대신 이 "단순화된 작동본"으로 폴백하게 한다.
-    if (weakened) return { ok: true, turn: { kind: "retry", problems: [weakened], blueprint: normalized } };
+    if (weakened) return { ok: true, turn: { kind: "retry", problems: [weakened] } };
     return { ok: true, turn: { kind: "blueprint", blueprint: normalized } };
   }
   const questions = normalizeQuestions(problems.map((p) => p.ask).filter(Boolean), state);
@@ -968,5 +1000,5 @@ module.exports = {
   BLUEPRINT_SCHEMA, MAX_QUESTIONS_PER_TURN, MAX_INTERVIEW_ROUNDS, MAX_REPEATS,
   startInterview, recordAnswers, buildInterviewPrompt, parseInterviewTurn, humanSchedule,
   MAX_SELF_CORRECTIONS, weakenedAgainstLastAttempt,
-  validateBlueprint, buildGraphFromBlueprint, branchLabel, describeBranches,
+  validateBlueprint, autofillOutputChecks, buildGraphFromBlueprint, branchLabel, describeBranches,
 };
