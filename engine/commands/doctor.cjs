@@ -27,7 +27,7 @@ function roleDetail(selection, role, en) {
 function run(ctx, args = []) {
   const en = ctx.lang === "en";
   // clig.dev: 스크립트 소비자를 위한 기계 계약. 사람용 줄과 같은 사실만 담는다.
-  if (args.includes("--json")) {
+  if (ctx.output?.format === "json" || args.includes("--json")) {
     const db = ctx.db();
     const clis = listAvailableCliRuntimes().map((c) => ({ kind: c.kind, path: c.path, authEvidence: runtimeAuthEvidence(c.kind).status }));
     const active = activeRuntimeRow(db);

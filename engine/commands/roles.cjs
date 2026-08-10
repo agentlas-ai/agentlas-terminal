@@ -38,7 +38,7 @@ function fmt(selection, en) {
 function show(ctx, args = []) {
   const en = ctx.lang === "en";
   const db = ctx.db();
-  if (args.includes("--json")) {
+  if (ctx.output?.format === "json" || args.includes("--json")) {
     ctx.out(JSON.stringify({
       orchestrator: resolvedModelRole(db, "orchestrator"),
       worker: resolvedModelRole(db, "worker"),
@@ -177,6 +177,7 @@ function set(ctx, args) {
 
 function run(ctx, args = []) {
   const en = ctx.lang === "en";
+  if (ctx.output?.format === "json" && !args.includes("--json")) args = [...args, "--json"];
   const [sub, ...rest] = args;
   if (!sub || sub === "show" || sub === "list" || sub === "--json") return show(ctx, sub === "--json" ? ["--json"] : rest);
   if (sub === "set") return set(ctx, rest);

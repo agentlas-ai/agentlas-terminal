@@ -7,7 +7,10 @@ const { runCloud } = require("../cloud-assets/commands.cjs");
 
 async function run(ctx, args) {
   try {
-    return await runCloud(ctx, args);
+    const commandArgs = ctx.output?.format === "json" && !args.includes("--json")
+      ? [...args, "--json"]
+      : args;
+    return await runCloud(ctx, commandArgs);
   } catch (e) {
     ctx.err(String((e && e.message) || e));
     return 1;

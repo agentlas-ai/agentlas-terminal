@@ -180,6 +180,29 @@ function cliMemoryContext(db, projectPath, agentId = null, task = "") {
  * 최종 시스템 프롬프트 조립. ctx = { lang, projectPath, agentId, turnId, permission }.
  * withEmitter=false 는 이미터/리마인더 없이(캡처·판정 등 내부 턴용).
  */
+/**
+ * Agentlas One 지시문. 켜져 있을 때만, 그리고 정본 파일이 실재할 때만 싣는다.
+ * 상태 파일이 없으면 조용히 빈 문자열 — 꺼진 One 의 지시문을 흘리지 않는다.
+ */
+function loadOneDirective() {
+  try {
+    const root = process.env.AGENTLAS_ONE_DIR
+      || require("node:path").join(require("node:os").homedir(), ".agentlas", "one");
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const state = JSON.parse(fs.readFileSync(path.join(root, "state.json"), "utf8"));
+    if (!state || state.on !== true) return "";
+    const text = fs.readFileSync(path.join(root, "directive.md"), "utf8").trim();
+    // 상한을 둔다 — 지시문이 남의 토큰 예산을 잠식하면 안 된다(메모리 예산과 같은 규칙).
+    return text.length > ONE_DIRECTIVE_MAX_CHARS ? text.slice(0, ONE_DIRECTIVE_MAX_CHARS) : text;
+  } catch {
+    return "";
+  }
+}
+
+/** [튜닝값, 근거 없음] — 현재 정본 지시문이 약 3.7KB 라 두 배 여유를 둔다. */
+const ONE_DIRECTIVE_MAX_CHARS = 8000;
+
 function augmentSystem(db, baseSystem, ctx, withEmitter, request = "") {
   const arch = loadArch();
   let sys = baseSystem || "";
@@ -188,6 +211,10 @@ function augmentSystem(db, baseSystem, ctx, withEmitter, request = "") {
   sys = responseDirective(lang) + (sys ? "\n\n" + sys : "");
   const connectionSkill = loadGlobalConnectionSkill();
   if (connectionSkill) sys += "\n\n" + connectionSkill;
+  // Agentlas One 이 켜져 있으면 그 지시문을 싣는다. R4 기준 터미널의 "매 턴 주입 지점"이 여기다.
+  // 정본은 `~/.agentlas/one/directive.md` 하나 — CLAUDE.md/AGENTS.md 의 마커 블록은 그 사본이다.
+  const oneDirective = loadOneDirective();
+  if (oneDirective) sys += "\n\n" + oneDirective;
   const mem = cliMemoryContext(db, ctx && ctx.projectPath, ctx && ctx.agentId, request);
   if (mem) sys += "\n\n" + mem;
   // 도구 접근 고지 — 터미널에는 이게 아예 없었다. 도구가 붙지 않은 턴에서 CLI는 아무

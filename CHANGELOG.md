@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.0.37 — 2026-08-10
+
+Agentlas One can now carry its owner-bound identity and curated memory tickets
+across Terminal sessions without turning the agent into the owner of a project.
+
+- When One is explicitly enabled, Terminal loads its bounded directive at the
+  per-turn system boundary and forwards only `agent_repo` and `user_identity`
+  memory candidates to One's existing ledger. Project memory stays with the
+  project, and a missing or disabled One workspace remains a no-op.
+- The Memory Events parser accepts both the canonical ticket envelope and the
+  legacy array form, so valid candidates are no longer silently discarded.
+- Global `--json` output now reaches doctor, list, roles, Cloud restore, and
+  upload commands consistently; machine-readable output is no longer prefixed
+  by human status text.
+- The built-in architecture projection includes Agentlas One as a hidden
+  orchestrator rather than a top-level project or user-facing worker.
+
 ## 1.0.34 — 2026-08-06
 
 Telegram, standalone. The terminal can now connect a Telegram bot with no desktop app.

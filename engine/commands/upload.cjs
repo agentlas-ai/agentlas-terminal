@@ -8,7 +8,10 @@ const { runUpload } = require("../cloud-assets/commands.cjs");
 
 async function run(ctx, args) {
   try {
-    return await runUpload(ctx, args);
+    const commandArgs = ctx.output?.format === "json" && !args.includes("--json")
+      ? [...args, "--json"]
+      : args;
+    return await runUpload(ctx, commandArgs);
   } catch (e) {
     ctx.err(String((e && e.message) || e));
     return 1;

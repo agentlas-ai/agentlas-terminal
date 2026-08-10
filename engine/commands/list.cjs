@@ -36,7 +36,7 @@ function run(ctx, args = []) {
 
   // clig.dev: 스크립트 소비자는 사람용 표를 파싱하게 두지 말 것 — --json 은
   // 사람용 출력과 같은 사실을 기계 계약으로 준다.
-  if (args.includes("--json")) {
+  if (ctx.output?.format === "json" || args.includes("--json")) {
     const orchestrator = resolvedModelRole(db, "orchestrator");
     const worker = resolvedModelRole(db, "worker");
     ctx.out(JSON.stringify({ agents, firms, modelRoles: { orchestrator, worker } }, null, 2));

@@ -96,7 +96,18 @@ function parseMemoryEventsCli(text) {
   const after = text.slice(idx + heading.length);
   const fence = after.match(/```(?:json)?\s*([\s\S]*?)```/);
   let events = [];
-  if (fence) { try { const d = JSON.parse(fence[1].trim()); if (Array.isArray(d)) events = d; } catch { /* ignore */ } }
+  // 봉투 두 형태를 모두 받는다. Desktop `electron/memory/events.ts:128,156` 과 같은 계약이다.
+  //  · 정본: {"schema_version":"agentlas.memory-ticket.v1","candidates":[...]}  ← 이미터가 지시하는 형태
+  //  · 레거시: [...]  (최상위 배열)
+  // ★배열만 받던 시절 정본 봉투는 **조용히 버려졌다**(실측: 터미널이 후보 5건을 냈는데 파서 결과 0건).
+  // 형태가 낯설면 버리지 말고, 최소한 왜 못 읽었는지 남길 수 있게 둘 다 통과시킨다.
+  if (fence) {
+    try {
+      const d = JSON.parse(fence[1].trim());
+      if (Array.isArray(d)) events = d;
+      else if (d && typeof d === "object" && Array.isArray(d.candidates)) events = d.candidates;
+    } catch { /* ignore */ }
+  }
   let cut = text.length;
   if (fence && fence.index != null) cut = idx + heading.length + fence.index + fence[0].length;
   const before = text.slice(0, idx).replace(/<!--\s*$/u, "");

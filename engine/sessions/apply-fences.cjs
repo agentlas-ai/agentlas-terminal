@@ -18,6 +18,75 @@ const memoryCurate = require("../memory-cli/curate.cjs");
 const automationStore = require("../automation/store.cjs");
 const schedule = require("../automation/schedule.cjs");
 
+/** One 이 가져가는 스코프. 프로젝트 스코프는 프로젝트에 남는다. */
+const ONE_SCOPES = new Set(["agent_repo", "user_identity"]);
+
+/**
+ * Agentlas One 서랍(`~/.agentlas/one/.agentlas/memory-tickets.jsonl`)으로 후보를 넘긴다.
+ *
+ * One 은 프로젝트를 넘나드는 정체성이라 agent_repo/user_identity 만 가져간다.
+ * One 이 꺼져 있거나 서랍이 없으면 아무것도 하지 않는다 — 없는 폴더를 만들지 않는다.
+ * 실패해도 턴을 죽이지 않는다(펜스 적용 계약과 동일).
+ */
+function forwardToOne(events) {
+  try {
+    const fs = require("node:fs");
+    const os = require("node:os");
+    const path = require("node:path");
+    const root = process.env.AGENTLAS_ONE_DIR || path.join(os.homedir(), ".agentlas", "one");
+    const state = JSON.parse(fs.readFileSync(path.join(root, "state.json"), "utf8"));
+    if (!state || state.on !== true) return 0;
+    const ledger = path.join(root, ".agentlas", "memory-tickets.jsonl");
+    if (!fs.existsSync(ledger)) return 0;
+
+    // 이미 올라온 내용은 다시 넣지 않는다(같은 계약을 One 쪽 emit_ticket 도 쓴다).
+    const seen = new Set();
+    for (const line of fs.readFileSync(ledger, "utf8").split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const row = JSON.parse(line);
+        const text = String((row.candidate || {}).content || "");
+        if (text) seen.add(text.trim().toLowerCase().replace(/\s+/g, " "));
+      } catch { /* 깨진 줄은 건너뛴다 */ }
+    }
+
+    let written = 0;
+    for (const raw of events) {
+      for (const candidate of (raw && Array.isArray(raw.candidates) ? raw.candidates : [raw])) {
+        if (!candidate || typeof candidate !== "object") continue;
+        const scope = String(candidate.suggested_scope || candidate.scope || "");
+        if (!ONE_SCOPES.has(scope)) continue;
+        const content = String(candidate.content || "").trim();
+        if (!content) continue;
+        const key = content.toLowerCase().replace(/\s+/g, " ");
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const evidence = Array.isArray(candidate.evidence) ? candidate.evidence.slice(0, 8) : [];
+        fs.appendFileSync(ledger, JSON.stringify({
+          schemaVersion: "agentlas.one-workspace.v1",
+          ticketId: `one-tkt-${Date.now()}-${written}`,
+          agentId: "builtin-agentlas-one",
+          turnKey: "",
+          source: "terminal-memory-events",
+          state: "queued",
+          candidate: {
+            type: String(candidate.memory_kind || candidate.type || "hypothesis"),
+            scope,
+            content: content.slice(0, 600),
+            evidence,
+          },
+          downgraded: false,
+          createdAt: new Date().toISOString().replace(/\.\d+Z$/, "Z"),
+        }) + "\n", "utf8");
+        written += 1;
+      }
+    }
+    return written;
+  } catch {
+    return 0;
+  }
+}
+
 /**
  * @param {import('./session.cjs').Session} session 방금 턴을 끝낸 세션
  * @param {object} parsed parseReplyFences 결과
@@ -69,6 +138,10 @@ function applyReplyFences(session, parsed, opts = {}) {
       written: ctx.curatedMemories.length,
       permission: session.permission,
     };
+    // Agentlas One 이 켜져 있으면 에이전트 스코프 후보를 One 서랍에도 티켓으로 넘긴다.
+    // 프로젝트 스코프는 여기 남기고 옮기지 않는다 — One 은 프로젝트를 넘나드는 정체성이라
+    // agent_repo/user_identity 만 One 의 것이다(기획 2.2 스코프 경계).
+    receipts.memory.one = forwardToOne(parsed.memoryEvents);
     // read 권한 턴 = durable 쓰기 0 — 영수증 이벤트만 남는다.
     record({ type: "memory-curated", ...receipts.memory });
   }
@@ -185,4 +258,5 @@ function applyReplyFences(session, parsed, opts = {}) {
   return receipts;
 }
 
-module.exports = { applyReplyFences };
+// forwardToOne 은 One 서랍 전달의 유일한 지점이라 계약 테스트가 직접 잴 수 있게 함께 노출한다.
+module.exports = { applyReplyFences, forwardToOne };
