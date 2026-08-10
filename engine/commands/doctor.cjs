@@ -24,7 +24,7 @@ function roleDetail(selection, role, en) {
   ].filter(Boolean).join(" · ");
 }
 
-function run(ctx, args = []) {
+async function run(ctx, args = []) {
   const en = ctx.lang === "en";
   // clig.dev: 스크립트 소비자를 위한 기계 계약. 사람용 줄과 같은 사실만 담는다.
   if (ctx.output?.format === "json" || args.includes("--json")) {
@@ -124,14 +124,43 @@ function run(ctx, args = []) {
     }
   } catch { /* db issue already reported */ }
 
-  // 3) 로그인 상태 (세션 파일 관측만 — 네트워크 호출 없음)
+  /*
+   * 3) 로그인 상태 — 자격 존재 + 실제 세션 검증.
+   * 파일 존재만 보고 all clear를 내면 만료 세션에서 편성이 죽는데 doctor는
+   * 초록불이었다(2026-08-11 존폐 판단 결함 5 — 사용자가 가장 먼저 칠 진단이
+   * 거짓말을 했다). 검증 실패는 종류를 가른다: 만료=경고(로그인 안내),
+   * 네트워크 불가=검증불가 표기(오프라인이 doctor를 적색으로 만들면 안 된다).
+   * --json 경로는 기존대로 관측만 한다(스크립트 소비자를 네트워크에 묶지 않는다).
+   */
   const sessionFile = path.join(userDataDir(), "auth", "cli-session.v1.json");
-  if (process.env.AGENTLAS_SESSION) {
-    ok(en ? "cloud session" : "클라우드 세션", "AGENTLAS_SESSION env");
-  } else if (fs.existsSync(sessionFile)) {
-    ok(en ? "cloud session" : "클라우드 세션", sessionFile);
-  } else {
+  const auth = require("../cloud/auth.cjs");
+  const sessionCookie = auth.cloudSessionCookie();
+  const credentialLabel = process.env.AGENTLAS_SESSION
+    ? "AGENTLAS_SESSION env"
+    : (fs.existsSync(sessionFile) ? sessionFile : null);
+  if (!sessionCookie || !credentialLabel) {
     ctx.out(`  ${ctx.ui.dim("·")} ${en ? "cloud session" : "클라우드 세션"}${ctx.ui.dim(en ? " — not signed in (agentlas login)" : " — 로그인 안 됨 (agentlas login)")}`);
+  } else {
+    try {
+      const meta = await auth.fetchSessionMeta(sessionCookie);
+      const who = meta && (meta.email || meta?.user?.email || meta?.account?.email || null);
+      ok(
+        en ? "cloud session" : "클라우드 세션",
+        `${credentialLabel}${who ? ` · ${who}` : ""} · ${en ? "verified" : "검증됨"}`,
+      );
+    } catch (sessionError) {
+      const status = /returned (\d{3})/.exec(String(sessionError?.message || ""))?.[1];
+      if (status === "401" || status === "403") {
+        warn(
+          en ? "cloud session" : "클라우드 세션",
+          en ? "expired — run `agentlas login`" : "만료됨 — `agentlas login`으로 다시 로그인",
+        );
+      } else {
+        ctx.out(`  ${ctx.ui.dim("·")} ${en ? "cloud session" : "클라우드 세션"}${ctx.ui.dim(en
+          ? ` — ${credentialLabel} · unverified (network unreachable)`
+          : ` — ${credentialLabel} · 검증 불가 (네트워크 연결 안 됨)`)}`);
+      }
+    }
   }
 
   ctx.out("");

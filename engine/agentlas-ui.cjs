@@ -594,13 +594,28 @@ class Ui {
     this.stopSpinner();
     this._message("! ", this.c.amber, this.c.text, msg);
   }
-  error(msg) {
+  error(msg, opts = {}) {
     this.stopSpinner();
-    // Last-resort presentation boundary for legacy/direct commands. Raw
-    // provider text, stack messages, paths and codes must never become UI.
-    // REPL/session paths route the private evidence to the controller before
-    // reaching this boundary; direct commands get a neutral recovery state.
-    void msg;
+    /*
+     * 표시 경계 — 조건이 있어야 경계다 (2026-08-11, 존폐 판단 규칙 2).
+     * 무조건 삼키면 기계 코드·사용법·안내문까지 전부 같은 복구 한 줄이 되어
+     * 진단 자체가 불가능해진다(실사고: 죽은 명령 0인데 "안 돌아간다"로 보임).
+     * 통과 조건 — 저자가 의도한 메시지라는 기계 신호가 있을 때만:
+     *   · Error 이고 code 또는 honestStop 이 있다 (usage/정직정지/서버 중계)
+     *   · 호출자가 opts.reveal === true 로 명시했다 (storm/swarm 안내문 등)
+     * 신호 없는 문자열/Error 는 provider 날것으로 간주해 기존 계약대로 삼킨다
+     * (recovery-presentation-contract 가 이 삼킴을 계속 잠근다).
+     */
+    const isErrorLike = msg instanceof Error || (msg !== null && typeof msg === "object" && "message" in msg);
+    const machineSignal = isErrorLike && Boolean(msg.code || msg.honestStop);
+    if (opts.reveal === true || machineSignal) {
+      const raw = String((isErrorLike ? msg.message : msg) ?? "").trim();
+      const text = redactCommandSecrets(stripAnsi(raw)).slice(0, 800);
+      if (text) {
+        this._message("✖ ", this.c.amber, this.c.text, text);
+        return;
+      }
+    }
     this._message(
       "◆ ",
       this.c.amber,

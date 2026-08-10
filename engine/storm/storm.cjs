@@ -78,7 +78,7 @@ function create(deps) {
       return { ok: false };
     }
     if (goal.startsWith("-")) {
-      ui.error("goal cannot start with '-'.");
+      ui.error("goal cannot start with '-'.", { reveal: true });
       return { ok: false };
     }
     const cwd = ctx.cwd || (typeof D.projectCwd === "function" ? D.projectCwd() : D.runCwd());
@@ -86,7 +86,7 @@ function create(deps) {
     try {
       executionHarness = await loadCoreStormbreakerHarness(cwd);
     } catch (error) {
-      ui.error(`Stormbreaker Core harness unavailable: ${String((error && error.message) || error).slice(0, 400)}`);
+      ui.error(`Stormbreaker Core harness unavailable: ${String((error && error.message) || error).slice(0, 400)}`, { reveal: true });
       return { ok: false, error: "stormbreaker-core-harness-unavailable" };
     }
     const args = ["route", goal, "--project", cwd, "--runtime", "terminal"];

@@ -146,7 +146,7 @@ function create(deps) {
     // Core 하네스 없이 stormbreaker 모드 진입 금지 — 로컬 모조 프롬프트로 대체하는
     // 것은 계약 위반이다(모델 실행 전에 실패해야 한다).
     if (stormbreaker && (!executionHarness || typeof executionHarness.system_prompt !== "string")) {
-      ui.error("Stormbreaker requires the canonical Goal + UltraCode harness from Agentlas Core.");
+      ui.error("Stormbreaker requires the canonical Goal + UltraCode harness from Agentlas Core.", { reveal: true });
       return { ok: false, error: "stormbreaker-core-harness-unavailable" };
     }
     const coreHarnessPrompt = executionHarness && executionHarness.system_prompt;
@@ -307,7 +307,7 @@ function create(deps) {
     if (!planned) {
       ui.error(ui.lang === "ko"
         ? "플래너가 유효한 실행 계획(JSON)을 내지 못했습니다 — 정지합니다 (조용한 폴백 금지)."
-        : "The planner did not produce a valid plan JSON — stopping (no silent fallback).");
+        : "The planner did not produce a valid plan JSON — stopping (no silent fallback).", { reveal: true });
       return { ok: false, reason: "invalid_plan_json" };
     }
     if (planned) {
@@ -376,7 +376,7 @@ function create(deps) {
     ui.line("");
     ui.info(`tasks: ${tasks.length}  ·  done: ${done.length}  ·  failed: ${failed}`);
     if (!done.length) {
-      ui.error(ui.lang === "ko" ? "스웜이 완료한 작업이 없습니다." : "The swarm completed no work.");
+      ui.error(ui.lang === "ko" ? "스웜이 완료한 작업이 없습니다." : "The swarm completed no work.", { reveal: true });
       return { ok: false };
     }
 
@@ -411,7 +411,7 @@ function create(deps) {
       );
     } catch (e) {
       ui.stopSpinner();
-      ui.error("Synthesis failed: " + String((e && e.message) || e).slice(0, 200));
+      ui.error("Synthesis failed: " + String((e && e.message) || e).slice(0, 200), { reveal: true });
       finalText = pieces;
     }
     ui.stopSpinner();
@@ -435,7 +435,7 @@ function create(deps) {
     const strayFlag = rest.find((token) => String(token).startsWith("-"));
     if (strayFlag) {
       const ui = executionContext.ui || newUi();
-      ui.error(`unknown option ${strayFlag} — swarm accepts: --parallel N | -n N, --runtime <kind>`);
+      ui.error(`unknown option ${strayFlag} — swarm accepts: --parallel N | -n N, --runtime <kind>`, { reveal: true });
       process.exitCode = 1;
       return { ok: false, error: "unknown-option" };
     }

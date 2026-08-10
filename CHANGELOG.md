@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.0.38 — 2026-08-11
+
+Silence was the worst failure mode — this release makes failures speak.
+
+- The presentation boundary (`Ui.error`) now has conditions. Machine-coded
+  messages (usage guidance, honest stops, server relays) pass through; only
+  uncoded raw provider text is still replaced by the neutral recovery line.
+  Previously every failure — including usage help for eight argless slash
+  commands — collapsed into the same "One is recovering" sentence.
+- `/s` `/switch` `/kill` `/rm` `/runtime` `/model` `/effort` `/permission`
+  without arguments now print their usage line instead of a recovery notice.
+- Workforce sign-in expiry is relayed honestly: the server's `auth_required`
+  guidance reaches the user (run `agentlas login`), instead of being
+  misreported as an invalid continuity receipt and then swallowed.
+- `doctor` verifies the cloud session against the server instead of only
+  checking that a session file exists. Expired sessions are reported as a
+  warning with the login hint; offline is reported as "unverified", never as
+  a false all-clear. `--json` output remains observation-only.
+- Authored guidance in storm/swarm/workforce flows (planner refusals, unknown
+  options, persisted receipt issues) is no longer swallowed by the boundary.
+- `npm run sync:architecture` works again — the script was restored to
+  `scripts/` where its relative paths are correct.
+
 ## 1.0.37 — 2026-08-10
 
 Agentlas One can now carry its owner-bound identity and curated memory tickets

@@ -314,11 +314,30 @@ async function workforceAccountContext() {
       params: { name: "agentlas.account_context", arguments: {} },
     }),
   });
+  /*
+   * 서버의 로그인 안내를 먼저 중계한다 (2026-08-11 존폐 판단 결함 4).
+   * 실사고: 세션 만료 시 서버는 auth_required + 로그인 방법을 친절히 돌려줬는데,
+   * 클라이언트가 그 필드를 안 보고 스키마 검사부터 실패시켜 "유효하지 않은 연속성
+   * 영수증"으로 오진했고, 그 오진마저 표시 경계가 지웠다 — 안내가 세 번 소실됐다.
+   * 기계 code를 달아 표시 경계(usage/honestStop 통과 조건)를 지나게 한다.
+   */
+  const authRequiredError = (detail) => Object.assign(
+    new Error(detail || "Agentlas sign-in required — run `agentlas login`, then retry."),
+    { code: "auth_required", honestStop: true },
+  );
+  if (response.status === 401 || response.status === 403) throw authRequiredError();
   if (!response.ok) throw new Error(`Agentlas account context failed with HTTP ${response.status}.`);
   const rpc = hubClient.parseHubJson(response, "Agentlas account context");
   const text = rpc?.result?.content?.[0]?.text;
   let payload;
   try { payload = JSON.parse(String(text || "")); } catch { payload = null; }
+  const authMarker = [payload?.error, payload?.code, rpc?.error?.code, rpc?.error?.message]
+    .map((v) => String(v || ""))
+    .find((v) => /auth_required|unauthorized|not signed in/i.test(v));
+  if (authMarker) {
+    const hint = String(payload?.message || payload?.hint || rpc?.error?.message || "").slice(0, 400);
+    throw authRequiredError(hint ? `${hint} — run \`agentlas login\`, then retry.` : null);
+  }
   // 연속성 영수증은 스키마·계정 다이제스트·과금 권한을 정확히 검증한다 — 위조/구버전
   // 응답으로 goal 바인딩을 진행하면 안 된다.
   if (

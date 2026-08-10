@@ -4549,10 +4549,10 @@ const TRANSIENT_MODEL_ERROR_RE = /Connection closed mid-response|"terminal_reaso
         const detailText = otherDetails && (typeof otherDetails !== "object" || Object.keys(otherDetails).length)
           ? ` — ${JSON.stringify(otherDetails).slice(0, 1_200)}`
           : "";
-        ui.error(`${receipt.failure.code}: ${receipt.failure.message}${detailText}`);
+        ui.error(`${receipt.failure.code}: ${receipt.failure.message}${detailText}`, { reveal: true });
         if (issues) {
-          for (const issue of issues.slice(0, 16)) ui.error(`  - ${String(issue).slice(0, 400)}`);
-          if (issues.length > 16) ui.error(`  … ${issues.length - 16} more issues in the persisted receipt`);
+          for (const issue of issues.slice(0, 16)) ui.error(`  - ${String(issue).slice(0, 400)}`, { reveal: true });
+          if (issues.length > 16) ui.error(`  … ${issues.length - 16} more issues in the persisted receipt`, { reveal: true });
         }
         // 실패한 실행이야말로 토큰이 어디로 갔는지 알아야 하는 순간이다. issues 유무와
         // 무관하게 낸다 — 첫 배선이 이 블록 안에 들어가는 바람에 issues 없는 실패에서는

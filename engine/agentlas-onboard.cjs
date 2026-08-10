@@ -184,7 +184,7 @@ async function runOnboard({ ui, rl, helpers, persist }) {
     }
     ui.line("");
     if (saveError) {
-      ui.error(ui.t("wiz.saveFailed", String((saveError && saveError.message) || saveError)));
+      ui.error(ui.t("wiz.saveFailed", String((saveError && saveError.message) || saveError)), { reveal: true });
     } else {
       printSaved(ui.t("wiz.saved"));
       printIndented(ui.t("wiz.changeLang"), c.faint);

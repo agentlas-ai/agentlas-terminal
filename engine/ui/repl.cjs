@@ -140,6 +140,11 @@ async function startRepl(ctx, opts = {}) {
      * 그대로 보여주고, 어떻게 실행하는지까지 덧붙인다. One 복구는 예상 못 한
      * 실패에만 쓴다. (사람용 문장과 기계 판단은 다른 필드 — 스케줄러와 같은 원칙.)
      */
+    if (error && error.code === "usage") {
+      // 사용법은 복구 대상이 아니라 안내다 — 그대로 보여주고 끝낸다.
+      ui.line(ui.c.dim(String(error.message || error)));
+      return;
+    }
     if (error && (error.honestStop || error.code)) {
       // 공유 controller 모듈은 lang을 모른다 — 기계 code로 여기서 현지화한다.
       const KO_REASON = {
@@ -628,9 +633,18 @@ function printSessions(ctx, orch) {
  * 날 TypeError 를 냈다. 팔레트가 `/steer <n> <msg>` 라고 안내하므로 인자 없이 Enter 를
  * 눌러 사용법을 보려는 것은 정상적인 탐색이다.
  */
+/*
+ * 사용법 에러는 기계 코드를 단다 — 코드 없는 Error 는 recoverPresentation 이
+ * "One이 복구 중" 으로 치환해 사용법이 통째로 사라졌다(2026-08-11 존폐 판단 결함 2:
+ * /runtime /model /effort /permission /s /switch /kill /rm 여덟 명령).
+ */
+function usageError(text) {
+  return Object.assign(new Error(text), { code: "usage", honestStop: true });
+}
+
 function sessionKeyArg(rest, usage) {
   const token = rest[0];
-  if (!token) throw new Error(usage);
+  if (!token) throw usageError(usage);
   return String(token).startsWith("s") ? token : `s${token}`;
 }
 
@@ -669,7 +683,8 @@ function handleSlash(ctx, cmdline, api) {
       return;
     }
     case "agents": case "list": require("../commands/list.cjs").run(ctx, rest); return;
-    case "doctor": require("../commands/doctor.cjs").run(ctx, rest); return;
+    // doctor 는 세션 검증(네트워크)으로 async 가 됐다 — 특례로 fire-and-forget 하면
+    // REPL 종료가 출력을 잘라먹는다. promise 를 track 하는 default 폴스루로 보낸다.
     case "mcp": require("../commands/mcp.cjs").run(ctx, rest); return;
 
     case "sessions": case "tree": printSessions(ctx, orch); return;
@@ -695,7 +710,7 @@ function handleSlash(ctx, cmdline, api) {
     }
 
     case "runtime": {
-      if (!rest[0]) throw new Error("Usage: /runtime claude-code|codex|gemini");
+      if (!rest[0]) throw usageError("Usage: /runtime claude-code|codex|gemini");
       // 세션 오버라이드는 저장되지 않는다 — 고지 없이는 사용자가 영구 설정으로
       // 믿는다(2026-08-05 감사 결함 C). 영구 경로를 같은 줄에서 알려준다.
       api.setRuntime(rest[0]);
@@ -706,7 +721,7 @@ function handleSlash(ctx, cmdline, api) {
     }
     case "model": {
       const model = String(rest[0] || "").trim();
-      if (!model) throw new Error("Usage: /model <provider-model-id|default>");
+      if (!model) throw usageError("Usage: /model <provider-model-id|default>");
       const next = ["default", "inherit"].includes(model.toLowerCase()) ? null : model;
       api.setModel(next);
       ctx.out(ui.c.dim(
@@ -719,7 +734,7 @@ function handleSlash(ctx, cmdline, api) {
     case "effort": {
       const effort = String(rest[0] || "").trim().toLowerCase();
       if (!EFFORTS.includes(effort)) {
-        throw new Error(`Usage: /effort ${EFFORTS.join("|")}`);
+        throw usageError(`Usage: /effort ${EFFORTS.join("|")}`);
       }
       api.setEffort(effort === "none" ? null : effort);
       ctx.out(ui.c.dim(
@@ -729,7 +744,7 @@ function handleSlash(ctx, cmdline, api) {
     }
     case "permission": {
       if (!["read", "write", "full"].includes(String(rest[0] || ""))) {
-        throw new Error("Usage: /permission read|write|full");
+        throw usageError("Usage: /permission read|write|full");
       }
       const level = permissions.normalize(rest[0]);
       api.setPermission(level);
