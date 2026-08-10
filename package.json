@@ -48,5 +48,8 @@
     "url": "https://github.com/agentlas-ai/agentlas-terminal/issues"
   },
   "author": "Agentlas (https://agentlas.cloud)",
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@earendil-works/pi-tui": "0.84.1"
+  }
 }
