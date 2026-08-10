@@ -110,7 +110,7 @@ const RULES = [
   "",
   "Return ONLY compact JSON, one of these two shapes:",
   '  {"ask":[{"id":"<stable-id>","question":"...","why":"...","choices":["...","..."]}]}',
-  `  {"blueprint":{"schema":"${BLUEPRINT_SCHEMA}","name":"...","goal":"...","trigger":{...},"steps":[...],"branches":[...]}}`,
+  `  {"blueprint":{"schema":"${BLUEPRINT_SCHEMA}","name":"...","goal":"...","trigger":{...},"steps":[...],"branches":[...],"checks":[...]}}`,
   "",
   'trigger is either {"kind":"cron","schedule":"daily-08:00"} (24h, or a 5-field cron string)',
   'or {"kind":"input","label":"<what to ask the person>","varName":"<one word, a-z>"}.',
@@ -226,8 +226,13 @@ function buildInterviewPrompt(state, locale = "ko") {
     lines.push(
       "",
       "Your previous blueprint could NOT be built. Fix exactly these problems and return a",
-      "corrected blueprint. Do not repeat the same mistake, and do not ask the person about it —",
-      "these are format problems on your side, not missing information:",
+      "corrected blueprint. EVERY fix below is ADDITIVE: add the missing top-level checks[] entry",
+      "(each problem message gives you the exact entry to add). Keep EVERY step, the trigger, and",
+      "every produces/consumes exactly as they are — never delete, merge, or shrink a step to make",
+      "a problem disappear: that removes what the person asked for and just triggers a different",
+      "error. More steps and more checks is the right direction, never fewer. Do not repeat the",
+      "same mistake, and do not ask the person — these are format problems on your side,",
+      "not missing information:",
     );
     for (const a of attempts) for (const problem of a.problems) lines.push(`  · ${problem}`);
   }
@@ -431,12 +436,15 @@ function validateBlueprint(bp, ctx = {}) {
       for (const value of consumes) {
         const name = String(value == null ? "" : value).trim();
         if (!name || checkedSubjects.has(name)) continue;
-        const madeByAStep = steps.some((s, i) => i < index && (s.produces || "").trim() === name);
-        if (!madeByAStep) continue;
+        const madeAt = steps.findIndex((s, i) => i < index && (s.produces || "").trim() === name);
+        if (madeAt < 0) continue;
         push(
           `"${step.title || `${index + 1}번째 단계`}"는 바깥으로 나가는데, 그 앞에서 만든 `
-          + `"${name}" 값이 쓸 만한지 확인하는 단계가 없습니다. `
-          + `checks[]에 {"afterStep":<그 값을 만든 단계>,"subject":"${name}",…}를 넣어 주세요.`,
+          + `"${name}" 값이 쓸 만한지 확인하는 단계가 없습니다. 단계는 하나도 지우지 말고, `
+          + `top-level checks[]에 이 항목을 그대로 추가하세요: `
+          + `{"afterStep":${madeAt},"subject":"${name}","criteria":"${name}이(가) 비어있지 않고 요청대로 채워졌다",`
+          + `"produces":"${name}_ok","items":[{"text":"${name}이(가) 실제 내용으로 채워졌다","kind":"must"},`
+          + `{"text":"빈 값·자리표시자·지어낸 값이 아니다","kind":"mustNot"}]}`,
         );
       }
     });
@@ -949,8 +957,10 @@ function parseInterviewTurn(text, state) {
   };
 }
 
-/** 모델이 스스로 고쳐 볼 기회의 상한. 데스크탑과 같은 값. */
-const MAX_SELF_CORRECTIONS = 2;
+/** 모델이 스스로 고쳐 볼 기회의 상한. 데스크탑과 같은 값.
+ *  2→4: 출력검증 문제는 사람에게 못 묻고 모델 단독 교정만 가능한데, 이제 메시지가 정확한
+ *  checks[] 항목을 그대로 주므로(추가만 하면 됨) 몇 번 더 주면 대개 수렴한다. */
+const MAX_SELF_CORRECTIONS = 4;
 
 module.exports = {
   BLUEPRINT_SCHEMA, MAX_QUESTIONS_PER_TURN, MAX_INTERVIEW_ROUNDS, MAX_REPEATS,
