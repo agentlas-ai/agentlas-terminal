@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.0.43 — 2026-08-11
+
+Zero runtime dependencies. The renderer now lives in this repository.
+
+- The terminal shell's renderer and diagram sources are vendored into
+  `engine/vendor/` and `package.json` declares no runtime dependencies at all.
+  An exact version pin already prevented drift and tampering, but a package
+  removed from the registry would still have broken installs; that last failure
+  mode is now gone, and the code is ours to fix.
+- Upstream copyright notices are preserved beside each vendored tree, as the
+  MIT and Apache-2.0 terms require. The vendoring script refuses to run if a
+  notice is missing.
+- New release gate `vendor-tui-sync` fails when the vendored tree and its
+  upstream differ, so the copy cannot rot silently.
+
 ## 1.0.42 — 2026-08-11
 
 Projects, automations and firms reach the interactive shell; the shell is

@@ -1,6 +1,6 @@
 {
   "name": "agentlas",
-  "version": "1.0.42",
+  "version": "1.0.43",
   "description": "Agentlas project terminal — run project controllers and task-scoped agent teams from the terminal. Standalone: no desktop app process required.",
   "bin": {
     "agentlas": "bin/agentlas.cjs"
@@ -48,9 +48,5 @@
     "url": "https://github.com/agentlas-ai/agentlas-terminal/issues"
   },
   "author": "Agentlas (https://agentlas.cloud)",
-  "license": "Apache-2.0",
-  "dependencies": {
-    "@earendil-works/pi-tui": "0.84.1",
-    "grok-mermaid": "0.2.2"
-  }
+  "license": "Apache-2.0"
 }

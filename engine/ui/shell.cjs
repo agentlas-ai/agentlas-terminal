@@ -29,8 +29,14 @@ const { resolveProjectController, withProjectControllerContext } = require("../p
 
 function loadRenderer() {
   try {
-    // ESM 패키지 — Node >=20.19 의 require(esm). engines 가 이 최소선을 선언한다.
-    return require("@earendil-works/pi-tui");
+    /*
+     * 렌더러는 engine/vendor/tui 에 내재화돼 있다 — npm 의존성이 아니다.
+     * 이유: 정확 핀+무결성 해시는 버전 드리프트·변조를 막지만 레지스트리에서
+     * 그 버전이 삭제되면 설치가 실패한다. 소스가 저장소에 있으면 그 위험이 없고
+     * 우리가 직접 고칠 수 있다. 갱신은 scripts/vendor-tui.mjs.
+     * ESM 이므로 require(esm) 이 필요하다 — engines 가 Node >=20.19 를 선언한다.
+     */
+    return require("../vendor/tui/index.js");
   } catch (cause) {
     throw Object.assign(
       new Error("The Agentlas shell needs Node >=20.19. Run without AGENTLAS_TUI=1, or upgrade Node."),
@@ -272,7 +278,7 @@ async function startShell(ctx, opts = {}) {
             const lbl = e.sourceHandle === "true" ? "|참|" : e.sourceHandle === "false" ? "|거짓|" : "";
             lines.push(`  ${e.source} -->${lbl} ${e.target}`);
           }
-          const { render, toAnsi } = require("grok-mermaid");
+          const { render, toAnsi } = require("../vendor/mermaid/index.js");
           const art = toAnsi(render(lines.join("\n")));
           ui.ensureNl();
           ui.line(ui.c.bold(row.name));
