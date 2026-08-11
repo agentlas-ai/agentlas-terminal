@@ -296,7 +296,13 @@ function coreHarness() {
 
 async function workforceAccountContext() {
   const cookie = await hubClient.cloudSessionCookie();
-  if (!cookie) throw new Error("Agentlas sign-in is required for cross-session Workforce continuity.");
+  // 가장 흔한 로그아웃 경로 — 마커가 없으면 표시 경계가 삼켜 "복구 중" 한 줄이 된다.
+  if (!cookie) {
+    throw Object.assign(
+      new Error("Agentlas sign-in required — run `agentlas login`, then retry."),
+      { code: "auth_required", honestStop: true },
+    );
+  }
   const webBase = (process.env.AGENTLAS_WEB_BASE_URL || "https://agentlas.cloud").replace(/\/$/, "");
   const mcpBase = (process.env.AGENTLAS_MCP_BASE_URL || `${webBase}/api/mcp/v1`).replace(/\/$/, "");
   const response = await hubClient.fetchHub(mcpBase, {

@@ -10,8 +10,9 @@ const path = require("node:path");
 
 // 각 명령 파일은 { run(ctx, args) } 를 export한다. ctx는 엔진이 만든 얕은 DI 객체.
 const COMMANDS = {
+  // 정본 이름은 agents. list 는 별칭으로 영구 호출 가능(스크립트·게이트 사용).
+  agents: () => require("./list.cjs"),
   version: () => require("./version.cjs"),
-  list: () => require("./list.cjs"),
   graph: () => require("./graph.cjs"),
   doctor: () => require("./doctor.cjs"),
   mcp: () => require("./mcp.cjs"),
@@ -31,14 +32,11 @@ const COMMANDS = {
   cd: () => require("./cd.cjs"),
   install: () => require("./install.cjs"),
   plugin: () => require("./plugin.cjs"),
-  plugins: () => require("./plugin.cjs"),
   automation: () => require("./automation.cjs"),
   native: () => require("./native.cjs"),
   multimodal: () => require("./multimodal.cjs"),
   document: () => require("./document.cjs"),
   workforce: () => require("./workforce.cjs"),
-  network: () => require("./workforce.cjs"),
-  taskforce: () => require("./workforce.cjs"),
   // 소스 스코프 편성 4종 — 2026-08-05 네이티브 배선(경위는 workforce.cjs 참조).
   // 별칭이 아니라 1급인 이유는 여전하다: 별칭은 스코프를 전달하지 못한다.
   "hep-network": () => require("./hep-network.cjs"),
@@ -46,7 +44,6 @@ const COMMANDS = {
   "hep-cloud": () => require("./hep-cloud.cjs"),
   "hep-hub": () => require("./hep-hub.cjs"),
   oberon: () => require("./oberon.cjs"),
-  film: () => require("./film.cjs"),
   experience: () => require("./experience.cjs"),
   memory: () => require("./memory.cjs"),
   evolve: () => require("./evolve.cjs"),
@@ -60,7 +57,6 @@ const COMMANDS = {
   route: () => require("./route.cjs"),
   research: () => require("./research.cjs"),
   netadmin: () => require("./netadmin.cjs"),
-  journal: () => require("./journal.cjs"),
   cloud: () => require("./cloud.cjs"),
   upload: () => require("./upload.cjs"),
   storm: () => require("./storm.cjs"),
@@ -68,7 +64,6 @@ const COMMANDS = {
   project: () => require("./project.cjs"),
   context: () => require("./context.cjs"),
   ontology: () => require("./ontology.cjs"),
-  "career-graph": () => require("./career-graph.cjs"),
   creds: () => require("./creds.cjs"),
   billing: () => require("./billing.cjs"),
   uninstall: () => require("./uninstall.cjs"),
@@ -139,6 +134,30 @@ const COMMAND_ALIASES = {
   "hep-storm": "storm",
   "hep-browser": "browser",
   "hep-connect": "connect",
+  // 2026-08-11: 같은 기능을 두 이름으로 광고하던 것을 별칭으로 접었다.
+  list: "agents",
+  network: "workforce",
+  taskforce: "workforce",
+  film: "oberon",
+};
+
+/*
+ * 제거된 명령 — 이름을 그냥 없애면 인자와 함께 프롬프트로 새어 유료 턴이 된다
+ * (아래 marketplace 사고 주석과 같은 계열). 착지 안내를 두고 arity 무관하게 잡는다.
+ */
+const REMOVED_COMMANDS = {
+  journal: {
+    en: "`journal` was removed — it reported \"ok\" for runs that do not exist and read the wrong folder.\nExperts: agentlas hep stormbreaker journal --run-id <id> --journal <path>",
+    ko: "`journal` 은 제거됐습니다 — 없는 실행에도 \"ok\" 를 답했고 다른 폴더를 봤습니다.\n전문가용: agentlas hep stormbreaker journal --run-id <id> --journal <path>",
+  },
+  "career-graph": {
+    en: "`career-graph` was removed — its read commands silently created project state.\nSources: agentlas ontology   ·   Index: hephaestus career-graph ingest --project .",
+    ko: "`career-graph` 는 제거됐습니다 — 조회 명령이 말없이 프로젝트 상태를 만들었습니다.\n소스: agentlas ontology   ·   색인: hephaestus career-graph ingest --project .",
+  },
+  plugins: {
+    en: "Use: agentlas plugin list",
+    ko: "이렇게 쓰세요: agentlas plugin list",
+  },
 };
 
 function resolveCommandName(cmd) {
@@ -189,6 +208,10 @@ function dispatch(ctx, argv) {
   // 낙하 가드부터 만들 것: 상위 오타 가드는 한 단어 전용이라 인자가 붙은
   // 삭제 이름은 프롬프트로 흘러 에이전트를 기동한다(실측·토큰 소모).
 
+  if (REMOVED_COMMANDS[cmd]) {
+    ctx.err(REMOVED_COMMANDS[cmd][ctx.lang === "ko" ? "ko" : "en"]);
+    return 1;
+  }
   if (DESKTOP_ONLY_SURFACES[cmd]) {
     const asTask = [rawCmd, ...rest].join(" ");
     ctx.err(`${DESKTOP_ONLY_SURFACES[cmd]}\nIt was not run as a prompt — rerun with quotes if you meant a task: agentlas "${asTask}"`);
@@ -207,4 +230,4 @@ function dispatch(ctx, argv) {
   return undefined; // 알 수 없는 토큰 — 엔진이 에이전트 이름/프롬프트로 해석 시도
 }
 
-module.exports = { dispatch, COMMANDS, COMMAND_ALIASES, resolveCommandName, SELF_HELP_COMMANDS, NOT_YET_PORTED, GUARDED_NO_ARG, DESKTOP_ONLY_SURFACES };
+module.exports = { dispatch, COMMANDS, COMMAND_ALIASES, resolveCommandName, SELF_HELP_COMMANDS, NOT_YET_PORTED, GUARDED_NO_ARG, DESKTOP_ONLY_SURFACES, REMOVED_COMMANDS };

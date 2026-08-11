@@ -683,22 +683,17 @@ function handleSlash(ctx, cmdline, api) {
   switch (cmd) {
     case "quit": case "exit": return "quit";
     case "help": {
-      require("../commands/help.cjs").run(ctx, rest);
-      ctx.out("");
-      ctx.out(ui.c.bold(en ? "Project Work runs" : "프로젝트 Work 실행"));
-      // 팔레트는 Tab 완성과 같은 정본(ui/palette)에서 렌더한다 — 목록 드리프트 금지.
-      ctx.out(require("./palette.cjs").renderPalette(ctx.lang));
+      // CLI 와 같은 렌더러 한 번. 예전엔 CLI 61줄 + 팔레트 67줄 + 트레일러 = 133줄이었다.
+      ctx.out(require("./palette.cjs").renderPalette(ctx.lang, { all: String(rest[0] || "") === "all" }));
       ctx.out("");
       ctx.out(ctx.uiInstance.c.dim(en
-        ? "Tab completes commands, agent names and session keys · ↑/↓ history · typing during a run queues steering · ctrl-c interrupts"
-        : "Tab: 명령·에이전트·세션키 완성 · ↑/↓ 히스토리 · 실행 중 입력은 스티어링 큐 · ctrl-c 턴 중단"));
-      // 배너가 광고하는 Shift-Tab 은 여기에도 적힌다 — 문구와 구현은 한 곳에서 움직인다.
-      ctx.out(ctx.uiInstance.c.dim(`Shift-Tab: ${i18n.t(ctx.lang, "help.shiftTab")}`));
+        ? "Tab completes commands · ↑/↓ history · Shift-Tab cycles permission · ctrl-c interrupts a turn"
+        : "Tab: 명령 완성 · ↑/↓ 히스토리 · Shift-Tab 권한 순환 · ctrl-c 턴 중단"));
       return;
     }
     case "shell": {
       /*
-       * 새 대화형 셸 켜기/끄기. 저장하고 즉시 안내한다 — 프로세스 중간에
+       * 새 대화형 셸 켜기/끄기. 저장하고 재실행을 안내한다 — 프로세스 중간에
        * stdin 소유권을 바꾸면 지금 도는 readline 과 경합한다(실사고 계열).
        */
       const want = String(rest[0] || "").toLowerCase();
@@ -711,13 +706,11 @@ function handleSlash(ctx, cmdline, api) {
       const { userDataDir } = require("../core/paths.cjs");
       config.updatePrefs(userDataDir(), { shell: want === "on" ? "interactive" : "classic" });
       if (ctx.prefs) ctx.prefs.shell = want === "on" ? "interactive" : "classic";
-      ui.line(want === "on"
-        ? ui.c.dim(en
-          ? "Interactive shell enabled — restart agentlas to enter it (/shell off to revert)."
-          : "대화형 셸을 켰습니다 — agentlas 를 다시 실행하면 그 화면으로 들어갑니다 (/shell off 로 되돌림).")
-        : ui.c.dim(en
-          ? "Interactive shell disabled — restart agentlas for the classic REPL."
-          : "대화형 셸을 껐습니다 — agentlas 를 다시 실행하면 기본 REPL 입니다."));
+      ui.line(ui.c.dim(want === "on"
+        ? (en ? "Interactive shell enabled — restart agentlas to enter it (/shell off to revert)."
+              : "대화형 셸을 켰습니다 — agentlas 를 다시 실행하면 그 화면으로 들어갑니다 (/shell off 로 되돌림).")
+        : (en ? "Interactive shell disabled — restart agentlas for the classic REPL."
+              : "대화형 셸을 껐습니다 — agentlas 를 다시 실행하면 기본 REPL 입니다.")));
       return;
     }
     case "agents": case "list": require("../commands/list.cjs").run(ctx, rest); return;

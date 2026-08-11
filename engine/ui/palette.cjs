@@ -11,90 +11,21 @@
 const { completePath, isAbsolutePathTask } = require("../agentlas-input.cjs");
 
 // command, 인자 힌트, 한 줄 설명 — /help 팔레트와 Tab 완성이 같은 정본을 쓴다.
-const SLASH_COMMANDS = [
-  { command: "/help", args: "", ko: "명령·단축키 보기", en: "Show commands and shortcuts" },
-  { command: "/sessions", args: "", ko: "세션 표", en: "Session table" },
-  { command: "/tree", args: "", ko: "세션 트리", en: "Session tree" },
-  { command: "/s", args: "<n>", ko: "활성 세션 전환", en: "Switch active session" },
-  { command: "/switch", args: "<n>", ko: "활성 세션 전환", en: "Switch active session" },
-  { command: "/kill", args: "<n>", ko: "실행 중 턴 중단", en: "Interrupt a running turn" },
-  { command: "/rm", args: "<n>", ko: "세션 제거", en: "Remove a session" },
-  { command: "/agents", args: "", ko: "설치 에이전트 목록", en: "List installed agents" },
-  { command: "/list", args: "", ko: "설치 에이전트 목록", en: "List installed agents" },
-  { command: "/graph", args: "[run <이름>]", ko: "저장된 자동화 그래프", en: "Saved automation graphs" },
-  { command: "/mcp", args: "", ko: "MCP 서버 목록", en: "MCP servers" },
-  { command: "/doctor", args: "", ko: "런타임·데이터 점검", en: "Health check" },
-  { command: "/shell", args: "on|off", ko: "대화형 셸 켜기/끄기", en: "Turn the interactive shell on or off" },
-  { command: "/runtime", args: "<kind>", ko: "새 세션 런타임 지정", en: "Set runtime for new sessions" },
-  { command: "/model", args: "<id|default>", ko: "새 세션 모델 지정", en: "Set model for new sessions" },
-  { command: "/effort", args: "<level|none>", ko: "새 세션 추론 강도 지정", en: "Set effort for new sessions" },
-  { command: "/permission", args: "<level>", ko: "새 세션 권한 지정", en: "Set permission for new sessions" },
-  { command: "/login", args: "", ko: "Agentlas Cloud 로그인", en: "Sign in to Agentlas Cloud" },
-  { command: "/whoami", args: "", ko: "로그인 상태", en: "Signed-in account" },
-  { command: "/search", args: "\"<what you need>\"", ko: "Hub 에이전트 검색", en: "Search Hub agents" },
-  { command: "/install", args: "<slug>", ko: "Hub 에이전트 설치", en: "Install a Hub agent" },
-  { command: "/usage", args: "", ko: "로컬 사용 현황", en: "Local usage" },
-  { command: "/billing", args: "", ko: "크레딧 잔액", en: "Credit balance" },
-  { command: "/automation", args: "[sub]", ko: "자동화", en: "Automations" },
-  { command: "/storm", args: "<goal>", ko: "Goal+UltraCode 하니스", en: "Goal+UltraCode harness" },
-  { command: "/swarm", args: "<goal>", ko: "에이전트 스웜", en: "Agent swarm" },
-  { command: "/network", args: "<request>", ko: "Workforce 라우트", en: "Workforce route" },
-  { command: "/workforce", args: "<request>", ko: "Workforce 라우트", en: "Workforce route" },
-  { command: "/taskforce", args: "<request>", ko: "임시 태스크포스 편성", en: "Assemble a task force" },
-  // 소스 스코프 편성 4종 — 2026-08-05 같은 날 삭제 후 네이티브 배선으로 복원.
-  // 이전에는 외부 CLI 스텁(exit 3)이라 죽은 메뉴였다. 지금은 이 터미널의 편성
-  // 루프가 직접 돌고 로컬 Agentlas-OS Core가 선언된 스코프의 메뉴를 연합한다.
-  // 팔레트 문구가 곧 사용자에게 하는 약속이다 — 스코프를 문장에 적는다.
-  { command: "/hep-network", args: "\"<request>\"", ko: "로컬+오너 클라우드+공개 Hub 연합 편성", en: "Staff across Local + owner Cloud + public Hub" },
-  { command: "/hep-local", args: "\"<request>\"", ko: "등록된 로컬 에이전트만으로 편성", en: "Staff from registered Local agents only" },
-  { command: "/hep-cloud", args: "\"<request>\"", ko: "오너 Agent Cloud만으로 편성", en: "Staff from owner Agent Cloud only" },
-  { command: "/hep-hub", args: "\"<request>\"", ko: "공개 Hub 에이전트만으로 편성", en: "Staff from public Hub agents only" },
-  { command: "/build", args: "\"<request>\"", ko: "에이전트·팀 제작/수리/패키징", en: "Build, repair or package an agent or team" },
-  { command: "/call", args: "\"a,b\" \"<ctx>\"", ko: "지정 에이전트 호출", en: "Call named agents" },
-  { command: "/route", args: "\"<req>\"", ko: "최적 에이전트 라우팅", en: "Route to the best agent" },
-  { command: "/browser", args: "[sub]", ko: "브라우저 하드포인트", en: "Browser hardpoint" },
-  { command: "/connect", args: "<target>", ko: "에이전트·팀 연결", en: "Connect an agent or team" },
-  { command: "/research", args: "<sub>", ko: "리서치", en: "Research" },
-  { command: "/upload", args: "<path>", ko: "Agent Cloud에 저장·발행", en: "Save to Agent Cloud or publish" },
-  { command: "/cloud", args: "<sub>", ko: "클라우드 자산 관리", en: "Cloud assets" },
-  { command: "/import", args: "<path>", ko: "로컬 폴더 에이전트 가져오기", en: "Import a local folder agent" },
-  { command: "/cd", args: "[path]", ko: "작업 폴더 이동", en: "Change working folder" },
-  { command: "/native", args: "prepare <agent>", ko: "네이티브 CLI 컨텍스트 생성", en: "Prepare native CLI context" },
-  { command: "/plugin", args: "<sub>", ko: "Hub 플러그인(MCP)", en: "Hub plugins (MCP servers)" },
-  { command: "/plugins", args: "", ko: "설치된 플러그인", en: "Installed plugins" },
-  { command: "/experience", args: "<sub>", ko: "이식 가능한 Experience", en: "Portable Experience" },
-  { command: "/variant", args: "resolve", ko: "로컬 변형 선택", en: "Local variant selection" },
-  { command: "/memory", args: "<sub>", ko: "메모리", en: "Memory" },
-  { command: "/evolve", args: "", ko: "프롬프트 진화 제안", en: "Prompt-evolution proposals" },
-  // 데스크탑의 `ontology` 는 Core 의 지식·메모리 **런타임**(임베딩 포함)이고, 터미널의
-  // 이것은 **이 프로젝트의 지식 소스 등록부**다. 서로 다른 것이 같은 이름을 쓰고 있어
-  // (감사 D6) 라벨이라도 정확해야 한다 — 명령 이름은 사용자 습관과 스크립트가 걸려
-  // 있어 바꾸지 않는다. Core 의 지식 런타임은 터미널에 아직 미노출이다(결함 아님).
-  { command: "/ontology", args: "", ko: "프로젝트 지식 소스 등록", en: "Project knowledge sources" },
-  { command: "/career-graph", args: "", ko: "소스 라우팅 그래프", en: "Source routing graph" },
-  { command: "/journal", args: "<sub>", ko: "Stormbreaker 실행 일지", en: "Stormbreaker run journal" },
-  { command: "/project", args: "[status|init]", ko: ".agentlas 프로젝트 상태", en: "Private project state" },
-  { command: "/context", args: "<sub>", ko: "의존성 맵", en: "Dependency map" },
-  { command: "/creds", args: "<sub>", ko: "자격증명", en: "Credentials" },
-  { command: "/env", args: "", ko: "공유 환경 키", en: "Shared env keys" },
-  { command: "/multimodal", args: "", ko: "이미지·영상·음성 설정", en: "Image/video/audio providers" },
-  { command: "/document", args: "pdf <html|url>", ko: "문서 PDF 내보내기", en: "Export a document to PDF" },
-  { command: "/roles", args: "[set <role> <runtime>]", ko: "오케스트레이터·워커 모델 역할 조회/설정", en: "Show or set orchestrator/worker model roles" },
-  { command: "/telegram", args: "[sub]", ko: "텔레그램 연결", en: "Telegram bindings" },
-  { command: "/oberon", args: "[sub]", ko: "AI 필름", en: "AI film" },
-  { command: "/film", args: "<sub>", ko: "필름 렌더", en: "Film render" },
-  { command: "/hep", args: "<sub…>", ko: "Hephaestus 패스스루", en: "Hephaestus passthrough" },
-  // "네트워크"만 쓰면 WiFi·LAN 관리로 읽힌다. 이 명령이 다루는 것은 로컬
-  // 에이전트 네트워크(init|status|reindex|bench|add-source)다.
-  { command: "/netadmin", args: "[sub]", ko: "로컬 에이전트 네트워크 관리", en: "Local agent network" },
-  { command: "/update", args: "", ko: "npm 업데이트 확인", en: "npm update check" },
-  { command: "/version", args: "", ko: "버전", en: "Version" },
-  { command: "/logout", args: "", ko: "로그아웃", en: "Sign out" },
-  // 대화가 있으면 --yes 없이는 거절한다(챗/메시지 CASCADE 삭제) — 팔레트에도 노출.
-  { command: "/uninstall", args: "<slug> [--yes]", ko: "에이전트 제거", en: "Uninstall an agent" },
-  { command: "/quit", args: "", ko: "종료", en: "Quit" },
-  { command: "/exit", args: "", ko: "종료", en: "Quit" },
-];
+const catalog = require("./commands-catalog.cjs");
+
+/*
+ * 정본은 ui/commands-catalog.cjs 하나다(2026-08-11). 여기 있던 71행 리터럴은
+ * help.cjs 의 EN/KO 블록과 어긋나 언어 혼재·중복 숨김을 만들었다.
+ */
+const SLASH_COMMANDS = catalog.forSurface("repl").map((entry) => ({
+  command: "/" + entry.name,
+  args: entry.args || "",
+  argsKo: entry.argsKo,
+  ko: entry.ko,
+  en: entry.en,
+  group: entry.group,
+  tier: entry.tier,
+}));
 
 const SLASH_NAMES = SLASH_COMMANDS.map((c) => c.command);
 const RUNTIME_KINDS = ["claude-code", "codex", "gemini"];
@@ -157,9 +88,9 @@ function suggestions(line, limit = 12, lang = "en") {
   const rows = SLASH_COMMANDS.map((entry) => ({
     command: entry.command,
     description: ko ? entry.ko : entry.en,
-    usage: entry.command + (entry.args ? " " + entry.args : ""),
+    usage: "/" + catalog.usageFor(catalog.byName(entry.command) || entry, lang),
     detail: "",
-    category: "",
+    category: entry.group || "",
     examples: [],
   }));
   const q = value.toLowerCase();
@@ -173,14 +104,13 @@ function suggestions(line, limit = 12, lang = "en") {
   return starts.concat(contains).slice(0, limit);
 }
 
-/** /help 팔레트 렌더 — Tab 완성과 같은 정본에서 나온다. */
-function renderPalette(lang) {
-  const ko = lang === "ko";
-  const width = Math.max(...SLASH_COMMANDS.map((c) => (c.command + " " + c.args).length));
-  return SLASH_COMMANDS
-    .filter((c, i, all) => all.findIndex((x) => (ko ? x.ko : x.en) === (ko ? c.ko : c.en)) === i)
-    .map((c) => `  ${(c.command + (c.args ? " " + c.args : "")).padEnd(width + 2)}${ko ? c.ko : c.en}`)
-    .join("\n");
+/*
+ * /help 팔레트 — CLI 와 완전히 같은 렌더러를 쓴다. 예전엔 여기서 설명 텍스트로
+ * 중복 제거를 해서 `/switch` `/list` `/exit` 가 조용히 사라졌다. 별칭이 필드가 된
+ * 지금은 중복 자체가 없으므로 그 필터도 없다.
+ */
+function renderPalette(lang, opts = {}) {
+  return catalog.renderHelp({ lang, surface: "repl", all: opts.all === true });
 }
 
 module.exports = { SLASH_COMMANDS, SLASH_NAMES, makeCompleter, renderPalette, suggestions };

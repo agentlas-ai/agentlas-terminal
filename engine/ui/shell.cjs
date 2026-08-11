@@ -47,9 +47,21 @@ function loadRenderer() {
 
 /* Ui 를 상속해 write 초크포인트만 렌더러로 돌린다. */
 class ShellUi extends Ui {
+  /*
+   * 실터미널 대신 dummy 스트림 — 놓친 직접 out.write 가 프레임을 찢는 대신 소멸한다.
+   * 단 columns 는 살려야 한다: Ui 의 줄바꿈·표·구분선이 전부 this.out.columns 를 읽는데
+   * PassThrough 에는 그 속성이 없어 전부 80/100 에 고정돼 있었다(폭 넓은 터미널에서
+   * 화면 절반만 쓰던 원인). 렌더러의 실제 폭을 게터로 물린다.
+   */
+  static _sinkFor(tui) {
+    const sink = new PassThrough();
+    Object.defineProperty(sink, "columns", {
+      get() { return (tui.terminal && tui.terminal.columns) || 80; },
+    });
+    return sink;
+  }
   constructor(opts, pi, tui, transcript) {
-    // 실터미널 대신 dummy 스트림 — 놓친 직접 out.write 가 프레임을 찢는 대신 소멸한다.
-    super({ ...opts, stream: new PassThrough(), color: true });
+    super({ ...opts, stream: ShellUi._sinkFor(tui), color: true });
     this._pi = pi;
     this._tui = tui;
     this._transcript = transcript;
@@ -59,7 +71,12 @@ class ShellUi extends Ui {
     this._loader = null;
   }
   _appendText(text) {
-    this._transcript.addChild(new this._pi.Text(String(text), 1, 0));
+    /*
+     * 벤더 Text.render 는 공백만 있는 줄에 [] 를 돌려준다 — screens.cjs 의 ui.line("")
+     * 22곳이 전부 조용히 사라져 화면이 한 덩어리로 붙어 있었다. 빈 줄은 Spacer 로.
+     */
+    const value = String(text);
+    this._transcript.addChild(value.trim() === "" ? new this._pi.Spacer(1) : new this._pi.Text(value, 1, 0));
     this._tui.requestRender();
   }
   write(s) {
@@ -101,7 +118,7 @@ class ShellUi extends Ui {
     this.stopSpinner();
     this.ensureNl();
     this._mdText = "";
-    this._md = new this._pi.Markdown("", 3, 0, this._mdTheme());
+    this._md = new this._pi.Markdown("", 1, 0, this._mdTheme());
     this._transcript.addChild(this._md);
     this._streaming = true;
   }
@@ -171,7 +188,16 @@ async function startShell(ctx, opts = {}) {
 
   const terminal = new pi.ProcessTerminal();
   const tui = new pi.TuiMainScreen(terminal);
-  const ui = new ShellUi({ lang: ctx.lang }, pi, tui, tui);
+  /*
+   * Container.render 는 삽입 순서로 그린다. 예전엔 헤더 3줄 뒤에 Editor 를 넣어서
+   * 입력면이 4번째 줄에 영구 고정됐고, 이후 모든 출력이 그 아래로 흘러 입력 상자가
+   * 화면 한가운데 박혔다. 위=트랜스크립트 / 아래=입력면 두 칸으로 나눈다.
+   */
+  const transcript = new pi.Container();
+  const bottom = new pi.Container();
+  tui.addChild(transcript);
+  tui.addChild(bottom);
+  const ui = new ShellUi({ lang: ctx.lang }, pi, tui, transcript);
 
   // ctx 초크포인트 재지정 — 55파일의 ctx.out 직출력이 전부 프레임 안으로 들어온다.
   const shellCtx = {
@@ -227,7 +253,26 @@ async function startShell(ctx, opts = {}) {
       description: ui.c.dim, scrollInfo: ui.c.faint, noMatch: ui.c.dim,
     },
   };
-  const editor = new pi.Editor(tui, editorTheme, { autocompleteMaxVisible: 8 });
+  /*
+   * 빈 입력 상자가 "구분선 사이의 빈 칸"으로 보이던 문제(오너 지적). 렌더러의 Editor 는
+   * placeholder 를 지원하지 않으므로, 비어 있을 때만 첫 내용 줄 뒤에 힌트를 덧붙인다.
+   * 커서는 그 줄에 이미 그려져 있으므로 교체가 아니라 append 여야 안전하다.
+   */
+  class ShellEditor extends pi.Editor {
+    render(width) {
+      const lines = super.render(width);
+      if (this.getText() === "" && lines.length >= 3) {
+        const hint = ui.c.faint(en
+          ? "type a task  ·  / for commands"
+          : "할 일을 문장으로  ·  / 명령");
+        // 에디터가 줄을 폭까지 공백으로 채운다 — 그대로 덧붙이면 힌트가 오른쪽 끝으로 밀린다.
+        // 꼬리 공백만 걷어내고 커서 바로 뒤에 붙인다(ANSI 리셋은 보존).
+        lines[1] = lines[1].replace(/[ \t]+(\u001b\[0m)?$/, "$1") + " " + hint;
+      }
+      return lines;
+    }
+  }
+  const editor = new ShellEditor(tui, editorTheme, { autocompleteMaxVisible: 8, paddingX: 1 });
   editor.setAutocompleteProvider(new pi.CombinedAutocompleteProvider(toSlashCommands(ctx.lang), process.cwd()));
 
   // ── 히스토리 디스크 영속 (증분 2) — cli-history.json v2 계약을 그대로 재사용 ──
@@ -253,11 +298,16 @@ async function startShell(ctx, opts = {}) {
   const commands = require("../commands/index.cjs");
   const handleSlash = async (cmdline) => {
     const raw = cmdline.split(/\s+/)[0] || "";
-    const rest = cmdline.slice(raw.length).trim().split(/\s+/).filter(Boolean);
+    // 팔레트가 따옴표 인자를 가르치므로 REPL 과 같은 토크나이저를 쓴다.
+    const rest = require("../agentlas-input.cjs").tokenizeCommandLine(cmdline).slice(1);
     const cmd = commands.resolveCommandName(raw);
     if (cmd === "quit" || cmd === "exit") return "quit";
     if (cmd === "help") {
-      ui.line(palette.renderPalette(ctx.lang));
+      ui.line(palette.renderPalette(ctx.lang, { all: String(rest[0] || "") === "all" }));
+      ui.line("");
+      ui.line(ui.c.dim(en
+        ? "Tab completes commands · ↑/↓ history · Shift-Tab cycles permission · Esc interrupts a turn"
+        : "Tab: 명령 완성 · ↑/↓ 히스토리 · Shift-Tab 권한 순환 · Esc 턴 중단"));
       return;
     }
     // 그래프 보기 (Phase 4) — 캔버스를 흉내내지 않는다: mermaid → 유니코드 박스 아트.
@@ -275,7 +325,8 @@ async function startShell(ctx, opts = {}) {
             lines.push(n.type === "condition" ? `  ${n.id}{${label}}` : `  ${n.id}[${label}]`);
           }
           for (const e of g.edges || []) {
-            const lbl = e.sourceHandle === "true" ? "|참|" : e.sourceHandle === "false" ? "|거짓|" : "";
+            const lbl = e.sourceHandle === "true" ? (en ? "|yes|" : "|참|")
+              : e.sourceHandle === "false" ? (en ? "|no|" : "|거짓|") : "";
             lines.push(`  ${e.source} -->${lbl} ${e.target}`);
           }
           const { render, toAnsi } = require("../vendor/mermaid/index.js");
@@ -288,10 +339,37 @@ async function startShell(ctx, opts = {}) {
         } catch { /* 렌더 실패 → 아래 클래식 폴스루가 텍스트로 보여준다 */ }
       }
     }
+    /*
+     * 세션 설정 4종. 자동완성은 되는데 처리 case 가 없어 "여기서는 아직 안 됩니다"만
+     * 답하던 죽은 광고였다(신설 게이트가 잡았다). 기본 REPL 과 같은 의미로 배선하고,
+     * 영구 저장 경로를 같은 줄에서 알려준다 — 이 값들은 이 셸 한정이다.
+     */
+    if (cmd === "permission" || cmd === "model" || cmd === "runtime" || cmd === "effort") {
+      const value = String(rest[0] || "").trim();
+      const entry = require("./commands-catalog.cjs").byName(cmd);
+      if (!value) {
+        ui.line(ui.c.dim(`Usage: /${cmd} ${entry ? entry.args : ""}`));
+        return;
+      }
+      if (cmd === "permission") {
+        const next = permissions.normalize(value);
+        if (!next) { ui.line(ui.c.dim("Usage: /permission read|write|full")); return; }
+        permission = next;
+        ui.line(ui.c.dim(`permission: ${next}  ·  ${en ? "persist: agentlas setup" : "영구 저장: agentlas setup"}`));
+        return;
+      }
+      if (cmd === "model") opts.model = value === "default" ? null : value;
+      else if (cmd === "runtime") opts.runtime = value;
+      else opts.effort = value;
+      ui.line(ui.c.dim(`${cmd}: ${value}  ·  ${en
+        ? "applies to new sessions here (persist: agentlas roles set)"
+        : "이 셸의 새 세션부터 (영구 저장: agentlas roles set)"}`));
+      return;
+    }
     // 셸 끄기 — 여기서도 되돌아갈 수 있어야 한다(들어와서 못 나가면 갇힌다)
     if (cmd === "shell") {
       const want = String(rest[0] || "").toLowerCase();
-      if (!["on", "off"].includes(want)) { ui.line(ui.c.dim("Usage: /shell on|off   (현재: on)")); return; }
+      if (!["on", "off"].includes(want)) { ui.line(ui.c.dim(en ? "Usage: /shell on|off" : "사용법: /shell on|off")); return; }
       const config = require("../agentlas-config.cjs");
       const { userDataDir } = require("../core/paths.cjs");
       config.updatePrefs(userDataDir(), { shell: want === "on" ? "interactive" : "classic" });
@@ -386,7 +464,7 @@ async function startShell(ctx, opts = {}) {
       }
     })();
   };
-  tui.addChild(editor);
+  bottom.addChild(editor);
   tui.setFocus(editor);
 
   const shutdown = (code) => {

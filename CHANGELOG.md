@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.0.45 — 2026-08-11
+
+The command surface was rebuilt from one catalog, and failures stopped printing JSON.
+
+- **Commands.** The same list used to be maintained by hand in four places, and they
+  disagreed: an English screen advertised a Korean argument hint, one feature was sold
+  twice under two names, and a de-duplication pass then hid `/switch`, `/list` and
+  `/exit` entirely. There is now a single catalog. Aliases are a field on a command,
+  never a row of their own, so a duplicate can no longer appear or be silently dropped.
+- **Help.** `/help` is grouped and short — 25 lines in the terminal instead of 133 —
+  ordered by what a new user needs first. `help all` lists everything; `help <command>`
+  answers about that one command instead of dumping the whole list. The CLI, the classic
+  REPL and the interactive shell now call the same renderer, so they cannot drift apart.
+- **Removed.** `journal` reported success for runs that did not exist and read the wrong
+  folder; `career-graph`'s read commands silently created project state; `plugins` was a
+  second name for `plugin`. All three now stop with the exact replacement command instead
+  of leaking into a paid model turn.
+- **Failures.** A failed staffing run used to print a machine code followed by a raw JSON
+  object, with the one useful sentence — run `agentlas login` — buried inside it and cut
+  mid-escape by two stacked truncations. The sentence now comes first and the code last;
+  no JSON reaches a human. Sign-in expiry is relayed intact instead of being re-wrapped.
+- **Shell layout.** Output now stays above the input box instead of below it,
+  the box shows what to type, the whole terminal width is used, blank lines survive,
+  and `/permission` `/model` `/runtime` `/effort` work where they were only autocompleted.
+
 ## 1.0.44 — 2026-08-11
 
 Turn the interactive shell on once and keep it.

@@ -2916,6 +2916,12 @@ const TRANSIENT_MODEL_ERROR_RE = /Connection closed mid-response|"terminal_reaso
       try {
         runtimeContext = await D.loadWorkforceGoalRuntime(cwd, ctx.goalId || null);
       } catch (error) {
+        /*
+         * 저자·호스트가 이미 한 문장으로 쓴 안내(로그인 필요, 정직 정지)는 그대로 올린다.
+         * 여기서 다시 감싸면 code/honestStop 이 떨어져 나가고, 유일하게 실행 가능한
+         * 문장이 JSON 의 cause 키 밑으로 들어가 사용자에게 blob 으로 보인다(실사고).
+         */
+        if (error && (error.honestStop || error.code)) throw error;
         fail(
           "workforce_goal_runtime_unavailable",
           "the active account/project Workforce binding could not be inspected",
@@ -3291,6 +3297,12 @@ const TRANSIENT_MODEL_ERROR_RE = /Connection closed mid-response|"terminal_reaso
           hostRuntime: identity.runtimeId,
         });
       } catch (error) {
+        /*
+         * 저자·호스트가 이미 한 문장으로 쓴 안내(로그인 필요, 정직 정지)는 그대로 올린다.
+         * 여기서 다시 감싸면 code/honestStop 이 떨어져 나가고, 유일하게 실행 가능한
+         * 문장이 JSON 의 cause 키 밑으로 들어가 사용자에게 blob 으로 보인다(실사고).
+         */
+        if (error && (error.honestStop || error.code)) throw error;
         fail(
           "workforce_goal_binding_failed",
           "prepared execution was blocked because the durable goal binding could not be committed",
@@ -4552,14 +4564,22 @@ const TRANSIENT_MODEL_ERROR_RE = /Connection closed mid-response|"terminal_reaso
         const otherDetails = details && typeof details === "object" && !Array.isArray(details)
           ? Object.fromEntries(Object.entries(details).filter(([key]) => key !== "issues"))
           : details;
-        const detailText = otherDetails && (typeof otherDetails !== "object" || Object.keys(otherDetails).length)
-          ? ` — ${JSON.stringify(otherDetails).slice(0, 1_200)}`
-          : "";
-        ui.error(`${receipt.failure.code}: ${receipt.failure.message}${detailText}`, { reveal: true });
+        // otherDetails 는 사람 줄에 쓰지 않는다 — 영수증에 그대로 남는다.
+        void otherDetails;
+        /*
+         * 사람이 읽는 줄에 JSON 을 찍지 않는다(2026-08-11 오너 지적). 예전에는
+         * `code: message — {"cause":"…"}` 형태로 나가서, 유일하게 실행 가능한 문장
+         * ("agentlas login")이 JSON 안에 묻히고 두 번의 절단(1200자→800자)에 걸려
+         * 이스케이프 중간에서 잘렸다. 지금은 문장이 먼저, 기계 코드는 맨 끝 한 줄.
+         */
+        const failureError = receipt.failure.error;
+        if (failureError && (failureError.honestStop || failureError.code)) ui.error(failureError);
+        else ui.error(String(receipt.failure.message || ""), { reveal: true });
         if (issues) {
-          for (const issue of issues.slice(0, 16)) ui.error(`  - ${String(issue).slice(0, 400)}`, { reveal: true });
-          if (issues.length > 16) ui.error(`  … ${issues.length - 16} more issues in the persisted receipt`, { reveal: true });
+          for (const issue of issues.slice(0, 16)) ui.line(ui.c.dim(`  · ${String(issue).slice(0, 400)}`));
+          if (issues.length > 16) ui.line(ui.c.dim(`  · … ${issues.length - 16} more in the persisted receipt`));
         }
+        ui.line(ui.c.faint(`  ${receipt.failure.code}`));
         // 실패한 실행이야말로 토큰이 어디로 갔는지 알아야 하는 순간이다. issues 유무와
         // 무관하게 낸다 — 첫 배선이 이 블록 안에 들어가는 바람에 issues 없는 실패에서는
         // 장부가 통째로 사라졌다.
