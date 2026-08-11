@@ -3,7 +3,7 @@
  * ui/width: 터미널 셀 폭·그래핌 유틸 정본.
  * agentlas-composer.cjs(데드코드가 된 바텀 입력 박스)에서 2026-08-11 추출 — 함수는
  * 바이트 동일. 소비자: agentlas-ui / agentlas-banner / agentlas-onboard /
- * ui/repl / hephaestus/runtime. pi-tui 이행(D3 Phase 1-3) 정지작업.
+ * ui/repl / hephaestus/runtime. 셸 이행(D3 Phase 1-3) 정지작업.
  */
 const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const MARK_RE = /\p{Mark}/u;

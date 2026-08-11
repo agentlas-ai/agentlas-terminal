@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.0.42 — 2026-08-11
+
+Projects, automations and firms reach the interactive shell; the shell is
+enabled with `AGENTLAS_TUI=1`.
+
+- `/projects` — every connected project with chat/task counts, and a clear
+  marker for the one this folder belongs to (or an explicit warning when the
+  folder is not connected).
+- `/automations` — the full list with schedule, next run, run count and failure
+  count; `/automations <name>` opens the detail view with recent run outcomes
+  and the exact commands to run or toggle it.
+- `/firms` — teams with member counts; `/firms <slug>` shows the roster.
+- Table layout no longer inflates narrow status columns when a row overflows
+  the terminal width.
+- The shell is now enabled with `AGENTLAS_TUI=1`. Renderer internals are an
+  implementation detail and no longer appear in commands, environment
+  variables, or on screen.
+
 ## 1.0.41 — 2026-08-11
 
 Desktop surfaces, measured against the desktop inventory and rebuilt for the terminal.
@@ -16,28 +34,27 @@ Desktop surfaces, measured against the desktop inventory and rebuilt for the ter
 - `/settings` — language, permission, active runtime, installed CLIs, and the
   resolved orchestrator/worker model roles; names what remains Desktop-only
   instead of implying parity.
-- Those five honest stops now point at the pi shell instead of claiming the
+- Those five honest stops now point at the interactive shell instead of claiming the
   surface is unreachable from the terminal.
 
 ## 1.0.40 — 2026-08-11
 
-Desktop surfaces reach the pi shell: dashboard and graph view.
+Desktop surfaces reach the interactive shell: dashboard and graph view.
 
-- `/dashboard` (pi shell): agents/firms/telegram badges + automations panel
+- `/dashboard` (interactive shell): agents/firms/telegram badges + automations panel
   (enabled state, last run) from the local store — first of the thirteen
   Desktop-only honest stops to be lifted.
-- `/graph show <name>` (pi shell): the automation graph renders as Unicode
+- `/graph show <name>` (interactive shell): the automation graph renders as Unicode
   box art (grok-mermaid) — condition branches, loop-back edges, and Korean
   labels align correctly. No canvas emulation; editing stays declarative.
-- First-run onboarding now runs before the pi shell starts (sequential
-  readline → pi-tui, no stdin contention), so `AGENTLAS_TUI=pi` works for
+- First-run onboarding now runs before the interactive shell starts (sequential, no stdin contention), so `AGENTLAS_TUI=1` works for
   brand-new installs too.
 
 ## 1.0.39 — 2026-08-11
 
-pi-tui shell increment 2 + architecture mirror sync.
+Interactive shell increment 2 + architecture mirror sync.
 
-- Experimental pi shell (`AGENTLAS_TUI=pi`): persisted history (cli-history.json
+- Experimental interactive shell (`AGENTLAS_TUI=1`): persisted history (cli-history.json
   v2 contract), Shift-Tab permission cycling (same two-step FULL arming state
   machine as the classic REPL), `!` shell passthrough (full-permission gate,
   secret masking), and `/s` `/switch` `/kill` `/rm` `/sessions` `/tree` session

@@ -1,16 +1,18 @@
 "use strict";
 /*
- * ui/pitui-shell — pi-tui 기반 실험 셸 (D3 Phase 2 증분 1, 2026-08-11).
+ * ui/shell — Agentlas 대화형 셸 (D3 Phase 2~3, 2026-08-11).
  *
- * 켜는 법: AGENTLAS_TUI=pi agentlas   (TTY 필수 · 기본 REPL은 그대로 정본)
+ * 켜는 법: AGENTLAS_TUI=1 agentlas   (TTY 필수 · 기본 REPL은 그대로 정본)
+ *
+ * 렌더러 의존은 구현 세부다 — 사용자 문구·환경변수·명령 어디에도 상류 이름을 쓰지 않는다.
  *
  * 설계 (D2 위험 5의 해법이 이 파일의 구조다):
- *  - PiUi 는 기존 Ui 를 상속하되 write() 초크포인트만 pi-tui 트랜스크립트로 돌린다.
+ *  - PiUi 는 기존 Ui 를 상속하되 write() 초크포인트만 렌더러 트랜스크립트로 돌린다.
  *    line/_message/tool/rule 등 기존 메서드는 전부 write 로 수렴하므로 그대로 산다.
  *  - 스트리밍 3종은 Markdown 누적으로 교체 — 표·코드블록이 실시간 재렌더된다.
- *  - 스피너는 pi-tui Loader 로 교체 (기존 \r 기반 페인트는 dummy 스트림으로 무해화).
+ *  - 스피너는 렌더러 Loader 로 교체 (기존 \r 기반 페인트는 dummy 스트림으로 무해화).
  *  - ctx.out/err 55파일의 직출력은 shellCtx 재지정으로 전부 프레임 안에 들어온다.
- *  - 자동완성은 ui/palette 정본(SLASH_COMMANDS)을 pi-tui SlashCommand 로 변환 — 목록 드리프트 금지.
+ *  - 자동완성은 ui/palette 정본(SLASH_COMMANDS)을 렌더러 SlashCommand 로 변환 — 목록 드리프트 금지.
  *
  * 증분 1 범위 밖(기본 REPL로): Shift-Tab 권한 순환 · ! 셸 · 세션 전환(/s) ·
  * 히스토리 디스크 영속 · 스티어링 큐 표시. 이 항목들은 D3 Phase 2-2에서 이전한다.
@@ -25,20 +27,20 @@ const palette = require("./palette.cjs");
 const { readVersion } = require("../agentlas-banner.cjs");
 const { resolveProjectController, withProjectControllerContext } = require("../project/controller.cjs");
 
-function loadPiTui() {
+function loadRenderer() {
   try {
     // ESM 패키지 — Node >=20.19 의 require(esm). engines 가 이 최소선을 선언한다.
     return require("@earendil-works/pi-tui");
   } catch (cause) {
     throw Object.assign(
-      new Error("pi-tui shell needs Node >=20.19 (require(esm)). Run without AGENTLAS_TUI=pi, or upgrade Node."),
-      { code: "pitui_unavailable", cause },
+      new Error("The Agentlas shell needs Node >=20.19. Run without AGENTLAS_TUI=1, or upgrade Node."),
+      { code: "shell_unavailable", cause },
     );
   }
 }
 
-/* Ui 를 상속해 write 초크포인트만 pi-tui 로 돌린다. */
-class PiUi extends Ui {
+/* Ui 를 상속해 write 초크포인트만 렌더러로 돌린다. */
+class ShellUi extends Ui {
   constructor(opts, pi, tui, transcript) {
     // 실터미널 대신 dummy 스트림 — 놓친 직접 out.write 가 프레임을 찢는 대신 소멸한다.
     super({ ...opts, stream: new PassThrough(), color: true });
@@ -128,39 +130,42 @@ class PiUi extends Ui {
 }
 
 /*
- * pi 셸 전용 화면 (D3 Phase 3). 공용 팔레트(ui/palette)에는 넣지 않는다 —
+ * 셸 전용 화면 (D3 Phase 3). 공용 팔레트(ui/palette)에는 넣지 않는다 —
  * 그 정본은 기본 REPL 이 실제로 처리하는 명령만 광고해야 하고,
  * palette-command-coverage-contract 가 그 계약을 잠근다.
  */
-const PI_SCREENS = [
+const SHELL_SCREENS = [
   { name: "dashboard", ko: "관제 대시보드 — 확인 필요·실행 활동·자동화", en: "Dashboard — attention, run activity, automations" },
   { name: "library", ko: "라이브러리 — 에이전트·MCP", en: "Library — agents, MCP" },
   { name: "marketplace", ko: "Hub — 북마크·대여 현황", en: "Hub — bookmarks and borrows" },
   { name: "settings", ko: "설정 현황", en: "Settings overview" },
+  { name: "projects", ko: "프로젝트 목록 — 채팅·작업 수", en: "Projects — chats and tasks" },
+  { name: "automations", ko: "자동화 목록·상세 [이름]", en: "Automations list/detail [name]" },
+  { name: "firms", ko: "회사(팀) 목록·조직도 [슬러그]", en: "Firms and rosters [slug]" },
 ];
 
 function toSlashCommands(lang) {
-  // 팔레트 정본 → pi-tui SlashCommand. "/" 접두는 pi-tui 가 관리하므로 벗긴다.
+  // 팔레트 정본 → 렌더러 SlashCommand. "/" 접두는 렌더러가 관리하므로 벗긴다.
   const base = palette.SLASH_COMMANDS.map((cmd) => ({
     name: cmd.command.slice(1),
     description: lang === "ko" ? cmd.ko : cmd.en,
     argumentHint: cmd.args || undefined,
   }));
   const seen = new Set(base.map((c) => c.name));
-  for (const s of PI_SCREENS) {
+  for (const s of SHELL_SCREENS) {
     if (!seen.has(s.name)) base.push({ name: s.name, description: lang === "ko" ? s.ko : s.en });
   }
   return base;
 }
 
-async function startPiShell(ctx, opts = {}) {
-  const pi = loadPiTui();
+async function startShell(ctx, opts = {}) {
+  const pi = loadRenderer();
   const en = ctx.lang === "en";
   const db = ctx.db();
 
   const terminal = new pi.ProcessTerminal();
   const tui = new pi.TuiMainScreen(terminal);
-  const ui = new PiUi({ lang: ctx.lang }, pi, tui, tui);
+  const ui = new ShellUi({ lang: ctx.lang }, pi, tui, tui);
 
   // ctx 초크포인트 재지정 — 55파일의 ctx.out 직출력이 전부 프레임 안으로 들어온다.
   const shellCtx = {
@@ -202,7 +207,7 @@ async function startPiShell(ctx, opts = {}) {
   };
 
   // ── 헤더 ──
-  ui.line(`${ui.c.paw("▞▖")} ${ui.c.bold("AGENTLAS")} ${ui.c.dim(`${readVersion()} · pi-tui shell (experimental) · parallel ≤${maxParallel()}`)}`);
+  ui.line(`${ui.c.paw("▞▖")} ${ui.c.bold("AGENTLAS")} ${ui.c.dim(`${readVersion()} · parallel ≤${maxParallel()}`)}`);
   ui.line(ui.c.dim(en
     ? "plain words run a task · / commands · Esc interrupts · Ctrl+C quits"
     : "문장을 치면 실행 · / 명령 · Esc 중단 · Ctrl+C 종료"));
@@ -279,15 +284,19 @@ async function startPiShell(ctx, opts = {}) {
     }
     // 데스크탑 대응 화면 (Phase 3) — 정직 정지였던 표면들을 실물로 대체
     {
-      const screens = require("./pitui-screens.cjs");
+      const screens = require("./screens.cjs");
       const SCREEN = {
         dashboard: screens.dashboard,
         library: screens.library,
         marketplace: screens.marketplace,
         bookmarks: screens.marketplace,
         settings: screens.settings,
+        projects: screens.projects,
+        automations: screens.automations,
+        firms: screens.firms,
       };
-      if (SCREEN[cmd]) { SCREEN[cmd](ui, db, en, shellCtx); return; }
+      // 인자 있는 화면(automations/firms 상세)은 restStr 을 그대로 넘긴다.
+      if (SCREEN[cmd]) { SCREEN[cmd](ui, db, en, shellCtx, cmdline.slice(raw.length).trim()); return; }
     }
     // 세션 관찰/전환 (증분 2b) — 기본 REPL과 같은 orch/renderer 배선
     if (cmd === "sessions" || cmd === "tree") {
@@ -318,7 +327,7 @@ async function startPiShell(ctx, opts = {}) {
       ui.line(ui.c.dim(commands.DESKTOP_ONLY_SURFACES[cmd]));
       return;
     }
-    ui.line(ui.c.dim(en ? `not in the pi shell yet: /${cmd} — use the classic REPL` : `pi 셸에는 아직 없음: /${cmd} — 기본 REPL을 쓰세요`));
+    ui.line(ui.c.dim(en ? `not available here yet: /${cmd}` : `여기서는 아직 안 됩니다: /${cmd}`));
   };
 
   let busy = false;
@@ -368,7 +377,7 @@ async function startPiShell(ctx, opts = {}) {
   };
 
   tui.addInputListener((data) => {
-    // Shift-Tab 권한 순환 — pi-tui 가 raw mode 를 단독 소유하므로 readline 의
+    // Shift-Tab 권한 순환 — 렌더러가 raw mode 를 단독 소유하므로 readline 의
     // swallowCompletion 우회 없이 여기서 직접 소비한다 (D2 위험 2의 해소 형태).
     if (pi.matchesKey(data, "shift+tab")) {
       permShortcut.handleKey("", { name: "tab", shift: true });
@@ -398,8 +407,8 @@ async function startPiShell(ctx, opts = {}) {
   });
 
   tui.start();
-  // pi-tui 가 프로세스를 잡고 있는 동안 살아 있는 프라미스
+  // 렌더러가 프로세스를 잡고 있는 동안 살아 있는 프라미스
   return new Promise(() => {});
 }
 
-module.exports = { startPiShell };
+module.exports = { startShell };

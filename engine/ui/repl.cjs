@@ -125,12 +125,12 @@ async function startRepl(ctx, opts = {}) {
   }
 
   /*
-   * 실험 셸 opt-in (D3 Phase 2): AGENTLAS_TUI=pi + TTY.
+   * 대화형 셸 opt-in (D3 Phase 2): AGENTLAS_TUI=1 + TTY.
    * 온보딩 마법사(위 readline 블록)가 먼저 끝난 뒤 진입한다 — 순차 실행이라
-   * stdin 경합이 없고, 첫 실행 사용자도 pi 셸을 쓸 수 있다(증분 2c).
+   * stdin 경합이 없고, 첫 실행 사용자도 새 셸을 쓸 수 있다(증분 2c).
    */
-  if (process.env.AGENTLAS_TUI === "pi" && process.stdin.isTTY) {
-    return require("./pitui-shell.cjs").startPiShell(ctx, opts);
+  if (/^(1|true|on)$/i.test(String(process.env.AGENTLAS_TUI || "")) && process.stdin.isTTY) {
+    return require("./shell.cjs").startShell(ctx, opts);
   }
   const orch = new Orchestrator({ db, lang: ctx.lang });
   const renderer = new Renderer(ui);

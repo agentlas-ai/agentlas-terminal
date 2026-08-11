@@ -1,6 +1,6 @@
 "use strict";
 /*
- * ui/pitui-screens — 데스크탑 화면의 터미널 대응물 (D3 Phase 3).
+ * ui/screens — 데스크탑 화면의 터미널 대응물 (D3 Phase 3).
  *
  * 대조 원본: docs/2026-08-11-terminal-tui-overhaul/D1-데스크탑-기능-인벤토리.md
  * 각 화면은 데스크탑이 IPC로 읽는 것과 같은 로컬 저장소를 직접 읽는다.
@@ -17,10 +17,24 @@ function table(ui, rows, opts = {}) {
   if (!rows.length) return;
   const cols = rows[0].length;
   const max = Number(opts.maxWidth) || 78;
-  const widths = Array.from({ length: cols }, (_, i) =>
-    Math.min(opts.cap?.[i] || 40, Math.max(...rows.map((r) => visWidth(String(r[i] ?? ""))))));
-  const total = widths.reduce((a, b) => a + b + 2, 0);
-  if (total > max && widths.length) widths[0] = Math.max(8, widths[0] - (total - max));
+  const widths = Array.from({ length: cols }, (_, i) => {
+    const cap = opts.cap?.[i];
+    return Math.min(Number.isFinite(cap) ? cap : 40, Math.max(...rows.map((r) => visWidth(String(r[i] ?? "")))));
+  });
+  /*
+   * 넘치면 "가장 넓은 열"을 깎는다. 예전엔 0번 열을 깎으면서 Math.max(8, …) 바닥을
+   * 뒀는데, 1칸짜리 상태 마커 열이 8칸으로 부풀어 표가 깨졌다(실측). 바닥은 4칸이고
+   * 이미 그보다 좁은 열은 건드리지 않는다.
+   */
+  let over = widths.reduce((a, b) => a + b + 2, 0) - max;
+  while (over > 0) {
+    let widest = -1;
+    widths.forEach((w, i) => { if (w > 4 && (widest < 0 || w > widths[widest])) widest = i; });
+    if (widest < 0) break;
+    const cut = Math.min(over, widths[widest] - 4);
+    widths[widest] -= cut;
+    over -= cut;
+  }
   rows.forEach((row, index) => {
     const line = row.map((cell, i) => {
       const text = truncateWidth(String(cell ?? ""), widths[i]);
@@ -214,4 +228,127 @@ function settings(ui, db, en, ctx) {
     : "여기서 불가(데스크탑 전용): 테마, 모바일 페어링 QR, 자동 업데이트, 멀티모달 프로바이더"));
 }
 
-module.exports = { dashboard, library, marketplace, settings, table };
+/* ── /projects — 데스크탑 workspace + project/detail ── */
+function projects(ui, db, en) {
+  const list = rows(db,
+    `SELECT p.id, p.name, p.folder_path, p.source_type,
+            (SELECT COUNT(*) FROM chats c WHERE c.project_id = p.id AND c.archived_at IS NULL) chats,
+            (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.archived_at IS NULL) tasks,
+            p.updated_at
+       FROM projects p ORDER BY COALESCE(p.updated_at,'') DESC`);
+  ui.ensureNl();
+  ui.line(ui.c.bold(en ? `Projects (${list.length})` : `프로젝트 (${list.length})`));
+  const cwd = process.cwd();
+  if (list.length) {
+    table(ui, [[en ? "project" : "프로젝트", en ? "source" : "소스", en ? "chats" : "채팅", en ? "tasks" : "작업", en ? "updated" : "수정"],
+      ...list.map((p) => [
+        (p.folder_path && cwd.startsWith(p.folder_path) ? "▸ " : "  ") + (p.name || p.id),
+        p.source_type || "local", String(p.chats), String(p.tasks), shortTs(p.updated_at)])],
+      { cap: [30, 10, 6, 6, 16] });
+    const here = list.find((p) => p.folder_path && cwd.startsWith(p.folder_path));
+    ui.line("");
+    ui.line(here
+      ? ui.c.dim(en ? `▸ this folder is connected to "${here.name}"` : `▸ 이 폴더는 "${here.name}"에 연결돼 있습니다`)
+      : ui.c.amber(en ? "this folder is not connected — /project use <agent>" : "이 폴더는 연결 안 됨 — /project use <에이전트>"));
+  } else {
+    ui.line(ui.c.dim(en ? "  none — /project use <agent>" : "  없음 — /project use <에이전트>"));
+  }
+  ui.line(ui.c.dim(en
+    ? "detail: /project status  ·  team: /project team <agent>…  ·  timeline lives in the project store"
+    : "상세: /project status  ·  팀: /project team <에이전트>…  ·  타임라인은 프로젝트 저장소에"));
+}
+
+/* ── /automations — 데스크탑 automation 목록+상세 ── */
+function automations(ui, db, en, ctx, arg) {
+  const name = String(arg || "").trim();
+  if (name) {
+    const a = db.prepare("SELECT * FROM automations WHERE name = ? OR id = ?").get(name, name);
+    if (!a) { ui.line(ui.c.dim(en ? `no automation named "${name}"` : `"${name}" 자동화가 없습니다`)); return; }
+    ui.ensureNl();
+    ui.line(ui.c.bold(a.name) + " " + (a.enabled ? ui.c.green("● on") : ui.c.faint("○ off")));
+    table(ui, [
+      [en ? "field" : "항목", en ? "value" : "값"],
+      [en ? "schedule" : "일정", a.schedule || (a.trigger_type || "—")],
+      [en ? "next run" : "다음 실행", shortTs(a.next_run_at) || "—"],
+      [en ? "last run" : "마지막 실행", shortTs(a.last_run_at) || "—"],
+      [en ? "runs" : "실행 횟수", String(a.run_count || 0)],
+      [en ? "target" : "대상", `${a.target_type || "—"}${a.target_id ? `:${String(a.target_id).slice(0, 20)}` : ""}`],
+      [en ? "permission" : "권한", a.execution_permission || "—"],
+      [en ? "graph" : "그래프", a.graph_json ? (en ? `yes — /graph show ${a.name}` : `있음 — /graph show ${a.name}`) : (en ? "no" : "없음")],
+    ], { cap: [16, 54] });
+    const runs = rows(db,
+      "SELECT status, started_at FROM automation_runs WHERE automation_id = ? ORDER BY COALESCE(started_at,'') DESC LIMIT 6", [a.id]);
+    if (runs.length) {
+      ui.line("");
+      ui.line(ui.c.bold(en ? "Recent runs" : "최근 실행"));
+      for (const r of runs) {
+        const mark = r.status === "ok" ? ui.c.green("✓") : r.status === "error" ? ui.c.amber("✗") : ui.c.dim("·");
+        ui.line(`  ${mark} ${r.status} ${ui.c.dim(shortTs(r.started_at))}`);
+      }
+    }
+    ui.line("");
+    ui.line(ui.c.dim(en
+      ? `run now: /automation run ${a.name}  ·  toggle: /automation ${a.enabled ? "off" : "on"} ${a.name}`
+      : `지금 실행: /automation run ${a.name}  ·  ${a.enabled ? "끄기: /automation off" : "켜기: /automation on"} ${a.name}`));
+    return;
+  }
+  const list = rows(db,
+    `SELECT a.name, a.enabled, a.schedule, a.next_run_at, a.run_count,
+            (SELECT COUNT(*) FROM automation_runs r WHERE r.automation_id = a.id AND r.status='error') fails
+       FROM automations a ORDER BY a.enabled DESC, COALESCE(a.next_run_at,'')`);
+  ui.ensureNl();
+  ui.line(ui.c.bold(en ? `Automations (${list.length})` : `자동화 (${list.length})`));
+  if (!list.length) { ui.line(ui.c.dim(en ? "  none — /automation add" : "  없음 — /automation add")); return; }
+  table(ui, [[" ", en ? "name" : "이름", en ? "schedule" : "일정", en ? "next" : "다음", en ? "runs" : "실행", en ? "fails" : "실패"],
+    ...list.map((a) => [a.enabled ? "●" : "○", a.name, a.schedule || "—",
+      shortTs(a.next_run_at) || "—", String(a.run_count || 0), a.fails ? String(a.fails) : ""])],
+    { cap: [1, 30, 14, 16, 5, 5] });
+  ui.line("");
+  ui.line(ui.c.dim(en
+    ? "detail: /automations <name>  ·  graph: /graph show <name>  ·  add: /automation add"
+    : "상세: /automations <이름>  ·  그래프: /graph show <이름>  ·  추가: /automation add"));
+  void ctx;
+}
+
+/* ── /firms — 데스크탑 firm/detail (조직도) ── */
+function firms(ui, db, en, ctx, arg) {
+  const name = String(arg || "").trim();
+  if (name) {
+    const f = db.prepare("SELECT * FROM firms WHERE slug = ? OR name = ?").get(name, name);
+    if (!f) { ui.line(ui.c.dim(en ? `no firm named "${name}"` : `"${name}" 회사가 없습니다`)); return; }
+    ui.ensureNl();
+    ui.line(ui.c.bold(f.name || f.slug) + (f.tagline ? ui.c.dim(`  ·  ${f.tagline}`) : ""));
+    let org = null;
+    try { org = JSON.parse(f.org_chart_json || "null"); } catch { org = null; }
+    const members = rows(db,
+      "SELECT slug, COALESCE(local_display_name, name) nm, role FROM installed_agents WHERE parent_team_id = ? ORDER BY role, slug", [f.id]);
+    if (members.length) {
+      ui.line("");
+      ui.line(ui.c.bold(en ? `Roster (${members.length})` : `구성원 (${members.length})`));
+      table(ui, [[en ? "slug" : "슬러그", en ? "name" : "이름", en ? "role" : "역할"],
+        ...members.map((m) => [m.slug, m.nm || "", m.role || ""])], { cap: [30, 26, 14] });
+    } else if (org) {
+      ui.line(ui.c.dim(en ? "  roster is declared in the org chart only" : "  로스터가 조직도 선언에만 있습니다"));
+    }
+    const chats = count(db, "SELECT COUNT(*) n FROM chats WHERE firm_id = ? AND archived_at IS NULL", );
+    void chats;
+    ui.line("");
+    ui.line(ui.c.dim(en ? `run: /firm ${f.slug} "<task>"` : `실행: /firm ${f.slug} "<할 일>"`));
+    return;
+  }
+  const list = rows(db,
+    `SELECT f.slug, f.name, f.tagline,
+            (SELECT COUNT(*) FROM installed_agents a WHERE a.parent_team_id = f.id) members
+       FROM firms f ORDER BY f.slug`);
+  ui.ensureNl();
+  ui.line(ui.c.bold(en ? `Firms (${list.length})` : `회사 (${list.length})`));
+  if (!list.length) { ui.line(ui.c.dim(en ? "  none" : "  없음")); return; }
+  table(ui, [[en ? "slug" : "슬러그", en ? "name" : "이름", en ? "members" : "구성원"],
+    ...list.map((f) => [f.slug, f.name || "", String(f.members)])], { cap: [30, 30, 8] });
+  ui.line("");
+  ui.line(ui.c.dim(en ? "detail: /firms <slug>" : "상세: /firms <슬러그>"));
+  void ctx;
+}
+
+module.exports = { dashboard, library, marketplace, settings, projects, automations, firms, table };
+
