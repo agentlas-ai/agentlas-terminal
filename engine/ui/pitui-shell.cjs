@@ -232,6 +232,34 @@ async function startPiShell(ctx, opts = {}) {
       ui.line(palette.renderPalette(ctx.lang));
       return;
     }
+    // 대시보드 (Phase 3-2) — 데스크탑 정직 정지 13종 중 첫 해제. 로컬 DB 직조회.
+    if (cmd === "dashboard") {
+      const chip = (paint, s) => paint(` ${s} `);
+      const agents = db.prepare(
+        "SELECT COALESCE(NULLIF(entity_kind,''),'agent') k, builtin, COUNT(*) n FROM installed_agents WHERE COALESCE(visibility,'')!='background' GROUP BY k, builtin").all();
+      const firms = db.prepare("SELECT COUNT(*) n FROM firms").get().n;
+      const autos = db.prepare(
+        "SELECT name, enabled, last_run_at FROM automations ORDER BY COALESCE(last_run_at,'') DESC LIMIT 5").all();
+      const autoTotal = db.prepare("SELECT COUNT(*) n, SUM(enabled) e FROM automations").get();
+      const tg = db.prepare("SELECT COUNT(*) n FROM telegram_bindings").get().n;
+      ui.ensureNl();
+      ui.line(ui.c.bold(en ? "Dashboard" : "대시보드"));
+      const local = agents.filter(a => !a.builtin).reduce((s, a) => s + a.n, 0);
+      const builtin = agents.filter(a => a.builtin).reduce((s, a) => s + a.n, 0);
+      ui.line(`  ${chip(ui.c.inverse, en ? `agents ${local}` : `에이전트 ${local}`)} ${chip(ui.c.dim, `builtin ${builtin}`)} ${chip(ui.c.inverse, en ? `firms ${firms}` : `회사 ${firms}`)} ${chip(ui.c.dim, `telegram ${tg}`)}`);
+      ui.line("");
+      ui.line(ui.c.bold(en ? `Automations ${autoTotal.e || 0}/${autoTotal.n} on` : `자동화 ${autoTotal.e || 0}/${autoTotal.n} 켜짐`));
+      for (const a of autos) {
+        const st = a.enabled ? ui.c.green("●") : ui.c.faint("○");
+        ui.line(`  ${st} ${a.name}${a.last_run_at ? ui.c.dim(`  ·  ${String(a.last_run_at).slice(0, 16)}`) : ""}`);
+      }
+      if (!autos.length) ui.line(ui.c.dim(en ? "  (none — /automation add)" : "  (없음 — /automation add)"));
+      ui.line("");
+      ui.line(ui.c.dim(en
+        ? "details: /agents · /automation list · /usage · /sessions"
+        : "자세히: /agents · /automation list · /usage · /sessions"));
+      return;
+    }
     // 세션 관찰/전환 (증분 2b) — 기본 REPL과 같은 orch/renderer 배선
     if (cmd === "sessions" || cmd === "tree") {
       require("./repl.cjs").printSessions(shellCtx, orch);

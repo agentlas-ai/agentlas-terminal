@@ -24,6 +24,7 @@ const SLASH_COMMANDS = [
   { command: "/graph", args: "[run <이름>]", ko: "저장된 자동화 그래프", en: "Saved automation graphs" },
   { command: "/mcp", args: "", ko: "MCP 서버 목록", en: "MCP servers" },
   { command: "/doctor", args: "", ko: "런타임·데이터 점검", en: "Health check" },
+  { command: "/dashboard", args: "", ko: "관제 대시보드 (pi 셸)", en: "Dashboard (pi shell)" },
   { command: "/runtime", args: "<kind>", ko: "새 세션 런타임 지정", en: "Set runtime for new sessions" },
   { command: "/model", args: "<id|default>", ko: "새 세션 모델 지정", en: "Set model for new sessions" },
   { command: "/effort", args: "<level|none>", ko: "새 세션 추론 강도 지정", en: "Set effort for new sessions" },
