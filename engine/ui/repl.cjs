@@ -86,14 +86,6 @@ function pickProjectController(db, cwd = process.cwd()) {
 }
 
 async function startRepl(ctx, opts = {}) {
-  /*
-   * 실험 셸 opt-in (D3 Phase 2 증분 1): AGENTLAS_TUI=pi + TTY 일 때만.
-   * 기본 REPL 이 정본이며, 온보딩 전(prefs.onboarded=false)에는 켜지 않는다 —
-   * 마법사는 아직 readline 계약이다(Phase 2-2 에서 이전).
-   */
-  if (process.env.AGENTLAS_TUI === "pi" && process.stdin.isTTY && ctx.prefs && ctx.prefs.onboarded) {
-    return require("./pitui-shell.cjs").startPiShell(ctx, opts);
-  }
   // 마법사가 언어를 바꾸면 이 뒤의 문구도 따라가야 한다 — 아래 온보딩 블록에서 갱신한다.
   let en = ctx.lang === "en";
   const ui = ctx.uiInstance;
@@ -132,6 +124,14 @@ async function startRepl(ctx, opts = {}) {
     }
   }
 
+  /*
+   * 실험 셸 opt-in (D3 Phase 2): AGENTLAS_TUI=pi + TTY.
+   * 온보딩 마법사(위 readline 블록)가 먼저 끝난 뒤 진입한다 — 순차 실행이라
+   * stdin 경합이 없고, 첫 실행 사용자도 pi 셸을 쓸 수 있다(증분 2c).
+   */
+  if (process.env.AGENTLAS_TUI === "pi" && process.stdin.isTTY) {
+    return require("./pitui-shell.cjs").startPiShell(ctx, opts);
+  }
   const orch = new Orchestrator({ db, lang: ctx.lang });
   const renderer = new Renderer(ui);
   let permission = permissions.normalize(opts.permission || (ctx.prefs && ctx.prefs.permission) || "write");

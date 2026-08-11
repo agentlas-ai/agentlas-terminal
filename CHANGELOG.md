@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.40 — 2026-08-11
+
+Desktop surfaces reach the pi shell: dashboard and graph view.
+
+- `/dashboard` (pi shell): agents/firms/telegram badges + automations panel
+  (enabled state, last run) from the local store — first of the thirteen
+  Desktop-only honest stops to be lifted.
+- `/graph show <name>` (pi shell): the automation graph renders as Unicode
+  box art (grok-mermaid) — condition branches, loop-back edges, and Korean
+  labels align correctly. No canvas emulation; editing stays declarative.
+- First-run onboarding now runs before the pi shell starts (sequential
+  readline → pi-tui, no stdin contention), so `AGENTLAS_TUI=pi` works for
+  brand-new installs too.
+
 ## 1.0.39 — 2026-08-11
 
 pi-tui shell increment 2 + architecture mirror sync.

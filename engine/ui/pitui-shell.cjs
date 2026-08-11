@@ -232,6 +232,34 @@ async function startPiShell(ctx, opts = {}) {
       ui.line(palette.renderPalette(ctx.lang));
       return;
     }
+    // 그래프 보기 (Phase 4) — 캔버스를 흉내내지 않는다: mermaid → 유니코드 박스 아트.
+    if (cmd === "graph" && rest[0] === "show" && rest[1]) {
+      const name = rest.slice(1).join(" ");
+      const row = db.prepare(
+        "SELECT name, graph_json FROM automations WHERE name = ? AND graph_json IS NOT NULL").get(name);
+      if (row) {
+        try {
+          const g = JSON.parse(row.graph_json);
+          const esc = (s) => String(s || "").replace(/["[\]{}|<>]/g, " ").trim().slice(0, 28) || "·";
+          const lines = ["flowchart TD"];
+          for (const n of g.nodes || []) {
+            const label = esc(n.label || n.id);
+            lines.push(n.type === "condition" ? `  ${n.id}{${label}}` : `  ${n.id}[${label}]`);
+          }
+          for (const e of g.edges || []) {
+            const lbl = e.sourceHandle === "true" ? "|참|" : e.sourceHandle === "false" ? "|거짓|" : "";
+            lines.push(`  ${e.source} -->${lbl} ${e.target}`);
+          }
+          const { render, toAnsi } = require("grok-mermaid");
+          const art = toAnsi(render(lines.join("\n")));
+          ui.ensureNl();
+          ui.line(ui.c.bold(row.name));
+          for (const rowLine of (Array.isArray(art) ? art : String(art).split("\n"))) ui.line(rowLine);
+          ui.line("");
+          return;
+        } catch { /* 렌더 실패 → 아래 클래식 폴스루가 텍스트로 보여준다 */ }
+      }
+    }
     // 대시보드 (Phase 3-2) — 데스크탑 정직 정지 13종 중 첫 해제. 로컬 DB 직조회.
     if (cmd === "dashboard") {
       const chip = (paint, s) => paint(` ${s} `);
