@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.39 — 2026-08-11
+
+pi-tui shell increment 2 + architecture mirror sync.
+
+- Experimental pi shell (`AGENTLAS_TUI=pi`): persisted history (cli-history.json
+  v2 contract), Shift-Tab permission cycling (same two-step FULL arming state
+  machine as the classic REPL), `!` shell passthrough (full-permission gate,
+  secret masking), and `/s` `/switch` `/kill` `/rm` `/sessions` `/tree` session
+  observation wired to the same orchestrator/renderer pair.
+- Streaming display masks the Memory Events envelope (runtime contract, not
+  user-facing text); the harvest pipeline is unchanged.
+- ARCHITECTURE_VERSION mirror synced 1.7.0 → 1.7.1 (vendor regenerated from
+  the desktop dist, value-level parity gate green).
+
 ## 1.0.38 — 2026-08-11
 
 Silence was the worst failure mode — this release makes failures speak.
