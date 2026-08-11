@@ -101,7 +101,13 @@ class PiUi extends Ui {
     if (!text) return;
     if (!this._md) this.streamStart();
     this._mdText += String(text);
-    this._md.setText(this._mdText);
+    /*
+     * Memory Events 봉투는 런타임 계약(펜스 파이프라인이 수확)이지 사용자용이 아니다.
+     * append-only 기본 REPL은 이미 찍힌 봉투를 지울 수 없지만, 누적 재렌더는
+     * 표시만 잘라낼 수 있다 — 수확 경로(st.text/fences)는 건드리지 않는다.
+     */
+    const visible = this._mdText.replace(/\n#{1,3} Memory Events\b[\s\S]*$/, "\n");
+    this._md.setText(visible);
     this._tui.requestRender();
     this._streaming = true;
   }
