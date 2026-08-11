@@ -786,4 +786,4 @@ function handleSlash(ctx, cmdline, api) {
   }
 }
 
-module.exports = { startRepl, printSessions, createPermissionShortcut };
+module.exports = { startRepl, printSessions, createPermissionShortcut, runShell };

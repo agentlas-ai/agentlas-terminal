@@ -232,6 +232,26 @@ async function startPiShell(ctx, opts = {}) {
       ui.line(palette.renderPalette(ctx.lang));
       return;
     }
+    // 세션 관찰/전환 (증분 2b) — 기본 REPL과 같은 orch/renderer 배선
+    if (cmd === "sessions" || cmd === "tree") {
+      require("./repl.cjs").printSessions(shellCtx, orch);
+      return;
+    }
+    if (cmd === "s" || cmd === "switch" || cmd === "kill" || cmd === "rm") {
+      const token = rest[0];
+      if (!token) { ui.line(ui.c.dim(`Usage: /${cmd} <n>`)); return; }
+      const key = String(token).startsWith("s") ? token : `s${token}`;
+      if (cmd === "kill") { orch.kill(key); return; }
+      if (cmd === "rm") {
+        orch.remove(key);
+        const act = orch.active();
+        if (act) renderer.attach(act, { replay: false });
+        return;
+      }
+      const session = orch.setActive(key);
+      renderer.attach(session, { replay: true });
+      return;
+    }
     const EXCLUDED = new Set(["firm", "setup", "run"]);
     if (!EXCLUDED.has(cmd) && commands.COMMANDS[cmd]) {
       await commands.COMMANDS[cmd]().run(shellCtx, rest);
@@ -254,6 +274,11 @@ async function startPiShell(ctx, opts = {}) {
     ui.ensureNl();
     ui.line(ui.c.emerald("› ") + ui.c.text(input));
     (async () => {
+      if (input.startsWith("!")) {
+        await require("./repl.cjs").runShell(shellCtx, input.slice(1).trim(), permission)
+          .catch((e) => { if (e && (e.code || e.honestStop)) ui.error(e); else ui.error(); });
+        return;
+      }
       if (input.startsWith("/")) {
         const verdict = await handleSlash(input.slice(1)).catch((e) => {
           if (e && (e.code || e.honestStop)) ui.error(e);
