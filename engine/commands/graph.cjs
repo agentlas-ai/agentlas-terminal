@@ -153,8 +153,8 @@ function listGraphs(ctx) {
   }
   ctx.out("");
   ctx.out(ctx.ui.dim(en
-    ? "Run one with: agentlas graph run \"<name>\""
-    : "실행하려면: agentlas graph run \"<이름>\""));
+    ? `Run one with: ${ctx.surface === "shell" ? "/graph" : "agentlas graph run \"<name>\""}`
+    : `실행하려면: ${ctx.surface === "shell" ? "/graph" : "agentlas graph run \"<이름>\""}`));
   return 0;
 }
 
@@ -278,12 +278,11 @@ function graphProblems(graph, en) {
 /** 노드 한 줄. 무엇인지, 바깥을 바꾸는지, 어떤 값을 만들고 쓰는지. */
 function nodeLine(ctx, node, en) {
   const effect = node.config?.effect;
-  const approval = node.config?.approval;
+  // ★승인 게이트 폐지(오너 이사회 결정 2026-08-10) — 데스크탑 커널은 실행 중에 멈춰
+  //   묻지 않는다. "확인 후 실행" 표시는 거짓이므로 없앴다. 옛 그래프의 approval
+  //   선언이 남아 있어도 마찬가지다. 사실 그대로의 고지는 "바깥을 바꿈" 하나다.
   const marks = [
     effect === "mutation" ? (en ? "changes things outside" : "바깥을 바꿈") : null,
-    approval === "ask" || (effect === "mutation" && approval !== "auto")
-      ? (en ? "asks first" : "확인 후 실행")
-      : null,
     node.config?.consumes ? `${en ? "uses" : "사용"} {{${node.config.consumes}}}` : null,
     node.config?.produces ? `${en ? "makes" : "생성"} {{${node.config.produces}}}` : null,
   ].filter(Boolean);
@@ -470,7 +469,9 @@ async function runGraph(ctx, needle, flags) {
   if (row?.ambiguous) { reportAmbiguous(ctx, needle, row.ambiguous, en); return 1; }
   if (!row) {
     ctx.err(en ? `No graph matches "${needle}".` : `"${needle}"와 맞는 그래프가 없습니다.`);
-    ctx.err(en ? "See what is saved with: agentlas graph list" : "저장된 목록: agentlas graph list");
+    ctx.err(en
+      ? `See what is saved with: ${ctx.surface === "shell" ? "/graph" : "agentlas graph list"}`
+      : `저장된 목록: ${ctx.surface === "shell" ? "/graph" : "agentlas graph list"}`);
     return 1;
   }
   const graph = parseGraph(row);
@@ -746,7 +747,11 @@ async function newGraph(ctx, request, flags) {
     const mutations = built.graph.nodes.filter((n) => n.config && n.config.effect === "mutation");
     if (mutations.length) {
       ctx.out("");
-      ctx.out(en ? "Steps that go outside (locked to ask first):" : "바깥으로 나가는 단계 (실행 전에 확인하도록 잠급니다):");
+      // ★사실 그대로의 고지 — 이 단계들은 실행 중에 멈춰 묻지 않는다(승인 게이트 폐지,
+      //   오너 이사회 결정 2026-08-10). "잠근다"는 거짓말 대신 무엇이 나가는지를 알린다.
+      ctx.out(en
+        ? "Steps that change things outside (they run without stopping to ask):"
+        : "바깥을 바꾸는 단계 (실행 중에 멈춰 묻지 않습니다):");
       for (const n of mutations) ctx.out(`  · ${n.label}`);
     }
     ctx.out("");
@@ -1077,9 +1082,10 @@ function installPackage(ctx, filePath, flags = {}) {
   if (mutations.length) {
     ctx.out(en ? "It changes things outside at:" : "바깥을 바꾸는 지점:");
     for (const m of mutations) ctx.out(`  · ${m.label}`);
+    // ★승인 게이트 폐지(2026-08-10) — "멈추고 묻는다"는 거짓말이었다. 사실만 말한다.
     ctx.out(ctx.ui.dim(en
-      ? "Those steps stop and ask before they run unless you set them to automatic."
-      : "그 단계들은 자동 허용으로 바꾸지 않는 한 실행 전에 멈추고 묻습니다."));
+      ? "Those steps do not stop to ask — once this is switched on, they really change things outside."
+      : "그 단계들은 실행 중에 멈춰 묻지 않습니다 — 켜면 실제로 바깥을 바꿉니다."));
   }
   ctx.out(ctx.ui.dim(en
     ? "Nothing runs until you switch it on. The desktop app can simulate it first — the terminal cannot."

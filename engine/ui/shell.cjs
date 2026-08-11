@@ -202,6 +202,8 @@ async function startShell(ctx, opts = {}) {
   // ctx 초크포인트 재지정 — 55파일의 ctx.out 직출력이 전부 프레임 안으로 들어온다.
   const shellCtx = {
     ...ctx,
+    // 명령이 "지금 사용자가 어디에 서 있는지"를 알아야 안내를 옳게 쓴다.
+    surface: "shell",
     uiInstance: ui,
     out: (s = "") => ui.line(String(s)),
     err: (s = "") => ui.line(ui.c.amber(String(s))),
@@ -295,6 +297,38 @@ async function startShell(ctx, opts = {}) {
     onMessage: (msg) => { ui.ensureNl(); ui.line(ui.c.dim(msg.text)); },
   });
 
+  /*
+   * 목록 피커 — 슬러그를 손으로 받아치게 하지 않는다(오너 지적).
+   * SelectList 는 Focusable 이 아니라 포커스로는 키가 안 온다(Loader 와 같은 함정) —
+   * 전역 리스너에서 직접 forward 하고, 뜨는 동안 에디터 입력을 막는다.
+   */
+  let activePicker = null;
+  function pick(items, opts = {}) {
+    return new Promise((resolve) => {
+      if (!items.length) { resolve(null); return; }
+      ui.ensureNl();
+      if (opts.title) ui.line(ui.c.bold(opts.title));
+      ui.line(ui.c.dim(en
+        ? "↑/↓ choose · Enter confirm · Esc cancel"
+        : "↑/↓ 이동 · Enter 선택 · Esc 취소"));
+      const list = new pi.SelectList(items, Math.min(10, items.length), editorTheme.selectList, {});
+      const finish = (value) => {
+        if (activePicker !== list) return;
+        activePicker = null;
+        bottom.removeChild(list);
+        tui.setFocus(editor);
+        tui.requestRender();
+        resolve(value);
+      };
+      list.onSelect = (item) => finish(item);
+      list.onCancel = () => finish(null);
+      activePicker = list;
+      bottom.addChild(list);
+      tui.setFocus(null);
+      tui.requestRender();
+    });
+  }
+
   const commands = require("../commands/index.cjs");
   const handleSlash = async (cmdline) => {
     const raw = cmdline.split(/\s+/)[0] || "";
@@ -339,6 +373,69 @@ async function startShell(ctx, opts = {}) {
         } catch { /* 렌더 실패 → 아래 클래식 폴스루가 텍스트로 보여준다 */ }
       }
     }
+    /*
+     * /search — 결과를 목록으로 띄우고 방향키로 고른다. 슬러그를 손으로 받아치게
+     * 하지 않는다(오너 지적). 고르면 바로 설치까지 간다.
+     *
+     * kind 는 서버 열거값을 그대로 보여주지 않는다. "cloud-callable" 은 사용자에게
+     * "설치 안 해도 바로 부를 수 있음"이라는 뜻이지, 설치가 안 된다는 뜻이 아니다.
+     */
+    if (cmd === "search" && rest.length) {
+      const query = rest.join(" ");
+      const { callHubTool, HubError } = require("../cloud/hub-client.cjs");
+      let result;
+      ui.updateSpinner(en ? "Searching the Hub…" : "Hub 검색 중…");
+      try {
+        result = await callHubTool("marketplace.search_agents", { q: query, query, limit: 12 });
+      } catch (e) {
+        ui.stopSpinner();
+        ui.error(Object.assign(new Error(e instanceof HubError ? e.message : String((e && e.message) || e)),
+          { code: "hub_search_failed", honestStop: true }));
+        return;
+      }
+      ui.stopSpinner();
+      const raw = (result && (result.results || result.agents || result.items)) || (Array.isArray(result) ? result : []);
+      const hidden = (slug) => /^researcher-\d+/.test(String(slug || "").toLowerCase())
+        || String(slug || "").toLowerCase().startsWith("hephaestus-");
+      const rows = (Array.isArray(raw) ? raw : []).filter((it) => !hidden(it && (it.slug || it.id)));
+      if (!rows.length) { ui.line(ui.c.dim(en ? `No results for "${query}"` : `"${query}" 결과 없음`)); return; }
+      const callable = (k) => (String(k || "").includes("cloud")
+        ? (en ? "callable without installing" : "설치 없이 호출 가능")
+        : (en ? "install to use" : "설치해야 사용"));
+      const chosen = await pick(rows.map((it) => ({
+        value: it.slug || it.id || "?",
+        label: `${it.slug || it.id}`,
+        description: `${it.name || it.title || ""} — ${callable(it.kind || it.entity_kind)}`,
+      })), { title: en ? `Hub results for "${query}"` : `"${query}" Hub 결과` });
+      if (!chosen) { ui.line(ui.c.dim(en ? "cancelled" : "취소됨")); return; }
+      ui.line(ui.c.dim(en ? `installing ${chosen.value}…` : `${chosen.value} 설치 중…`));
+      await commands.COMMANDS.install().run(shellCtx, [chosen.value]);
+      return;
+    }
+
+    /*
+     * /graph — 저장된 그래프를 목록으로 띄우고 고른 것을 실행한다.
+     * (저장 테이블 이름은 automations 이지만 이 화면이 다루는 건 그래프다.)
+     */
+    if (cmd === "graph" && (!rest.length || rest[0] === "list")) {
+      const rowsOf = db.prepare("SELECT name, enabled, schedule, graph_json FROM automations ORDER BY name").all();
+      const graphs = rowsOf.filter((r) => r.graph_json);
+      if (!graphs.length) { ui.line(ui.c.dim(en ? "No saved graphs yet." : "저장된 그래프가 없습니다.")); return; }
+      const chosen = await pick(graphs.map((g) => {
+        let steps = 0;
+        try { steps = (JSON.parse(g.graph_json).nodes || []).length; } catch { steps = 0; }
+        return {
+          value: g.name,
+          label: g.name,
+          description: `${steps} ${en ? "steps" : "단계"} · ${g.enabled ? (en ? "on" : "켜짐") : (en ? "off" : "꺼짐")}`
+            + (g.schedule ? ` · ${g.schedule}` : ""),
+        };
+      }), { title: en ? "Saved graphs" : "저장된 그래프" });
+      if (!chosen) { ui.line(ui.c.dim(en ? "cancelled" : "취소됨")); return; }
+      await commands.COMMANDS.graph().run(shellCtx, ["run", chosen.value]);
+      return;
+    }
+
     /*
      * 세션 설정 4종. 자동완성은 되는데 처리 case 가 없어 "여기서는 아직 안 됩니다"만
      * 답하던 죽은 광고였다(신설 게이트가 잡았다). 기본 REPL 과 같은 의미로 배선하고,
@@ -474,6 +571,13 @@ async function startShell(ctx, opts = {}) {
   };
 
   tui.addInputListener((data) => {
+    // 피커가 떠 있으면 그 키는 피커 것이다 — 에디터로 새면 목록 위에서 글이 써진다.
+    if (activePicker) {
+      if (pi.matchesKey(data, "escape")) { activePicker.onCancel && activePicker.onCancel(); return { handled: true }; }
+      activePicker.handleInput(data);
+      tui.requestRender();
+      return { handled: true };
+    }
     // Shift-Tab 권한 순환 — 렌더러가 raw mode 를 단독 소유하므로 readline 의
     // swallowCompletion 우회 없이 여기서 직접 소비한다 (D2 위험 2의 해소 형태).
     if (pi.matchesKey(data, "shift+tab")) {

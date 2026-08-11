@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.46 — 2026-08-11
+
+Pick from a list instead of retyping a slug.
+
+- `/search` in the shell now shows its results as a list you move through with the
+  arrow keys; Enter installs the one you chose. `/graph` does the same and runs the
+  graph you pick. Escape cancels either.
+- Search results say what the listing actually means for you — "callable without
+  installing" or "install to use" — rather than repeating the server's own enum.
+- Commands now know which surface you are standing on, so the next step they print is
+  one you can actually type there. Inside the shell, `search` ends with `/install <slug>`
+  instead of `agentlas install <slug>`, which the shell would have refused.
+
 ## 1.0.45 — 2026-08-11
 
 The command surface was rebuilt from one catalog, and failures stopped printing JSON.

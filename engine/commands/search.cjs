@@ -48,7 +48,12 @@ async function run(ctx, args) {
     ctx.out(`${ctx.ui.accent(String(slug).padEnd(34).slice(0, 34))} ${String(name).slice(0, 26).padEnd(27)} ${ctx.ui.dim(String(kind).padEnd(14))} ${String(tagline).slice(0, 60)}`);
   }
   ctx.out("");
-  ctx.out(ctx.ui.dim("Install: agentlas install <slug>"));
+  /*
+   * 안내는 사용자가 서 있는 표면에서 실제로 칠 수 있는 형태여야 한다. 셸 안에서
+   * "agentlas install"을 안내하면 그대로 따라 쳤을 때 "여기서는 안 됩니다"가 나온다
+   * (오너 실측: /agentlas install → not available here yet).
+   */
+  ctx.out(ctx.ui.dim(ctx.surface === "shell" ? "Install: /install <slug>" : "Install: agentlas install <slug>"));
   return 0;
 }
 
