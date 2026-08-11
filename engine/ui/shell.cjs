@@ -288,6 +288,19 @@ async function startShell(ctx, opts = {}) {
         } catch { /* 렌더 실패 → 아래 클래식 폴스루가 텍스트로 보여준다 */ }
       }
     }
+    // 셸 끄기 — 여기서도 되돌아갈 수 있어야 한다(들어와서 못 나가면 갇힌다)
+    if (cmd === "shell") {
+      const want = String(rest[0] || "").toLowerCase();
+      if (!["on", "off"].includes(want)) { ui.line(ui.c.dim("Usage: /shell on|off   (현재: on)")); return; }
+      const config = require("../agentlas-config.cjs");
+      const { userDataDir } = require("../core/paths.cjs");
+      config.updatePrefs(userDataDir(), { shell: want === "on" ? "interactive" : "classic" });
+      ui.line(ui.c.dim(want === "on"
+        ? (en ? "Already here." : "이미 이 셸입니다.")
+        : (en ? "Interactive shell disabled — restart agentlas for the classic REPL."
+              : "대화형 셸을 껐습니다 — agentlas 를 다시 실행하면 기본 REPL 입니다.")));
+      return;
+    }
     // 데스크탑 대응 화면 (Phase 3) — 정직 정지였던 표면들을 실물로 대체
     {
       const screens = require("./screens.cjs");

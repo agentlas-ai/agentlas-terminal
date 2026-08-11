@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.44 — 2026-08-11
+
+Turn the interactive shell on once and keep it.
+
+- `/shell on` saves the choice, so plain `agentlas` opens the interactive shell
+  from then on; `/shell off` returns to the classic REPL. Both shells accept the
+  command, so you can always get back out.
+- `AGENTLAS_TUI=1` still works and takes precedence for a single run.
+
 ## 1.0.43 — 2026-08-11
 
 Zero runtime dependencies. The renderer now lives in this repository.
