@@ -202,6 +202,26 @@ async function startPiShell(ctx, opts = {}) {
   const editor = new pi.Editor(tui, editorTheme, { autocompleteMaxVisible: 8 });
   editor.setAutocompleteProvider(new pi.CombinedAutocompleteProvider(toSlashCommands(ctx.lang), process.cwd()));
 
+  // ── 히스토리 디스크 영속 (증분 2) — cli-history.json v2 계약을 그대로 재사용 ──
+  const input = require("../agentlas-input.cjs");
+  const historyLedger = (() => { try { return input.loadHistory(process.cwd()); } catch { return []; } })();
+  // readline 히스토리는 최신-우선 배열 — Editor에는 과거→최신 순으로 먹인다.
+  for (const entry of [...historyLedger].reverse()) editor.addToHistory(entry);
+  const recordHistory = (line) => {
+    historyLedger.unshift(line);
+    if (historyLedger.length > input.HISTORY_MAX) historyLedger.length = input.HISTORY_MAX;
+    try { input.saveHistory(historyLedger, process.cwd()); } catch { /* 히스토리는 최선노력 */ }
+  };
+
+  // ── Shift-Tab 권한 순환 (증분 2) — repl의 순수 상태기계를 그대로 재사용 ──
+  const { createPermissionShortcut } = require("./repl.cjs");
+  const permShortcut = createPermissionShortcut({
+    lang: ctx.lang,
+    getPermission: () => permission,
+    setPermission: (level) => { permission = level; },
+    onMessage: (msg) => { ui.ensureNl(); ui.line(ui.c.dim(msg.text)); },
+  });
+
   const commands = require("../commands/index.cjs");
   const handleSlash = async (cmdline) => {
     const raw = cmdline.split(/\s+/)[0] || "";
@@ -229,6 +249,7 @@ async function startPiShell(ctx, opts = {}) {
     const input = String(text || "").trim();
     if (!input) return;
     editor.addToHistory(input);
+    recordHistory(input);
     editor.setText("");
     ui.ensureNl();
     ui.line(ui.c.emerald("› ") + ui.c.text(input));
@@ -265,6 +286,13 @@ async function startPiShell(ctx, opts = {}) {
   };
 
   tui.addInputListener((data) => {
+    // Shift-Tab 권한 순환 — pi-tui 가 raw mode 를 단독 소유하므로 readline 의
+    // swallowCompletion 우회 없이 여기서 직접 소비한다 (D2 위험 2의 해소 형태).
+    if (pi.matchesKey(data, "shift+tab")) {
+      permShortcut.handleKey("", { name: "tab", shift: true });
+      return { handled: true };
+    }
+    if (permShortcut.armed()) permShortcut.handleKey("", { name: "other" }); // 다른 키 = 무장 해제
     if (pi.matchesKey(data, "ctrl+c")) {
       const active = orch.active();
       if (active && active.isBusy()) {
