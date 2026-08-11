@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.0.41 — 2026-08-11
+
+Desktop surfaces, measured against the desktop inventory and rebuilt for the terminal.
+
+- `/dashboard` now mirrors the desktop control panel: a **Needs attention**
+  section (waiting approvals and runs that stalled without a terminal state),
+  run activity that states failures out loud (e.g. "8/11 failed" rather than a
+  quiet list), automations with next-run times, most-used agents, and evolution
+  proposal counts.
+- `/library` — installed agents with role/kind, MCP server count, and pointers
+  to env, credentials, and plugins.
+- `/marketplace` (also `/bookmarks`) — Hub bookmarks and borrowed-agent careers
+  held locally, with search/install/credit pointers.
+- `/settings` — language, permission, active runtime, installed CLIs, and the
+  resolved orchestrator/worker model roles; names what remains Desktop-only
+  instead of implying parity.
+- Those five honest stops now point at the pi shell instead of claiming the
+  surface is unreachable from the terminal.
+
 ## 1.0.40 — 2026-08-11
 
 Desktop surfaces reach the pi shell: dashboard and graph view.

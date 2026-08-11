@@ -93,13 +93,13 @@ const DESKTOP_ONLY_SURFACES = {
   trex: "T-rex slide studio is Desktop-only.",
   slides: "T-rex slide studio is Desktop-only.",
   prompts: "Prompt Store is Desktop-only.",
-  dashboard: "Dashboard is Desktop-only — use: agentlas doctor · usage · list",
-  marketplace: "Marketplace browsing is Desktop-only — use: agentlas search \"<what you need>\"",
-  library: "Library is Desktop-only — use: agentlas list · env · mcp",
-  settings: "Settings UI is Desktop-only — use: agentlas setup · env · creds · multimodal · doctor",
+  dashboard: "Dashboard: run `AGENTLAS_TUI=pi agentlas` then /dashboard — or: agentlas doctor · usage · list",
+  marketplace: "Hub view: run `AGENTLAS_TUI=pi agentlas` then /marketplace — or: agentlas search \"<what you need>\"",
+  library: "Library: run `AGENTLAS_TUI=pi agentlas` then /library — or: agentlas list · env · mcp",
+  settings: "Settings: run `AGENTLAS_TUI=pi agentlas` then /settings — change with: agentlas setup · env · creds · multimodal",
   apps: "Apps surface is Desktop-only.",
   quests: "Quests are Desktop-only.",
-  bookmarks: "Hub bookmarks are Desktop-only.",
+  bookmarks: "Hub bookmarks: run `AGENTLAS_TUI=pi agentlas` then /marketplace.",
   one: "Agentlas One is a separate Desktop/Mobile product surface.",
 };
 

@@ -127,13 +127,30 @@ class PiUi extends Ui {
   }
 }
 
+/*
+ * pi 셸 전용 화면 (D3 Phase 3). 공용 팔레트(ui/palette)에는 넣지 않는다 —
+ * 그 정본은 기본 REPL 이 실제로 처리하는 명령만 광고해야 하고,
+ * palette-command-coverage-contract 가 그 계약을 잠근다.
+ */
+const PI_SCREENS = [
+  { name: "dashboard", ko: "관제 대시보드 — 확인 필요·실행 활동·자동화", en: "Dashboard — attention, run activity, automations" },
+  { name: "library", ko: "라이브러리 — 에이전트·MCP", en: "Library — agents, MCP" },
+  { name: "marketplace", ko: "Hub — 북마크·대여 현황", en: "Hub — bookmarks and borrows" },
+  { name: "settings", ko: "설정 현황", en: "Settings overview" },
+];
+
 function toSlashCommands(lang) {
   // 팔레트 정본 → pi-tui SlashCommand. "/" 접두는 pi-tui 가 관리하므로 벗긴다.
-  return palette.SLASH_COMMANDS.map((cmd) => ({
+  const base = palette.SLASH_COMMANDS.map((cmd) => ({
     name: cmd.command.slice(1),
     description: lang === "ko" ? cmd.ko : cmd.en,
     argumentHint: cmd.args || undefined,
   }));
+  const seen = new Set(base.map((c) => c.name));
+  for (const s of PI_SCREENS) {
+    if (!seen.has(s.name)) base.push({ name: s.name, description: lang === "ko" ? s.ko : s.en });
+  }
+  return base;
 }
 
 async function startPiShell(ctx, opts = {}) {
@@ -260,33 +277,17 @@ async function startPiShell(ctx, opts = {}) {
         } catch { /* 렌더 실패 → 아래 클래식 폴스루가 텍스트로 보여준다 */ }
       }
     }
-    // 대시보드 (Phase 3-2) — 데스크탑 정직 정지 13종 중 첫 해제. 로컬 DB 직조회.
-    if (cmd === "dashboard") {
-      const chip = (paint, s) => paint(` ${s} `);
-      const agents = db.prepare(
-        "SELECT COALESCE(NULLIF(entity_kind,''),'agent') k, builtin, COUNT(*) n FROM installed_agents WHERE COALESCE(visibility,'')!='background' GROUP BY k, builtin").all();
-      const firms = db.prepare("SELECT COUNT(*) n FROM firms").get().n;
-      const autos = db.prepare(
-        "SELECT name, enabled, last_run_at FROM automations ORDER BY COALESCE(last_run_at,'') DESC LIMIT 5").all();
-      const autoTotal = db.prepare("SELECT COUNT(*) n, SUM(enabled) e FROM automations").get();
-      const tg = db.prepare("SELECT COUNT(*) n FROM telegram_bindings").get().n;
-      ui.ensureNl();
-      ui.line(ui.c.bold(en ? "Dashboard" : "대시보드"));
-      const local = agents.filter(a => !a.builtin).reduce((s, a) => s + a.n, 0);
-      const builtin = agents.filter(a => a.builtin).reduce((s, a) => s + a.n, 0);
-      ui.line(`  ${chip(ui.c.inverse, en ? `agents ${local}` : `에이전트 ${local}`)} ${chip(ui.c.dim, `builtin ${builtin}`)} ${chip(ui.c.inverse, en ? `firms ${firms}` : `회사 ${firms}`)} ${chip(ui.c.dim, `telegram ${tg}`)}`);
-      ui.line("");
-      ui.line(ui.c.bold(en ? `Automations ${autoTotal.e || 0}/${autoTotal.n} on` : `자동화 ${autoTotal.e || 0}/${autoTotal.n} 켜짐`));
-      for (const a of autos) {
-        const st = a.enabled ? ui.c.green("●") : ui.c.faint("○");
-        ui.line(`  ${st} ${a.name}${a.last_run_at ? ui.c.dim(`  ·  ${String(a.last_run_at).slice(0, 16)}`) : ""}`);
-      }
-      if (!autos.length) ui.line(ui.c.dim(en ? "  (none — /automation add)" : "  (없음 — /automation add)"));
-      ui.line("");
-      ui.line(ui.c.dim(en
-        ? "details: /agents · /automation list · /usage · /sessions"
-        : "자세히: /agents · /automation list · /usage · /sessions"));
-      return;
+    // 데스크탑 대응 화면 (Phase 3) — 정직 정지였던 표면들을 실물로 대체
+    {
+      const screens = require("./pitui-screens.cjs");
+      const SCREEN = {
+        dashboard: screens.dashboard,
+        library: screens.library,
+        marketplace: screens.marketplace,
+        bookmarks: screens.marketplace,
+        settings: screens.settings,
+      };
+      if (SCREEN[cmd]) { SCREEN[cmd](ui, db, en, shellCtx); return; }
     }
     // 세션 관찰/전환 (증분 2b) — 기본 REPL과 같은 orch/renderer 배선
     if (cmd === "sessions" || cmd === "tree") {
