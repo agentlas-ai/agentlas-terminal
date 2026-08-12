@@ -2450,6 +2450,21 @@ const TRANSIENT_MODEL_ERROR_RE = /Connection closed mid-response|"terminal_reaso
       }
       return value;
     })();
+    // 후보 검색 인자는 **여기 한 곳**에서만 만든다. hubStage 는 보낸 인자 객체로
+    // requestDigest 를 계산하고 supersedeCandidateSearch 는 같은 값을 다시 만들어
+    // 행을 찾으므로, 두 곳이 어긋나면 supersession 이 조용히 실패한다(sourceScope
+    // 추가 때 한 번, fullDossier 추가 때 또 한 번 실측으로 깨졌다).
+    //
+    // fullDossier: 이 루프의 검증기는 legacy full-echo 계약이다 —
+    // validateCandidateSet 이 packageHash·contentDigest·qualificationEvidence 와
+    // semanticSnapshot.produces/consumes 를 필수로 요구하고(assertExactKeys),
+    // 준비된 번들의 핀을 candidate.packageHash/contentDigest 와 직접 대조한다
+    // (execution_bundle_digest_mismatch). 감사용 필드가 아니라 실행 검증에 쓰이는
+    // 필수값이므로 메뉴 투영으로 대체할 수 없다. 로컬 Core 경로는 이미 같은 이유로
+    // 이 값을 싣는다(workforce/local-core-transport.cjs). 서버 기본값에 의존하면
+    // 기본값이 메뉴로 바뀌는 순간 이 표면이 candidate_set_invalid 로 전멸한다.
+    // 모르는 인자는 무시되므로 투영 이전 서버에도 안전하다.
+    const candidateSearchArgs = (workOrder) => ({ workOrder, sourceScope, fullDossier: true });
     const ui = ctx.ui || newUi();
     const runtime = ctx.runtime || D.resolveRuntime(db, ctx.runtimeOverride);
     const cwd = ctx.cwd || (typeof D.projectCwd === "function" ? D.projectCwd() : process.cwd());
@@ -2801,9 +2816,11 @@ const TRANSIENT_MODEL_ERROR_RE = /Connection closed mid-response|"terminal_reaso
     };
 
     const supersedeCandidateSearch = (workOrder, refinementNumber, triggerKind) => {
-      // hubStage가 저장한 requestDigest와 같은 인자 모양이어야 행을 찾는다 —
-      // search 인자에 sourceScope가 실리므로(2026-08-05) 여기서도 함께 계산한다.
-      const requestDigest = sha256({ workOrder, sourceScope });
+      // hubStage가 저장한 requestDigest와 **같은 인자 객체**여야 행을 찾는다.
+      // 이 다이제스트를 손으로 다시 조립하는 구조가 이미 두 번 깨졌다(sourceScope
+      // 추가 때 한 번, fullDossier 추가 때 또 한 번) — 인자는 candidateSearchArgs
+      // 한 곳에서만 만든다.
+      const requestDigest = sha256(candidateSearchArgs(workOrder));
       for (const row of receipt.hubTools) {
         if (row.tool !== "workforce.search_candidates" || row.requestDigest !== requestDigest || row.authoritativeChain !== true) continue;
         row.authoritativeChain = false;
@@ -3133,7 +3150,7 @@ const TRANSIENT_MODEL_ERROR_RE = /Connection closed mid-response|"terminal_reaso
         // sourceScope는 MCP 스키마상 required다. 예전에는 싣지 않아 서버 기본값
         // ("hub")에 의존했다 — 기본값이 바뀌면 이 표면의 실제 스코프가 조용히
         // 넓어지거나 좁아진다. 이 표면이 보는 메뉴를 스스로 선언한다.
-        const candidateRaw = await hubStage("workforce.search_candidates", { workOrder, sourceScope });
+        const candidateRaw = await hubStage("workforce.search_candidates", candidateSearchArgs(workOrder));
         candidateSet = validateCandidateSet(
           candidateRaw,
           workOrder,
