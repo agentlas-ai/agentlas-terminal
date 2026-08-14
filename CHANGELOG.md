@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.0.47 — 2026-08-14
+
+Antigravity and the shared runtime contracts now reach the independent
+Terminal surface.
+
+- `agy` is recognized as a first-class runtime in capabilities, detection,
+  resolution, permissions, and the interactive shell.
+- Terminal model and runtime choices use the same runtime contract as Desktop,
+  including honest no-runtime stops and project-scoped execution.
+- Workforce capture, local Core transport, graph commands, and the native host
+  preserve the synchronized Agentlas architecture without copying Desktop-only
+  SaaS state into Terminal.
+
+Verification: the local smoke suite passed 100 cases with 0 failures. The npm
+publication gate remains the authority for whether this tag is visible in the
+registry.
+
 ## 1.0.46 — 2026-08-11
 
 Pick from a list instead of retyping a slug.
