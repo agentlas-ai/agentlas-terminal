@@ -25,7 +25,7 @@ const store = require("./store.cjs");
 // 손상된/미래 계약 값은 절대 조용히 넓혀 실행하지 않는다 — raw-row 게이트로
 // 무인 실행 직전에 검사한다(데스크탑 automation-scheduler.ts:538-549).
 const RUNTIME_KINDS = new Set([
-  "claude-code", "codex", "gemini", "kimi", "grok", "cursor", "byok", "ollama", "lmstudio", "mlx",
+  "claude-code", "codex", "agy", "gemini", "kimi", "grok", "cursor", "byok", "ollama", "lmstudio", "mlx",
 ]);
 const RUNTIME_BACKENDS = new Set([
   "anthropic", "openai", "google", "ollama", "lmstudio", "mlx", "upstage", "custom", "glm",

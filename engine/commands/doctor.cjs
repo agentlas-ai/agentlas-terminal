@@ -10,6 +10,7 @@ const path = require("node:path");
 const { dbPath, userDataDir } = require("../core/paths.cjs");
 const { listAvailableCliRuntimes, activeRuntimeRow } = require("../runtimes/detect.cjs");
 const { runtimeAuthEvidence } = require("../runtimes/auth-evidence.cjs");
+const { sharedRuntimeKind } = require("../runtimes/resolve.cjs");
 const { resolvedModelRole } = require("../runtimes/roles.cjs");
 
 function roleDetail(selection, role, en) {
@@ -31,11 +32,12 @@ async function run(ctx, args = []) {
     const db = ctx.db();
     const clis = listAvailableCliRuntimes().map((c) => ({ kind: c.kind, path: c.path, authEvidence: runtimeAuthEvidence(c.kind).status }));
     const active = activeRuntimeRow(db);
+    const activeKind = sharedRuntimeKind(active);
     return (() => {
       ctx.out(JSON.stringify({
         database: { path: dbPath(), exists: fs.existsSync(dbPath()) },
         runtimes: clis,
-        activeRuntime: active ? { ...active, authEvidence: runtimeAuthEvidence(active.kind).status } : null,
+        activeRuntime: active ? { ...active, runtimeKind: activeKind, authEvidence: runtimeAuthEvidence(activeKind).status } : null,
         modelRoles: {
           orchestrator: resolvedModelRole(db, "orchestrator"),
           worker: resolvedModelRole(db, "worker"),
@@ -98,12 +100,13 @@ async function run(ctx, args = []) {
     const db = ctx.db();
     const active = activeRuntimeRow(db);
     if (active) {
-      const detail = `${active.kind}${active.model ? ` (${active.model})` : ""}`;
+      const activeKind = sharedRuntimeKind(active);
+      const detail = `${activeKind}${active.model ? ` (${active.model})` : ""}`;
       // 활성 런타임은 모든 실행이 지나는 문이다 — 로그인 흔적이 없으면 all clear
       // 가 아니라 경고다. 흔적 없음 = 미로그인 "가능성"이므로 단정하지 않는다.
-      const evidence = runtimeAuthEvidence(active.kind);
+      const evidence = runtimeAuthEvidence(activeKind);
       if (evidence.status === "none") {
-        const bin = { "claude-code": "claude", codex: "codex", gemini: "gemini" }[active.kind] || active.kind;
+        const bin = { "claude-code": "claude", codex: "codex", gemini: "gemini", agy: "agy" }[activeKind] || activeKind;
         warn(
           en ? "active runtime" : "활성 런타임",
           en

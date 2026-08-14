@@ -11,10 +11,10 @@ const { spawnSync } = require("node:child_process");
 const RUNTIME_BIN = {
   "claude-code": "claude",
   codex: "codex",
-  gemini: "gemini",
   // Antigravity CLI — gemini 후속. 공식 gemini CLI가 계정 티어로 죽어도(IneligibleTierError,
   // 실측 2026-08-06) 이쪽은 산다. 데스크탑 gemini 러너의 agy 경로와 같은 실물.
   agy: "agy",
+  gemini: "gemini",
   kimi: "kimi",
   grok: "grok",
   cursor: "cursor-agent",

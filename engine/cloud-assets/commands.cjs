@@ -282,7 +282,7 @@ async function runCloud(ctx, args) {
     const limit = Math.max(1, Math.min(30, Number(flags.limit) || 10));
     let result;
     try {
-      result = await callHubTool("marketplace.search_agents", { q: query, query, limit });
+      result = await callHubTool("marketplace.search_agents", { q: query, limit });
     } catch (e) {
       ctx.err(e instanceof HubError ? e.message : `Marketplace connection failed: ${(e && e.message) || e}`);
       return 1;

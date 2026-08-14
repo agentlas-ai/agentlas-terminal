@@ -7,16 +7,14 @@
  *   search_candidates  요청 {workOrder, sourceScope}
  *                      응답 agentlas.workforce-federation-result.v1 봉투
  *                      → 루프에는 봉투를 벗긴 candidateSet만 준다.
- *   validate_selection 요청 {workOrder, selection, candidateSet}
- *                      (federationResult를 실으면 invalid_federation_result —
- *                       Core는 자기 선택 세션에서 연합을 이미 안다)
+ *   validate_selection 요청 {workOrder, selection}
+ *                      (Core는 selectionSessionId로 자기 핀 세션을 복원한다)
  *                      응답 안의 selectionValidation이 정확히
  *                      agentlas.workforce-selection-validation.v1 — 루프 검증기와
  *                      동일 계약이라 그대로 돌려준다. 원본 응답은 여기 상태로
  *                      붙잡아 둔다(prepare가 요구).
- *   prepare_execution  요청 {workOrder, selection, candidateSet,
- *                       federatedSelection: <validate 원본 응답>,
- *                       validationReceipt: <동일>, projectDir}
+ *   prepare_execution  요청 {workOrder, selection,
+ *                       federatedSelection: <validate 원본 응답>, projectDir}
  *                      응답 안의 executionPlan이 정확히
  *                      agentlas.workforce-execution-plan.v5 (roster에
  *                      directiveBundle·permissionPolicy 동봉) — 그대로 돌려준다.
@@ -115,7 +113,7 @@ function createLocalCoreHubTool({ sourceScope, projectDir, cwd, client } = {}) {
   const core = client || createLocalCoreClient({ cwd: cwd || projectDir });
   // 편성 계보 상태 — 전부 "Core 어휘"(opaque id) 원본이다:
   //   maps: 마지막 search 의 id 지도. 재검색(refinement)마다 재구성된다.
-  //   coreCandidateSet: Core 가 준 원본 CandidateSet (validate/prepare 로 무수정 반송).
+  //   coreCandidateSet: Core 가 준 요약 메뉴. 로컬 계보 확인에만 쓰며 반송하지 않는다.
   //   lastValidationEnvelope: validate 원본 응답. prepare 의 federatedSelection 은
   //     이것이어야 한다 — 루프가 들고 있는 것은 벗겨낸 selectionValidation 뿐이다.
   let maps = { forward: new Map(), reverse: new Map() };
@@ -137,12 +135,11 @@ function createLocalCoreHubTool({ sourceScope, projectDir, cwd, client } = {}) {
       maps = buildIdMaps(args.workOrder);
       coreCandidateSet = null;
       lastValidationEnvelope = null;
-      // fullDossier: 터미널 루프의 후보 검증기는 legacy full-echo 계약이다
-      // (qualificationEvidence·packageHash·contentDigest 필수 — 실측: 기본
-      // reference-first 메뉴는 candidate_set_invalid 로 거절된다).
+      // Current Core keeps the full dossier in its pinned session and returns a
+      // numbered decision menu. Do not request the legacy full-echo form.
       let envelope;
       try {
-        envelope = await core.call(name, { workOrder: mapDeep(args.workOrder, maps.forward), sourceScope, fullDossier: true });
+        envelope = await core.call(name, { workOrder: mapDeep(args.workOrder, maps.forward), sourceScope });
       } catch (error) {
         // 반응형 정규화(1회): 경계가 지목한 finite 값만 opaque 로 바꿔 재시도.
         const issues = error.code === "work_order_hub_boundary_rejected" ? boundaryIssues(error) : null;
@@ -161,7 +158,7 @@ function createLocalCoreHubTool({ sourceScope, projectDir, cwd, client } = {}) {
           repaired += 1;
         }
         if (!repaired) throw error;
-        envelope = await core.call(name, { workOrder: mapDeep(args.workOrder, maps.forward), sourceScope, fullDossier: true });
+        envelope = await core.call(name, { workOrder: mapDeep(args.workOrder, maps.forward), sourceScope });
       }
       const candidateSet = envelope && envelope.candidateSet;
       if (!candidateSet || typeof candidateSet !== "object") throw invalid("local Core federation returned no candidateSet");
@@ -174,9 +171,10 @@ function createLocalCoreHubTool({ sourceScope, projectDir, cwd, client } = {}) {
         error.code = "local_core_lineage_missing";
         throw error;
       }
-      // 루프의 candidateSet(역치환본)과 보관본의 계보 일치를 다이제스트로 확인한다.
-      if (args.candidateSet?.candidateSetDigest !== coreCandidateSet.candidateSetDigest) {
-        throw invalid("candidateSet lineage mismatch between the loop and the local Core session");
+      // The host-authored selection must point at the exact summary menu just
+      // returned. Core independently reloads and verifies the full pinned set.
+      if (args.selection?.candidateSetDigest !== coreCandidateSet.candidateSetDigest) {
+        throw invalid("selection lineage mismatch between the loop and the local Core session");
       }
       let envelope;
       let coreSelection = mapDeep(args.selection, maps.forward);
@@ -184,7 +182,6 @@ function createLocalCoreHubTool({ sourceScope, projectDir, cwd, client } = {}) {
         envelope = await core.call(name, {
           workOrder: mapDeep(args.workOrder, maps.forward),
           selection: coreSelection,
-          candidateSet: coreCandidateSet,
         });
       } catch (error) {
         /*
@@ -205,7 +202,6 @@ function createLocalCoreHubTool({ sourceScope, projectDir, cwd, client } = {}) {
         envelope = await core.call(name, {
           workOrder: mapDeep(args.workOrder, maps.forward),
           selection: repairedSelection,
-          candidateSet: coreCandidateSet,
         });
         coreSelection = repairedSelection;
       }
@@ -224,9 +220,7 @@ function createLocalCoreHubTool({ sourceScope, projectDir, cwd, client } = {}) {
         workOrder: mapDeep(args.workOrder, maps.forward),
         // validate 가 수락한 정확한 본 — 반응형 reasonCode 수리를 반영한다.
         selection: lastCoreSelection || mapDeep(args.selection, maps.forward),
-        candidateSet: coreCandidateSet,
         federatedSelection: lastValidationEnvelope,
-        validationReceipt: lastValidationEnvelope,
         projectDir,
       });
       if (!envelope || typeof envelope.executionPlan !== "object") throw invalid("local Core preparation returned no executionPlan");

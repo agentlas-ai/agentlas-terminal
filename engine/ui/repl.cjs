@@ -741,7 +741,7 @@ function handleSlash(ctx, cmdline, api) {
     }
 
     case "runtime": {
-      if (!rest[0]) throw usageError("Usage: /runtime claude-code|codex|gemini");
+      if (!rest[0]) throw usageError("Usage: /runtime claude-code|codex|agy|gemini");
       // 세션 오버라이드는 저장되지 않는다 — 고지 없이는 사용자가 영구 설정으로
       // 믿는다(2026-08-05 감사 결함 C). 영구 경로를 같은 줄에서 알려준다.
       api.setRuntime(rest[0]);
@@ -774,7 +774,7 @@ function handleSlash(ctx, cmdline, api) {
       return;
     }
     case "permission": {
-      if (!["read", "write", "full"].includes(String(rest[0] || ""))) {
+      if (!permissions.isLevel(rest[0])) {
         throw usageError("Usage: /permission read|write|full");
       }
       const level = permissions.normalize(rest[0]);

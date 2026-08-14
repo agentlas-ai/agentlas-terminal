@@ -13,6 +13,7 @@ const { projectCwd } = require("../project/paths.cjs");
 const { ensureTerminalProjectForExecutionCli } = require("../project/state.cjs");
 const {
   CONTEXT_MAP_MIN_CORE_VERSION,
+  CONTEXT_MAP_V3_RUNTIME_MARKERS,
   resolveCoreRuntimeRoot,
   resolvePython,
   spawnCoreModule,
@@ -25,6 +26,10 @@ function usage(ctx) {
   return 1;
 }
 
+function hasExplicitProjectArg(args) {
+  return args.some((arg) => arg === "--project" || String(arg).startsWith("--project="));
+}
+
 async function run(ctx, args) {
   if (!args[0]) return usage(ctx);
   if (!CONTEXT_SUBCOMMANDS.has(String(args[0]))) return usage(ctx);
@@ -32,7 +37,11 @@ async function run(ctx, args) {
   // 수동 검사만 — context 명령은 프로젝트를 초기화하지 않는다 (0.9.10 경계).
   ensureTerminalProjectForExecutionCli(ctx.db(), cwd, "read", "terminal-context");
 
-  const coreRoot = resolveCoreRuntimeRoot(null, [], { minVersion: CONTEXT_MAP_MIN_CORE_VERSION });
+  const coreRoot = resolveCoreRuntimeRoot(
+    null,
+    CONTEXT_MAP_V3_RUNTIME_MARKERS,
+    { minVersion: CONTEXT_MAP_MIN_CORE_VERSION },
+  );
   if (!coreRoot) {
     // 정직 정지: 맵을 지어내지 않는다.
     ctx.err(ctx.lang === "ko"
@@ -51,7 +60,9 @@ async function run(ctx, args) {
   }
 
   const contextArgs = args.slice();
-  if (!contextArgs.includes("--project")) contextArgs.push("--project", cwd);
+  if (!hasExplicitProjectArg(contextArgs)) {
+    contextArgs.push("--project", cwd);
+  }
   const child = spawnCoreModule("agentlas_cloud", ["context", ...contextArgs], { cwd, stdio: "inherit" }, coreRoot);
   if (!child) {
     ctx.err("Agentlas Core runtime or Python 3.9+ is unavailable.");
@@ -63,4 +74,4 @@ async function run(ctx, args) {
   });
 }
 
-module.exports = { run, CONTEXT_SUBCOMMANDS };
+module.exports = { run, CONTEXT_SUBCOMMANDS, hasExplicitProjectArg };

@@ -15,6 +15,7 @@ const RUNTIME_CAPS = {
   "claude-code": { code: true, image: false, label: "claude" },
   codex: { code: true, image: true, label: "codex" }, // Imagen
   gemini: { code: true, image: true, label: "gemini" }, // nano-banana
+  agy: { code: true, image: true, label: "antigravity" },
   grok: { code: true, image: true, label: "grok" }, // Grok Imagine (generate_image/generate_video, 구독 키리스)
   anthropic: { code: true, image: false, label: "anthropic" },
   openai: { code: true, image: true, label: "openai" }, // gpt-image
@@ -25,7 +26,7 @@ const RUNTIME_CAPS = {
 
 // NOTE: grok은 CAPS(멀티모달 능력 인지)만 등록 — 터미널 스폰 러너(RUNTIME_BIN)가 아직 없어
 // CLI_KINDS에 넣으면 repl의 which(RUNTIME_BIN[k]) 탐지가 깨진다. 러너 추가 시 함께 확장할 것.
-const CLI_KINDS = ["claude-code", "codex", "gemini"];
+const CLI_KINDS = ["claude-code", "codex", "agy", "gemini"];
 
 function capsFor(spec) {
   return RUNTIME_CAPS[spec] || { code: true, image: false, label: spec || "?" };
@@ -115,7 +116,7 @@ function clearImageJudgments() {
 function autoRuntimeFor(agent, { installedKinds, activeSpec }) {
   if (needsImage(agent)) {
     if (capsFor(activeSpec).image) return activeSpec;
-    for (const k of ["gemini", "codex"]) if ((installedKinds || []).includes(k)) return k;
+    for (const k of ["agy", "gemini", "codex"]) if ((installedKinds || []).includes(k)) return k;
   }
   return activeSpec;
 }

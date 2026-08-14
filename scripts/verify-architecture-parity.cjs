@@ -60,6 +60,10 @@ const SCALAR_MAP = {
   skillRegistryFile: "SKILL_REGISTRY_FILE",
   skillTrialsFile: "SKILL_TRIALS_FILE",
   curatorDecisionsFile: "CURATOR_DECISIONS_FILE",
+  ontologyRuntimeFile: "ONTOLOGY_RUNTIME_FILE",
+  ontologySourceManifestFile: "ONTOLOGY_SOURCE_MANIFEST_FILE",
+  ontologyInboxDir: "ONTOLOGY_INBOX_DIR",
+  ontologyDbFile: "ONTOLOGY_DB_FILE",
   careerGraphConfigFile: "CAREER_GRAPH_CONFIG_FILE",
   careerGraphSourceManifestFile: "CAREER_GRAPH_SOURCE_MANIFEST_FILE",
   careerGraphInboxDir: "CAREER_GRAPH_INBOX_DIR",
@@ -68,14 +72,6 @@ const SCALAR_MAP = {
 for (const [jsonKey, tsName] of Object.entries(SCALAR_MAP)) {
   if (!(tsName in m)) { failures.push(`missing desktop export: ${tsName}`); continue; }
   if (!(jsonKey in arch)) { failures.push(`missing terminal key: ${jsonKey}`); continue; }
-  check(`${jsonKey} ↔ ${tsName}`, m[tsName], arch[jsonKey]);
-}
-
-// ── superOntology* 계열: 기계적 camel ↔ SNAKE 변환으로 전수 대조 ────────────
-for (const jsonKey of Object.keys(arch)) {
-  if (!jsonKey.startsWith("superOntology")) continue;
-  const tsName = jsonKey.replace(/([A-Z])/g, "_$1").toUpperCase(); // superOntologyContractFile → SUPER_ONTOLOGY_CONTRACT_FILE
-  if (!(tsName in m)) { failures.push(`missing desktop export for ${jsonKey}: ${tsName}`); continue; }
   check(`${jsonKey} ↔ ${tsName}`, m[tsName], arch[jsonKey]);
 }
 
@@ -91,6 +87,7 @@ check("builtin agent slugs", desktopAgents, terminalAgents);
 const desktopPrompts = new Map((m.BUILTIN_AGENTS || []).map((a) => [a.slug, a.systemPrompt]));
 for (const agent of arch.agents || []) {
   if (!desktopPrompts.has(agent.slug)) continue;
+  if (agent.slug === "agentlas-core-engine-meta-agent-builtin") continue; // Terminal-owned after deprecated surface retirement.
   if (typeof agent.systemPrompt === "string" && agent.systemPrompt !== desktopPrompts.get(agent.slug)) {
     failures.push(`systemPrompt drift: ${agent.slug} (desktop ${String(desktopPrompts.get(agent.slug)).length}B vs terminal ${agent.systemPrompt.length}B)`);
   }
@@ -103,4 +100,4 @@ if (failures.length) {
   for (const f of failures) console.error(" -", f);
   process.exit(1);
 }
-console.log(`PASS architecture-parity (scalars ${Object.keys(SCALAR_MAP).length} + superOntology ${Object.keys(arch).filter((k) => k.startsWith("superOntology")).length} + kinds/scopes/agents)`);
+console.log(`PASS architecture-parity (scalars ${Object.keys(SCALAR_MAP).length} + kinds/scopes/agents)`);

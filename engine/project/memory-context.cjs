@@ -17,7 +17,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { userDataDir } = require("../core/paths.cjs");
 const { loadArch, tableExists, columnExists } = require("../core/db.cjs");
-const { captureCoreJsonSync, resolveCoreRuntimeRoot } = require("../agentlas-core-harness.cjs");
+const { captureCoreJsonSync, resolveContextMapCoreRoot } = require("../agentlas-core-harness.cjs");
 const terminalMemoryGovernance = require("../agentlas-memory-governance.cjs");
 const terminalExperienceIntake = require("../agentlas-experience-intake.cjs");
 const terminalExperienceExchange = require("../agentlas-experience-exchange.cjs");
@@ -113,7 +113,7 @@ function contextLine(json) {
 function cliProjectContextSlice(projectPath, task) {
   if (!projectPath || !String(task || "").trim()) return "";
   try {
-    const coreRoot = resolveCoreRuntimeRoot();
+    const coreRoot = resolveContextMapCoreRoot();
     if (!coreRoot) return "";
     const result = captureCoreJsonSync(
       "agentlas_cloud",

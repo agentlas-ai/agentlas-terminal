@@ -67,6 +67,12 @@ const CHECKS = {
     || envEvidence(["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
 };
 
+// Antigravity and legacy Gemini use the same Google local OAuth evidence on
+// this host. Keep the product/runtime identity distinct while reusing the
+// evidence probe; an unknown agy result would make doctor contradict the
+// actual executable path and would block runtime-independent selection.
+CHECKS.agy = CHECKS.gemini;
+
 function runtimeAuthEvidence(kind) {
   const check = CHECKS[kind];
   if (!check) return { status: "unknown", detail: "no local evidence check for this runtime" };

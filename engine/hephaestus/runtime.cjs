@@ -31,7 +31,7 @@ const { truncateWidth, visWidth, wrapWidth } = require("../ui/width.cjs");
 const coreHarness = require("../agentlas-core-harness.cjs");
 const { userDataDir } = require("../core/paths.cjs");
 
-const { CONTEXT_MAP_MIN_CORE_VERSION } = coreHarness;
+const { CONTEXT_MAP_MIN_CORE_VERSION, resolveContextMapCoreRoot } = coreHarness;
 
 // ── 명령 usage 문자열 (v1 TOP_LEVEL_COMMAND_USAGE에서 hephaestus 클러스터만 발췌) ──
 const USAGE = Object.freeze({
@@ -612,11 +612,7 @@ function create(ctx, deps = {}) {
     // the canonical context-map implementation.
     const isContextMap = args[0] === "context";
     const contextRoot = isContextMap
-      ? resolveCoreRuntimeRoot(
-          null,
-          [["agentlas_cloud", "context_map.py"]],
-          { minVersion: CONTEXT_MAP_MIN_CORE_VERSION },
-        )
+      ? resolveContextMapCoreRoot()
       : null;
     const contextCapable = Boolean(
       contextRoot && fs.existsSync(path.join(contextRoot, "agentlas_cloud", "context_map.py")),

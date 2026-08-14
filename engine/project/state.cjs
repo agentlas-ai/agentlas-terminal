@@ -25,7 +25,10 @@ const {
   resolveCoreRuntimeRoot,
 } = require("../agentlas-core-harness.cjs");
 const { runCwd } = require("./paths.cjs");
-const { ensureProjectMemoryCli } = require("./seed.cjs");
+const {
+  ensureProjectMemoryCli,
+  removeLegacySuperOntologyFiles,
+} = require("./seed.cjs");
 
 const AGENTLAS_PROJECT_STATE_IGNORE_START = "# >>> agentlas local project state >>>";
 const AGENTLAS_PROJECT_STATE_IGNORE_END = "# <<< agentlas local project state <<<";
@@ -280,6 +283,10 @@ function ensureCoreProjectCli(projectPath, options = {}) {
     if (canonical) {
       // Core owns the canonical seed. Terminal adds one intentionally broader
       // guard so future local memory files are private without a release update.
+      // Older installed Core releases can still recreate the owner-retired
+      // Super Ontology files. Remove only Terminal's exact legacy filenames;
+      // AO, Workforce/Semantic Ontology, Context Map and Career Graph remain.
+      removeLegacySuperOntologyFiles(path.join(root, ".agentlas"));
       ensureAgentlasProjectStateIgnoreCli(root);
       hardenAgentlasProjectStateCli(root);
       projectBootstrapStates.set(root, "core");

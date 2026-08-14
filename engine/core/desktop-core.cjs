@@ -93,6 +93,37 @@ function findCoreRoot() {
  * 밖이라 node_modules 디렉터리 walk-up으로 자연 해결되지 않는다 — 이 훅이 위치와 무관하게 잡는다.
  */
 let _nativeHookInstalled = false;
+let _projectProvisioningHookInstalled = false;
+
+function stripRetiredProjectProvisioningSource(source) {
+  const text = String(source || "");
+  if (!text.includes("SUPER_ONTOLOGY_")) return text;
+  const startMarker = "        const secureWriteMissing = (filePath, content, _encoding) => {";
+  const endMarker = "        preflightProjectProvisionTargets(identity);";
+  const start = text.indexOf(startMarker);
+  const end = start < 0 ? -1 : text.indexOf(endMarker, start);
+  if (start < 0 || end < 0) {
+    throw new Error("desktop_core_retired_surface_patch_failed: project provisioning layout changed");
+  }
+  return `${text.slice(0, start)}        // Terminal keeps semantic ontology and career graph provisioning, but does not\n` +
+    `        // load the retired project-file generation block from the Desktop bundle.\n${text.slice(end)}`;
+}
+
+function installRetiredProjectProvisioningHook() {
+  if (_projectProvisioningHookInstalled) return;
+  const Module = require("node:module");
+  const jsLoader = Module._extensions[".js"];
+  Module._extensions[".js"] = function loadTerminalDesktopCore(module, filename) {
+    if (filename.endsWith(path.join("electron", "memory", "project-files.js"))) {
+      const source = fs.readFileSync(filename, "utf8");
+      module._compile(stripRetiredProjectProvisioningSource(source), filename);
+      return;
+    }
+    return jsLoader(module, filename);
+  };
+  _projectProvisioningHookInstalled = true;
+}
+
 function installNativeModuleHook() {
   if (_nativeHookInstalled) return;
   const Module = require("node:module");
@@ -122,6 +153,7 @@ function loadDesktopCore() {
   if (_cache !== undefined) return _cache;
   const root = findCoreRoot();
   if (!root) { _cache = null; return null; }
+  installRetiredProjectProvisioningHook();
   installNativeModuleHook();
   // 코어의 store 가 이 값을 모듈 로드 시점에 읽는다 — require 이전에 세팅해야 한다.
   if (!process.env.AGENTLAS_STORE_PATH) process.env.AGENTLAS_STORE_PATH = dbPath();
@@ -167,4 +199,10 @@ async function loadDesktopCoreAsync({ onNotice } = {}) {
   return loadDesktopCore();
 }
 
-module.exports = { findCoreRoot, loadDesktopCore, loadDesktopCoreAsync, desktopCoreAvailable };
+module.exports = {
+  findCoreRoot,
+  loadDesktopCore,
+  loadDesktopCoreAsync,
+  desktopCoreAvailable,
+  _test: { stripRetiredProjectProvisioningSource },
+};

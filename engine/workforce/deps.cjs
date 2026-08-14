@@ -109,7 +109,7 @@ function legacyWorkforceRuntime(db, override) {
     }
   }
   const error = new Error(
-    "no_runtime: no agent CLI or connected API runtime found (claude / codex / gemini / BYOK / Ollama).",
+    "no_runtime: no agent CLI or connected API runtime found (claude / codex / Antigravity agy / legacy gemini / BYOK / Ollama).",
   );
   error.code = "no_runtime";
   throw error;
@@ -513,7 +513,7 @@ function projectContextSlice(projectPath, task) {
   if (!projectPath || !String(task || "").trim()) return "";
   try {
     const core = coreHarness();
-    const coreRoot = core.resolveCoreRuntimeRoot();
+    const coreRoot = core.resolveContextMapCoreRoot();
     if (!coreRoot) return "";
     const result = core.captureCoreJsonSync(
       "agentlas_cloud",

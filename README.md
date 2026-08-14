@@ -9,7 +9,7 @@
  ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝   ╚══════╝╚═╝  ╚═╝╚══════╝
 ```
 
-**Agentlas Terminal CLI** — Independent AI agent runtime installed via `npm install -g agentlas` and launched with `agentlas`. Run exact installed agents, teams, and parallel sessions directly from your shell without keeping Desktop open. When Desktop is installed, Terminal reads the same local project, agent, and runtime state. Bring your own model — use your existing Claude Code, Codex, or Gemini CLI subscriptions or BYOK API keys.
+**Agentlas Terminal CLI** — Independent AI agent runtime installed via `npm install -g agentlas` and launched with `agentlas`. Run exact installed agents, teams, and parallel sessions directly from your shell without keeping Desktop open. When Desktop is installed, Terminal reads the same local project, agent, and runtime state. Bring your own model — use Antigravity (`agy`), Claude Code, Codex, legacy Gemini CLI, or BYOK API keys.
 
 Use this existing independent Terminal as the command-line runtime: inspect owner-private packages with `agentlas cloud list`, restore one with `agentlas cloud restore <slug>`, or install an eligible public package with `agentlas install <slug>`.
 
@@ -24,10 +24,10 @@ Agent Trust is our product principle: agent packages are treated as portable, ow
 | Category | Requirement |
 | --- | --- |
 | **Node.js** | **Node 22+ recommended.** `package.json` specifies `engines: ">=20"`, but if native optional dependency `better-sqlite3` build fails, the launcher falls back strictly to `node:sqlite` in Node 22+. Node 20 works when `better-sqlite3` native build succeeds. |
-| **Agent CLI** | Requires at least one supported runtime CLI (`claude`, `codex`, or `gemini`) in your `PATH`. Halts honestly with `no_runtime` if none are found (no fake model responses). |
+| **Agent CLI** | Requires at least one supported runtime CLI: `agy` (Antigravity, preferred), `claude`, `codex`, or legacy `gemini` in your `PATH`. Halts honestly with `no_runtime` if none are found (no fake model responses). |
 | **OS** | macOS is verified by the current local release gate. Linux is covered by the public adapter/CI contract. A Windows launcher is provided, but this release does not claim independent end-to-end Windows verification. |
 
-*Note: `kimi`, `grok`, and `cursor-agent` are detected by diagnostics (`doctor`) but not yet executable (`has no v2 streaming driver yet`). Supported active runtimes are `claude-code`, `codex`, and `gemini`.*
+*Note: `kimi`, `grok`, and `cursor-agent` are detected by diagnostics (`doctor`) but not yet executable (`has no v2 streaming driver yet`). Supported active runtimes are `claude-code`, `codex`, `agy` (Antigravity), and legacy `gemini`.*
 
 ## Installation
 
@@ -143,7 +143,7 @@ agentlas netadmin <sub>           # Local network administration (init|status|re
 agentlas version | help
 ```
 
-Common flags across subcommands: `-p|--print`, `--runtime claude-code|codex|gemini`, `--permission read|write|full`.
+Common flags across subcommands: `-p|--print`, `--runtime claude-code|codex|agy|gemini`, `--permission read|write|full`.
 
 ### Typo Guard & Desktop Surface Redirection
 
@@ -183,7 +183,7 @@ Executing `agentlas` with no arguments resolves the current folder to an Agentla
 | `/agents` · `/list` | List installed agents |
 | `/mcp` | List active MCP servers |
 | `/doctor` | Run runtime & database diagnostics |
-| `/runtime <kind>` | Set runtime for new sessions (`claude-code` \| `codex` \| `gemini`) |
+| `/runtime <kind>` | Set runtime for new sessions (`claude-code` \| `codex` \| `agy` (Antigravity) \| legacy `gemini`) |
 | `/permission <level>` | Set permission level for new sessions (`read` \| `write` \| `full`) |
 | `/quit` · `/exit` | Exit REPL |
 
@@ -276,8 +276,8 @@ agentlas doctor      # Checks database, PATH runtimes, active CLI drivers, and c
 agentlas --where     # Outputs JSON diagnostic of launcher, engine, DB paths, driver, and Node version
 ```
 
-- **`no_runtime: no agent CLI found`**: Install `claude`, `codex`, or `gemini` CLI and add to `PATH`. Note that `kimi`/`grok`/`cursor-agent` are detected by `doctor` but do not yet have streaming execution drivers.
-- **`runtime '<kind>' has no v2 streaming driver yet`**: Specified `--runtime` is not supported for active execution. Supported values: `claude-code`, `codex`, `gemini`.
+- **`no_runtime: no agent CLI found`**: Connect Antigravity and put `agy` on `PATH` first, or install `claude`/`codex`; `gemini` remains available as a legacy CLI. Note that `kimi`/`grok`/`cursor-agent` are detected by `doctor` but do not yet have streaming execution drivers.
+- **`runtime '<kind>' has no v2 streaming driver yet`**: Specified `--runtime` is not supported for active execution. Supported values: `claude-code`, `codex`, `agy` (Antigravity), `gemini` (legacy).
 - **`Node vX — Node 22+ (node:sqlite) is required when better-sqlite3 is unavailable`**: `better-sqlite3` native build failed on Node 20/21. Upgrade to Node 22+ or install build tools for native compilation.
 - **`storm`/`context`/`hep` halting due to missing runtime**: Agentlas OS core runtime is missing. Install Agentlas OS or set `HEPHAESTUS_BIN=<path>`.
 - **`'xxx' is not an agentlas command`**: Typo guard intercepted an unrecognized command. Use `agentlas run -p "xxx"` to run it as a prompt.

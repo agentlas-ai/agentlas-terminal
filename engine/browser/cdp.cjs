@@ -21,9 +21,9 @@ const http = require("node:http");
 
 const DEFAULT_PORT = Number(process.env.AGENTLAS_CDP_PORT || 9222);
 
-function httpJson(port, path, { timeout = 3000 } = {}) {
+function httpJson(port, path, { timeout = 3000, method = "GET" } = {}) {
   return new Promise((resolve, reject) => {
-    const req = http.get({ host: "127.0.0.1", port, path, timeout }, (res) => {
+    const req = http.request({ host: "127.0.0.1", port, path, timeout, method }, (res) => {
       let body = "";
       res.on("data", (d) => { body += d; });
       res.on("end", () => {
@@ -32,12 +32,18 @@ function httpJson(port, path, { timeout = 3000 } = {}) {
     });
     req.on("error", reject);
     req.on("timeout", () => { req.destroy(); reject(new Error(`CDP ${path} timed out`)); });
+    req.end();
   });
 }
 
 /** 9222 가 살아있나(Agentlas 전용 Chrome). */
 async function cdpReady(port = DEFAULT_PORT) {
-  try { await httpJson(port, "/json/version"); return true; } catch { return false; }
+  try {
+    const version = await httpJson(port, "/json/version");
+    if (!version || typeof version !== "object" || typeof version.webSocketDebuggerUrl !== "string") return false;
+    const targets = await httpJson(port, "/json");
+    return Array.isArray(targets);
+  } catch { return false; }
 }
 
 /** 조종할 page 타겟 하나를 고른다(없으면 새로 연다). 반환: webSocketDebuggerUrl. */
@@ -46,7 +52,7 @@ async function pickPageTarget(port = DEFAULT_PORT) {
   let page = (Array.isArray(targets) ? targets : []).find((t) => t.type === "page" && t.webSocketDebuggerUrl);
   if (!page) {
     // 새 탭을 연다(DevTools HTTP: PUT /json/new).
-    page = await httpJson(port, "/json/new?about:blank");
+    page = await httpJson(port, "/json/new?about:blank", { method: "PUT" });
   }
   if (!page || !page.webSocketDebuggerUrl) throw new Error("no CDP page target available");
   return page.webSocketDebuggerUrl;

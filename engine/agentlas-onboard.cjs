@@ -133,11 +133,12 @@ async function runOnboard({ ui, rl, helpers, persist }) {
   // Step 2 — default runtime
   ui.line("");
   printIndented(ui.t("wiz.runtimeQ"), c.bold);
-  const cliKinds = ["claude-code", "codex", "gemini"];
+  const cliKinds = ["claude-code", "codex", "agy", "gemini"];
   const rtOpts = [{ value: "auto", label: ui.t("wiz.runtimeAuto") }];
   for (const k of cliKinds) {
     const has = !!H.which(H.RUNTIME_BIN[k]);
-    rtOpts.push({ value: k, label: `${k}  (${has ? ui.t("wiz.runtimeInstalled") : ui.t("wiz.runtimeMissing")})` });
+    const runtimeLabel = k === "agy" ? "agy · Antigravity" : k === "gemini" ? "gemini · legacy" : k;
+    rtOpts.push({ value: k, label: `${runtimeLabel}  (${has ? ui.t("wiz.runtimeInstalled") : ui.t("wiz.runtimeMissing")})` });
   }
   rtOpts.forEach((o, i) => optionLine(i + 1, o.label, i === 0));
   const ri = await pickNum(rtOpts.length);
@@ -149,6 +150,7 @@ async function runOnboard({ ui, rl, helpers, persist }) {
     const installHint = {
       "claude-code": "npm i -g @anthropic-ai/claude-code",
       codex: "npm i -g @openai/codex",
+      agy: "Install Antigravity from https://antigravity.google/ and put agy on PATH",
       gemini: "npm i -g @google/gemini-cli",
     }[runtime];
     if (!H.which(H.RUNTIME_BIN[runtime])) {
@@ -156,7 +158,10 @@ async function runOnboard({ ui, rl, helpers, persist }) {
     } else {
       try {
         const { runtimeAuthEvidence } = require("./runtimes/auth-evidence.cjs");
-        if (runtimeAuthEvidence(runtime).status === "none") {
+        // Antigravity and legacy Gemini currently share Google's local OAuth
+        // evidence root, but remain distinct executable/runtime selections.
+        const evidenceKind = runtime === "agy" ? "gemini" : runtime;
+        if (runtimeAuthEvidence(evidenceKind).status === "none") {
           printIndented(ui.t("wiz.runtimeLoginHint", H.RUNTIME_BIN[runtime]), c.dim);
         }
       } catch { /* evidence unavailable — say nothing rather than guess */ }

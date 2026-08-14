@@ -16,6 +16,7 @@ const source = require(compiledManifest);
 const target = path.join(terminalRoot, "engine/architecture.data.json");
 const current = JSON.parse(fs.readFileSync(target, "utf8"));
 const bySlug = new Map(source.BUILTIN_AGENTS.map((agent) => [agent.slug, agent]));
+const terminalOwnedPrompts = new Set(["agentlas-core-engine-meta-agent-builtin"]);
 const nextAgents = current.agents.map((stored) => {
   const canonical = bySlug.get(stored.slug);
   if (!canonical) throw new Error(`Desktop architecture no longer defines ${stored.slug}`);
@@ -28,7 +29,7 @@ const nextAgents = current.agents.map((stored) => {
     role: canonical.role,
     visibility: canonical.visibility,
     tone: canonical.tone,
-    systemPrompt: canonical.systemPrompt,
+    systemPrompt: terminalOwnedPrompts.has(stored.slug) ? stored.systemPrompt : canonical.systemPrompt,
   };
 });
 const next = {

@@ -5,8 +5,8 @@
  * v1 monolith "Agentlas Cloud packaging" 절의 충실 이식. 핵심 계약(약화 금지):
  *  - 패키징/보안 리뷰는 전부 로컬에서 돈다. Agent Cloud에는 패키지 데이터·해시·
  *    로컬 리뷰 증적만 올라간다 (플랫폼 LLM 호출 없음).
- *  - 시크릿 발견 = blocker = 등록 fetch 0회. (agentlas-secret-patterns 공유 모듈 +
- *    이 파일의 구조적 credential 검사 + 파일명 차단 목록의 3중 게이트)
+ *  - 정적 finding은 advisory다. 시크릿/위험 패턴/초과 바이트는 원문을 싣지 않고,
+ *    경로·사유·원본 SHA-256에 묶인 결정적 omission receipt를 남긴 뒤 등록을 계속한다.
  *  - 파일 읽기는 no-follow + 전/후 fstat 대조 — 스캔 중 바꿔치기(symlink swap,
  *    append)는 전부 blocker다. TOCTOU로 패키지에 외부 파일이 새는 것을 막는다.
  *  - .agentlas 로컬 상태(경험 계보 experience-relations.jsonl 계열, CAS 마커,
@@ -15,6 +15,7 @@
  *    으로만 — 조용한 덮어쓰기 금지 (cas.cjs).
  */
 const fs = require("node:fs");
+const crypto = require("node:crypto");
 const os = require("node:os");
 const path = require("node:path");
 const {
@@ -133,14 +134,19 @@ function cloudTextContainsStructuredCredential(text) {
 }
 
 function cloudAddSecretFindingsFromBytes(bytes, relativePath, addFinding) {
+  let found = false;
   const candidates = new Set([bytes.toString("utf8")]);
   const utf16 = cloudDecodeUtf16CredentialText(bytes);
   if (utf16) candidates.add(utf16);
   for (const text of candidates) {
     for (const [id, re, label] of CLOUD_SECRET_RE) {
-      if (re.test(text)) addFinding(id, "blocker", "secret", `Possible ${label} found in package content.`, relativePath, "Remove the value and require users to configure their own key.");
+      if (re.test(text)) {
+        found = true;
+        addFinding(id, "blocker", "secret", `Possible ${label} found in package content.`, relativePath, "Remove the value and require users to configure their own key.");
+      }
     }
     if (cloudTextContainsStructuredCredential(text)) {
+      found = true;
       addFinding("generic-unquoted-secret", "blocker", "secret", "Possible unquoted or URL-embedded credential found in package content.", relativePath, "Replace the value with an environment/BYOK placeholder.");
     }
     // 공유 시크릿 패턴(agentlas-secret-patterns)도 같은 게이트에 태운다.
@@ -157,12 +163,14 @@ function cloudAddSecretFindingsFromBytes(bytes, relativePath, addFinding) {
         const assignmentSplit = matched.match(/^[^:=]{0,40}[:=]\s*(.+)$/s);
         if (assignmentSplit && !cloudCredentialValueLooksReal(assignmentSplit[1])) continue;
         addFinding("shared-secret-pattern", "blocker", "secret", "Possible live credential (shared secret-pattern match) found in package content.", relativePath, "Remove the value and require users to configure their own key.");
+        found = true;
         sharedPatternHit = true;
         break;
       }
       if (sharedPatternHit) break;
     }
   }
+  return found;
 }
 
 // ── 스냅샷 읽기 도우미 ──
@@ -358,6 +366,7 @@ function scanCloudFolder(rootPath) {
   const files = [];
   const included = [];
   const findings = [];
+  const omissions = [];
   const restoredExecutablePaths = cloudReadRestoreExecutablePaths(rootPath);
   let localPackageMarker = null;
   let totalBytes = 0;
@@ -366,13 +375,22 @@ function scanCloudFolder(rootPath) {
   function addFinding(kind, severity, category, message, file, remediation) {
     findings.push({ id: `${kind}-${sha(file || message).slice(0, 10)}`, severity, category, message, ...(file ? { file } : {}), ...(remediation ? { remediation } : {}) });
   }
+  function addOmission(relativePath, reason, source) {
+    omissions.push({
+      path: relativePath,
+      reason,
+      sourceBytes: Number.isSafeInteger(source?.bytes) && source.bytes >= 0 ? source.bytes : 0,
+      sourceSha256: String(source?.sha256 || sha(`unavailable:${relativePath}:${reason}`)).toLowerCase(),
+      sourceHashKind: source?.hashKind || "unavailable-observation",
+    });
+  }
   function insideRoot(candidate) {
     const relative = path.relative(rootPath, candidate);
     return relative === "" || (relative && !relative.startsWith("..") && !path.isAbsolute(relative));
   }
   // no-follow open + 전/후 fstat/realpath 대조: 읽는 동안 파일이 바뀌면(스왑·append)
   // 무조건 실패한다. 캡처한 바이트와 디스크 상태가 다르면 패키지에 넣지 않는다.
-  function readStableFile(file, rel) {
+  function readStableFile(file, rel, { capture = true } = {}) {
     const beforeReal = fs.realpathSync.native(file);
     if (!insideRoot(beforeReal)) throw new Error("file resolves outside the approved package root");
     const noFollow = fs.constants.O_NOFOLLOW || 0;
@@ -381,18 +399,19 @@ function scanCloudFolder(rootPath) {
     try {
       const before = fs.fstatSync(fd);
       if (!before.isFile()) throw new Error("package entry is not a regular file");
-      if (before.size > CLOUD_MAX_FILE_BYTES) throw new Error(`file exceeds ${CLOUD_MAX_FILE_BYTES} bytes`);
+      const captureBytes = capture && before.size <= CLOUD_MAX_FILE_BYTES;
       const chunks = [];
+      const hasher = crypto.createHash("sha256");
       let actualBytes = 0;
       for (;;) {
-        const capacity = Math.min(64 * 1024, CLOUD_MAX_FILE_BYTES + 1 - actualBytes);
-        if (capacity <= 0) throw new Error(`file exceeds ${CLOUD_MAX_FILE_BYTES} bytes`);
+        const capacity = 64 * 1024;
         const chunk = Buffer.allocUnsafe(capacity);
         const read = fs.readSync(fd, chunk, 0, chunk.length, null);
         if (read === 0) break;
         actualBytes += read;
-        if (actualBytes > CLOUD_MAX_FILE_BYTES) throw new Error(`file exceeds ${CLOUD_MAX_FILE_BYTES} bytes`);
-        chunks.push(chunk.subarray(0, read));
+        const slice = chunk.subarray(0, read);
+        hasher.update(slice);
+        if (captureBytes) chunks.push(slice);
       }
       const after = fs.fstatSync(fd);
       const afterReal = fs.realpathSync.native(file);
@@ -407,7 +426,9 @@ function scanCloudFolder(rootPath) {
         throw new Error("package entry changed while it was being read");
       }
       return {
-        bytes: Buffer.concat(chunks, actualBytes),
+        bytes: captureBytes ? Buffer.concat(chunks, actualBytes) : null,
+        byteLength: actualBytes,
+        sha256: hasher.digest("hex"),
         executable: cloudPortableExecutableForFile(rel, after.mode, restoredExecutablePaths),
       };
     } finally {
@@ -430,6 +451,7 @@ function scanCloudFolder(rootPath) {
     let entries;
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });
+      entries.sort((a, b) => cloudCodePointPathOrder({ path: a.name }, { path: b.name }));
     } catch (error) {
       addFinding("unsafe-directory", "blocker", "policy", `Package directory could not be read safely: ${error.message || error}`, path.relative(rootPath, dir).split(path.sep).join("/"), "Remove linked or changing directories and retry.");
       return;
@@ -463,7 +485,11 @@ function scanCloudFolder(rootPath) {
       }
       if (entry.isSymbolicLink()) {
         addFinding("symlink", "blocker", "policy", "Symbolic links are not allowed in cloud agent packages.", rel, "Replace the symlink with an ordinary file or remove it.");
-        files.push({ path: rel, bytes: 0, sha256: "", kind: "binary", included: false, reason: "symlink-blocked" });
+        let linkTarget = "";
+        try { linkTarget = fs.readlinkSync(abs); } catch { /* advisory receipt keeps unavailable observation */ }
+        const source = { bytes: Buffer.byteLength(linkTarget), sha256: sha(Buffer.from(linkTarget)), hashKind: "link-target" };
+        addOmission(rel, "symlink-blocked", source);
+        files.push({ path: rel, bytes: source.bytes, sha256: source.sha256, kind: "binary", included: false, reason: "symlink-blocked" });
         continue;
       }
       if (entry.isDirectory()) {
@@ -473,30 +499,49 @@ function scanCloudFolder(rootPath) {
       }
       if (!entry.isFile()) {
         addFinding("unsupported-entry", "blocker", "policy", "Only stable ordinary files and directories are allowed in Cloud packages.", rel, "Remove sockets, FIFOs, devices, and other special filesystem entries.");
-        files.push({ path: rel, bytes: 0, sha256: "", kind: "binary", included: false, reason: "unsupported-entry" });
+        const descriptor = Buffer.from(`special-entry:${entry.name}`);
+        const source = { bytes: 0, sha256: sha(descriptor), hashKind: "filesystem-entry" };
+        addOmission(rel, "unsupported-entry", source);
+        files.push({ path: rel, bytes: 0, sha256: source.sha256, kind: "binary", included: false, reason: "unsupported-entry" });
         continue;
       }
       if (!cloudPortableRelativePath(rel)) {
         addFinding("unsafe-path", "blocker", "policy", "File path is not portable across supported hosts.", rel, "Rename the file to a Unicode NFC, relative, cross-platform-safe path.");
-        files.push({ path: rel, bytes: 0, sha256: "", kind: "binary", included: false, reason: "unsafe-path" });
+        let source;
+        try {
+          const stable = readStableFile(abs, rel, { capture: false });
+          source = { bytes: stable.byteLength, sha256: stable.sha256, hashKind: "content" };
+        } catch { source = null; }
+        addOmission(rel, "unsafe-path", source);
+        files.push({ path: rel, bytes: source?.bytes || 0, sha256: source?.sha256 || "", kind: "binary", included: false, reason: "unsafe-path" });
         continue;
       }
       count++;
-      if (count > CLOUD_MAX_FILES) {
-        addFinding("file-count-limit", "blocker", "size", `Package has more than ${CLOUD_MAX_FILES} files.`, "", "Publish a focused agent/team folder.");
-        continue;
-      }
+      const exceedsFileCount = count > CLOUD_MAX_FILES;
+      if (exceedsFileCount) addFinding("file-count-limit", "blocker", "size", `Package has more than ${CLOUD_MAX_FILES} files.`, rel, "Publish a focused agent/team folder.");
       if (CLOUD_AGENT_FILES.has(entry.name)) hasDefinition = true;
       let hint;
       try { hint = fs.lstatSync(abs); } catch { hint = { size: 0 }; }
       if (CLOUD_BLOCKED_FILE_RE.some((re) => re.test(entry.name))) {
         addFinding("blocked-file", "blocker", "secret", "Secret-bearing file names are not allowed in cloud packages.", rel, "Remove credentials and publish only env key names.");
-        files.push({ path: rel, bytes: Number(hint.size) || 0, sha256: "", kind: "binary", included: false, reason: "secret-file-blocked" });
+        let source;
+        try {
+          const stable = readStableFile(abs, rel, { capture: false });
+          source = { bytes: stable.byteLength, sha256: stable.sha256, hashKind: "content" };
+        } catch { source = null; }
+        addOmission(rel, "secret-file-redacted", source);
+        files.push({ path: rel, bytes: source?.bytes ?? (Number(hint.size) || 0), sha256: source?.sha256 || "", kind: "binary", included: false, reason: "secret-file-redacted" });
         continue;
       }
       if (Number(hint.size) > CLOUD_MAX_FILE_BYTES) {
         addFinding("large-file", "blocker", "size", `File exceeds ${CLOUD_MAX_FILE_BYTES} bytes.`, rel, "Move large assets out of the package.");
-        files.push({ path: rel, bytes: Number(hint.size), sha256: "", kind: "binary", included: false, reason: "file-too-large" });
+        let source;
+        try {
+          const stable = readStableFile(abs, rel, { capture: false });
+          source = { bytes: stable.byteLength, sha256: stable.sha256, hashKind: "content" };
+        } catch { source = null; }
+        addOmission(rel, "file-too-large", source);
+        files.push({ path: rel, bytes: source?.bytes ?? Number(hint.size), sha256: source?.sha256 || "", kind: "binary", included: false, reason: "file-too-large" });
         continue;
       }
       const ext = path.extname(entry.name).toLowerCase();
@@ -506,26 +551,53 @@ function scanCloudFolder(rootPath) {
         stable = readStableFile(abs, rel);
       } catch (error) {
         addFinding("unstable-file", "blocker", "policy", `Package file could not be read safely: ${error.message || error}`, rel, "Remove linked or concurrently changing files and retry.");
+        addOmission(rel, "unstable-file", { bytes: Number(hint.size) || 0, sha256: sha(`unstable:${rel}:${Number(hint.size) || 0}`), hashKind: "unstable-observation" });
         files.push({ path: rel, bytes: Number(hint.size) || 0, sha256: "", kind: isText ? "text" : "binary", included: false, reason: "unstable-file" });
         continue;
       }
       const content = stable.bytes;
       const executable = stable.executable;
-      totalBytes += content.length;
-      const digest = sha(content);
-      cloudAddSecretFindingsFromBytes(content, rel, addFinding);
+      const digest = stable.sha256;
+      const source = { bytes: stable.byteLength, sha256: digest, hashKind: "content" };
+      if (!content) {
+        addFinding("large-file", "blocker", "size", `File exceeds ${CLOUD_MAX_FILE_BYTES} bytes.`, rel, "Move large assets out of the package.");
+        addOmission(rel, "file-too-large", source);
+        files.push({ path: rel, bytes: stable.byteLength, sha256: digest, kind: isText ? "text" : "binary", executable, included: false, reason: "file-too-large" });
+        continue;
+      }
+      if (exceedsFileCount) {
+        addOmission(rel, "file-count-limit", source);
+        files.push({ path: rel, bytes: content.length, sha256: digest, kind: isText ? "text" : "binary", executable, included: false, reason: "file-count-limit" });
+        continue;
+      }
+      if (cloudAddSecretFindingsFromBytes(content, rel, addFinding)) {
+        addOmission(rel, "secret-content-redacted", source);
+        files.push({ path: rel, bytes: content.length, sha256: digest, kind: isText ? "text" : "binary", executable, included: false, reason: "secret-content-redacted" });
+        continue;
+      }
       if (isText) {
         const decoded = cloudDecodeTextAsset(content);
         if (!decoded.ok) {
           addFinding("invalid-text-encoding", "blocker", "policy", "A text agent asset is not valid UTF-8 or BOM-marked UTF-16.", rel, "Save the file as UTF-8 or BOM-marked UTF-16 before packaging.");
+          addOmission(rel, "invalid-text-encoding", source);
           files.push({ path: rel, bytes: content.length, sha256: digest, kind: "text", executable, included: false, reason: "invalid-text-encoding" });
           continue;
         }
         const text = decoded.text;
         if (/(?:curl|wget)[^\n|&;]+[|]\s*(?:sh|bash)/i.test(text)) {
           addFinding("curl-pipe-shell", "high", "network", "Remote shell install pattern detected.", rel, "Use explicit, reviewable install steps.");
+          addOmission(rel, "remote-shell-pattern-redacted", source);
+          files.push({ path: rel, bytes: content.length, sha256: digest, kind: "text", executable, included: false, reason: "remote-shell-pattern-redacted" });
+          continue;
         }
       }
+      if (totalBytes + content.length > CLOUD_MAX_TOTAL_BYTES) {
+        addFinding("package-size-limit", "blocker", "size", `Including this file would exceed ${CLOUD_MAX_TOTAL_BYTES} package bytes.`, rel, "Publish a smaller agent folder.");
+        addOmission(rel, "package-total-bytes-limit", source);
+        files.push({ path: rel, bytes: content.length, sha256: digest, kind: isText ? "text" : "binary", executable, included: false, reason: "package-total-bytes-limit" });
+        continue;
+      }
+      totalBytes += content.length;
       files.push({ path: rel, bytes: content.length, sha256: digest, kind: isText ? "text" : "binary", executable, included: true });
       included.push({ path: rel, bytes: content.length, sha256: digest, executable, contentBase64: content.toString("base64") });
     }
@@ -545,15 +617,38 @@ function scanCloudFolder(rootPath) {
     }
   }
   walk(rootPath);
-  const pathConflict = cloudPortablePathConflict(included.map((file) => file.path));
-  if (pathConflict) {
-    addFinding(pathConflict.code, "blocker", "policy", pathConflict.message, "", "Rename aliased paths so every file and ancestor directory has one portable identity.");
-  }
-  if (!hasDefinition) addFinding("missing-agent-definition", "blocker", "structure", "No agent definition file was found.", "", "Add AGENTS.md, CLAUDE.md, GEMINI.md, AGENT.md, or README.md at the package root.");
-  if (totalBytes > CLOUD_MAX_TOTAL_BYTES) addFinding("package-size-limit", "blocker", "size", `Package exceeds ${CLOUD_MAX_TOTAL_BYTES} bytes.`, "", "Publish a smaller agent folder.");
-  files.sort(cloudCodePointPathOrder);
   included.sort(cloudCodePointPathOrder);
-  return { files, included, findings, totalBytes, localPackageMarker };
+  const portableIncluded = [];
+  for (const file of included) {
+    const pathConflict = cloudPortablePathConflict([...portableIncluded.map((row) => row.path), file.path]);
+    if (!pathConflict) {
+      portableIncluded.push(file);
+      continue;
+    }
+    addFinding(pathConflict.code, "blocker", "policy", pathConflict.message, file.path, "Rename aliased paths so every file and ancestor directory has one portable identity.");
+    addOmission(file.path, "portable-path-conflict", { bytes: file.bytes, sha256: file.sha256, hashKind: "content" });
+    const record = files.find((row) => row.path === file.path);
+    if (record) { record.included = false; record.reason = "portable-path-conflict"; }
+  }
+  included.splice(0, included.length, ...portableIncluded);
+  totalBytes = included.reduce((sum, file) => sum + file.bytes, 0);
+  if (!hasDefinition) addFinding("missing-agent-definition", "blocker", "structure", "No agent definition file was found.", "", "Add AGENTS.md, CLAUDE.md, GEMINI.md, AGENT.md, or README.md at the package root.");
+  files.sort(cloudCodePointPathOrder);
+  omissions.sort(cloudCodePointPathOrder);
+  return { files, included, findings, omissions, totalBytes, localPackageMarker };
+}
+
+function cloudOmissionReceipt(omissions) {
+  if (!Array.isArray(omissions) || omissions.length === 0) return undefined;
+  const entries = omissions.map((entry) => ({
+    path: entry.path,
+    reason: entry.reason,
+    sourceBytes: entry.sourceBytes,
+    sourceSha256: entry.sourceSha256,
+    sourceHashKind: entry.sourceHashKind,
+  })).sort(cloudCodePointPathOrder);
+  const payload = { schemaVersion: "agentlas.cloud-package-omission-receipt.v1", entries };
+  return { ...payload, digest: `sha256:${sha(Buffer.from(JSON.stringify(payload)))}` };
 }
 
 // ── 라우팅 카드 (공개 Hub 발행 전용 게이트) ──
@@ -736,6 +831,13 @@ function cloudReplacePublicCareerCard(scan, card) {
   if (!card) {
     // redact 실패 시 원본 카드는 절대 발행 패키지에 실리지 않는다.
     if (fileRecord) { fileRecord.included = false; fileRecord.reason = "public-career-card-blocked"; }
+    if (existing) scan.omissions.push({
+      path: relativePath,
+      reason: "public-career-card-redacted",
+      sourceBytes: existing.bytes,
+      sourceSha256: existing.sha256,
+      sourceHashKind: "content",
+    });
     return;
   }
   const bytes = Buffer.from(JSON.stringify(card, null, 2) + "\n", "utf8");
@@ -743,6 +845,13 @@ function cloudReplacePublicCareerCard(scan, card) {
   scan.included.push(replacement);
   scan.included.sort(cloudCodePointPathOrder);
   scan.totalBytes += bytes.length - (existing?.bytes || 0);
+  if (existing && existing.sha256 !== replacement.sha256) scan.omissions.push({
+    path: relativePath,
+    reason: "public-career-card-redacted",
+    sourceBytes: existing.bytes,
+    sourceSha256: existing.sha256,
+    sourceHashKind: "content",
+  });
   if (fileRecord) Object.assign(fileRecord, { bytes: bytes.length, sha256: replacement.sha256, kind: "text", executable: false, included: true, reason: undefined });
   else scan.files.push({ path: relativePath, bytes: bytes.length, sha256: replacement.sha256, kind: "text", executable: false, included: true });
 }
@@ -758,14 +867,15 @@ function privateCloudSafetyFindings(findings) {
 }
 
 function cloudStaticReview(findings, scope = "hub-public") {
-  const blockers = findings.filter((f) => f.severity === "blocker").length;
-  const high = findings.filter((f) => f.severity === "high").length;
+  const blockers = findings.filter((f) => (f.riskLevel || f.severity) === "blocker").length;
+  const high = findings.filter((f) => (f.riskLevel || f.severity) === "high").length;
   return {
     mode: "static-only",
-    verdict: blockers ? "fail" : high ? "needs-review" : "pass",
+    authority: "advisory",
+    verdict: "pass",
     costOwner: "none",
     summary: blockers || high
-      ? `${blockers} blocker(s), ${high} high-risk finding(s).`
+      ? `${blockers} blocker-level and ${high} high-risk advisory finding(s); unsafe source bytes were omitted or redacted.`
       : scope === "owner-private"
         ? "Private Agent Cloud safety checks passed."
         : "Static public package review passed.",
@@ -775,9 +885,9 @@ function cloudStaticReview(findings, scope = "hub-public") {
 }
 
 function cloudSecuritySummary(findings) {
-  const blockerCount = findings.filter((f) => f.severity === "blocker").length;
-  const highCount = findings.filter((f) => f.severity === "high").length;
-  return { verdict: blockerCount ? "fail" : highCount ? "needs-review" : "pass", blockerCount, highCount, findingCount: findings.length };
+  const blockerCount = findings.filter((f) => (f.riskLevel || f.severity) === "blocker").length;
+  const highCount = findings.filter((f) => (f.riskLevel || f.severity) === "high").length;
+  return { verdict: "pass", authority: "advisory", blockerCount, highCount, findingCount: findings.length };
 }
 
 // ── 메인: 패키지(+등록) ──
@@ -848,13 +958,20 @@ async function packageCloudAgent(db, root, opts = {}) {
       });
     }
   }
-  const packageFindings = isPublicHubPublish ? scan.findings : privateCloudSafetyFindings(scan.findings);
+  const selectedFindings = isPublicHubPublish ? scan.findings : privateCloudSafetyFindings(scan.findings);
+  const packageFindings = selectedFindings.map((finding) => ({
+    ...finding,
+    riskLevel: finding.severity,
+    severity: "advisory",
+  }));
   const name = cloudReadName(snapshot, path.basename(rootPath));
   const slug = cloudSlug(opts.slug || cloudReadStableSlug(snapshot) || name || path.basename(rootPath));
   const scope = cas.cloudScopeForVisibility(visibility);
   let baseDescriptor = state.cloudBaseDescriptorForSource(scan.localPackageMarker, rootPath, slug, scope);
   const packageHashVersion = CLOUD_PACKAGE_HASH_V2;
   const packageHash = cloudHashPackage(scan.included, packageHashVersion);
+  scan.omissions.sort(cloudCodePointPathOrder);
+  const omissionReceipt = cloudOmissionReceipt(scan.omissions);
   const manifest = {
     version: "0.1",
     kind: "agentlas-cloud-agent",
@@ -869,13 +986,15 @@ async function packageCloudAgent(db, root, opts = {}) {
     rootFingerprint: sha(`agentlas-package-root:${packageHash}`),
     packageHash,
     packageHashVersion,
-    fileCount: scan.files.length,
+    fileCount: scan.included.length,
+    sourceFileCount: scan.files.length,
     includedFileCount: scan.included.length,
     totalBytes: scan.included.reduce((sum, file) => sum + file.bytes, 0),
     createdAt: new Date().toISOString(),
     billingMode: "static-only",
     costOwner: "none",
     security: cloudSecuritySummary(packageFindings),
+    ...(omissionReceipt ? { omissionReceipt } : {}),
     ...(careerGraph ? { careerGraph } : {}),
   };
   if (routingCard.card) manifest.routingCard = routingCard.card;
@@ -887,6 +1006,7 @@ async function packageCloudAgent(db, root, opts = {}) {
     manifest,
     files: scan.included,
     source: { packagedBy: "agentlas-cli", packagedAt: manifest.createdAt, costOwner: manifest.costOwner },
+    ...(omissionReceipt ? { omissionReceipt } : {}),
     ...(careerGraph ? { careerGraph } : {}),
   };
   fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n", "utf8");
@@ -896,10 +1016,9 @@ async function packageCloudAgent(db, root, opts = {}) {
   manifest.security = cloudSecuritySummary(allFindings);
   fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n", "utf8");
   fs.writeFileSync(bundlePath, JSON.stringify({ ...bundle, manifest }, null, 2) + "\n", "utf8");
-  const blocked = review.verdict === "fail" || allFindings.some((f) => f.severity === "blocker");
   let registration = null;
-  let status = blocked ? "blocked" : opts.dryRun ? "dry-run" : "ready";
-  if (!blocked && !opts.dryRun) {
+  let status = opts.dryRun ? "dry-run" : "ready";
+  if (!opts.dryRun) {
     // 자산의 정체성은 (로그인 계정, slug)다 — 어느 폴더에서 올리는지는 중요하지 않다.
     // 쓰기 전에 서버가 들고 있는 내 자산의 현재 버전을 조회해서:
     //   · 이 폴더에 기록이 없으면(새 PC, 새 클론) 그 버전을 기준으로 업데이트한다.
@@ -970,11 +1089,7 @@ async function packageCloudAgent(db, root, opts = {}) {
       ? isPublicHubPublish
         ? `Published ${slug} publicly to Agentlas Hub.`
         : `Saved ${slug} privately in Agent Cloud.`
-      : status === "blocked"
-        ? isPublicHubPublish
-          ? `Hub publish blocked: ${review.summary}`
-          : `Private Agent Cloud save blocked: ${review.summary}`
-        : isPublicHubPublish
+      : isPublicHubPublish
           ? `Hub package ready: ${slug}.`
           : `Private Agent Cloud package ready: ${slug}.`,
   };
@@ -1004,6 +1119,7 @@ module.exports = {
   cloudReadRestoreExecutablePaths,
   cloudPortableExecutableForFile,
   scanCloudFolder,
+  cloudOmissionReceipt,
   readCloudRoutingCard,
   cloudRoutingCardProblem,
   cloudReadPublicCareerCard,

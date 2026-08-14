@@ -29,6 +29,7 @@ const { dbPath, userDataDir } = require("../core/paths.cjs");
 const RUNTIME_BIN = {
   "claude-code": "claude",
   codex: "codex",
+  agy: "agy",
   gemini: "gemini",
 };
 
@@ -198,6 +199,14 @@ function buildArgs(kind, systemPrompt, prompt, permission, runtimeOptions = {}) 
     const mcp = native.geminiMcpIsolationArgs();
     return ["--prompt", `[SYSTEM]\n${systemPrompt}\n\n${prompt}`, ...(model ? ["-m", model] : []), ...perm, ...noAuthorityArgs, ...mcp];
   }
+  if (kind === "agy") {
+    return native.agyArgs({
+      prompt,
+      systemPrompt,
+      permission: noAuthority ? "read" : level,
+      model,
+    });
+  }
   return [prompt];
 }
 
@@ -287,6 +296,7 @@ function capturedRuntimeUsage(kind, raw) {
     }
     const direct =
       genericUsage(event?.usage) ||
+      genericUsage(event?.step_update?.usage) ||
       genericUsage(event?.usageMetadata) ||
       genericUsage(event?.stats);
     if (direct) return direct;
@@ -346,6 +356,12 @@ function capturedRuntimeFailure(kind, raw, text) {
         return { message: `gemini ${event.status}`, source: "marker" };
       }
     }
+    if (kind === "agy" && event.event === "result") {
+      const status = String(event.result?.status || "").toLowerCase();
+      if (status && !["success", "completed", "done"].includes(status)) {
+        return { message: `agy ${status}`, source: "marker" };
+      }
+    }
   }
   // 표식이 전혀 없는 케이스(codex 한도) — 휴리스틱 최후 그물, 출처 표기.
   const refusal = detectRuntimeRefusal(text);
@@ -399,6 +415,21 @@ function capturedRuntimeAgentText(kind, raw) {
     return final ? String(final.result ?? final.response) : "";
   }
 
+  if (kind === "agy") {
+    const isProtocol = events.some((event) =>
+      event?.event === "step_update" || event?.event === "result",
+    );
+    if (!isProtocol) return text.trim();
+    const final = [...events].reverse().find((event) =>
+      event?.event === "result" && typeof event.result?.response === "string",
+    );
+    if (final) return final.result.response;
+    return events
+      .filter((event) => event?.event === "step_update" && event.step_update?.step_type === "agent_response")
+      .map((event) => typeof event.step_update?.text_delta === "string" ? event.step_update.text_delta : "")
+      .join("");
+  }
+
   return text.trim();
 }
 
@@ -423,6 +454,7 @@ function captureRuntime(kind, systemPrompt, prompt, opts) {
     // 계약 테스트용 실행 파일 주입(가짜 CLI가 픽스처를 cat) — 프로덕션 경로에선 없음.
     const bin = opts.binOverride || which(RUNTIME_BIN[kind]) || RUNTIME_BIN[kind];
     let child;
+    let launchCleanup = () => {};
     try {
       const spawnImpl = opts.spawn || spawn;
       const env = nativeHost.runtimeEnvForKind(kind, opts.env || process.env, {
@@ -431,13 +463,28 @@ function captureRuntime(kind, systemPrompt, prompt, opts) {
         mcpAllowlistMode: kind === "gemini" ? "exact" : undefined,
       });
       const groupedChild = process.platform !== "win32" && spawnImpl === spawn;
-      child = spawnImpl(bin, buildArgs(kind, systemPrompt, prompt, opts.permission, {
+      const runtimeOptions = {
         model: opts.model,
         effort: opts.effort,
         authorityMode: opts.authorityMode,
         noToolsPolicyPath: opts.noToolsPolicyPath,
         allowedNativeTools: opts.allowedNativeTools,
-      }), {
+      };
+      let childArgs = buildArgs(kind, systemPrompt, prompt, opts.permission, runtimeOptions);
+      if (kind === "agy") {
+        const prepared = nativeHost.prepareAgyLaunch({
+          prompt,
+          systemPrompt,
+          permission: opts.authorityMode === "no-authority" ? "read" : opts.permission,
+          model: opts.model,
+        }, {
+          platform: opts.platform,
+          promptLimit: opts.agyPromptLimit,
+        });
+        childArgs = prepared.args;
+        launchCleanup = prepared.cleanup;
+      }
+      child = spawnImpl(bin, childArgs, {
         cwd,
         stdio: ["ignore", "pipe", "pipe"],
         env,
@@ -446,6 +493,7 @@ function captureRuntime(kind, systemPrompt, prompt, opts) {
       });
       child.__agentlasGroupedChild = groupedChild;
     } catch (error) {
+      launchCleanup();
       reject(error);
       return;
     }
@@ -479,6 +527,7 @@ function captureRuntime(kind, systemPrompt, prompt, opts) {
       child.removeListener("error", onError);
       child.removeListener("close", onClose);
       if (opts.signal) opts.signal.removeEventListener?.("abort", onAbort);
+      launchCleanup();
     };
     const finishReject = (error) => {
       if (settled) return;
@@ -562,7 +611,7 @@ function captureRuntime(kind, systemPrompt, prompt, opts) {
       let text;
       if (kind === "codex" && opts.authorityMode === "no-authority") {
         text = codexCaptureAgentText(raw);
-      } else if (kind === "claude-code" || kind === "gemini") {
+      } else if (kind === "claude-code" || kind === "gemini" || kind === "agy") {
         text = capturedRuntimeAgentText(kind, raw);
       } else {
         text = raw;

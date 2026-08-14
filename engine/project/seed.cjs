@@ -2,10 +2,6 @@
 /*
  * project/seed — .agentlas/ 비공개 프로젝트 상태 시드 (v1 ensureProjectMemoryCli 포팅).
  *
- * v1 monolith 4184–7652에서 ~3,400줄이 super-ontology JSON 문서 리터럴 25개였다.
- * 그 문서들은 engine/project/super-ontology-seed.json 데이터 파일로 추출했고
- * (바이트 동일 — projectId만 치환 자리), 이 모듈은 그 목록을 순회만 한다.
- *
  * 경계(0.9.10): 이 함수는 아무 명령에서나 자동으로 불리지 않는다.
  * `agentlas project init` 경로(state.cjs의 ensureCoreProjectCli 폴백)만 호출한다.
  */
@@ -17,14 +13,51 @@ const {
   ensureSoulCredentialIndexCli,
 } = require("./credentials.cjs");
 
-// 추출된 super-ontology 시드 문서 (v1과 동일한 기록 순서를 배열 순서로 보존).
-const SUPER_ONTOLOGY_SEED = require("./super-ontology-seed.json");
+// 제거 범위는 과거 Terminal이 직접 생성한 정해진 파일명에만 한정한다. `super-ontology-*`
+// 와일드카드 삭제는 사용자가 만든 동명 문서까지 지울 수 있고, AO/Workforce/semantic ontology,
+// Context Map, Career Graph는 별도 살아 있는 계약이므로 이름 추측으로 건드리지 않는다.
+const LEGACY_SUPER_ONTOLOGY_FILES = Object.freeze([
+  "super-ontology-contract.json",
+  "super-ontology-open-world-coverage.json",
+  "super-ontology-consensus-coordination.json",
+  "super-ontology-task-coverage.json",
+  "super-ontology-contextual-flow.json",
+  "super-ontology-causal-impact.json",
+  "super-ontology-assurance-case.json",
+  "super-ontology-knowledge-homeostasis.json",
+  "super-ontology-adversarial-provenance.json",
+  "super-ontology-epistemic-calibration.json",
+  "super-ontology-semantic-alignment.json",
+  "super-ontology-resilience-control.json",
+  "super-ontology-invariant-verification.json",
+  "super-ontology-observability-telemetry.json",
+  "super-ontology-objective-proxy-validity.json",
+  "super-ontology-stakeholder-preference-governance.json",
+  "super-ontology-normative-authority-drift.json",
+  "super-ontology-side-effect-containment.json",
+  "super-ontology-source-lineage-version.json",
+  "super-ontology-entity-identity-resolution.json",
+  "super-ontology-temporal-state-transition.json",
+  "super-ontology-capability-delegation-authority.json",
+  "super-ontology-privacy-confidentiality-boundary.json",
+  "super-ontology-strategic-incentive-compatibility.json",
+  "super-ontology-reflexive-feedback-stability.json",
+  "super-ontology-replays.jsonl",
+  "super-ontology-evidence.jsonl",
+  "super-ontology-memory-bridge.jsonl",
+]);
 
-/** projectId 자리만 치환해 v1과 바이트 동일한 문서를 만든다 (키 순서 보존). */
-function superOntologyDocumentFor(entry, projectName) {
-  const doc = JSON.parse(JSON.stringify(entry.doc));
-  doc.projectId = projectName;
-  return doc;
+function removeLegacySuperOntologyFiles(dir) {
+  for (const fileName of LEGACY_SUPER_ONTOLOGY_FILES) {
+    const filePath = path.join(dir, fileName);
+    let stat;
+    try { stat = fs.lstatSync(filePath); } catch (error) {
+      if (error && error.code === "ENOENT") continue;
+      throw error;
+    }
+    // 알려진 레거시 산출물은 파일/링크였다. 같은 이름의 디렉터리는 사용자 데이터일 수 있다.
+    if (stat.isFile() || stat.isSymbolicLink()) fs.unlinkSync(filePath);
+  }
 }
 
 function ensureProjectMemoryCli(projectPath, projectName) {
@@ -32,6 +65,7 @@ function ensureProjectMemoryCli(projectPath, projectName) {
   try {
     const dir = path.join(projectPath, arch.memoryDir || ".agentlas");
     fs.mkdirSync(dir, { recursive: true });
+    removeLegacySuperOntologyFiles(dir);
     const name = projectName || path.basename(projectPath) || "Project";
     ensureLocalCredentialStoreCli(projectPath, name, arch);
     ensureSoulCredentialIndexCli(projectPath, name, arch);
@@ -51,9 +85,6 @@ function ensureProjectMemoryCli(projectPath, projectName) {
     const careerGraphSourceManifestFile = arch.careerGraphSourceManifestFile || "career-graph-sources.json";
     const careerGraphInboxDir = arch.careerGraphInboxDir || "career-graph-inbox";
     const careerGraphDbFile = arch.careerGraphDbFile || "career-graph.sqlite";
-    const superOntologyReplaysFile = arch.superOntologyReplaysFile || "super-ontology-replays.jsonl";
-    const superOntologyEvidenceFile = arch.superOntologyEvidenceFile || "super-ontology-evidence.jsonl";
-    const superOntologyMemoryBridgeFile = arch.superOntologyMemoryBridgeFile || "super-ontology-memory-bridge.jsonl";
     const skillRegistry = path.join(dir, skillRegistryFile);
     if (!fs.existsSync(skillRegistry)) {
       fs.writeFileSync(skillRegistry, JSON.stringify({
@@ -177,24 +208,8 @@ function ensureProjectMemoryCli(projectPath, projectName) {
       const filePath = path.join(dir, fileName);
       if (!fs.existsSync(filePath)) fs.writeFileSync(filePath, "", "utf8");
     }
-    // super-ontology 계약 문서 25종 — 데이터 파일 순회 (v1 인라인 리터럴과 바이트 동일).
-    for (const entry of SUPER_ONTOLOGY_SEED.documents) {
-      const fileName = arch[entry.archKey] || entry.file;
-      const filePath = path.join(dir, fileName);
-      if (!fs.existsSync(filePath)) {
-        fs.writeFileSync(filePath, JSON.stringify(superOntologyDocumentFor(entry, name), null, 2), "utf8");
-      }
-    }
-    for (const fileName of [
-      superOntologyReplaysFile,
-      superOntologyEvidenceFile,
-      superOntologyMemoryBridgeFile,
-    ]) {
-      const filePath = path.join(dir, fileName);
-      if (!fs.existsSync(filePath)) fs.writeFileSync(filePath, "", "utf8");
-    }
     return dir;
   } catch { return null; }
 }
 
-module.exports = { ensureProjectMemoryCli, SUPER_ONTOLOGY_SEED };
+module.exports = { ensureProjectMemoryCli, removeLegacySuperOntologyFiles };

@@ -6,6 +6,7 @@
  * 아무것도 없으면 no_runtime "정직 정지" — 키워드/저품질 폴백 금지(오너 결정).
  */
 const { RUNTIME_BIN, whichSync, listAvailableCliRuntimes, activeRuntimeRow } = require("./detect.cjs");
+const path = require("node:path");
 
 // Session이 실제 드라이버를 갖춘 런타임만 실행 대상으로 삼는다.
 // CLI는 native-host, Ollama는 로컬 API loop를 쓴다. 다른 드라이버가 포팅되면
@@ -25,6 +26,16 @@ function apiRuntime(kind, model, source) {
     ...(model ? { model } : {}),
     source,
   };
+}
+
+function sharedRuntimeKind(row) {
+  if (!row) return null;
+  // Desktop historically stored Antigravity as kind=gemini with the actual
+  // selected executable in source. Preserve the selected product surface;
+  // never discard `agy` and silently fall through to Gemini or another CLI.
+  const selectedBin = path.posix.basename(path.win32.basename(String(row.source || ""))).toLowerCase();
+  if (row.kind === "gemini" && /^agy(?:\.exe|\.cmd)?$/i.test(selectedBin)) return "agy";
+  return row.kind;
 }
 
 class NoRuntimeError extends Error {
@@ -61,12 +72,19 @@ function resolveRuntime({ db, prefs, explicit }) {
   }
   if (db) {
     const active = activeRuntimeRow(db);
-    if (active && API_EXECUTABLE_KINDS.has(active.kind)) {
-      return apiRuntime(active.kind, active.model || undefined, "active");
+    const activeKind = sharedRuntimeKind(active);
+    if (active && API_EXECUTABLE_KINDS.has(activeKind)) {
+      return apiRuntime(activeKind, active.model || undefined, "active");
     }
-    if (active && CLI_EXECUTABLE_KINDS.has(active.kind)) {
-      const p = whichSync(RUNTIME_BIN[active.kind]);
-      if (p) return { kind: active.kind, bin: p, model: active.model || undefined, source: "active" };
+    if (active && CLI_EXECUTABLE_KINDS.has(activeKind)) {
+      const p = whichSync(RUNTIME_BIN[activeKind]);
+      if (p) return {
+        kind: activeKind,
+        bin: p,
+        model: active.model || undefined,
+        source: "active",
+        runtimeSource: active.source || undefined,
+      };
     }
   }
   const found = listAvailableCliRuntimes().filter((r) => CLI_EXECUTABLE_KINDS.has(r.kind));
@@ -76,10 +94,11 @@ function resolveRuntime({ db, prefs, explicit }) {
   throw new NoRuntimeError([
     "no_runtime: no agent CLI is connected — Agentlas runs your agents on a CLI you already subscribe to.",
     "",
-    "Install one, then rerun:",
+    "Connect or install one, then rerun:",
+    "  agy                                      # Antigravity CLI (preferred)",
     "  npm i -g @anthropic-ai/claude-code    # Claude Code",
     "  npm i -g @openai/codex                # Codex CLI",
-    "  npm i -g @google/gemini-cli           # Gemini CLI",
+    "  npm i -g @google/gemini-cli           # Gemini CLI (legacy)",
     "",
     "Already installed? Make sure its binary is on PATH (agentlas doctor shows what was detected).",
   ].join("\n"));
@@ -91,4 +110,5 @@ module.exports = {
   EXECUTABLE_KINDS,
   CLI_EXECUTABLE_KINDS,
   API_EXECUTABLE_KINDS,
+  sharedRuntimeKind,
 };

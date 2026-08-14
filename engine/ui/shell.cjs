@@ -386,7 +386,7 @@ async function startShell(ctx, opts = {}) {
       let result;
       ui.updateSpinner(en ? "Searching the Hub…" : "Hub 검색 중…");
       try {
-        result = await callHubTool("marketplace.search_agents", { q: query, query, limit: 12 });
+        result = await callHubTool("marketplace.search_agents", { q: query, limit: 12 });
       } catch (e) {
         ui.stopSpinner();
         ui.error(Object.assign(new Error(e instanceof HubError ? e.message : String((e && e.message) || e)),
@@ -449,8 +449,11 @@ async function startShell(ctx, opts = {}) {
         return;
       }
       if (cmd === "permission") {
+        if (!permissions.isLevel(value)) {
+          ui.line(ui.c.dim("Usage: /permission read|write|full"));
+          return;
+        }
         const next = permissions.normalize(value);
-        if (!next) { ui.line(ui.c.dim("Usage: /permission read|write|full")); return; }
         permission = next;
         ui.line(ui.c.dim(`permission: ${next}  ·  ${en ? "persist: agentlas setup" : "영구 저장: agentlas setup"}`));
         return;

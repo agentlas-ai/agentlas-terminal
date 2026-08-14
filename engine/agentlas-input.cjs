@@ -270,7 +270,7 @@ const SLASH_COMMAND_META = [
   { command: "/agent", description: "Switch to another agent", category: "Routing", usage: "/agent <name>", detail: "Switch the current conversation to an installed agent." },
   { command: "/firms", description: "List installed companies", category: "Routing", usage: "/firms", detail: "Show company CEOs available in this terminal." },
   { command: "/firm", description: "Switch to a company CEO", category: "Routing", usage: "/firm <name>", detail: "Switch the current conversation to a company CEO agent." },
-  { command: "/runtime", description: "Switch runtime: claude-code, codex, gemini, BYOK, or Ollama", category: "Settings", usage: "/runtime codex", detail: "Change the engine Agentlas uses for subsequent turns." },
+  { command: "/runtime", description: "Switch runtime: claude-code, codex, agy, legacy gemini, BYOK, or Ollama", category: "Settings", usage: "/runtime agy", detail: "Change the engine Agentlas uses for subsequent turns." },
   { command: "/model", description: "Pin a model or return to auto allocation", category: "Settings", usage: "/model <id|auto>", detail: "An id is an explicit session pin; auto lets the higher-level allocator choose a provider-compatible tier." },
   { command: "/effort", description: "Pin reasoning effort or return to auto", category: "Settings", usage: "/effort low|medium|high|max|off|auto", detail: "A level is an explicit pin; auto lets the higher-level allocator choose per task; off is an explicit no-effort pin." },
   { command: "/permission", description: "Set read/write/full permission", category: "Settings", usage: "/permission full", detail: "No argument shows what read, write, and full mean.", aliases: ["/perm"] },
@@ -306,7 +306,7 @@ const SLASH_COMMAND_META = [
   { command: "/exit", description: "Quit Agentlas", category: "Session", usage: "/exit", detail: "Close the terminal session.", aliases: ["/quit"] },
 ];
 const SLASH_COMMANDS = SLASH_COMMAND_META.flatMap((entry) => [entry.command].concat(entry.aliases || []));
-const RUNTIME_SPECS = ["claude-code", "codex", "gemini", "anthropic", "openai", "google", "ollama", "upstage"];
+const RUNTIME_SPECS = ["claude-code", "codex", "agy", "gemini", "anthropic", "openai", "google", "ollama", "upstage"];
 const PERM_LEVELS = ["read", "write", "full"];
 
 const HELP_KEY_BY_COMMAND = {

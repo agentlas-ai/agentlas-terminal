@@ -1096,6 +1096,7 @@ function validateWorkOrder(value) {
 
 function validateCandidateSet(value, workOrder, now = new Date(), options = {}) {
   const set = assertObject(value, "candidateSet");
+  const summaryMenu = set.projection === "menu.v1";
   assertNoForbiddenFitSignals(set);
   // projection은 로컬 Core(연합) 응답에만 있는 메뉴 투영 메타데이터다(실측
   // 2026-08-05, reference-first: fullDossier=false). 원격 서버는 보내지 않는다.
@@ -1129,15 +1130,21 @@ function validateCandidateSet(value, workOrder, now = new Date(), options = {}) 
     const orderSlot = orderSlots.get(slotId);
     seenSlots.add(slotId);
     const releases = new Set();
-    for (const candidate of assertArray(slotResult.candidates, `candidateSet.${slotId}.candidates`, 100)) {
+    for (const [candidateIndex, candidate] of assertArray(slotResult.candidates, `candidateSet.${slotId}.candidates`, 100).entries()) {
       assertObject(candidate, "candidate");
       // missingMandatory는 로컬 Core(연합) 응답에만 있는 미충족 필수 표식이다
       // (실측 2026-08-05, fullDossier=true에도 동봉). 원격 서버는 보내지 않는다.
-      const candidateKeys = [
-        "agentDefinitionId", "agentReleaseId", "releaseVersion", "packageHash", "contentDigest",
-        "entityKind", "name", "communities", "fitEvidence", "qualificationEvidence", "optionalGaps",
-        "semanticSnapshot", "operational",
-      ];
+      const candidateKeys = summaryMenu
+        ? [
+            "agentDefinitionId", "agentReleaseId", "releaseVersion", "entityKind", "name",
+            "communities", "fitEvidence", "qualificationEvidenceCount", "optionalGaps",
+            "semanticSnapshot", "operational", "candidateOrdinal",
+          ]
+        : [
+            "agentDefinitionId", "agentReleaseId", "releaseVersion", "packageHash", "contentDigest",
+            "entityKind", "name", "communities", "fitEvidence", "qualificationEvidence", "optionalGaps",
+            "semanticSnapshot", "operational",
+          ];
       if (Object.prototype.hasOwnProperty.call(candidate, "missingMandatory")) candidateKeys.push("missingMandatory");
       assertExactKeys(candidate, candidateKeys, "candidate", "candidate_set_invalid");
       assertId(candidate.agentDefinitionId, "candidate.agentDefinitionId");
@@ -1145,15 +1152,22 @@ function validateCandidateSet(value, workOrder, now = new Date(), options = {}) 
       if (releases.has(releaseId)) fail("candidate_set_invalid", `duplicate release ${releaseId} in ${slotId}`);
       releases.add(releaseId);
       assertString(candidate.releaseVersion, "candidate.releaseVersion", 100);
-      assertHash(candidate.packageHash, "candidate.packageHash");
-      assertHash(candidate.contentDigest, "candidate.contentDigest");
+      if (summaryMenu) {
+        if (candidate.candidateOrdinal !== candidateIndex + 1) fail("candidate_set_invalid", `candidate ordinal mismatch in ${slotId}`);
+        if (!Number.isInteger(candidate.qualificationEvidenceCount) || candidate.qualificationEvidenceCount < 0) {
+          fail("candidate_set_invalid", "candidate.qualificationEvidenceCount is invalid");
+        }
+      } else {
+        assertHash(candidate.packageHash, "candidate.packageHash");
+        assertHash(candidate.contentDigest, "candidate.contentDigest");
+      }
       if (!["agent", "team"].includes(candidate.entityKind) || !orderSlot.allowedEntityKinds.includes(candidate.entityKind)) {
         fail("candidate_set_invalid", "candidate.entityKind is not executable or violates the WorkOrder slot boundary");
       }
       assertString(candidate.name, "candidate.name", 200);
       assertIds(candidate.communities, "candidate.communities");
       assertIds(candidate.fitEvidence, "candidate.fitEvidence");
-      assertIds(candidate.qualificationEvidence, "candidate.qualificationEvidence");
+      if (!summaryMenu) assertIds(candidate.qualificationEvidence, "candidate.qualificationEvidence");
       assertIds(candidate.optionalGaps, "candidate.optionalGaps");
       const operational = assertObject(candidate.operational, "candidate.operational");
       assertExactKeys(operational, ["callable", "installable"], "candidate.operational", "candidate_set_invalid", ["unavailableReasons"]);
@@ -1163,10 +1177,15 @@ function validateCandidateSet(value, workOrder, now = new Date(), options = {}) 
       // knowledge·modalities는 로컬 Core 스냅샷에만 있는 확장 어휘다(실측 2026-08-05).
       // 원격 서버는 보내지 않는다 — missingMandatory·projection과 같은 규칙으로
       // "있으면 검증하고 허용", 원격 계약의 exact-keys는 그대로 둔다.
-      const semanticKeys = [
-        "summaries", "roles", "skills", "toolCapabilities", "consumes", "produces",
-        "authorities", "runtimes", "languages",
-      ];
+      const semanticKeys = summaryMenu
+        ? [
+            "summaries", "roles", "skills", "toolCapabilities", "consumesCount", "producesCount",
+            "authorities", "runtimes", "languages",
+          ]
+        : [
+            "summaries", "roles", "skills", "toolCapabilities", "consumes", "produces",
+            "authorities", "runtimes", "languages",
+          ];
       for (const optional of ["knowledge", "modalities"]) {
         if (Object.prototype.hasOwnProperty.call(semantic, optional)) semanticKeys.push(optional);
       }
@@ -1177,8 +1196,14 @@ function validateCandidateSet(value, workOrder, now = new Date(), options = {}) 
       assertIds(semantic.roles, "candidate.semanticSnapshot.roles");
       assertLeveledConcepts(semantic.skills, "candidate.semanticSnapshot.skills");
       assertLeveledConcepts(semantic.toolCapabilities, "candidate.semanticSnapshot.toolCapabilities");
-      assertIds(semantic.consumes, "candidate.semanticSnapshot.consumes");
-      assertIds(semantic.produces, "candidate.semanticSnapshot.produces");
+      if (summaryMenu) {
+        for (const field of ["consumesCount", "producesCount"]) {
+          if (!Number.isInteger(semantic[field]) || semantic[field] < 0) fail("candidate_set_invalid", `candidate.semanticSnapshot.${field} is invalid`);
+        }
+      } else {
+        assertIds(semantic.consumes, "candidate.semanticSnapshot.consumes");
+        assertIds(semantic.produces, "candidate.semanticSnapshot.produces");
+      }
       assertIds(semantic.authorities, "candidate.semanticSnapshot.authorities");
       assertStrings(semantic.runtimes, "candidate.semanticSnapshot.runtimes");
       assertStrings(semantic.languages, "candidate.semanticSnapshot.languages");
@@ -1379,7 +1404,9 @@ function normalizedRosterPairs(rows, label, candidateSet) {
     seen.add(pair);
     const candidate = maps.bySlot.get(slotId)?.get(releaseId);
     if (!candidate || candidate.agentDefinitionId !== definitionId || candidate.releaseVersion !== releaseVersion ||
-        candidate.packageHash !== packageHash || candidate.contentDigest !== contentDigest || candidate.entityKind !== row.entityKind) {
+        (candidate.packageHash !== undefined && candidate.packageHash !== packageHash) ||
+        (candidate.contentDigest !== undefined && candidate.contentDigest !== contentDigest) ||
+        candidate.entityKind !== row.entityKind) {
       fail("selection_validation_invalid", `${label}[${index}] does not match the frozen candidate release`);
     }
     return pair;
@@ -1479,6 +1506,10 @@ function validatePreparedExecution(value, workOrder, selection, candidateSet, va
   const contextDigest = assertHash(prepared.executionContextDigest, "preparedExecution.executionContextDigest");
   if (!constantTimeHashEqual(contextDigest, executionContextDigest(context))) fail("execution_context_mismatch", "prepared execution context digest is invalid");
   const maps = candidateMaps(candidateSet);
+  const validatedRows = new Map(validationReceipt.executableTeam.map((row) => [
+    `${row.slotId}\0${row.agentReleaseId}`,
+    row,
+  ]));
   const expected = selectedPairs(selection);
   const roster = assertArray(prepared.executionRoster, "preparedExecution.executionRoster", MAX_ASSIGNMENTS, { min: 1 });
   const actual = [];
@@ -1512,7 +1543,18 @@ function validatePreparedExecution(value, workOrder, selection, candidateSet, va
     const bundleDigest = assertHash(row.bundleDigest, "executionRoster.bundleDigest");
     assertObject(row.directiveBundle, "executionRoster.directiveBundle");
     if (!["agent", "team"].includes(row.entityKind)) fail("execution_bundle_invalid", "executionRoster.entityKind is invalid");
-    if (packageHash !== candidate.packageHash || contentDigest !== candidate.contentDigest) fail("execution_bundle_digest_mismatch", `prepared bytes do not match candidate pin for ${releaseId}`);
+    const validated = validatedRows.get(pair);
+    if (!validated) fail("execution_bundle_invalid", `prepared release ${releaseId} has no accepted exact-release receipt`);
+    if (
+      definitionId !== candidate.agentDefinitionId ||
+      releaseVersion !== candidate.releaseVersion ||
+      row.entityKind !== candidate.entityKind ||
+      definitionId !== validated.agentDefinitionId ||
+      releaseVersion !== validated.releaseVersion ||
+      packageHash !== validated.packageHash ||
+      contentDigest !== validated.contentDigest ||
+      row.entityKind !== validated.entityKind
+    ) fail("execution_bundle_digest_mismatch", `prepared bytes do not match the accepted exact-release receipt for ${releaseId}`);
     if (releaseVersion !== candidate.releaseVersion) fail("execution_bundle_digest_mismatch", `prepared version does not match candidate pin for ${releaseId}`);
     if (definitionId !== candidate.agentDefinitionId) fail("execution_bundle_digest_mismatch", `prepared definition does not match candidate pin for ${releaseId}`);
     if (row.entityKind !== candidate.entityKind) fail("execution_bundle_digest_mismatch", `prepared entity kind does not match candidate pin for ${releaseId}`);
@@ -1660,6 +1702,7 @@ function candidateMenu(candidateSet) {
           .slice(0, 5)
           .map((value) => term(value, "skill:"));
         const row = {
+          candidateOrdinal: candidate.candidateOrdinal,
           agentReleaseId: candidate.agentReleaseId,
           name: String(candidate.name || "").slice(0, 80),
           entityKind: candidate.entityKind,
@@ -1668,8 +1711,10 @@ function candidateMenu(candidateSet) {
         if (skills.length) row.skills = skills;
         const roles = (snapshot.roles || []).slice(0, 2).map((value) => term(value, "role:"));
         if (roles.length) row.roles = roles;
-        const summary = String(snapshot.summary || candidate.summary || "").trim();
+        const summary = String((snapshot.summaries || [])[0] || candidate.summary || "").trim();
         if (summary) row.summary = summary.slice(0, 200);
+        const fitEvidence = (candidate.fitEvidence || []).slice(0, 4).map(String);
+        if (fitEvidence.length) row.fitEvidence = fitEvidence;
         return row;
       }),
     })),
@@ -2455,16 +2500,11 @@ const TRANSIENT_MODEL_ERROR_RE = /Connection closed mid-response|"terminal_reaso
     // 행을 찾으므로, 두 곳이 어긋나면 supersession 이 조용히 실패한다(sourceScope
     // 추가 때 한 번, fullDossier 추가 때 또 한 번 실측으로 깨졌다).
     //
-    // fullDossier: 이 루프의 검증기는 legacy full-echo 계약이다 —
-    // validateCandidateSet 이 packageHash·contentDigest·qualificationEvidence 와
-    // semanticSnapshot.produces/consumes 를 필수로 요구하고(assertExactKeys),
-    // 준비된 번들의 핀을 candidate.packageHash/contentDigest 와 직접 대조한다
-    // (execution_bundle_digest_mismatch). 감사용 필드가 아니라 실행 검증에 쓰이는
-    // 필수값이므로 메뉴 투영으로 대체할 수 없다. 로컬 Core 경로는 이미 같은 이유로
-    // 이 값을 싣는다(workforce/local-core-transport.cjs). 서버 기본값에 의존하면
-    // 기본값이 메뉴로 바뀌는 순간 이 표면이 candidate_set_invalid 로 전멸한다.
-    // 모르는 인자는 무시되므로 투영 이전 서버에도 안전하다.
-    const candidateSearchArgs = (workOrder) => ({ workOrder, sourceScope, fullDossier: true });
+    // Current Core returns a numbered summary menu by default and keeps the
+    // audit-weight dossier in its pinned selection session. Exact hashes are
+    // reintroduced only in accepted validation/preparation receipts and are
+    // cross-checked there; never request or echo the legacy full dossier.
+    const candidateSearchArgs = (workOrder) => ({ workOrder, sourceScope });
     const ui = ctx.ui || newUi();
     const runtime = ctx.runtime || D.resolveRuntime(db, ctx.runtimeOverride);
     const cwd = ctx.cwd || (typeof D.projectCwd === "function" ? D.projectCwd() : process.cwd());
@@ -3286,13 +3326,13 @@ const TRANSIENT_MODEL_ERROR_RE = /Connection closed mid-response|"terminal_reaso
             : `  picked ${row.slotId} ← ${nameByRelease.get(row.agentReleaseId) || row.agentReleaseId}`);
         }
       }
-      const validationRaw = await hubStage("workforce.validate_selection", { workOrder, candidateSet, selection });
+      const validationRaw = await hubStage("workforce.validate_selection", { workOrder, selection });
       validationReceipt = validateSelectionReceipt(validationRaw, selection, candidateSet, workOrder);
       benchmarkState.selectionValidation = validationReceipt;
       receipt.selectionReceiptId = validationReceipt.selectionReceiptId;
       if (!ctx.silent) ui.info(ui.lang === "ko" ? "허브 검증 수락 — 번들 준비 중" : "hub validation accepted — preparing bundles");
 
-      const preparedRaw = await hubStage("workforce.prepare_execution", { workOrder, candidateSet, selection, validationReceipt });
+      const preparedRaw = await hubStage("workforce.prepare_execution", { workOrder, selection, validationReceipt });
       ({ prepared, rosterByPair } = validatePreparedExecution(preparedRaw, workOrder, selection, candidateSet, validationReceipt));
       receipt.preparationReceiptId = prepared.preparationReceiptId;
       benchmarkState.preparedExecution = prepared;

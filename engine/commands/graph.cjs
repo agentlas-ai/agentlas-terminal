@@ -1,10 +1,9 @@
 "use strict";
 /*
- * graph — 저장된 자동화 그래프를 터미널에서 보고 실행 요청한다.
+ * graph — 저장된 자동화 그래프를 터미널에서 보고 vendored Desktop Core로 직접 실행한다.
  *
- * 실행 주체는 데스크탑 스케줄러다. 터미널은 그래프를 "지금 실행 대상"으로 표시할 뿐이며,
- * 데스크탑이 꺼져 있으면 아무 일도 일어나지 않는다 — 그 사실을 숨기지 않고 그대로 말한다.
- * (표시해 놓고 "실행했습니다"라고 답하면, 사용자는 돌아가지 않은 자동화를 돌아갔다고 믿는다.)
+ * `graph run`은 데스크탑 앱/스케줄러를 깨우지 않는다. npm 패키지에 포함된 동일 Core의
+ * runGraph(automation, graph, opts)를 현재 Node 프로세스에서 호출하고 실제 결과/오류를 반환한다.
  *
  * 공유 DB(데스크탑과 동일 파일)를 읽고 쓴다. 스키마 소유권은 데스크탑에 있으므로
  * 여기서는 컬럼을 만들지 않고, 없는 컬럼은 없는 대로 다룬다.
@@ -12,8 +11,8 @@
 const readline = require("node:readline");
 const fs = require("node:fs");
 const path = require("node:path");
-const crypto = require("node:crypto");
 const pkgLib = require("../graph/package.cjs");
+const desktopCore = require("../core/desktop-core.cjs");
 
 function graphRows(ctx, db) {
   if (!ctx.tableExists(db, "automations")) return [];
@@ -440,23 +439,6 @@ function renderGraphTree(ctx, graph, en) {
   }
 }
 
-/**
- * 시작 값을 대기열에 넣는다. 데스크탑 스키마 v88의 automation_run_inputs를 쓴다.
- * 자리가 아직 없는(구버전) 데스크탑이면 false — 값이 전달된 것처럼 말하지 않기 위해서다.
- */
-function enqueueRunInput(ctx, db, automationId, payload) {
-  if (!ctx.tableExists || !ctx.tableExists(db, "automation_run_inputs")) return false;
-  try {
-    db.prepare(
-      `INSERT INTO automation_run_inputs (id, automation_id, payload_json, requested_by, created_at)
-       VALUES (?, ?, ?, ?, ?)`,
-    ).run(crypto.randomUUID(), automationId, JSON.stringify(payload), "terminal", new Date().toISOString());
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function ask(rl, question) {
   return new Promise((resolve) => rl.question(question, (answer) => resolve(String(answer || "").trim())));
 }
@@ -475,6 +457,12 @@ async function runGraph(ctx, needle, flags) {
     return 1;
   }
   const graph = parseGraph(row);
+  if (!graph || !Array.isArray(graph.edges)) {
+    ctx.err(en
+      ? `"${row.name}" has no executable visual graph.`
+      : `"${row.name}"에는 실행할 수 있는 시각적 그래프가 없습니다.`);
+    return 1;
+  }
   const kind = triggerKind(row, graph);
 
   if (!flags.yes && process.stdin.isTTY) {
@@ -518,38 +506,42 @@ async function runGraph(ctx, needle, flags) {
     return 1;
   }
 
-  // 실행 요청 = "지금 예약". 데스크탑 스케줄러가 60초 주기로 due를 집어간다.
-  const now = new Date().toISOString();
-  const updated = db.prepare(
-    "UPDATE automations SET next_run_at = ? WHERE id = ? AND enabled = 1",
-  ).run(now, row.id);
-  if (updated.changes !== 1) {
-    ctx.err(en
-      ? `"${row.name}" is switched off, so a run request would sit unread. Turn it on in the desktop app first.`
-      : `"${row.name}"이(가) 꺼져 있어 실행 요청이 읽히지 않습니다. 데스크탑 앱에서 먼저 켜 주세요.`);
+  const core = ctx.desktopCore || desktopCore.loadDesktopCore();
+  if (!core || core.error || typeof core.runGraph !== "function") {
+    const cause = core?.error instanceof Error ? core.error.message : "vendored Desktop Core is unavailable";
+    ctx.err(JSON.stringify({ ok: false, error: cause }, null, 2));
     return 1;
   }
-  ctx.out(en
-    ? `Requested a run of "${row.name}".`
-    : `"${row.name}" 실행을 요청했습니다.`);
-  // 여기서 "실행했습니다"라고 말하면 거짓이 된다 — 실행 주체는 데스크탑이다.
-  ctx.out(ctx.ui.dim(en
-    ? "The desktop app picks this up within a minute while it is running. If it is closed, the run happens the next time you open it."
-    : "데스크탑 앱이 켜져 있으면 1분 안에 가져갑니다. 꺼져 있으면 다음에 앱을 열 때 실행됩니다."));
-  if (requirement && flags.input) {
-    // 값은 대기열에 넣는다. 다음 실행 1회가 이 값을 집어간다(한 번만 소비된다).
-    const enqueued = enqueueRunInput(ctx, db, row.id, { [requirement.varName]: flags.input });
-    if (!enqueued) {
-      ctx.err(en
-        ? "The value could not be attached to this run. Update the desktop app, then try again."
-        : "이번 실행에 값을 붙이지 못했습니다. 데스크탑 앱을 업데이트한 뒤 다시 시도해 주세요.");
-      return 1;
-    }
-    ctx.out(ctx.ui.dim(en
-      ? `Attached ${requirement.label}: ${flags.input}`
-      : `${requirement.label}: ${flags.input} — 이번 실행에 함께 넘겼습니다.`));
+  let automation = null;
+  try {
+    automation = typeof core.require === "function"
+      ? core.require("store/automations").getAutomation(row.id)
+      : null;
+  } catch { /* test/fallback row below */ }
+  automation ||= {
+    id: row.id,
+    name: row.name,
+    scheduleHuman: row.schedule,
+    targetType: row.target_type,
+    targetId: row.target_id,
+    enabled: Boolean(row.enabled),
+    createdBy: row.created_by || "terminal",
+    graph,
+  };
+  automation.graph = graph;
+  const initialVars = requirement && flags.input ? { [requirement.varName]: flags.input } : {};
+  try {
+    const result = await core.runGraph(automation, graph, { initialVars });
+    ctx.out(JSON.stringify(result, null, 2));
+    return result && result.ok === true ? 0 : 1;
+  } catch (error) {
+    ctx.err(JSON.stringify({
+      ok: false,
+      ...(error && typeof error.code === "string" ? { code: error.code } : {}),
+      error: error instanceof Error ? error.message : String(error),
+    }, null, 2));
+    return 1;
   }
-  return 0;
 }
 
 
@@ -1119,7 +1111,7 @@ async function run(ctx, args = []) {
     ctx.out(en ? '  new "<what you want>"     build one by talking it through' : '  new "<하고 싶은 일>"       말로 설명하면 만들어 줍니다');
     ctx.out(en ? "  list                      what is saved" : "  list                      저장된 것 목록");
     ctx.out(en ? "  show \"<name>\"             steps, wiring, and problems" : "  show \"<이름>\"             단계·배선·문제점");
-    ctx.out(en ? "  run \"<name>\" [--input \"<value>\"]  ask the desktop app to run it" : "  run \"<이름>\" [--input \"<값>\"]   데스크탑 앱에 실행을 요청");
+    ctx.out(en ? "  run \"<name>\" [--input \"<value>\"]  run locally with the included Desktop Core" : "  run \"<이름>\" [--input \"<값>\"]   포함된 Desktop Core로 로컬 실행");
     ctx.out(en ? "  export \"<name>\" [file]    write a shareable package file" : "  export \"<이름>\" [파일]     남에게 줄 수 있는 파일로 저장");
     ctx.out(en ? "  inspect <file>            read a package file before installing" : "  inspect <파일>            설치 전에 패키지 파일 확인");
     ctx.out(en ? "  install <file> [--name \"<new name>\"]  install a package file" : "  install <파일> [--name \"<새 이름>\"]  패키지 파일 설치");
@@ -1179,8 +1171,8 @@ async function run(ctx, args = []) {
   ]);
   if (AUTHORING.has(sub)) {
     ctx.err(en
-      ? `Graphs are built and edited in the Agentlas desktop app (Automation → the graph canvas). The terminal can only look at saved graphs and ask for a run.`
-      : `그래프를 만들고 고치는 일은 Agentlas 데스크탑 앱에서 합니다(자동화 → 그래프 화면). 터미널에서는 저장된 그래프를 보고 실행을 요청하는 것까지만 됩니다.`);
+      ? `Graphs are built and edited in the Agentlas desktop app (Automation → the graph canvas). The terminal can inspect saved graphs and run them locally with the included Desktop Core.`
+      : `그래프를 만들고 고치는 일은 Agentlas 데스크탑 앱에서 합니다(자동화 → 그래프 화면). 터미널에서는 저장된 그래프를 보고 포함된 Desktop Core로 로컬 실행할 수 있습니다.`);
     ctx.err(ctx.ui.dim(en
       ? `Here you can: list, show <name>, run <name>, export <name>, inspect <file>, install <file>.`
       : `여기서 되는 것: list, show <이름>, run <이름>, export <이름>, inspect <파일>, install <파일>.`));

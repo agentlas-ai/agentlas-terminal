@@ -17,6 +17,10 @@ const CORE_RUNTIME_MARKERS = [
   ["schemas", "workforce-work-order.schema.json"],
   ["schemas", "workforce-selection.schema.json"],
 ];
+const CONTEXT_MAP_V3_RUNTIME_MARKERS = [
+  ["agentlas_cloud", "project_bootstrap.py"],
+  ["schemas", "context-index-policy.schema.json"],
+];
 
 const PY_BOOTSTRAP =
   "import os, runpy, sys; " +
@@ -114,6 +118,18 @@ function resolveCoreRuntimeRootFromCandidates(candidateRoots, requiredMarkers = 
 
 function resolveCoreRuntimeRoot(explicitRoot, requiredMarkers = [], options = {}) {
   return resolveCoreRuntimeRootFromCandidates(runtimeRoots(explicitRoot), requiredMarkers, options);
+}
+
+// Context Map is a versioned Core capability. Every Terminal caller that
+// injects a slice must use the same marker and minimum-version gate as the
+// explicit `agentlas context` command; otherwise a stale runtime can silently
+// supply a pre-v3 map to prompts, memory, or Workforce.
+function resolveContextMapCoreRoot(explicitRoot) {
+  return resolveCoreRuntimeRoot(
+    explicitRoot,
+    CONTEXT_MAP_V3_RUNTIME_MARKERS,
+    { minVersion: CONTEXT_MAP_MIN_CORE_VERSION },
+  );
 }
 
 function pythonCandidates() {
@@ -262,10 +278,12 @@ module.exports = {
   HARNESS_ID,
   HARNESS_MODE,
   CONTEXT_MAP_MIN_CORE_VERSION,
+  CONTEXT_MAP_V3_RUNTIME_MARKERS,
   PY_BOOTSTRAP,
   readCoreRuntimeVersion,
   resolveCoreRuntimeRootFromCandidates,
   resolveCoreRuntimeRoot,
+  resolveContextMapCoreRoot,
   resolvePython,
   spawnCoreModule,
   parseJsonOutput,

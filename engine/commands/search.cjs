@@ -27,8 +27,8 @@ async function run(ctx, args) {
 
   let result;
   try {
-    // Hub 파라미터 이름은 `q` — 데스크탑 mcp-source.ts와 동일하게 q/query 둘 다 전송.
-    result = await callHubTool("marketplace.search_agents", { q: query, query, limit });
+    // Hub 파라미터 이름은 `q` — 데스크탑 mcp-source.ts와 동일하게 q만 전송.
+    result = await callHubTool("marketplace.search_agents", { q: query, limit });
   } catch (e) {
     ctx.err(e instanceof HubError ? e.message : `Marketplace connection failed: ${(e && e.message) || e}`);
     return 1;

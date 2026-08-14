@@ -103,7 +103,6 @@ test-results/
 .agentlas/career-graph-inbox/
 .agentlas/career-graph.sqlite*
 .agentlas/experience-relations.jsonl
-.agentlas/super-ontology-*
 .agentlas/stormbreaker/
 .agentlas/pipeline/
 .agentlas/*.lock
@@ -118,6 +117,9 @@ signing/*
 credentials/*
 !credentials/README.md
 # <<< agentlas local project state <<<
+
+# Context Map is a local development index, not a runtime/package asset.
+agentlas-context-map*.json
 
 # 내부 설계 문서 — 공개 저장소에 올리지 않는다(오너 공개 allowlist 정책).
 ARCHITECTURE-V2.md

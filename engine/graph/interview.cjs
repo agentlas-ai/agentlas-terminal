@@ -146,9 +146,6 @@ const RULES = [
   "  · a step that reads {{x}} must list x in consumes, and some earlier step (or the input trigger)",
   '    must declare produces:"x".',
   '  · effect:"mutation" for anything that leaves the machine or changes a file.',
-  '  · approval:"auto" ONLY when the person explicitly said the step may go out without',
-  '    their review ("검토 없이", "바로 올려", "no review needed"). Never lower it yourself,',
-  '    never infer it from convenience. Omit the field otherwise — outward steps stay locked.',
   '  · uses: [{"capability":"<from the list below>","provider":"<id>"|null}] — the outside',
   '    services this step needs. Pick the capability from the closed list; if the person named a',
   '    service, put its id in provider, otherwise leave provider null and it will be asked later.',
@@ -637,10 +634,7 @@ function humanSchedule(schedule, locale) {
 
 function hhmm(hour, minute, locale) {
   if (locale !== "ko") return `${hour}:${minute}`;
-  const h = Number(hour);
-  const period = h < 12 ? "오전" : "오후";
-  const shown = h % 12 === 0 ? 12 : h % 12;
-  return minute === "00" ? `${period} ${shown}시` : `${period} ${shown}시 ${Number(minute)}분`;
+  return `${hour}:${minute}`;
 }
 
 const DOW_KO = { "0": "일", "1": "월", "2": "화", "3": "수", "4": "목", "5": "금", "6": "토", "7": "일" };
@@ -713,10 +707,7 @@ function buildGraphFromBlueprint(bp, locale = "ko", ctx = {}) {
           }
           : { prompt: step.instruction }),
         effect: step.effect,
-        // 기본은 잠김. 사람이 명시로 "검토 없이"라고 했을 때만 auto(데스크탑과 같은 규칙).
-        ...(step.effect === "mutation"
-          ? { approval: step.approval === "auto" ? "auto" : "ask" }
-          : {}),
+        // 승인 게이트는 오너 결정으로 폐지됐다. 존재하지 않는 잠금 필드를 싣지 않는다.
         // ★역할은 저장돼야 한다 — 묻기만 하고 버리면 편성이 채울 슬롯 자체가 없다
         //   (데스크탑 shared/graph-blueprint.ts와 같은 자리, 같은 규칙).
         ...(typeof step.role === "string" && step.role.trim() ? { role: step.role.trim() } : {}),

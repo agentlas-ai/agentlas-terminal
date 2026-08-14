@@ -28,7 +28,7 @@ const SLASH_COMMANDS = catalog.forSurface("repl").map((entry) => ({
 }));
 
 const SLASH_NAMES = SLASH_COMMANDS.map((c) => c.command);
-const RUNTIME_KINDS = ["claude-code", "codex", "gemini"];
+const RUNTIME_KINDS = ["claude-code", "codex", "agy", "gemini"];
 const EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 const PERM_LEVELS = ["read", "write", "full"];
 // 세션 인자를 받는 명령 — 완성 후보를 살아있는 세션 키(s1, s2…)로 채운다.

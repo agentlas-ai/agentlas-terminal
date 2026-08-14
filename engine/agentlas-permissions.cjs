@@ -9,6 +9,10 @@
 
 const LEVELS = ["read", "write", "full"];
 
+function isLevel(value) {
+  return LEVELS.includes(String(value || "").trim().toLowerCase());
+}
+
 const COPY = {
   en: {
     read: {
@@ -94,4 +98,4 @@ function createCycleController(options = {}) {
   };
 }
 
-module.exports = { LEVELS, normalize, persistent, next, copy, createCycleController };
+module.exports = { LEVELS, isLevel, normalize, persistent, next, copy, createCycleController };

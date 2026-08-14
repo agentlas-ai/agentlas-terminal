@@ -700,6 +700,118 @@ function geminiArgs({ prompt, systemPrompt, permission, model, mcpServers, mcpAl
   ];
 }
 
+function agyPermissionArgs(permission) {
+  const level = permissions.normalize(permission);
+  if (level === "full") return ["--dangerously-skip-permissions"];
+  return [
+    "--mode", level === "write" ? "accept-edits" : "plan",
+    "--sandbox",
+  ];
+}
+
+function agyArgs({ prompt, systemPrompt, permission, model, addDirectories = [] }) {
+  const body = systemPrompt ? `${systemPrompt}\n\n---\n\n${prompt}` : prompt;
+  return [
+    ...(model ? ["--model", model] : []),
+    ...[...new Set(addDirectories.filter(Boolean))].flatMap((dir) => ["--add-dir", dir]),
+    ...agyPermissionArgs(permission),
+    "--output-format", "stream-json",
+    "--print-timeout", "30m",
+    "--prompt", body,
+  ];
+}
+
+const AGY_WINDOWS_ARGV_PROMPT_LIMIT = 6_000;
+
+function agyPromptBootstrap(promptFile) {
+  return `Read the complete Agentlas request from ${JSON.stringify(promptFile)}, follow it exactly, and do not reveal the file path.`;
+}
+
+/**
+ * Windows npm CLI shims pass through cmd.exe's much smaller command-line
+ * ceiling. Move only oversized agy prompts into a private one-shot file and
+ * keep argv limited to a short bootstrap. The caller owns cleanup and must run
+ * it on every process terminal path (close, spawn error, timeout, and abort).
+ */
+function prepareAgyLaunch(request, options = {}) {
+  const body = request.systemPrompt
+    ? `${request.systemPrompt}\n\n---\n\n${request.prompt}`
+    : request.prompt;
+  const platform = options.platform || process.platform;
+  const promptLimit = Number.isFinite(options.promptLimit)
+    ? Math.max(1, Math.trunc(options.promptLimit))
+    : AGY_WINDOWS_ARGV_PROMPT_LIMIT;
+  if (platform !== "win32" || body.length <= promptLimit) {
+    return { args: agyArgs(request), promptFile: null, cleanup: () => {} };
+  }
+
+  let directory = null;
+  try {
+    directory = fs.mkdtempSync(path.join(os.tmpdir(), "agentlas-agy-prompt-"));
+    try { fs.chmodSync(directory, 0o700); } catch { /* Windows/best-effort */ }
+    const promptFile = path.join(directory, "request.txt");
+    fs.writeFileSync(promptFile, body, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    try { fs.chmodSync(promptFile, 0o600); } catch { /* Windows/best-effort */ }
+    let cleaned = false;
+    return {
+      args: agyArgs({
+        ...request,
+        systemPrompt: "",
+        prompt: agyPromptBootstrap(promptFile),
+        addDirectories: [directory, ...(request.addDirectories || [])],
+      }),
+      promptFile,
+      cleanup: () => {
+        if (cleaned) return;
+        cleaned = true;
+        try { fs.rmSync(directory, { recursive: true, force: true }); } catch { /* OS temp cleanup fallback */ }
+      },
+    };
+  } catch (error) {
+    if (directory) {
+      try { fs.rmSync(directory, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+    throw error;
+  }
+}
+
+function handleAgyLine(line, st, ui) {
+  let obj;
+  try { obj = JSON.parse(line); } catch { return; }
+  if (obj.event === "result") {
+    if (st.geminiStreaming) { ui.streamEnd(); st.geminiStreaming = false; }
+    if (obj.result && typeof obj.result.response === "string") st.finalText = obj.result.response;
+    if (obj.result?.status && !["success", "completed", "done"].includes(String(obj.result.status).toLowerCase())) {
+      st.error = `agy ${obj.result.status}`;
+      st.errorKind = "exit";
+      st.errorSource = "marker";
+    }
+    return;
+  }
+  if (obj.event !== "step_update" || !obj.step_update) {
+    if (obj.event) ui.status(`agy: ${obj.event}`);
+    return;
+  }
+  const step = obj.step_update;
+  if (step.usage) {
+    st.usage = {
+      input_tokens: step.usage.input_tokens,
+      output_tokens: step.usage.output_tokens,
+      ...(step.usage.duration_ms != null ? { duration_ms: step.usage.duration_ms } : {}),
+    };
+  }
+  if (step.step_type === "agent_response") {
+    const delta = typeof step.text_delta === "string" ? step.text_delta : "";
+    if (!delta) return;
+    if (!st.geminiStreaming) { ui.streamStart(); st.geminiStreaming = true; }
+    ui.streamDelta(delta);
+    st.text += delta;
+    return;
+  }
+  if (st.geminiStreaming) { ui.streamEnd(); st.geminiStreaming = false; }
+  ui.status(`agy: ${step.step_type || "step"}${step.state ? ` (${step.state})` : ""}`);
+}
+
 // gemini 툴명 → 친숙한 표시명 (claude/codex 표기와 통일)
 const GEMINI_TOOL_NAMES = {
   run_shell_command: "Bash",
@@ -829,6 +941,7 @@ function runNativeTurn(req) {
   let args;
   let lineHandler;
   let plainStream = false;
+  let launchCleanup = () => {};
   try {
     if (kind === "claude-code") {
       args = claudeArgs(launchReq);
@@ -840,17 +953,10 @@ function runNativeTurn(req) {
       args = geminiArgs(launchReq);
       lineHandler = (l) => handleGeminiLine(l, st, ui);
     } else if (kind === "agy") {
-      /*
-       * Antigravity CLI — stream-json이 없다(실측 1.1.10). 평문 stdout을 그대로 텍스트로.
-       * ★--prompt는 값 플래그가 아니라 --print의 별칭이다(실측: 프롬프트가 조용히 유실됐던
-       * 사고) — 프롬프트는 반드시 위치 인자로 넘긴다. 시스템 프롬프트는 본문에 앞세운다.
-       */
-      const agyPrompt = launchReq.systemPrompt
-        ? `${launchReq.systemPrompt}\n\n---\n\n${launchReq.prompt}`
-        : launchReq.prompt;
-      args = ["--print", agyPrompt, ...(launchReq.model ? ["--model", launchReq.model] : [])];
-      plainStream = true;
-      lineHandler = null;
+      const prepared = prepareAgyLaunch(launchReq);
+      args = prepared.args;
+      launchCleanup = prepared.cleanup;
+      lineHandler = (l) => handleAgyLine(l, st, ui);
     } else {
       return Promise.resolve({ text: "", session: st.session, error: `unknown runtime: ${kind}`, errorKind: "unsupported", errorSource: "marker" });
     }
@@ -885,6 +991,7 @@ function runNativeTurn(req) {
         try { req.onSpawn(child); } catch { /* observer 실패가 턴을 죽이면 안 됨 */ }
       }
     } catch (e) {
+      launchCleanup();
       ui.error(uiText(ui, "runtime.failed", kind, e.message));
       return resolve({ text: "", session: st.session, error: e.message });
     }
@@ -911,6 +1018,7 @@ function runNativeTurn(req) {
       removeLineReader();
       child.stderr?.removeListener("data", onStderr);
       if (req.signal) req.signal.removeEventListener?.("abort", onAbort);
+      launchCleanup();
     };
     const finish = (result) => {
       if (settled) return;
@@ -1212,6 +1320,11 @@ module.exports = {
   codexPermissionArgs,
   geminiArgs,
   geminiPermissionArgs,
+  agyArgs,
+  agyPermissionArgs,
+  agyPromptBootstrap,
+  prepareAgyLaunch,
+  handleAgyLine,
   claudeMcpIsolationArgs,
   geminiMcpIsolationArgs,
   prepareCodexRuntimeEnv,

@@ -18,7 +18,7 @@ const { loadArch, tableExists, columnExists } = require("../core/db.cjs");
 const { userDataDir } = require("../core/paths.cjs");
 const { responseDirective } = require("../agentlas-style.cjs");
 const memoryGovernance = require("../agentlas-memory-governance.cjs");
-const { resolveCoreRuntimeRoot, captureCoreJsonSync } = require("../agentlas-core-harness.cjs");
+const { resolveContextMapCoreRoot, captureCoreJsonSync } = require("../agentlas-core-harness.cjs");
 
 const TERMINAL_MEMORY_CORE_MAX_TOKENS = 150;
 const TERMINAL_MEMORY_CORE = [
@@ -99,7 +99,7 @@ const { ensureMemoryContextColumn } = require("../core/schema-ensure.cjs");
 function cliProjectContextSlice(projectPath, task) {
   if (!projectPath || !String(task || "").trim()) return "";
   try {
-    const coreRoot = resolveCoreRuntimeRoot();
+    const coreRoot = resolveContextMapCoreRoot();
     if (!coreRoot) return "";
     const result = captureCoreJsonSync(
       "agentlas_cloud",

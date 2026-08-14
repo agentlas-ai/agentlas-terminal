@@ -1,6 +1,6 @@
--- Agentlas first-run bootstrap schema (project-first Work contract)
--- Source DB user_version=86. Desktop remains the migration authority.
-PRAGMA user_version=86;
+-- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-08-12T07:38:56Z)
+-- 소스 DB user_version=94 — 앱이 나중에 설치되면 여기서부터 마이그레이션한다.
+PRAGMA user_version=94;
 CREATE TABLE active_runtime (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         kind TEXT NOT NULL
@@ -21,21 +21,19 @@ CREATE TABLE projects (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         description TEXT,
-        system_prompt TEXT,
-        agent_pool_json TEXT NOT NULL DEFAULT '[]',
-        source_type TEXT NOT NULL DEFAULT 'local' CHECK(source_type IN ('local','github','sample')),
-        source_ref TEXT,
+        default_agent_id TEXT,
+        context_note TEXT,
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        folder_path TEXT
+        updated_at TEXT NOT NULL, folder_path TEXT, system_prompt TEXT, agent_pool_json TEXT NOT NULL DEFAULT '[]', source_type TEXT NOT NULL DEFAULT 'local', source_ref TEXT,
+        FOREIGN KEY(default_agent_id) REFERENCES installed_agents(id) ON DELETE SET NULL
       );
 CREATE TABLE chats (
         id TEXT PRIMARY KEY,
         project_id TEXT,
         agent_id TEXT NOT NULL,
-        title TEXT NOT NULL DEFAULT '새 채팅',
+        title TEXT NOT NULL DEFAULT 'New chat',
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL, firm_id TEXT REFERENCES firms(id) ON DELETE SET NULL, archived_at TEXT, working_folder TEXT, kind TEXT NOT NULL DEFAULT 'user', parent_chat_id TEXT, used_at TEXT, continuous_mode INTEGER NOT NULL DEFAULT 0, swarm_mode INTEGER NOT NULL DEFAULT 0, last_viewed_at TEXT, origin_surface TEXT NOT NULL DEFAULT 'work', runtime_selection_json TEXT,
+        updated_at TEXT NOT NULL, firm_id TEXT REFERENCES firms(id) ON DELETE SET NULL, archived_at TEXT, working_folder TEXT, kind TEXT NOT NULL DEFAULT 'user', parent_chat_id TEXT, used_at TEXT, continuous_mode INTEGER NOT NULL DEFAULT 0, swarm_mode INTEGER NOT NULL DEFAULT 0, last_viewed_at TEXT, hired_agents TEXT, origin_surface TEXT NOT NULL DEFAULT 'work', runtime_selection_json TEXT, goal_id TEXT,
         FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL,
         FOREIGN KEY(agent_id) REFERENCES installed_agents(id) ON DELETE CASCADE
       );
@@ -52,6 +50,18 @@ CREATE TABLE chat_messages (
       );
 CREATE INDEX idx_chat_messages_chat_created
         ON chat_messages(chat_id, created_at);
+CREATE TABLE firms (
+        id TEXT PRIMARY KEY,
+        slug TEXT UNIQUE NOT NULL,
+        name TEXT NOT NULL,
+        tagline TEXT NOT NULL,
+        persona TEXT NOT NULL,
+        ceo_agent_id TEXT NOT NULL,
+        org_chart_json TEXT NOT NULL,
+        installed_at TEXT NOT NULL, name_en TEXT NOT NULL DEFAULT '', tagline_en TEXT NOT NULL DEFAULT '',
+        FOREIGN KEY(ceo_agent_id) REFERENCES installed_agents(id) ON DELETE RESTRICT
+      );
+CREATE INDEX idx_firms_installed ON firms(installed_at DESC);
 CREATE INDEX idx_chats_firm_updated ON chats(firm_id, updated_at DESC);
 CREATE INDEX idx_chats_archived_updated ON chats(archived_at, updated_at DESC);
 CREATE TABLE mcp_servers (
@@ -118,20 +128,8 @@ CREATE TABLE automations (
         last_run_at TEXT,
         next_run_at TEXT,
         created_at TEXT NOT NULL
-      , graph_json TEXT, schedule_json TEXT, timezone TEXT, end_at TEXT, max_runs INTEGER, run_count INTEGER NOT NULL DEFAULT 0, trigger_type TEXT NOT NULL DEFAULT 'schedule', trigger_json TEXT, claimed_at TEXT, lease_owner TEXT, tool_mode TEXT NOT NULL DEFAULT 'auto', hub_mode TEXT NOT NULL DEFAULT 'hub-allowed', execution_permission TEXT NOT NULL DEFAULT 'write' CHECK(execution_permission IN ('read','write')), target_version TEXT, runtime_selection_json TEXT, project_id TEXT REFERENCES projects(id) ON DELETE SET NULL);
+      , graph_json TEXT, goal TEXT, schedule_json TEXT, timezone TEXT, end_at TEXT, max_runs INTEGER, run_count INTEGER NOT NULL DEFAULT 0, trigger_type TEXT NOT NULL DEFAULT 'schedule', trigger_json TEXT, claimed_at TEXT, lease_owner TEXT, tool_mode TEXT NOT NULL DEFAULT 'auto', hub_mode TEXT NOT NULL DEFAULT 'hub-allowed', execution_permission TEXT NOT NULL DEFAULT 'write' CHECK(execution_permission IN ('read','write')), target_version TEXT, runtime_selection_json TEXT, project_id TEXT REFERENCES projects(id) ON DELETE SET NULL, goal_id TEXT, attention_cleared_at TEXT);
 CREATE INDEX idx_automations_due ON automations(enabled, next_run_at);
-CREATE TABLE automation_sessions (
-        id TEXT PRIMARY KEY,
-        automation_id TEXT NOT NULL,
-        target_kind TEXT NOT NULL CHECK(target_kind IN ('host','agent','firm','hub')),
-        target_id TEXT NOT NULL,
-        ledger_chat_id TEXT NOT NULL UNIQUE REFERENCES chats(id) ON DELETE CASCADE,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        UNIQUE(automation_id, target_kind, target_id)
-      );
-CREATE INDEX idx_automation_sessions_owner
-        ON automation_sessions(automation_id, updated_at DESC);
 CREATE TABLE agent_apps (
         id TEXT PRIMARY KEY,
         chat_id TEXT NOT NULL,
@@ -372,26 +370,6 @@ CREATE TABLE agent_runtime_overrides (
       );
 CREATE INDEX idx_agent_runtime_overrides_updated
         ON agent_runtime_overrides(updated_at DESC);
-CREATE TABLE persona_loop_runs (
-        id TEXT PRIMARY KEY,
-        automation_id TEXT NOT NULL,
-        target_type TEXT NOT NULL CHECK(target_type IN ('agent','firm')),
-        target_id TEXT NOT NULL,
-        target_label TEXT NOT NULL,
-        persona_label TEXT NOT NULL,
-        cadence TEXT NOT NULL,
-        status TEXT NOT NULL,
-        current_step TEXT NOT NULL,
-        started_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        ends_at TEXT NOT NULL,
-        transcript_json TEXT NOT NULL,
-        FOREIGN KEY(automation_id) REFERENCES automations(id) ON DELETE CASCADE
-      );
-CREATE INDEX idx_persona_loop_runs_updated
-        ON persona_loop_runs(updated_at DESC);
-CREATE INDEX idx_persona_loop_runs_automation
-        ON persona_loop_runs(automation_id);
 CREATE INDEX idx_chats_used_updated ON chats(used_at, updated_at DESC);
 CREATE TABLE run_history (
         id TEXT PRIMARY KEY,
@@ -401,23 +379,22 @@ CREATE TABLE run_history (
         status TEXT,
         skipped_count INTEGER DEFAULT 0,
         error TEXT
-      );
+      , outcome TEXT, outcome_reason TEXT, acknowledged_at TEXT);
 CREATE INDEX idx_run_history_automation ON run_history(automation_id);
 CREATE TABLE automation_runs (
         id TEXT PRIMARY KEY,
         automation_id TEXT,
         started_at TEXT,
+        last_activity_at TEXT,
         status TEXT,
-        node_states_json TEXT
-      , last_activity_at TEXT, occurrence_id TEXT, graph_digest TEXT, checkpoint_json TEXT, resume_of_run_id TEXT);
+        node_states_json TEXT,
+        occurrence_id TEXT,
+        graph_digest TEXT,
+        checkpoint_json TEXT,
+        resume_of_run_id TEXT
+      , node_failures_json TEXT, resume_consumed_at TEXT);
 CREATE INDEX idx_automation_runs_auto
-        ON automation_runs(automation_id, started_at);
--- (제거됨 2026-08-06) agentlas_auto_cua_social_insert/update 트리거가 여기 있었다.
--- 소셜 키워드 목록("twitter/인스타/댓글/게시/로그인"…)으로 tool_mode를 computer-use로
--- 강제 되돌리던 DB 차원 단어목록 판정 — 코드의 단어목록을 LLM 판정으로 대체할 때
--- 이 트리거만 살아남아, 코드 리뷰가 볼 수 없는 곳에서 toolMode 도출 규칙을 무효화했다
--- (실측: UPDATE tool_mode='auto'가 같은 연결에서 즉시 되돌아왔다). 판정을 DB 트리거로
--- 만들지 않는다 — 판정은 코드·게이트가 보는 곳에만 산다.
+      ON automation_runs(automation_id, started_at);
 CREATE TABLE agent_evolution_proposals (
         id TEXT PRIMARY KEY,
         agent_id TEXT NOT NULL,
@@ -482,32 +459,6 @@ CREATE INDEX idx_failure_events_run
         ON failure_events(run_id, ts DESC);
 CREATE INDEX idx_failure_events_automation
         ON failure_events(automation_id, ts DESC);
-CREATE TABLE telegram_bindings (
-        id TEXT PRIMARY KEY,
-        target_kind TEXT NOT NULL CHECK(target_kind IN ('agent','firm','group')),
-        target_id TEXT NOT NULL,
-        telegram_chat_id TEXT,
-        telegram_chat_title TEXT,
-        bot_user_id INTEGER,
-        bot_username TEXT,
-        bot_display_name TEXT,
-        chat_session_id TEXT REFERENCES chats(id) ON DELETE SET NULL,
-        status TEXT NOT NULL,
-        enabled INTEGER NOT NULL DEFAULT 0,
-        last_update_id INTEGER NOT NULL DEFAULT 0,
-        last_error TEXT,
-        last_test_at TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      , automation_report_enabled INTEGER NOT NULL DEFAULT 0, token_saved INTEGER NOT NULL DEFAULT 0, token_fingerprint TEXT);
-CREATE INDEX idx_telegram_bindings_target
-        ON telegram_bindings(target_kind, target_id);
-CREATE INDEX idx_telegram_bindings_chat
-        ON telegram_bindings(telegram_chat_id);
-CREATE INDEX idx_telegram_bindings_enabled
-        ON telegram_bindings(enabled, status);
-CREATE INDEX idx_telegram_bindings_automation_report
-        ON telegram_bindings(automation_report_enabled, enabled, telegram_chat_id);
 CREATE TABLE browser_sites (
         id TEXT PRIMARY KEY,
         site TEXT NOT NULL UNIQUE,
@@ -546,20 +497,6 @@ CREATE TABLE browser_action_logs (
         meta TEXT
       );
 CREATE INDEX idx_browser_logs_ts ON browser_action_logs(ts DESC);
-CREATE TABLE IF NOT EXISTS "firms" (
-              id TEXT PRIMARY KEY,
-              slug TEXT UNIQUE NOT NULL,
-              name TEXT NOT NULL,
-              name_en TEXT NOT NULL DEFAULT '',
-              tagline TEXT NOT NULL,
-              tagline_en TEXT NOT NULL DEFAULT '',
-              persona TEXT NOT NULL,
-              ceo_agent_id TEXT NOT NULL,
-              org_chart_json TEXT NOT NULL,
-              installed_at TEXT NOT NULL,
-              FOREIGN KEY(ceo_agent_id) REFERENCES installed_agents(id) ON DELETE RESTRICT
-            );
-CREATE INDEX idx_firms_installed ON firms(installed_at DESC);
 CREATE TABLE agent_asset_versions (
         agent_id TEXT PRIMARY KEY,
         version INTEGER NOT NULL,
@@ -605,10 +542,6 @@ CREATE INDEX idx_hub_agent_bookmarks_workspace_time
           ON hub_agent_bookmarks(workspace_id, bookmarked_at DESC);
 CREATE INDEX idx_hub_agent_bookmarks_outbox
           ON hub_agent_bookmarks(workspace_id, sync_state, bookmarked_at ASC);
-CREATE INDEX idx_hub_agent_bookmarks_time
-        ON hub_agent_bookmarks(bookmarked_at DESC);
-CREATE INDEX idx_hub_agent_bookmarks_kind
-        ON hub_agent_bookmarks(entity_kind, bookmarked_at DESC);
 CREATE TABLE experience_packs (
         id TEXT PRIMARY KEY,
         agent_id TEXT NOT NULL,
@@ -619,6 +552,11 @@ CREATE TABLE experience_packs (
         name TEXT NOT NULL,
         description TEXT NOT NULL DEFAULT '',
         base_package_hash TEXT,
+        -- 2축 좌표. 몸통(코어) 해시가 신원이고 부품 목록 해시는 실행 무결성이다.
+        -- axis_version 2 = 옛 한 축 기록, 3 = 두 축을 갖춘 기록. 상세는 REQUIRED_COLUMNS 주석.
+        axis_version INTEGER NOT NULL DEFAULT 2,
+        base_core_hash TEXT,
+        module_set_hash TEXT,
         status TEXT NOT NULL DEFAULT 'active'
           CHECK(status IN ('active','archived')),
         created_at TEXT NOT NULL,
@@ -647,7 +585,7 @@ CREATE TABLE experience_candidates (
         public_safe INTEGER NOT NULL DEFAULT 0 CHECK(public_safe IN (0,1)),
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
-        promoted_at TEXT, auto_managed INTEGER NOT NULL DEFAULT 0 CHECK(auto_managed IN (0,1)), embedding_model TEXT, embedding_adapter TEXT, embedding_model_sha256 TEXT, embedding_content_hash TEXT, embedding_dimensions INTEGER, embedding_json TEXT,
+        promoted_at TEXT, auto_managed INTEGER NOT NULL DEFAULT 0 CHECK(auto_managed IN (0,1)), embedding_model TEXT, embedding_adapter TEXT, embedding_model_sha256 TEXT, embedding_content_hash TEXT, embedding_dimensions INTEGER, embedding_json TEXT, axis_version INTEGER NOT NULL DEFAULT 2, base_core_hash TEXT, module_set_hash TEXT,
         FOREIGN KEY(pack_id) REFERENCES experience_packs(id) ON DELETE CASCADE,
         FOREIGN KEY(agent_id) REFERENCES installed_agents(id) ON DELETE CASCADE,
         UNIQUE(pack_id, source_memory_id)
@@ -790,10 +728,8 @@ CREATE TABLE experience_auto_intake_receipts (
       );
 CREATE INDEX idx_experience_auto_intake_agent_status
         ON experience_auto_intake_receipts(agent_id, status, created_at DESC);
-CREATE INDEX idx_run_events_agent_ts
-        ON run_events(agent_id, ts DESC);
-CREATE INDEX idx_failure_events_agent_ts
-        ON failure_events(agent_id, ts DESC);
+CREATE INDEX idx_run_events_agent_ts ON run_events(agent_id, ts DESC);
+CREATE INDEX idx_failure_events_agent_ts ON failure_events(agent_id, ts DESC);
 CREATE INDEX idx_run_events_agent_kind_ts
           ON run_events(agent_id, kind, ts DESC);
 CREATE TABLE installed_agent_hub_bindings (
@@ -1063,46 +999,8 @@ CREATE INDEX idx_memory_episodes_project_path_created
         ON memory_episodes(project_path_hash, created_at DESC);
 CREATE INDEX idx_memory_episodes_agent_created
         ON memory_episodes(agent_id, created_at DESC);
-CREATE TABLE activated_folder_identity (
-      path TEXT PRIMARY KEY,
-      identity_json TEXT NOT NULL,
-      captured_at TEXT NOT NULL
-    );
 CREATE INDEX idx_automation_runs_occurrence
       ON automation_runs(automation_id, occurrence_id, started_at);
-CREATE TABLE automation_trigger_events (
-        id TEXT PRIMARY KEY,
-        automation_id TEXT NOT NULL,
-        trigger_kind TEXT NOT NULL CHECK(trigger_kind IN ('fs','chain','webhook','poll')),
-        dedupe_key TEXT NOT NULL,
-        payload_json TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'pending'
-          CHECK(status IN ('pending','claimed','delivered','parked')),
-        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
-        next_attempt_at TEXT NOT NULL,
-        claim_owner TEXT,
-        claimed_until TEXT,
-        run_id TEXT,
-        run_outcome TEXT CHECK(run_outcome IS NULL OR run_outcome IN
-          ('ok','partial','error','skipped','blocked','needs_input')),
-        last_error TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        delivered_at TEXT,
-        FOREIGN KEY(automation_id) REFERENCES automations(id) ON DELETE CASCADE,
-        UNIQUE(automation_id, trigger_kind, dedupe_key),
-        CHECK(
-          (status = 'claimed' AND claim_owner IS NOT NULL AND claimed_until IS NOT NULL) OR
-          (status <> 'claimed' AND claim_owner IS NULL AND claimed_until IS NULL)
-        ),
-        CHECK((status = 'delivered' AND delivered_at IS NOT NULL) OR status <> 'delivered')
-      );
-CREATE INDEX idx_automation_trigger_events_due
-        ON automation_trigger_events(status, next_attempt_at, created_at);
-CREATE INDEX idx_automation_trigger_events_automation
-        ON automation_trigger_events(automation_id, status, created_at);
-CREATE INDEX idx_automation_trigger_events_run
-        ON automation_trigger_events(run_id) WHERE run_id IS NOT NULL;
 CREATE TABLE tasks (
         id TEXT PRIMARY KEY,
         title TEXT NOT NULL DEFAULT '',
@@ -1132,56 +1030,6 @@ CREATE TABLE task_agent_participants (
         FOREIGN KEY(agent_id) REFERENCES installed_agents(id) ON DELETE SET NULL
       );
 CREATE INDEX idx_task_participants_agent ON task_agent_participants(agent_id);
-CREATE TABLE terminal_memory_turn_intents (
-      turn_id TEXT PRIMARY KEY,
-      request_fingerprint TEXT NOT NULL,
-      context_key TEXT NOT NULL,
-      permission TEXT NOT NULL,
-      project_key TEXT,
-      owner_key TEXT,
-      owner_policy_json TEXT NOT NULL DEFAULT '{}',
-      status TEXT NOT NULL DEFAULT 'pending',
-      started_at TEXT NOT NULL,
-      completed_at TEXT
-    );
-CREATE INDEX idx_terminal_memory_intent_pending
-      ON terminal_memory_turn_intents(request_fingerprint, status, started_at);
-CREATE UNIQUE INDEX idx_terminal_memory_one_pending_request
-      ON terminal_memory_turn_intents(request_fingerprint)
-      WHERE status IN ('pending','curating');
-CREATE TABLE terminal_memory_episode_receipts (
-      turn_id TEXT PRIMARY KEY,
-      ticket_json TEXT NOT NULL,
-      project_key TEXT,
-      created_at TEXT NOT NULL
-    );
-CREATE TABLE terminal_memory_curator_decisions (
-      decision_id TEXT PRIMARY KEY,
-      turn_id TEXT NOT NULL,
-      candidate_id TEXT NOT NULL,
-      content_digest TEXT NOT NULL,
-      semantic_disposition TEXT NOT NULL,
-      semantic_scope TEXT NOT NULL,
-      final_disposition TEXT NOT NULL,
-      final_scope TEXT NOT NULL,
-      reason_codes_json TEXT NOT NULL DEFAULT '[]',
-      created_at TEXT NOT NULL
-    );
-CREATE INDEX idx_terminal_memory_decisions_turn
-      ON terminal_memory_curator_decisions(turn_id);
-CREATE TABLE terminal_memory_scope_timeline (
-      event_id TEXT PRIMARY KEY,
-      turn_id TEXT NOT NULL,
-      memory_id TEXT NOT NULL,
-      lane TEXT NOT NULL,
-      project_key TEXT,
-      owner_key TEXT,
-      created_at TEXT NOT NULL
-    );
-CREATE INDEX idx_terminal_memory_timeline_project
-      ON terminal_memory_scope_timeline(project_key, lane, created_at);
-CREATE INDEX idx_terminal_memory_timeline_owner
-      ON terminal_memory_scope_timeline(owner_key, lane, created_at);
 CREATE TABLE agent_usage (
         agent_key TEXT PRIMARY KEY,
         kind TEXT NOT NULL,
@@ -1289,3 +1137,180 @@ CREATE TABLE model_role_members (
         updated_at TEXT NOT NULL,
         PRIMARY KEY(role, position)
       );
+CREATE TABLE automation_sessions (
+        id TEXT PRIMARY KEY,
+        automation_id TEXT NOT NULL,
+        target_kind TEXT NOT NULL CHECK(target_kind IN ('host','agent','firm','hub')),
+        target_id TEXT NOT NULL,
+        ledger_chat_id TEXT NOT NULL UNIQUE REFERENCES chats(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(automation_id, target_kind, target_id)
+      );
+CREATE INDEX idx_automation_sessions_owner
+        ON automation_sessions(automation_id, updated_at DESC);
+CREATE TABLE IF NOT EXISTS "telegram_bindings" (
+        id TEXT PRIMARY KEY,
+        target_kind TEXT NOT NULL CHECK(target_kind IN ('agent','firm','one')),
+        target_id TEXT NOT NULL,
+        telegram_chat_id TEXT,
+        telegram_chat_title TEXT,
+        bot_user_id INTEGER,
+        bot_username TEXT,
+        bot_display_name TEXT,
+        chat_session_id TEXT REFERENCES chats(id) ON DELETE SET NULL,
+        status TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 0,
+        last_update_id INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        last_test_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        automation_report_enabled INTEGER NOT NULL DEFAULT 0,
+        token_saved INTEGER NOT NULL DEFAULT 0,
+        token_fingerprint TEXT,
+        designated_project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+        designated_graph_id TEXT,
+        legacy_notice_at TEXT
+      );
+CREATE INDEX idx_telegram_bindings_target
+        ON telegram_bindings(target_kind, target_id);
+CREATE INDEX idx_telegram_bindings_chat
+        ON telegram_bindings(telegram_chat_id);
+CREATE INDEX idx_telegram_bindings_enabled
+        ON telegram_bindings(enabled, status);
+CREATE INDEX idx_telegram_bindings_automation_report
+        ON telegram_bindings(automation_report_enabled, enabled, telegram_chat_id);
+CREATE UNIQUE INDEX idx_telegram_bindings_one_singleton
+        ON telegram_bindings(target_kind) WHERE target_kind = 'one';
+CREATE TABLE automation_node_approvals (
+      automation_id TEXT NOT NULL,
+      occurrence_id TEXT NOT NULL,
+      node_id       TEXT NOT NULL,
+      decision      TEXT NOT NULL,
+      decided_at    TEXT NOT NULL,
+      decided_by    TEXT NOT NULL, scope TEXT NOT NULL DEFAULT 'once',
+      PRIMARY KEY (automation_id, occurrence_id, node_id)
+    );
+CREATE INDEX idx_automation_node_approvals_node ON automation_node_approvals(automation_id, node_id, decided_at);
+CREATE TABLE automation_eval_corrections (
+      automation_id  TEXT NOT NULL,
+      node_id        TEXT NOT NULL,
+      subject_preview TEXT NOT NULL,
+      corrected_verdict TEXT NOT NULL,
+      note           TEXT NOT NULL DEFAULT '',
+      created_at     TEXT NOT NULL,
+      PRIMARY KEY (automation_id, node_id, created_at)
+    );
+CREATE TABLE graph_run_journal (
+      run_id   TEXT NOT NULL,
+      seq      INTEGER NOT NULL,
+      ts       TEXT NOT NULL,
+      kind     TEXT NOT NULL,
+      node_id  TEXT,
+      payload_json TEXT,
+      PRIMARY KEY (run_id, seq)
+    );
+CREATE INDEX idx_graph_run_journal_run ON graph_run_journal(run_id, seq);
+CREATE TABLE automation_graph_versions (
+      id            TEXT PRIMARY KEY,
+      automation_id TEXT NOT NULL,
+      saved_at      TEXT NOT NULL,
+      note          TEXT,
+      node_count    INTEGER NOT NULL DEFAULT 0,
+      graph_json    TEXT NOT NULL
+    );
+CREATE INDEX idx_automation_graph_versions ON automation_graph_versions(automation_id, saved_at DESC);
+CREATE TABLE automation_run_inputs (
+      id            TEXT PRIMARY KEY,
+      automation_id TEXT NOT NULL,
+      payload_json  TEXT NOT NULL,
+      requested_by  TEXT NOT NULL,
+      created_at    TEXT NOT NULL,
+      consumed_at   TEXT,
+      consumed_run_id TEXT
+    );
+CREATE INDEX idx_automation_run_inputs_pending ON automation_run_inputs(automation_id, consumed_at, created_at);
+CREATE TABLE automation_approval_waits (
+      automation_id      TEXT NOT NULL,
+      node_id            TEXT NOT NULL,
+      first_requested_at TEXT NOT NULL,
+      PRIMARY KEY (automation_id, node_id)
+    );
+CREATE TABLE automation_trigger_events (
+        id TEXT PRIMARY KEY,
+        automation_id TEXT NOT NULL,
+        trigger_kind TEXT NOT NULL CHECK(trigger_kind IN ('fs','chain','webhook','poll','command')),
+        dedupe_key TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending'
+          CHECK(status IN ('pending','claimed','delivered','parked')),
+        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+        next_attempt_at TEXT NOT NULL,
+        claim_owner TEXT,
+        claimed_until TEXT,
+        run_id TEXT,
+        run_outcome TEXT CHECK(run_outcome IS NULL OR run_outcome IN
+          ('ok','partial','error','skipped','blocked','needs_input')),
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        delivered_at TEXT,
+        FOREIGN KEY(automation_id) REFERENCES automations(id) ON DELETE CASCADE,
+        UNIQUE(automation_id, trigger_kind, dedupe_key),
+        CHECK(
+          (status = 'claimed' AND claim_owner IS NOT NULL AND claimed_until IS NOT NULL) OR
+          (status <> 'claimed' AND claim_owner IS NULL AND claimed_until IS NULL)
+        ),
+        CHECK((status = 'delivered' AND delivered_at IS NOT NULL) OR status <> 'delivered')
+      );
+CREATE INDEX idx_automation_trigger_events_due
+          ON automation_trigger_events(status, next_attempt_at, created_at);
+CREATE INDEX idx_automation_trigger_events_automation
+          ON automation_trigger_events(automation_id, status, created_at);
+CREATE INDEX idx_automation_trigger_events_run
+          ON automation_trigger_events(run_id) WHERE run_id IS NOT NULL;
+CREATE INDEX idx_run_events_chat_kind_ts
+          ON run_events(chat_id, kind, ts DESC);
+CREATE INDEX idx_experience_packs_core_axis
+                  ON experience_packs(agent_id, project_scope_key, environment_key, base_core_hash);
+CREATE TABLE judgment_verdicts (
+      kind          TEXT NOT NULL,
+      signature     TEXT NOT NULL,
+      verdict       TEXT NOT NULL,
+      confidence    REAL NOT NULL DEFAULT 0,
+      reason        TEXT NOT NULL DEFAULT '',
+      created_at    TEXT NOT NULL,
+      last_hit_at   TEXT NOT NULL,
+      hits          INTEGER NOT NULL DEFAULT 1,
+      PRIMARY KEY (kind, signature)
+    );
+CREATE INDEX idx_judgment_verdicts_recency ON judgment_verdicts(last_hit_at);
+CREATE TABLE activated_folder_identity (
+      path TEXT PRIMARY KEY,
+      identity_json TEXT NOT NULL,
+      captured_at TEXT NOT NULL
+    );
+CREATE TABLE one_artifact_bindings (
+      id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      task_version INTEGER NOT NULL,
+      bound_task_version INTEGER NOT NULL,
+      chat_id TEXT NOT NULL,
+      run_id TEXT NOT NULL,
+      manifest_id TEXT NOT NULL,
+      artifact_ref TEXT NOT NULL,
+      source_path TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      mime_type TEXT NOT NULL,
+      size_bytes INTEGER NOT NULL,
+      file_dev TEXT NOT NULL,
+      file_ino TEXT NOT NULL,
+      file_mtime_ns TEXT NOT NULL,
+      file_ctime_ns TEXT NOT NULL,
+      sha256 TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(task_id, chat_id, run_id, manifest_id, artifact_ref)
+    );
+CREATE INDEX idx_one_artifact_binding_exact
+      ON one_artifact_bindings(task_id, chat_id, run_id, manifest_id, artifact_ref);

@@ -11,6 +11,7 @@
  */
 const crypto = require("node:crypto");
 const { listRoutableAgents } = require("./registry.cjs");
+const { sharedRuntimeKind } = require("../runtimes/resolve.cjs");
 
 const UNRESOLVED_LABEL = "unresolved";
 
@@ -28,8 +29,9 @@ function ensureJudgeRunner(db, runtime) {
   if (!resolved && db) {
     try {
       const active = require("../runtimes/detect.cjs").activeRuntimeRow(db);
-      if (active && capture.RUNTIME_BIN[active.kind]) {
-        resolved = { kind: active.kind, model: active.model || null };
+      const activeKind = sharedRuntimeKind(active);
+      if (active && capture.RUNTIME_BIN[activeKind]) {
+        resolved = { kind: activeKind, model: active.model || null };
       } else if (active && active.kind === "byok" && active.backend) {
         resolved = { kind: "byok", backend: active.backend, model: active.model || null };
       } else if (active && active.kind === "ollama") {
