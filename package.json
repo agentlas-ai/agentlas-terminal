@@ -6,6 +6,7 @@
     "agentlas": "bin/agentlas.cjs"
   },
   "scripts": {
+    "test": "sh test/smoke.sh",
     "smoke": "sh test/smoke.sh",
     "test:release-contracts": "npm run smoke",
     "sync:architecture": "node scripts/sync-architecture-from-desktop.cjs",

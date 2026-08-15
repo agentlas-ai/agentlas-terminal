@@ -19,6 +19,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const permissions = require("./agentlas-permissions.cjs");
+const acpDriver = require("./runtimes/acp-driver.cjs");
 const i18n = require("./agentlas-i18n.cjs");
 const { wrapStdioServer } = require("./agentlas-mcp-env.cjs");
 
@@ -915,6 +916,11 @@ function handleGeminiLine(line, st, ui) {
 function runNativeTurn(req) {
   const { kind, bin, ui } = req;
   const cwd = req.cwd;
+  // kimi/grok/cursor: 손코딩 3번째 대신 벤더 코어의 공용 ACP 러너로 (PRD 2026-08-15 T-2).
+  // 같은 결과 계약({text, session, usage, error, errorKind, errorSource})으로 돌아온다.
+  if (acpDriver.ACP_KINDS.has(kind)) {
+    return acpDriver.runAcpTurn(req);
+  }
   let launchReq = req;
   if (
     kind === "gemini" && permissions.normalize(req.permission) === "full" &&

@@ -11,12 +11,38 @@ const path = require("node:path");
 // Session이 실제 드라이버를 갖춘 런타임만 실행 대상으로 삼는다.
 // CLI는 native-host, Ollama는 로컬 API loop를 쓴다. 다른 드라이버가 포팅되면
 // 해당 집합에 추가한다(조용한 오폭 방지).
-const CLI_EXECUTABLE_KINDS = new Set(["claude-code", "codex", "gemini", "agy"]);
+//
+// kimi/grok/cursor 는 ACP 드라이버(runtimes/acp-driver.cjs → 벤더 코어의 공용 ACP 러너)로 돈다
+// (PRD 2026-08-15 T-2). 벤더 코어가 그 러너를 갖고 있을 때만 실행 대상에 든다 — 옛 코어면
+// 종전과 같은 "드라이버 없음" 정직 거부.
+const NATIVE_CLI_KINDS = new Set(["claude-code", "codex", "gemini", "agy"]);
+const ACP_CLI_KINDS = new Set(["kimi", "grok", "cursor"]);
 const API_EXECUTABLE_KINDS = new Set(["ollama"]);
-const EXECUTABLE_KINDS = new Set([
-  ...CLI_EXECUTABLE_KINDS,
-  ...API_EXECUTABLE_KINDS,
-]);
+
+function acpKindsAvailable() {
+  try {
+    const { acpDriverAvailability } = require("./acp-driver.cjs");
+    return acpDriverAvailability().ok ? ACP_CLI_KINDS : new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+// 라이브 집합: 네이티브 4종 + (코어가 ACP 러너를 갖고 있으면) ACP 3종.
+const CLI_EXECUTABLE_KINDS = new Proxy(NATIVE_CLI_KINDS, {
+  get(target, prop) {
+    const live = new Set([...target, ...acpKindsAvailable()]);
+    const value = live[prop];
+    return typeof value === "function" ? value.bind(live) : value;
+  },
+});
+const EXECUTABLE_KINDS = new Proxy(NATIVE_CLI_KINDS, {
+  get(target, prop) {
+    const live = new Set([...target, ...acpKindsAvailable(), ...API_EXECUTABLE_KINDS]);
+    const value = live[prop];
+    return typeof value === "function" ? value.bind(live) : value;
+  },
+});
 
 function apiRuntime(kind, model, source) {
   if (!API_EXECUTABLE_KINDS.has(kind)) return null;
@@ -56,7 +82,10 @@ function resolveRuntime({ db, prefs, explicit }) {
     const bin = RUNTIME_BIN[explicit];
     if (!bin) throw new NoRuntimeError(`unknown runtime: ${explicit}`);
     if (!CLI_EXECUTABLE_KINDS.has(explicit)) {
-      throw new NoRuntimeError(`runtime '${explicit}' has no v2 streaming driver yet (available: ${[...EXECUTABLE_KINDS].join(", ")})`);
+      const acpHint = ACP_CLI_KINDS.has(explicit)
+        ? ` — its ACP driver needs the desktop core with electron/runtime/acp.js (npm run vendor:core / agentlas doctor)`
+        : "";
+      throw new NoRuntimeError(`runtime '${explicit}' has no v2 streaming driver yet (available: ${[...EXECUTABLE_KINDS].join(", ")})${acpHint}`);
     }
     const p = whichSync(bin);
     if (!p) throw new NoRuntimeError(`runtime '${explicit}' requested but '${bin}' is not on PATH`);
@@ -109,6 +138,8 @@ module.exports = {
   NoRuntimeError,
   EXECUTABLE_KINDS,
   CLI_EXECUTABLE_KINDS,
+  NATIVE_CLI_KINDS,
+  ACP_CLI_KINDS,
   API_EXECUTABLE_KINDS,
   sharedRuntimeKind,
 };

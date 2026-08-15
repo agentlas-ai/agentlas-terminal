@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- kimi, grok, and cursor run through the desktop core's generic ACP runner
+  (`engine/runtimes/acp-driver.cjs`) instead of being refused as "no v2
+  streaming driver". Same file, same tool-call vocabulary as Desktop; an old
+  core without `electron/runtime/acp.js` still refuses honestly with a repair
+  hint. `agentlas doctor` lists the newly executable runtimes.
+- `npm test` is the smoke gate; the stale `.internal` copy of the architecture
+  sync script is gone (one canonical script under `scripts/`).
+
+
 ## 1.0.47 — 2026-08-14
 
 Antigravity and the shared runtime contracts now reach the independent

@@ -178,6 +178,30 @@ function loadDesktopCore() {
   return _cache;
 }
 
+/**
+ * 코어의 공용 ACP 러너(electron/runtime/acp.js)만 가볍게 로드한다 (PRD 2026-08-15 T-2).
+ * initStore·그래프 커널을 끌지 않고, electron 셰임과 네이티브 모듈 훅만 건 뒤 require 한다 —
+ * kimi/grok/cursor 실행에 DB가 필요 없기 때문. 코어가 없거나 acp.js가 없는 옛 코어면
+ * { error } 를 준다(정직한 부재; 조용한 폴백 금지).
+ */
+let _acpCache = undefined;
+function loadCoreAcpRuntime() {
+  if (_acpCache !== undefined) return _acpCache;
+  const root = findCoreRoot();
+  if (!root) { _acpCache = null; return null; }
+  const file = path.join(root, "electron", "runtime", "acp.js");
+  if (!fs.existsSync(file)) { _acpCache = { root, error: new Error("desktop core predates the ACP runner (no electron/runtime/acp.js)") }; return _acpCache; }
+  try {
+    installRetiredProjectProvisioningHook();
+    installNativeModuleHook();
+    const mod = require(file);
+    _acpCache = { root, module: mod };
+  } catch (e) {
+    _acpCache = { root, error: e };
+  }
+  return _acpCache;
+}
+
 /** 재사용 코어가 이 머신에서 가용한가(정직한 가부). */
 function desktopCoreAvailable() {
   const c = loadDesktopCore();
@@ -202,6 +226,7 @@ async function loadDesktopCoreAsync({ onNotice } = {}) {
 module.exports = {
   findCoreRoot,
   loadDesktopCore,
+  loadCoreAcpRuntime,
   loadDesktopCoreAsync,
   desktopCoreAvailable,
   _test: { stripRetiredProjectProvisioningSource },
