@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `agentlas acp` — Agentlas as an Agent Client Protocol agent (Phase B-3). Zed,
+  JetBrains IDEs and other ACP clients can run the project controller (or an
+  installed agent via `_meta.agentlas.agent`) on the runtime you subscribe to,
+  with tool calls and streamed text projected onto ACP. `--info` prints the
+  registry-style descriptor. CLI-only (stdout is the wire).
 - kimi, grok, and cursor run through the desktop core's generic ACP runner
   (`engine/runtimes/acp-driver.cjs`) instead of being refused as "no v2
   streaming driver". Same file, same tool-call vocabulary as Desktop; an old

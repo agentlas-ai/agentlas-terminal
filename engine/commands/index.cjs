@@ -34,6 +34,8 @@ const COMMANDS = {
   plugin: () => require("./plugin.cjs"),
   automation: () => require("./automation.cjs"),
   native: () => require("./native.cjs"),
+  // Agentlas as an ACP agent for editors (Zed, JetBrains, …) — PRD 2026-08-15 B-3.
+  acp: () => require("./acp.cjs"),
   multimodal: () => require("./multimodal.cjs"),
   document: () => require("./document.cjs"),
   workforce: () => require("./workforce.cjs"),

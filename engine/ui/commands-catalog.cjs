@@ -107,6 +107,8 @@ const CATALOG = [
   { name: "import", group: "advanced", tier: "more", surfaces: BOTH, args: "<path>", argsKo: "<경로>", ko: "로컬 폴더 에이전트 가져오기", en: "Import a local folder agent" },
   { name: "cd", group: "advanced", tier: "more", surfaces: BOTH, args: "<agent>", argsKo: "<에이전트>", ko: "그 에이전트의 폴더 경로를 출력", en: "Print that agent's folder path" },
   { name: "native", group: "advanced", tier: "more", surfaces: BOTH, args: "prepare <agent>", argsKo: "prepare <에이전트>", ko: "네이티브 CLI 컨텍스트 생성", en: "Prepare native CLI context" },
+  // CLI only: stdout is the protocol wire, so it cannot run inside the REPL.
+  { name: "acp", group: "advanced", tier: "more", surfaces: CLI, args: "[--info]", ko: "에디터(Zed·JetBrains)용 ACP 에이전트로 실행", en: "Serve Agentlas as an ACP agent for editors (Zed, JetBrains)" },
   { name: "mcp", group: "advanced", tier: "more", surfaces: BOTH, args: "[list|probe <id>]", ko: "MCP 서버", en: "MCP servers" },
   { name: "plugin", group: "advanced", tier: "more", surfaces: BOTH, args: "<add <slug>|list|remove>", ko: "Hub 플러그인 (MCP 서버)", en: "Hub plugins (MCP servers)" },
   { name: "creds", group: "advanced", tier: "more", surfaces: BOTH, args: "<list|save|file>", ko: "API 키 보관 (값은 절대 표시 안 함)", en: "API keys (values are never printed)" },

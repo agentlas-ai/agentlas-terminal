@@ -791,7 +791,8 @@ function handleSlash(ctx, cmdline, api) {
        * (REPL의 평문 입력이 곧 run이다).
        */
       // help/agents/list/mcp/doctor 등은 위 케이스에서 이미 처리된다.
-      const REPL_EXCLUDED = new Set(["firm", "setup", "run"]);
+      // acp: stdout becomes the protocol wire — meaningless (and destructive) inside the REPL.
+      const REPL_EXCLUDED = new Set(["firm", "setup", "run", "acp"]);
       if (!REPL_EXCLUDED.has(cmd) && commands.COMMANDS[cmd]) {
         const result = commands.COMMANDS[cmd]().run(ctx, rest);
         if (result && typeof result.then === "function") {
