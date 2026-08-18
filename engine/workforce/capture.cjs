@@ -24,14 +24,10 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { dbPath, userDataDir } = require("../core/paths.cjs");
 
-// 캡처 드라이버가 검증된 런타임만. v2 detect.cjs의 RUNTIME_BIN에는 kimi/grok/cursor도
-// 있지만 buildArgs/텍스트 추출 계약이 없으므로 여기 목록에 절대 조용히 추가하지 않는다.
-const RUNTIME_BIN = {
-  "claude-code": "claude",
-  codex: "codex",
-  agy: "agy",
-  gemini: "gemini",
-};
+// 캡처 드라이버가 검증된 런타임만. 정본(runtimes/kinds.cjs)의 RUNTIME_BIN에는 kimi/grok/cursor도
+// 있지만 buildArgs/텍스트 추출 계약이 없으므로 캡처 검증 파생본만 쓴다 — 새 kind 를
+// 정본에 추가해도 capture:true 를 명시하기 전엔 여기 조용히 들어오지 않는다.
+const { CAPTURE_RUNTIME_BIN: RUNTIME_BIN } = require("../runtimes/kinds.cjs");
 
 const SERVICE = "com.agentlas.desktop";
 

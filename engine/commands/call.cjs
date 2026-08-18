@@ -18,6 +18,10 @@ async function run(ctx, args) {
     ctx.err("✖ " + usageFor("call", ctx.lang));
     return 1;
   }
+  // 과금 사전 고지 — 가격은 서버가 청구 시 확정하므로 숫자를 지어내지 않는다.
+  ctx.out(ctx.lang !== "en"
+    ? "ℹ 공개 Hub 에이전트·팀 호출은 크레딧이 소모됩니다(활성 장기대여 중에는 0). 잔액 확인: agentlas billing"
+    : "ℹ Public Hub agent/team calls consume credits (0 while a day-lease is active). Check balance: agentlas billing");
   return create(ctx).cmdHep(["hep-call", ...args]);
 }
 

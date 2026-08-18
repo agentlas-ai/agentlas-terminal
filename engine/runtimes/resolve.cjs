@@ -6,6 +6,7 @@
  * 아무것도 없으면 no_runtime "정직 정지" — 키워드/저품질 폴백 금지(오너 결정).
  */
 const { RUNTIME_BIN, whichSync, listAvailableCliRuntimes, activeRuntimeRow } = require("./detect.cjs");
+const KINDS = require("./kinds.cjs");
 const path = require("node:path");
 
 // Session이 실제 드라이버를 갖춘 런타임만 실행 대상으로 삼는다.
@@ -15,9 +16,10 @@ const path = require("node:path");
 // kimi/grok/cursor 는 ACP 드라이버(runtimes/acp-driver.cjs → 벤더 코어의 공용 ACP 러너)로 돈다
 // (PRD 2026-08-15 T-2). 벤더 코어가 그 러너를 갖고 있을 때만 실행 대상에 든다 — 옛 코어면
 // 종전과 같은 "드라이버 없음" 정직 거부.
-const NATIVE_CLI_KINDS = new Set(["claude-code", "codex", "gemini", "agy"]);
-const ACP_CLI_KINDS = new Set(["kimi", "grok", "cursor"]);
-const API_EXECUTABLE_KINDS = new Set(["ollama"]);
+// 집합의 원소는 정본(runtimes/kinds.cjs)에서 파생한다 — 여기서 다시 적지 않는다.
+const NATIVE_CLI_KINDS = new Set(KINDS.NATIVE_CLI_KINDS);
+const ACP_CLI_KINDS = new Set(KINDS.ACP_CLI_KINDS);
+const API_EXECUTABLE_KINDS = new Set(KINDS.API_EXECUTABLE_KINDS);
 
 function acpKindsAvailable() {
   try {

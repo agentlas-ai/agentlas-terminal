@@ -306,7 +306,8 @@ const SLASH_COMMAND_META = [
   { command: "/exit", description: "Quit Agentlas", category: "Session", usage: "/exit", detail: "Close the terminal session.", aliases: ["/quit"] },
 ];
 const SLASH_COMMANDS = SLASH_COMMAND_META.flatMap((entry) => [entry.command].concat(entry.aliases || []));
-const RUNTIME_SPECS = ["claude-code", "codex", "agy", "gemini", "anthropic", "openai", "google", "ollama", "upstage"];
+// /runtime 이 받는 spec 전체(네이티브 CLI + API 백엔드) — 정본은 runtimes/kinds.cjs.
+const RUNTIME_SPECS = require("./runtimes/kinds.cjs").RUNTIME_SPECS;
 const PERM_LEVELS = ["read", "write", "full"];
 
 const HELP_KEY_BY_COMMAND = {

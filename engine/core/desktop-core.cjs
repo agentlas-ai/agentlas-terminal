@@ -202,6 +202,34 @@ function loadCoreAcpRuntime() {
   return _acpCache;
 }
 
+/**
+ * 코어의 **공유 순수 모듈**(dist/shared/*)만 가볍게 로드한다 (예: "agent-control-blocks").
+ * shared/* 는 electron·DB 의존이 없는 순수 함수 모듈이라 initStore·그래프 커널·셰임 없이
+ * require 만 한다. 코어가 없으면 null, 그 모듈이 없는 옛 벤더 번들이면 { root, error } —
+ * 정직한 부재(조용한 폴백 금지는 호출부 계약; 표시 경로는 fail-open 해도 된다).
+ */
+const _sharedCache = new Map();
+function loadCoreShared(rel) {
+  const key = String(rel || "").replace(/\.js$/, "");
+  if (_sharedCache.has(key)) return _sharedCache.get(key);
+  let result = null;
+  const root = findCoreRoot();
+  if (root) {
+    const file = path.join(root, "shared", key + ".js");
+    if (!fs.existsSync(file)) {
+      result = { root, error: new Error(`desktop core has no shared/${key}.js (older vendor bundle)`) };
+    } else {
+      try {
+        result = { root, module: require(file) };
+      } catch (e) {
+        result = { root, error: e };
+      }
+    }
+  }
+  _sharedCache.set(key, result);
+  return result;
+}
+
 /** 재사용 코어가 이 머신에서 가용한가(정직한 가부). */
 function desktopCoreAvailable() {
   const c = loadDesktopCore();
@@ -227,6 +255,7 @@ module.exports = {
   findCoreRoot,
   loadDesktopCore,
   loadCoreAcpRuntime,
+  loadCoreShared,
   loadDesktopCoreAsync,
   desktopCoreAvailable,
   _test: { stripRetiredProjectProvisioningSource },

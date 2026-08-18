@@ -11,7 +11,8 @@
  */
 const { loadCoreAcpRuntime } = require("../core/desktop-core.cjs");
 
-const ACP_KINDS = new Set(["kimi", "grok", "cursor"]);
+// 정본(runtimes/kinds.cjs)의 ACP 3종에서 파생 — resolve.cjs의 ACP_CLI_KINDS와 같은 원소.
+const ACP_KINDS = new Set(require("./kinds.cjs").ACP_CLI_KINDS);
 
 /** 이 머신에서 ACP 드라이버를 쓸 수 있는가. { ok, reason?, module? } */
 function acpDriverAvailability() {

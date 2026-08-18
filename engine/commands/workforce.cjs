@@ -75,6 +75,11 @@ async function dispatch(ctx, command, args) {
         permission,
         `terminal-${command}`,
       ) || cwd;
+      // 과금 사전 고지 — 이 표면은 서버가 청구 시 확정하는 가격을 미리 모르므로
+      // 숫자를 지어내지 않고 사실만 말한다(공개 Hub 호출=크레딧 소모, 장기대여=0).
+      ctx.out(ctx.lang !== "en"
+        ? "ℹ 공개 Hub 에이전트·팀 호출은 크레딧이 소모됩니다(활성 장기대여 중에는 0). 잔액 확인: agentlas billing"
+        : "ℹ Public Hub agent/team calls consume credits (0 while a day-lease is active). Check balance: agentlas billing");
       const runtime = workforceRuntime({ lang: ctx.lang, out: ctx.out, uiInstance: ctx.uiInstance });
       const result = await runtime.cmdWorkforce(db, rest, runtimeOverride, {
         cwd,
@@ -124,6 +129,12 @@ async function dispatch(ctx, command, args) {
       const cwd = projectCwd();
       const permission = resolvePermission(ctx);
       const projectPath = ensureTerminalProjectForExecutionCli(db, cwd, permission, `terminal-${command}`) || cwd;
+      // 과금 사전 고지 — local 스코프는 원격 과금이 없다.
+      if (sourceScope !== "local") {
+        ctx.out(ko
+          ? "ℹ 공개 Hub 에이전트·팀 호출은 크레딧이 소모됩니다(활성 장기대여 중에는 0). 잔액 확인: agentlas billing"
+          : "ℹ Public Hub agent/team calls consume credits (0 while a day-lease is active). Check balance: agentlas billing");
+      }
       const { createLocalCoreHubTool } = require("../workforce/local-core-transport.cjs");
       const { createLocalCoreWorkforceRuntime } = require("../workforce/deps.cjs");
       const transport = createLocalCoreHubTool({ sourceScope, projectDir: projectPath, cwd });

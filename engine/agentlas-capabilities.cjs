@@ -26,7 +26,8 @@ const RUNTIME_CAPS = {
 
 // NOTE: grok은 CAPS(멀티모달 능력 인지)만 등록 — 터미널 스폰 러너(RUNTIME_BIN)가 아직 없어
 // CLI_KINDS에 넣으면 repl의 which(RUNTIME_BIN[k]) 탐지가 깨진다. 러너 추가 시 함께 확장할 것.
-const CLI_KINDS = ["claude-code", "codex", "agy", "gemini"];
+// 목록의 정본은 runtimes/kinds.cjs — 여기서는 네이티브 스폰 러너 4종만 가져다 쓴다.
+const CLI_KINDS = require("./runtimes/kinds.cjs").NATIVE_CLI_KINDS;
 
 function capsFor(spec) {
   return RUNTIME_CAPS[spec] || { code: true, image: false, label: spec || "?" };

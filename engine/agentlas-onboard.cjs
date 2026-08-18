@@ -133,7 +133,8 @@ async function runOnboard({ ui, rl, helpers, persist }) {
   // Step 2 — default runtime
   ui.line("");
   printIndented(ui.t("wiz.runtimeQ"), c.bold);
-  const cliKinds = ["claude-code", "codex", "agy", "gemini"];
+  // 위저드 선택지 = 네이티브 스폰 러너 4종 (정본 runtimes/kinds.cjs, 표시 순서 포함).
+  const cliKinds = require("./runtimes/kinds.cjs").NATIVE_CLI_KINDS;
   const rtOpts = [{ value: "auto", label: ui.t("wiz.runtimeAuto") }];
   for (const k of cliKinds) {
     const has = !!H.which(H.RUNTIME_BIN[k]);

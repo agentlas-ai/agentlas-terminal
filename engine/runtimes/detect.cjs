@@ -7,20 +7,10 @@
  * (없으면 no_runtime 정직 정지 — 폴백 금지는 상위 계층의 계약).
  */
 const { spawnSync } = require("node:child_process");
+// kind 목록/실행 파일 이름의 정본은 runtimes/kinds.cjs 하나다 — 여기서 다시 적지 않는다.
+const { RUNTIME_BIN, CLI_KINDS } = require("./kinds.cjs");
 
-const RUNTIME_BIN = {
-  "claude-code": "claude",
-  codex: "codex",
-  // Antigravity CLI — gemini 후속. 공식 gemini CLI가 계정 티어로 죽어도(IneligibleTierError,
-  // 실측 2026-08-06) 이쪽은 산다. 데스크탑 gemini 러너의 agy 경로와 같은 실물.
-  agy: "agy",
-  gemini: "gemini",
-  kimi: "kimi",
-  grok: "grok",
-  cursor: "cursor-agent",
-};
-
-const CLI_RUNTIMES = Object.keys(RUNTIME_BIN);
+const CLI_RUNTIMES = CLI_KINDS;
 
 function whichSync(bin) {
   const cmd = process.platform === "win32" ? "where" : "which";

@@ -68,6 +68,26 @@ function loadDelegateParser() {
   return parseDelegationsLocal;
 }
 
+/*
+ * 제어 블록 스트리퍼 정본 — 벤더 코어의 shared/agent-control-blocks
+ * (Desktop·Mobile 과 같은 규칙). 옛 벤더 번들이라 없으면 null — cleanFenceText 는
+ * 종전 규칙만으로 fail-open 한다(원문 파괴보다 마커 잔존이 낫다).
+ */
+let _stripCanonical; // undefined=미시도 · null=정본 없음 · function=정본
+function loadCanonicalStripper() {
+  if (_stripCanonical === undefined) {
+    try {
+      const loaded = require("../core/desktop-core.cjs").loadCoreShared("agent-control-blocks");
+      _stripCanonical = loaded && loaded.module && typeof loaded.module.stripAgentControlBlocks === "function"
+        ? loaded.module.stripAgentControlBlocks
+        : null;
+    } catch {
+      _stripCanonical = null;
+    }
+  }
+  return _stripCanonical;
+}
+
 /** 표시/전달용 텍스트에서 제어 펜스를 제거한다(파싱만 — 부작용 없음). 실패 시 원문. */
 function cleanFenceText(text) {
   const raw = String(text || "");
@@ -79,8 +99,18 @@ function cleanFenceText(text) {
     }
   } catch { /* fences 미존재/파서 실패 — 원문 보존 */ }
   if (cleaned == null) cleaned = parseDelegationsLocal(raw).cleanedText;
+  // HTML 주석 봉투는 정본보다 먼저 — 정본이 헤딩만 도려내면 주석 껍데기가 남는다.
+  cleaned = cleaned.replace(/<!--\s*[\s\S]*?## Memory Events[\s\S]*?-->/gi, "");
+  // 정본 스트리퍼(settled 모드): 손코딩이 몰랐던 <<agentlas-ask>>·surface·followups·
+  // goal-complete 마커와 잔여 헤딩까지 Desktop 과 같은 규칙으로 지운다.
+  const strip = loadCanonicalStripper();
+  if (strip) {
+    try {
+      cleaned = strip(cleaned, { streaming: false });
+    } catch { /* 정본 실패 — 종전 규칙만으로 fail-open */ }
+  }
+  // 터미널 고유 정제(정본 범위 밖): 스킬 나레이션·오케스트레이터 헤더·판정 태그.
   return cleaned
-    .replace(/<!--\s*[\s\S]*?## Memory Events[\s\S]*?-->/gi, "")
     .replace(/^\s*(?:사용 스킬|Skills used)\s*:[^\n.!?]*[.!?]?\s*(?:(?:이유|Reason)\s*:[^.!?]*[.!?]\s*)?/i, "")
     .replace(/^\s*I(?:'|’)m using (?:the )?`?[^`.\n]+`? skill because [^.]*\.\s*/i, "")
     .replace(/^\s*Execution mode:\s*`?appbridge-ceo-orchestrator`?[^\n]*\n?/gim, "")
@@ -485,6 +515,7 @@ async function runFirmTurn(p) {
 module.exports = {
   runFirmTurn,
   parseDelegationsLocal,
+  cleanFenceText,
   buildDelegateProtocol,
   matchTargets,
   resolveDivisions,

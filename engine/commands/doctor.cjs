@@ -9,6 +9,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { dbPath, userDataDir } = require("../core/paths.cjs");
 const { listAvailableCliRuntimes, activeRuntimeRow } = require("../runtimes/detect.cjs");
+const { RUNTIME_BIN } = require("../runtimes/kinds.cjs");
 const { runtimeAuthEvidence } = require("../runtimes/auth-evidence.cjs");
 const { sharedRuntimeKind } = require("../runtimes/resolve.cjs");
 const { resolvedModelRole } = require("../runtimes/roles.cjs");
@@ -106,7 +107,7 @@ async function run(ctx, args = []) {
       // 가 아니라 경고다. 흔적 없음 = 미로그인 "가능성"이므로 단정하지 않는다.
       const evidence = runtimeAuthEvidence(activeKind);
       if (evidence.status === "none") {
-        const bin = { "claude-code": "claude", codex: "codex", gemini: "gemini", agy: "agy" }[activeKind] || activeKind;
+        const bin = RUNTIME_BIN[activeKind] || activeKind;
         warn(
           en ? "active runtime" : "활성 런타임",
           en

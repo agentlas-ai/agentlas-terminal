@@ -45,6 +45,35 @@ function loadRenderer() {
   }
 }
 
+/*
+ * 제어 블록 스트리퍼 — 정본은 벤더 코어의 shared/agent-control-blocks
+ * (Desktop·Mobile 과 같은 규칙: Memory Events/Delegate/Automation 헤딩,
+ * <<agentlas-ask>>·<<agentlas-surface>>·<<agentlas-one-followups>>·goal-complete
+ * 마커, 스트리밍 미완성 꼬리까지). 손 regex 는 Memory Events 만 알아 나머지
+ * 마커가 화면에 원문으로 샜다. 옛 벤더 번들이라 정본이 없으면 종전 regex 로
+ * fail-open — 스트리퍼 부재가 TUI 를 죽여선 안 된다.
+ */
+let _stripCanonical; // undefined=미시도 · null=정본 없음 · function=정본
+function stripControlBlocksForDisplay(text, streaming) {
+  if (_stripCanonical === undefined) {
+    try {
+      const loaded = require("../core/desktop-core.cjs").loadCoreShared("agent-control-blocks");
+      _stripCanonical = loaded && loaded.module && typeof loaded.module.stripAgentControlBlocks === "function"
+        ? loaded.module.stripAgentControlBlocks
+        : null;
+    } catch {
+      _stripCanonical = null;
+    }
+  }
+  const value = String(text);
+  if (_stripCanonical) {
+    try {
+      return _stripCanonical(value, { streaming: !!streaming });
+    } catch { /* 정본 실패 → 아래 종전 regex 로 fail-open */ }
+  }
+  return value.replace(/\n#{1,3} Memory Events\b[\s\S]*$/, "\n");
+}
+
 /* Ui 를 상속해 write 초크포인트만 렌더러로 돌린다. */
 class ShellUi extends Ui {
   /*
@@ -127,16 +156,22 @@ class ShellUi extends Ui {
     if (!this._md) this.streamStart();
     this._mdText += String(text);
     /*
-     * Memory Events 봉투는 런타임 계약(펜스 파이프라인이 수확)이지 사용자용이 아니다.
+     * 제어 블록은 런타임 계약(펜스 파이프라인이 수확)이지 사용자용이 아니다.
      * append-only 기본 REPL은 이미 찍힌 봉투를 지울 수 없지만, 누적 재렌더는
      * 표시만 잘라낼 수 있다 — 수확 경로(st.text/fences)는 건드리지 않는다.
+     * 정본 스트리퍼의 streaming 모드가 미완성 마커 꼬리도 한 프레임 감춘다.
      */
-    const visible = this._mdText.replace(/\n#{1,3} Memory Events\b[\s\S]*$/, "\n");
+    const visible = stripControlBlocksForDisplay(this._mdText, true);
     this._md.setText(visible);
     this._tui.requestRender();
     this._streaming = true;
   }
   streamEnd() {
+    // 확정 렌더 — streaming 모드가 감춰 두던 꼬리를 settled 규칙으로 최종 판정한다.
+    if (this._md && this._mdText) {
+      this._md.setText(stripControlBlocksForDisplay(this._mdText, false));
+      this._tui.requestRender();
+    }
     this._md = null;
     this._mdText = "";
     this._streaming = false;
@@ -615,4 +650,4 @@ async function startShell(ctx, opts = {}) {
   return new Promise(() => {});
 }
 
-module.exports = { startShell };
+module.exports = { startShell, stripControlBlocksForDisplay };
