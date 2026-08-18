@@ -37,14 +37,22 @@ const {
   normalizeCloudAssetDescriptor,
 } = require("../hub/install.cjs");
 const { SECRET_PATTERNS } = require("../agentlas-secret-patterns.cjs");
+const {
+  SECRET_SCAN_TEXT_EXTENSIONS,
+  UPLOAD_AGENT_DEFINITION_FILES,
+  UPLOAD_SKIP_DIRECTORIES,
+} = require("./upload-scan-catalog.generated.cjs");
 const { userDataDir } = require("../core/paths.cjs");
 const state = require("./state.cjs");
 const { cargoSearchAgents } = require("./cargo.cjs");
 const cas = require("./cas.cjs");
 
-const CLOUD_TEXT_EXTS = new Set([".cfg", ".cjs", ".conf", ".config", ".css", ".csv", ".env", ".html", ".ini", ".js", ".json", ".jsonl", ".md", ".mjs", ".properties", ".ps1", ".psd1", ".psm1", ".py", ".sh", ".toml", ".ts", ".tsx", ".txt", ".xml", ".yaml", ".yml"]);
-const CLOUD_AGENT_FILES = new Set(["AGENT.md", "AGENTS.md", "CLAUDE.md", "GEMINI.md", "README.md", "agent.md", "manifest.md", "system-prompt.md"]);
-const CLOUD_SKIP_DIRS = new Set([".git", ".next", ".studio-runtime", ".turbo", "build", "coverage", "dist", "node_modules", "out", "release"]);
+// 업로드/시크릿 스캔 어휘는 업로드 계약에서 온다. 세 제품이 각자 손으로 적어
+// 두었고 이미 갈려 있었다 — .bat/.cmd/.jsx 는 데스크탑만 스캔해서 서버 스캔과
+// 터미널 업로드가 그 파일들을 아예 열지 않았다.
+const CLOUD_TEXT_EXTS = new Set(SECRET_SCAN_TEXT_EXTENSIONS);
+const CLOUD_AGENT_FILES = new Set(UPLOAD_AGENT_DEFINITION_FILES);
+const CLOUD_SKIP_DIRS = new Set(UPLOAD_SKIP_DIRECTORIES);
 const CLOUD_BLOCKED_FILE_RE = [/^\.env(?:\..*)?$/i, /^id_rsa(?:\.pub)?$/i, /^credentials(?:\..*)?$/i, /^secrets?(?:\..*)?$/i, /^cloud-asset-state\.v1\.json$/i, /(?:^|[._-])service-account(?:[._-]|$)/i, /\.(?:key|pem|p12|pfx|mobileprovision)$/i];
 const CLOUD_ROUTING_CARD_PATH = ".agentlas/routing-card.json";
 const CLOUD_ROUTING_CARD_CAPABILITY_RE = /^[a-z][a-z0-9]*(_[a-z0-9]+)+$/;
