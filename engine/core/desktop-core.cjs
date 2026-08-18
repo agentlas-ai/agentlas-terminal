@@ -141,6 +141,25 @@ function installNativeModuleHook() {
   _nativeHookInstalled = true;
 }
 
+/**
+ * 코어의 initStore 를 부르기 전에, 공유 저장소의 user_version 을 **우리 드라이버로** 확인한다.
+ * 별도 커넥션을 잠깐 열고 닫을 뿐 아무것도 쓰지 않는다. 파일이 아직 없으면(첫 실행 부트스트랩
+ * 이전) 판단할 것이 없으므로 통과 — 코어가 만들게 둔다.
+ */
+function assertSharedStoreSchemaBeforeCoreInit() {
+  const file = process.env.AGENTLAS_STORE_PATH || dbPath();
+  if (!fs.existsSync(file)) return;
+  const { openRaw } = require("./db.cjs");
+  const { assertStoreSchemaCompatible } = require("./store-schema.cjs");
+  let probe = null;
+  try {
+    probe = openRaw(file);
+    assertStoreSchemaCompatible(probe, file);
+  } finally {
+    try { probe && probe.close(); } catch { /* noop */ }
+  }
+}
+
 let _cache = undefined;
 
 /**
@@ -148,8 +167,22 @@ let _cache = undefined;
  *  · require(rel): 코어 안의 임의 컴파일 모듈을 상대경로로 로드(예: "store/automations").
  *  · runGraph: electron/workflow/run-graph.js 의 runGraph(automation, graph, opts).
  * 공유 DB(AGENTLAS_STORE_PATH)를 코어 로드 전에 반드시 세팅한다 — store/db 가 모듈 로드 시 읽는다.
+ *
+ * ★마이그레이션 권위 (Phase 0, docs/DAEMON-ARCHITECTURE-DESIGN-2026-08-18.md §2/§6).
+ *
+ * 여기가 **두 번째 마이그레이션 주인**이었다. 이 셰임은 isPackaged:true 를 보고해
+ * (설계상) db.ts 의 개발 샌드박스 가드를 무력화하고, 공유 라이브 파일에 데스크탑과
+ * 같은 사다리를 돌렸다. 락이 없는 파일에서 두 프로세스가 사다리를 겹쳐 도는 것이
+ * 정확히 run_events + 인덱스 4개를 malformed 로 만든 경로다.
+ *
+ * **선택: (a) 사다리를 돌리지 않는다.** initStore 를 follower 로 부른다 — 코어는 열고
+ * 확인만 하며, 낮으면 정직하게 거절한다. (b)("데스크탑이 없으면 터미널이 주인")를 고르지
+ * 않은 이유: 데스크탑의 부재는 경합 없이 관측할 수 없다. 터미널이 사다리를 도는 중에
+ * 데스크탑이 켜질 수 있고, 틀렸을 때의 비용이 비대칭이다(손상 vs 앱 한 번 실행).
+ * 데스크탑이 정말 없는 머신은 `AGENTLAS_STORE_MIGRATION_ROLE=owner` 로 **사람이 일부러**
+ * 한 번 켠다 — 사고로 되는 일과 적어서 되는 일은 달라야 한다.
  */
-function loadDesktopCore() {
+function loadDesktopCore(options = {}) {
   if (_cache !== undefined) return _cache;
   const root = findCoreRoot();
   if (!root) { _cache = null; return null; }
@@ -157,13 +190,30 @@ function loadDesktopCore() {
   installNativeModuleHook();
   // 코어의 store 가 이 값을 모듈 로드 시점에 읽는다 — require 이전에 세팅해야 한다.
   if (!process.env.AGENTLAS_STORE_PATH) process.env.AGENTLAS_STORE_PATH = dbPath();
+  const migrationRole = options.migrationRole
+    || (String(process.env.AGENTLAS_STORE_MIGRATION_ROLE || "").trim().toLowerCase() === "owner"
+      ? "owner"
+      : "follower");
   const req = (rel) => require(path.join(root, "electron", rel.replace(/\.js$/, "") + ".js"));
   let kernel;
   try {
+    const store = req("store/db");
+    if (migrationRole === "follower") {
+      // 옛 벤더 번들은 이 계약을 모른다(옵션·env 를 무시하고 사다리를 돈다). 조용히 넘어가지
+      // 않고 무엇이 위험한지 말한다 — `npm run vendor:core` 로 갱신하면 사라진다.
+      if (typeof store.STORE_SCHEMA_VERSION !== "number") {
+        console.warn(
+          "[store] vendored Desktop core predates the single-migration-authority contract "
+          + "(no STORE_SCHEMA_VERSION export); it may migrate the shared database. "
+          + "Refresh it with `npm run vendor:core`.",
+        );
+      }
+      // 코어를 부르기 **전에** 우리 쪽에서 먼저 확인한다 — 옛 코어가 옵션을 무시해도
+      // 최소한 낮은 스키마에서는 사다리에 닿지 않는다.
+      assertSharedStoreSchemaBeforeCoreInit();
+    }
     // 데스크탑은 app.whenReady 에서 initStore() 를 부른다 — 터미널도 코어를 쓰기 전에 부른다.
-    // initStore 가 스키마 마이그레이션까지 소유하므로(데스크탑과 같은 정본 스키마) 공유 DB 는
-    // 언제나 코어가 기대하는 모양이 된다. 이것이 "재구현"이 아니라 "재사용"의 핵심.
-    req("store/db").initStore();
+    store.initStore({ migrationRole });
     kernel = req("workflow/run-graph");
   } catch (e) { _cache = { root, error: e }; return _cache; }
   _cache = {

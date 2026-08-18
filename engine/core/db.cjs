@@ -7,11 +7,17 @@
  * 스키마 소유권: 정본 스키마는 데스크탑 앱. 터미널은 bootstrap-schema.sql로
  * 첫 부트스트랩만 하고(런처가 수행), 이후 마이그레이션은 앱이 한다.
  * 터미널은 "있으면 쓰는" 방어적 열 확인(columnExists)으로만 전진 호환한다.
+ *
+ * ★2026-08-18: 위 문단은 계약이었지 배선이 아니었다. 이 파일은 user_version 을 **한 번도
+ * 읽지 않으면서** seedBuiltins 로 BEGIN IMMEDIATE 쓰기 트랜잭션을 열었다 — 검사도 거절도
+ * 없이 그냥 진행. 이제 openDb() 가 core/store-schema.cjs 로 버전을 확인하고, 낮으면
+ * 정직하게 거절한다(승급은 여전히 데스크탑의 일이다).
  */
 const fs = require("node:fs");
 const { configureSqliteConnection } = require("../agentlas-sqlite-policy.cjs");
 const { parseSemVer, compareSemVer } = require("../semver.cjs");
 const { dbPath } = require("./paths.cjs");
+const { assertStoreSchemaCompatible } = require("./store-schema.cjs");
 
 function loadNodeSqliteQuietly() {
   const originalEmitWarning = process.emitWarning;
@@ -45,15 +51,60 @@ function openRaw(file) {
 }
 
 /**
+ * 이 프로세스가 마이그레이션 권위인가. 기본은 **아니다**(follower).
+ * `AGENTLAS_STORE_MIGRATION_ROLE=owner` 는 데스크탑이 없는 머신을 위한 명시적 탈출구다 —
+ * 사람이 일부러 켜야 하고, 그때만 벤더 코어의 사다리가 한 번 돈다.
+ */
+function storeMigrationRole() {
+  return String(process.env.AGENTLAS_STORE_MIGRATION_ROLE || "").trim().toLowerCase() === "owner"
+    ? "owner"
+    : "follower";
+}
+
+/**
  * DB 파일이 없으면 하드 실패한다. 부트스트랩은 런처(bin/agentlas.cjs)의 책임 —
  * 엔진이 임의 경로에 빈 DB를 만들면 데스크탑과의 공유 계약이 조용히 깨진다.
+ *
+ * 연 다음에는 스키마 버전을 **확인**한다. 낮으면 거절 — 조용히 진행하지 않는다.
+ * owner 로 명시 지정된 경우에만, 거절 대신 벤더 코어의 사다리를 한 번 돌려 승급한다.
  */
 function openDb() {
   const file = dbPath();
   if (!fs.existsSync(file)) {
     throw new Error(`Agentlas database not found: ${file} (run via bin/agentlas.cjs)`);
   }
-  return openRaw(file);
+  if (storeMigrationRole() === "owner") migrateSharedStoreAsOwner(file);
+  const db = openRaw(file);
+  try {
+    assertStoreSchemaCompatible(db, file);
+  } catch (e) {
+    try { db.close(); } catch { /* noop */ }
+    throw e;
+  }
+  return db;
+}
+
+/**
+ * 명시적 탈출구의 실행부. 데스크탑이 없는 머신에서 사람이 일부러 켰을 때만 불린다.
+ * 승급 자체는 여전히 **데스크탑 사다리 코드 하나**가 한다 — 터미널은 그 사다리를 손으로
+ * 복제하지 않는다(두 번째 사다리 구현이 곧 세 번째 주인이다). 코어가 없으면 정직한 실패.
+ */
+function migrateSharedStoreAsOwner(file) {
+  let core;
+  try {
+    core = require("./desktop-core.cjs").loadDesktopCore({ migrationRole: "owner" });
+  } catch (e) {
+    throw new Error(`AGENTLAS_STORE_MIGRATION_ROLE=owner: could not load the Desktop core to migrate ${file}: ${e && e.message ? e.message : e}`);
+  }
+  if (!core) {
+    throw new Error(
+      `AGENTLAS_STORE_MIGRATION_ROLE=owner: no Desktop core is available on this machine, so ${file} cannot be migrated here.\n` +
+      "Run `agentlas doctor`, or launch the Agentlas Desktop app once.",
+    );
+  }
+  if (core.error) {
+    throw new Error(`AGENTLAS_STORE_MIGRATION_ROLE=owner: Desktop core failed to migrate ${file}: ${core.error.message}`);
+  }
 }
 
 function tableExists(db, name) {
@@ -151,6 +202,7 @@ function seedBuiltins(db) {
 module.exports = {
   openDb,
   openRaw,
+  storeMigrationRole,
   tableExists,
   columnExists,
   runWriteTransaction,

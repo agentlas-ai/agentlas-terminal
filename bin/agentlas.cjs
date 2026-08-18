@@ -155,12 +155,22 @@ function bootstrapDbIfMissing() {
     throw new Error(`Bootstrap schema not found: ${schemaFile}`);
   }
   const sql = fs.readFileSync(schemaFile, "utf8");
+  // ★새 저장소는 태어날 때부터 WAL 이어야 한다 (2026-08-18 실측).
+  // journal_mode 는 파일에 박히는 값이고, delete→WAL 전환은 **배타 락**을 요구하며
+  // busy_timeout 이 걸려 있어도 즉시 SQLITE_BUSY 로 실패할 수 있다. 그래서 터미널이
+  // 만든 DB 를 delete 모드로 남기면, 데스크탑과 터미널이 그 파일을 처음 동시에 여는
+  // 순간 한쪽이 "database is locked" 로 죽는다 — 첫 부팅에서만 나는, 재현이 어려운
+  // 결함이다. 여기서 한 번 켜 두면 그 전환 자체가 존재하지 않는다.
+  const WAL_PRAGMA = "PRAGMA journal_mode=WAL;\n";
   // DB를 정식 경로에서 직접 만들면 두 첫 실행이 모두 exists=false를 본 뒤 한 프로세스의
   // 실패 cleanup이 다른 프로세스의 정상 DB까지 지울 수 있다. 각자 같은 볼륨의 임시 DB를
   // 완성하고 hard-link(EEXIST=다른 프로세스 승리)로만 정식 이름을 원자 획득한다.
   const temp = `${p}.bootstrap-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`;
   const db = openSqlite(temp);
   try {
+    // 임시 파일에서 켠다. journal_mode 는 DB 헤더에 박히므로 hard-link 로 정식 이름을
+    // 얻은 뒤에도 유지된다(닫을 때 -wal 은 체크포인트되고 사라진다).
+    db.exec(WAL_PRAGMA);
     db.exec(sql);
   } catch (e) {
     db.close();

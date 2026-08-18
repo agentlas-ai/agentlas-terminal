@@ -4,6 +4,15 @@
 // lock waits bounded, and acquire writer authority before a transaction reads
 // state that it may subsequently update. A deferred read-to-write upgrade can
 // fail immediately with SQLITE_BUSY even when busy_timeout is configured.
+//
+// ★This value must stay identical to `STORE_BUSY_TIMEOUT_MS` in
+// agentlas_desktop/electron/store/db.ts. Until 2026-08-18 the Desktop waited 5s
+// and the terminal 15s on the very same file, so under contention the Desktop
+// was always the first to give up with SQLITE_BUSY — even when the terminal was
+// the slow writer. That asymmetry made shared-file contention look like a
+// Desktop-only bug. 15s is the agreed value: nothing holds a transaction on this
+// file for long (the longest writer is the migration ladder), so it is a ceiling
+// that is essentially never reached rather than added latency.
 const SQLITE_BUSY_TIMEOUT_MS = 15_000;
 
 // `foreign_keys` 는 파일이 아니라 **커넥션** 속성이다. 데스크탑은
