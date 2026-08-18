@@ -1,7 +1,7 @@
 {
-  "version": "2",
-  "url": "https://github.com/agentlas-ai/agentlas-terminal/releases/download/desktop-core-v2/desktop-core.tar.gz",
-  "sha256": "782760c34af1d06b9efd212d48ba032fe46907bdc8bc836025c44fc658968d6f",
-  "sizeBytes": 12295321,
-  "writtenAt": "2026-08-09T21:43:34.707Z"
+  "version": "3",
+  "url": "https://github.com/agentlas-ai/agentlas-terminal/releases/download/desktop-core-v3/desktop-core.tar.gz",
+  "sha256": "a72cce0ccfe718e2a9255b1b4722d330ef9887e22be92c654a0435f17f5ee178",
+  "sizeBytes": 12437404,
+  "writtenAt": "2026-08-18T04:09:04.540Z"
 }
