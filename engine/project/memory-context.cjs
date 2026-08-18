@@ -123,6 +123,13 @@ function cliProjectContextSlice(projectPath, task) {
         "--task-stdin",
         "--no-refresh",
         "--render",
+        // Recall degrades to a labelled map, never to nothing. Core's passive
+        // freshness check walks the whole repository (measured 11.0s on the
+        // pilot) against this 4s timeout, and any non-zero exit is swallowed
+        // into "" below — so without a budget a large project silently lost
+        // its slice on every turn.
+        "--allow-stale",
+        "--freshness-budget", "0.4",
       ],
       {
         cwd: projectPath,
