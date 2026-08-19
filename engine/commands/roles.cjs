@@ -17,6 +17,7 @@
  */
 const { RUNTIME_BIN, whichSync } = require("../runtimes/detect.cjs");
 const { runtimeAuthEvidence } = require("../runtimes/auth-evidence.cjs");
+const { canonicalRuntimeKind, storedRuntimeKind } = require("../runtimes/kinds.cjs");
 const { MODEL_ROLE_TABLE, VALID_ROLES, resolvedModelRole, roleMembers } = require("../runtimes/roles.cjs");
 const { runWriteTransaction } = require("../agentlas-sqlite-policy.cjs");
 const { EFFORTS } = require("../agentlas-workload-routing.cjs");
@@ -137,11 +138,13 @@ function set(ctx, args) {
     if (existing) {
       // kind가 바뀌면 이전 모델 id는 새 런타임의 어휘가 아니다(예: kimi에 opus).
       // --model 미지정 시 유지가 아니라 초기화 — 무의미한 좌표를 승계하지 않는다.
-      const keepModel = existing.kind === kind ? existing.model : null;
+      const keepModel = canonicalRuntimeKind(existing.kind) === kind ? existing.model : null;
       db.prepare(
         "UPDATE model_roles SET kind=?, model=?, effort=?, inherit=?, updated_at=? WHERE role=?",
       ).run(
-        kind,
+        // 공유 DB 는 데스크탑 어휘로 적는다(runtimes/kinds.cjs) — 여기서 이 저장소의
+        // 이름을 그대로 넣으면 데스크탑이 그 역할을 못 읽는다.
+        storedRuntimeKind(kind),
         model === undefined ? keepModel : model,
         flags.effort === undefined ? existing.effort : (flags.effort === "none" ? null : flags.effort),
         inherit,
@@ -151,7 +154,7 @@ function set(ctx, args) {
     } else {
       db.prepare(
         "INSERT INTO model_roles (role, kind, model, effort, inherit, updated_at) VALUES (?,?,?,?,?,?)",
-      ).run(role, kind, model === undefined ? null : model, flags.effort === undefined || flags.effort === "none" ? null : flags.effort, inherit, now);
+      ).run(role, storedRuntimeKind(kind), model === undefined ? null : model, flags.effort === undefined || flags.effort === "none" ? null : flags.effort, inherit, now);
     }
   });
 

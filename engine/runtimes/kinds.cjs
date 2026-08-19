@@ -54,6 +54,19 @@ function canonicalRuntimeKind(kind) {
   return STORED_KIND_ALIASES[text] ?? text;
 }
 
+/** 역방향 — 공유 DB 에 적을 이름. 어긋남은 **양쪽으로** 난다:
+ *  `agentlas roles set orchestrator agy` 가 `agy` 를 그대로 적으면, 이번에는
+ *  데스크탑이 그 이름을 모른다(shared/runtime-kinds.ts 에 `agy` 가 없다).
+ *  저장 어휘는 스키마 주인인 데스크탑 쪽으로 통일하고, 읽을 때 위에서 되돌린다. */
+const CANONICAL_TO_STORED = Object.fromEntries(
+  Object.entries(STORED_KIND_ALIASES).map(([stored, canonical]) => [canonical, stored]),
+);
+function storedRuntimeKind(kind) {
+  const text = typeof kind === "string" ? kind.trim() : "";
+  if (!text) return text;
+  return CANONICAL_TO_STORED[text] ?? text;
+}
+
 /** CLI 런타임 kind 전체(탐지 순서). */
 const CLI_KINDS = RUNTIME_KIND_SPECS.map((s) => s.kind);
 
@@ -97,6 +110,7 @@ module.exports = {
   RUNTIME_BIN,
   STORED_KIND_ALIASES,
   canonicalRuntimeKind,
+  storedRuntimeKind,
   CLI_KINDS,
   NATIVE_CLI_KINDS,
   ACP_CLI_KINDS,
