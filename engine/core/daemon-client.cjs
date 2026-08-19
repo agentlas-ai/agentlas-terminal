@@ -80,10 +80,42 @@ function callDaemon(method, params, timeoutMs) {
 async function daemonAvailable() {
   try {
     const pong = await callDaemon("daemon.ping", undefined, 2000);
-    return Boolean(pong && pong.ok === true);
+    if (!pong || pong.ok !== true) return false;
+    return sharesOurStore(pong);
   } catch {
     return false;
   }
 }
 
-module.exports = { daemonSocketPath, callDaemon, daemonAvailable };
+/**
+ * 데몬이 **우리와 같은 DB** 를 열었는가.
+ *
+ * ★`AGENTLAS_STORE_PATH` 는 이 프로세스에만 있다 — 소켓 너머 데몬은 그 값을 모른다.
+ *   그래서 사본을 지정해 놓고 일을 넘기면, 우리는 사본에 자동화를 만들고 데몬은
+ *   **라이브에** 실행 기록·부수효과를 남긴다. 둘 다 "성공" 이라고 답하는데 결과는
+ *   두 데이터베이스에 반씩 흩어진다. 넘기기 전에 물어보고, 다르면 넘기지 않는다.
+ *
+ *   경로를 못 받는 옛 데몬은 예전처럼 신뢰한다 — 그때는 양쪽 다 기본 경로였다.
+ *   우리가 경로를 명시했는데 상대가 답을 못 하면, 그건 확인할 수 없는 상태이므로 거절한다.
+ */
+function sharesOurStore(pong) {
+  const ours = String(process.env.AGENTLAS_STORE_PATH || "").trim();
+  if (!ours) return true;
+  const theirs = typeof pong.storePath === "string" ? pong.storePath.trim() : "";
+  if (!theirs) {
+    console.error(
+      "[daemon] AGENTLAS_STORE_PATH is set here, but the daemon does not report which database it opened.\n"
+      + "[daemon] Running the graph locally instead, so the work cannot land in a different store.",
+    );
+    return false;
+  }
+  const path = require("node:path");
+  if (path.resolve(theirs) === path.resolve(ours)) return true;
+  console.error(
+    `[daemon] the daemon opened a different database (${theirs}) than this command (${ours}).\n`
+    + "[daemon] Running the graph locally instead, so the work cannot land in a different store.",
+  );
+  return false;
+}
+
+module.exports = { daemonSocketPath, callDaemon, daemonAvailable, sharesOurStore };
