@@ -29,13 +29,32 @@ function check(name, ok, detail) {
   if (!ok) failures.push(`${name}: ${detail}`);
 }
 
-const vendored = path.join(root, "engine", "vendor", "desktop-core", "dist", "electron", "store", "graph-reconciliation.js");
+/*
+ * ★CI 가 볼 수 있는 증거로 잰다. 첫 판은 벤더 트리의 파일 존재를 봤는데, 그 트리는
+ *   gitignore 라 CI 에는 아예 없다 — 게이트가 로컬에서만 통과하고 **발행을 막았다**
+ *   (실측 2026-08-20: 1.0.56 발행이 이 게이트로 실패). 저장소에 있는 것은 벤더 스크립트의
+ *   진입점 선언이고, 그게 "이 모듈이 실린다"를 정하는 자리다.
+ */
+const vendorScript = fs.readFileSync(path.join(root, "scripts", "vendor-desktop-core.cjs"), "utf8");
 check(
-  "the-way-out-ships-with-the-engine",
-  fs.existsSync(vendored),
-  "재조정 모듈이 벤더 코어에 없습니다 — 터미널은 `automation_partial_reconciliation_required` 를 "
-  + "낼 수는 있는데 풀 수단이 없습니다. scripts/vendor-desktop-core.cjs 의 진입점에 추가하세요.",
+  "the-vendor-entry-list-carries-the-way-out",
+  /graph-reconciliation/.test(vendorScript),
+  "벤더 진입점에 재조정 모듈이 없습니다 — 터미널은 `automation_partial_reconciliation_required` 를 "
+  + "낼 수는 있는데 풀 수단이 없는 엔진을 싣게 됩니다.",
 );
+
+// 벤더 트리가 실제로 있을 때만(=로컬) 결과물까지 확인한다. 없으면 **못 잰 것**이지
+// 통과가 아니므로, 그 사실을 말한다.
+const vendored = path.join(root, "engine", "vendor", "desktop-core", "dist", "electron", "store", "graph-reconciliation.js");
+if (fs.existsSync(path.join(root, "engine", "vendor", "desktop-core", "dist"))) {
+  check(
+    "the-way-out-ships-with-the-engine",
+    fs.existsSync(vendored),
+    "벤더된 엔진에 재조정 모듈이 없습니다 — `npm run vendor:core` 를 다시 도세요.",
+  );
+} else {
+  console.log("SKIP the-way-out-ships-with-the-engine — 벤더 트리가 없습니다(여기서는 못 잽니다).");
+}
 
 const surface = fs.readFileSync(path.join(root, "engine", "core", "desktop-core.cjs"), "utf8");
 check(
