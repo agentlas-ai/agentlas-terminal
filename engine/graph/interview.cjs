@@ -198,6 +198,12 @@ const RULES = [
   "    the expected fields' / 'the row was appended with the submitted values'. If the outside",
   "    result genuinely cannot be re-observed, say so in the step instruction rather than",
   "    skipping the check.",
+  "  · A value a branch tests for emptiness (op truthy/falsy) MUST NOT also carry a check",
+  "    that demands it be non-empty. Threshold watchers are the common case: on a day the",
+  "    threshold is not crossed the value is correctly empty, and a check demanding content",
+  "    fails the run on exactly the days nothing was supposed to happen. Put that check",
+  "    INSIDE the branch that has the value, or check the comparison step's own report",
+  "    (both rates read, threshold applied) instead of the alert text.",
   "  · repeatOn says which side loops. Write the condition the way the person said it and",
   "    put the loop on the side they meant — do not flip either one to make it fit.",
   "",
@@ -555,6 +561,31 @@ function validateBlueprint(bp, ctx = {}) {
         why: "만든 단계가 자기 결과에 붙인 글자를 보고 정하면, 자기가 자기를 채점하는 셈이 됩니다.",
       });
     }
+  }
+
+  /*
+   * ★"비어 있을 수 있다"고 갈림길이 말한 값에 "비어 있으면 안 된다" 검증을 걸면 평상시마다
+   *   실패한다(실측 2026-08-19: 임계값 미달인 날 alertline 이 정당하게 비어 NODE_INPUT_MISSING).
+   *   정본은 데스크탑 shared/graph-blueprint.ts — 이 파일은 손복사본이고 패리티 게이트가 지킨다.
+   */
+  const emptinessTestedVars = new Set(
+    (bp.branches || [])
+      .filter((branch) => branch.op === "truthy" || branch.op === "falsy")
+      .map((branch) => String(branch.var || "").trim())
+      .filter(Boolean),
+  );
+  for (const check of bp.checks || []) {
+    const subject = String(check.subject || "").trim();
+    if (!subject || !emptinessTestedVars.has(subject)) continue;
+    push(
+      `"${subject}"은(는) 비어 있을 수 있다고 갈림길이 말하는데, 그 앞의 검증은 비어 있지 않기를 요구합니다. `
+      + "비어 있는 것이 정상인 날마다 이 자동화는 실패합니다.",
+      {
+        id: `check-${subject}-may-be-empty`,
+        question: `"${subject}"이(가) 비어 있는 것이 정상인 경우가 있나요? 그렇다면 이 검증을 값이 있는 쪽 가지 안으로 옮길까요?`,
+        why: "임계값 감시처럼 '알릴 것이 없는 날'이 정상인 자동화는, 그 날마다 실패하면 쓸 수 없습니다.",
+      },
+    );
   }
 
   for (const branch of bp.branches || []) {
