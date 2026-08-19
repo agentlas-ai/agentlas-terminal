@@ -20,6 +20,7 @@ const {
   API_EXECUTABLE_KINDS,
 } = require("./resolve.cjs");
 const { pickRoleFromPool } = require("./roles.cjs");
+const { canonicalRuntimeKind } = require("./kinds.cjs");
 
 const OVERRIDE_TABLE = "agent_runtime_overrides";
 // 데스크탑 VALID_SCOPES 동형. v2 터미널 호출자는 주로 'agent'지만 firm/division도 읽을 수 있다.
@@ -38,7 +39,8 @@ function rowToOverride(row) {
     targetId: row.target_id,
     label: cleanText(row.label),
     selection: {
-      kind: String(row.kind),
+      // 저장된 이름(데스크탑 표기) → 이 저장소의 이름. kinds.cjs 참고.
+      kind: canonicalRuntimeKind(String(row.kind)),
       backend: cleanText(row.backend) || undefined,
       source: cleanText(row.source) || undefined,
       model: cleanText(row.model) || undefined,

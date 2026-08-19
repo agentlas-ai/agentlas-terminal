@@ -30,6 +30,30 @@ const RUNTIME_KIND_SPECS = [
 /** kind → 실행 파일 이름. CLI 런타임 전체(네이티브 + ACP). */
 const RUNTIME_BIN = Object.fromEntries(RUNTIME_KIND_SPECS.map((s) => [s.kind, s.bin]));
 
+/**
+ * 데스크탑이 **같은 DB 에 적어 둔 이름** → 이 저장소의 이름.
+ *
+ * ★터미널과 데스크탑은 하나의 SQLite 를 공유하는데 같은 런타임을 다르게 부른다:
+ *   데스크탑 `shared/runtime-kinds.ts` 는 `antigravity`, 여기는 `agy` 다. 그 차이는
+ *   주석에만 적혀 있었고 **읽는 자리에서 번역되지 않았다**.
+ *
+ *   결과(실측 2026-08-19): 사용자가 오케스트레이터를 Antigravity 로 골라 두면
+ *   `model_roles.kind = "antigravity"` 가 저장되는데, 터미널의 실행 가능 집합에는
+ *   그 이름이 없어 **"이 컴퓨터에서 실행 불가"로 걸러지고** 풀 3순위(codex)가 대신 돌았다.
+ *   `agentlas roles` 는 antigravity 라고 보여 주면서 그래프 빌더는 codex 로 지었다 —
+ *   고른 대로 안 도는데 화면은 고른 대로 보였다.
+ *
+ *   저장된 이름은 못 바꾼다(데스크탑이 계속 그렇게 쓴다). 그러니 **읽는 쪽이 번역한다**.
+ */
+const STORED_KIND_ALIASES = { antigravity: "agy" };
+
+/** 저장소에서 읽은 kind 를 이 저장소의 정본 이름으로. 모르는 값은 그대로 돌려준다. */
+function canonicalRuntimeKind(kind) {
+  const text = typeof kind === "string" ? kind.trim() : "";
+  if (!text) return text;
+  return STORED_KIND_ALIASES[text] ?? text;
+}
+
 /** CLI 런타임 kind 전체(탐지 순서). */
 const CLI_KINDS = RUNTIME_KIND_SPECS.map((s) => s.kind);
 
@@ -71,6 +95,8 @@ const CONTRACT_RUNTIME_BACKENDS = [
 module.exports = {
   RUNTIME_KIND_SPECS,
   RUNTIME_BIN,
+  STORED_KIND_ALIASES,
+  canonicalRuntimeKind,
   CLI_KINDS,
   NATIVE_CLI_KINDS,
   ACP_CLI_KINDS,

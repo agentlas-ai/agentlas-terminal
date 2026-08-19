@@ -9,6 +9,7 @@
  * The worker may inherit upward for quality; the orchestrator never falls
  * downward to the worker row.
  */
+const { canonicalRuntimeKind } = require("./kinds.cjs");
 const { tableExists, columnExists } = require("../core/db.cjs");
 
 const MODEL_ROLE_TABLE = "model_roles";
@@ -49,7 +50,7 @@ function legacyOrchestrator(db) {
     }
     return {
       role: "orchestrator",
-      kind: cleanText(row.kind),
+      kind: canonicalRuntimeKind(cleanText(row.kind)),
       backend: cleanText(row.backend),
       source: cleanText(row.source),
       model: cleanText(row.model),
@@ -68,7 +69,8 @@ function normalizedRow(row, role) {
   if (!row || !cleanText(row.kind)) return null;
   return {
     role,
-    kind: cleanText(row.kind),
+    // 저장된 이름(데스크탑 표기)을 이 저장소의 이름으로 번역한다 — kinds.cjs 참고.
+    kind: canonicalRuntimeKind(cleanText(row.kind)),
     backend: cleanText(row.backend),
     source: cleanText(row.source),
     model: cleanText(row.model),
