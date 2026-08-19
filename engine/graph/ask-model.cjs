@@ -50,6 +50,23 @@ function quietSink() {
  * @returns {Promise<{ok:true,text:string,runtime:string,fellBackFrom?:string}
  *                  |{ok:false,reason:string,nextAction:string}>}
  */
+/**
+ * 이 컴퓨터에서 **이미 동의된** MCP 서버들. 빌더도 실행기와 같은 재료를 본다.
+ *
+ * 새 동의를 받지 않는다 — 만드는 중에 승인 창을 띄우면 사람이 흐름에서 튕긴다.
+ * 못 읽으면 빈 배열: 예전 동작과 같아질 뿐 나빠지지 않는다(조용한 실패가 아니라
+ * "없는 것"이 사실이다).
+ */
+function consentedMcpServersFor(ctx) {
+  try {
+    const mcp = require("../mcp/index.cjs");
+    if (typeof mcp.readConsentedSystemMcpServers !== "function") return [];
+    return mcp.readConsentedSystemMcpServers(ctx.db(), { env: process.env }) || [];
+  } catch {
+    return [];
+  }
+}
+
 async function askModel(ctx, prompt, opts = {}) {
   const db = ctx.db();
   let primary = null;
@@ -103,12 +120,27 @@ async function askModel(ctx, prompt, opts = {}) {
         ui: quietSink(),
         cwd: opts.cwd || process.cwd(),
         prompt,
-        // 읽기 권한 — 인터뷰는 사람에게 묻고 형식을 만드는 일이라 파일을 바꿀 이유가 없다.
+        /*
+         * 읽기 권한 — 만드는 동안 바깥을 바꾸지 않는다. 메일이 나가거나 글이 올라가면 안 된다.
+         * ★런타임의 "read"는 **쓰기 금지가 아니라 도구 금지에 가깝다**(이 저장소 실측:
+         *   조회 그래프가 조회조차 못 했던 사고). 조회 도구는 남으므로 확인은 할 수 있다.
+         */
         permission: "read",
         session: {},
         model: runtime.model,
         effort: runtime.effort,
-        mcpServers: [],
+        /*
+         * ★사용자가 **이미 동의한** MCP 를 빌더에게도 준다.
+         *
+         *   실측 2026-08-20: 여기가 빈 배열이었다. 그래서 빌더는 이 컴퓨터에 무엇이
+         *   연결돼 있는지 모른 채 그래프를 지었고, 자기가 쓴 스크립트가 도는지도 볼 수
+         *   없었다. 도구는 제품에 다 있는데(브라우저·MCP·크리덴셜) **만드는 자리에만
+         *   안 닿아 있었다.**
+         *
+         *   새로 동의를 받지 않는다 — 이미 받아 둔 것만 그대로 쓴다(consent 영수증 기준).
+         *   못 읽으면 빈 배열로 간다: 예전과 같아질 뿐 나빠지지 않는다.
+         */
+        mcpServers: consentedMcpServersFor(ctx),
         mcpAllowlistMode: "exact",
       });
     } catch (err) {

@@ -972,6 +972,37 @@ async function newGraph(ctx, request, flags) {
       }
     }
 
+    /*
+     * ★저장하기 **전에** 싼 단계를 실제로 돌려 본다.
+     *   빌더가 쓴 스크립트는 한 번도 돌아 본 적이 없다 — 실측 2026-08-20: 새로 만든 환율
+     *   자동화의 첫 단계가 자료원에서 403 을 받고 죽었고, 사람은 며칠 뒤 예약 실행에서야
+     *   알게 된다. code 단계 실행은 실측 0.0~0.1초라 사람이 못 느낀다.
+     *   ★에러코드를 늘어놓지 않는다 — 고칠 수 있으면 조용히 고치고, 안 되면 사람 말로 한 줄.
+     */
+    const core = await acquireCore(ctx);
+    const verifier = core && core.verifyBeforeSave;
+    if (verifier && typeof verifier.run === "function") {
+      try {
+        const seen = await verifier.run(built.graph);
+        for (const step of seen.steps || []) {
+          if (step.state === "repaired" && step.repairedCode) {
+            const node = built.graph.nodes.find((n) => n.id === step.nodeId);
+            if (node && node.config) node.config.code = step.repairedCode;
+          }
+        }
+        for (const line of verifier.render(seen)) ctx.out(ctx.ui.dim(line));
+      } catch (verifyError) {
+        /*
+         * ★확인하지 못한 것은 실패가 아니므로 저장은 막지 않는다. 다만 **조용히 삼키지도
+         *   않는다** — 실측 2026-08-20: 이 자리의 첫 판이 오타 하나로 매번 던졌는데,
+         *   빈 catch 가 그것을 통째로 먹어 "검증이 통과한 것"과 구분되지 않았다.
+         *   확인을 못 했으면 못 했다고 말한다.
+         */
+        ctx.err(ctx.ui.dim(en
+          ? `Could not check the steps before saving: ${verifyError && verifyError.message}`
+          : `저장 전 단계 확인을 하지 못했습니다: ${verifyError && verifyError.message}`));
+      }
+    }
     // 이름이 겹치면 덮어쓰지 않는다.
     const existing = graphRows(ctx, db).find((row) => row.name === bp.name);
     const name = existing ? `${bp.name} (2)` : bp.name;

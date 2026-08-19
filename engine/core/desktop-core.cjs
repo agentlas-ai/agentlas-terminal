@@ -231,6 +231,18 @@ function loadDesktopCore(options = {}) {
     initStore: req("store/db").initStore,
     getDb: req("store/db").getDb,
     runGraph: kernel.runGraph,
+    /*
+     * 저장 전 확인 — 빌더가 만든 스크립트를 **저장하기 전에** 돌려 보고, 안 되면 한 번
+     * 고친다. 옛 코어에는 없으므로 정직하게 null 로 둔다(부르는 쪽이 없으면 건너뛴다).
+     */
+    verifyBeforeSave: (() => {
+      try {
+        const mod = req("workflow/verify-before-save");
+        return typeof mod.verifyGraphBeforeSaveWithKernel === "function"
+          ? { run: mod.verifyGraphBeforeSaveWithKernel, render: mod.renderPreSaveVerification }
+          : null;
+      } catch { return null; }
+    })(),
     getAutomation: req("store/automations").getAutomation,
     // shared/ 는 electron/ 밖이라 req 로 못 닿는다 — 직접 해석한다.
     graphExecutionDigest: (() => {

@@ -45,6 +45,8 @@ const ROOT_ENTRY = path.join(distRoot, "electron", "workflow", "run-graph.js");
 //   내는 오류가 있으면 푸는 길도 같이 실어야 한다.
 const EXTRA_ENTRIES = [
   path.join(distRoot, "electron", "store", "graph-reconciliation.js"),
+  // 저장 전 확인 — 동적 req() 로만 닿아 정적 분석이 못 본다(재조정과 같은 자리).
+  path.join(distRoot, "electron", "workflow", "verify-before-save.js"),
 ];
 
 // 컴파일된 코드를 잘라내지 않는다(정적으로 도달 가능한 걸 손으로 프루닝하면, 그 가지가 실제로
