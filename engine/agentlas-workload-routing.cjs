@@ -485,14 +485,18 @@ function createDecisionReceipt({ taskId, stage, decision, resolution, role, usag
       modelId: normalized && normalized.exactModelId
         ? normalized.exactModelId
         : source === "user-pin" ? cleanText(resolution && resolution.model, 255) || null : null,
-      effort: normalized ? normalized.effort : "none",
+      // "none" is an effort level; no request is not one. Rendering the
+      // absence as a level made the receipt claim a decision nobody made —
+      // measured on the desktop twin, 17 of 46 receipts said resolved.effort
+      // "none" while carrying no effort-* reason code at all.
+      effort: normalized ? normalized.effort : null,
     },
     resolved: {
       tier: resolution && resolution.tier ? cleanText(resolution.tier, 32) : normalized ? normalized.tier : null,
       provider: cleanText(resolution && resolution.provider, 80) || null,
       modelId: cleanText(resolution && resolution.model, 255) || null,
       sessionId: cleanText(resolution && resolution.runtimeId, 255) || null,
-      effort: cleanText(resolution && resolution.effort, 16) || "none",
+      effort: cleanText(resolution && resolution.effort, 16) || null,
     },
     reasonCodes,
     inputFeatureHash: normalized && normalized.inputFeatureHash ? normalized.inputFeatureHash : featureHash,
