@@ -577,14 +577,25 @@ function validateBlueprint(bp, ctx = {}) {
   for (const check of bp.checks || []) {
     const subject = String(check.subject || "").trim();
     if (!subject || !emptinessTestedVars.has(subject)) continue;
+    const branch = (bp.branches || []).find((b) => String(b.var || "").trim() === subject);
+    if (!branch) continue;
+    // 위치를 본다 — 갈림길 뒤 값-있는 쪽의 검증은 비는 날 아예 안 돌므로 문제가 아니다.
+    const at = typeof check.afterStep === "number" ? check.afterStep : -1;
+    const runsBeforeTheBranchDecides = at <= (branch.afterStep ?? 0);
+    const sitsOnTheEmptySide = typeof branch.noStep === "number" && at === branch.noStep;
+    if (!runsBeforeTheBranchDecides && !sitsOnTheEmptySide) continue;
+    const yesStep = typeof branch.yesStep === "number" ? branch.yesStep : null;
+    // 사람에게 묻지 않는다 — 모양이 틀린 것이고 고치는 법이 하나로 정해진다.
     push(
-      `"${subject}"은(는) 비어 있을 수 있다고 갈림길이 말하는데, 그 앞의 검증은 비어 있지 않기를 요구합니다. `
-      + "비어 있는 것이 정상인 날마다 이 자동화는 실패합니다.",
-      {
-        id: `check-${subject}-may-be-empty`,
-        question: `"${subject}"이(가) 비어 있는 것이 정상인 경우가 있나요? 그렇다면 이 검증을 값이 있는 쪽 가지 안으로 옮길까요?`,
-        why: "임계값 감시처럼 '알릴 것이 없는 날'이 정상인 자동화는, 그 날마다 실패하면 쓸 수 없습니다.",
-      },
+      `"${subject}"은(는) 갈림길이 비어 있을 수 있다고 말하는 값인데, 그 앞의 검증이 비어 있지 않기를 요구합니다. `
+      + "임계값 감시처럼 '알릴 것이 없는 날'이 정상인 자동화는 그 날마다 실패합니다. "
+      + `검증을 지우지 말고 **값이 있는 쪽에서만 돌게** 옮기세요: 이 검증의 afterStep 을 `
+      + (yesStep !== null
+        ? `갈림길의 yes 쪽 단계(${yesStep})나 그 뒤 단계로 바꾸면 됩니다.`
+        : "갈림길의 yes 쪽 단계나 그 뒤 단계로 바꾸면 됩니다.")
+      + ` 값이 비었는지 자체를 확인하고 싶다면, "${subject}"을(를) 만든 비교 단계가 `
+      + "무엇을 읽고 어떤 임계값을 적용했는지 보고하게 하고 그 보고를 subject 로 삼으세요 "
+      + "— 그 보고는 알릴 것이 없는 날에도 비지 않습니다.",
     );
   }
 
