@@ -157,6 +157,116 @@ function listGraphs(ctx) {
   return 0;
 }
 
+/**
+ * 옛 실행이 부수효과를 남겨 막힌 자동화를, 사람이 **한 번** 판단해 풀어 준다.
+ *
+ * 실측 2026-08-20: 터미널 코어에는 재조정 모듈이 아예 실리지 않아,
+ * `automation_partial_reconciliation_required` 를 **낼 수는 있는데 풀 수단이 없었다**.
+ * CLI 만 쓰는 사람은 그 자동화를 영원히 못 돌린다. 내는 오류가 있으면 푸는 길도 있어야 한다.
+ *
+ * 판단은 노드마다 둘 중 하나다 — "이미 일어났다(--done)" / "확실히 안 일어났다(--not-done)".
+ * 아무 것도 주지 않으면 무엇을 정해야 하는지 보여 주기만 한다. 실행 중에 묻지 않는다.
+ */
+function reconcileGraph(ctx, needle, flags, en) {
+  const rows = graphRows(ctx, ctx.db());
+  const row = findGraph(rows, needle);
+  if (row?.ambiguous) { reportAmbiguous(ctx, needle, row.ambiguous, en); return 1; }
+  if (!row) {
+    ctx.err(en ? `No graph matches "${needle}".` : `"${needle}"와 맞는 그래프가 없습니다.`);
+    return 1;
+  }
+  const core = ctx.desktopCore || require("../core/desktop-core.cjs").loadDesktopCore();
+  const reconciliation = core && core.graphReconciliation;
+  if (!reconciliation || typeof reconciliation.get !== "function") {
+    ctx.err(en
+      ? "This engine build cannot reconcile. Update the CLI (`npm i -g agentlas@latest`) and try again."
+      : "이 엔진에는 재조정 기능이 없습니다. CLI를 업데이트한 뒤(`npm i -g agentlas@latest`) 다시 시도하세요.");
+    return 1;
+  }
+  const view = reconciliation.get(row.id);
+  if (!view) {
+    ctx.out(en
+      ? `"${row.name}" has nothing waiting to be reconciled.`
+      : `"${row.name}"에는 재조정을 기다리는 것이 없습니다.`);
+    return 0;
+  }
+
+  const done = new Set(asList(flags && (flags.done ?? flags["done"])));
+  const notDone = new Set(asList(flags && (flags["not-done"] ?? flags.notDone)));
+  const outputs = new Map();
+  for (const pair of asList(flags && flags.output)) {
+    const at = String(pair).indexOf("=");
+    if (at > 0) outputs.set(String(pair).slice(0, at).trim(), String(pair).slice(at + 1));
+  }
+
+  if (done.size === 0 && notDone.size === 0) {
+    ctx.out(en
+      ? `"${row.name}" stopped with steps whose effect cannot be told from the record.`
+      : `"${row.name}"은(는) 기록만으로는 일어났는지 알 수 없는 단계가 있어 멈춰 있습니다.`);
+    ctx.out("");
+    for (const node of view.nodes) {
+      const needs = node.outputRequired
+        ? (en ? `  (needs --output ${node.nodeId}=<value> when done)` : `  (일어났다면 --output ${node.nodeId}=<값> 필요)`)
+        : "";
+      ctx.out(`  ${node.nodeId}  ${node.label}${needs}`);
+    }
+    ctx.out("");
+    ctx.out(ctx.ui.dim(en
+      ? `Decide each one: agentlas graph reconcile "${row.name}" --done <node> --not-done <node>`
+      : `각각 정하세요: agentlas graph reconcile "${row.name}" --done <노드> --not-done <노드>`));
+    return 0;
+  }
+
+  const undecided = view.nodes.filter((n) => !done.has(n.nodeId) && !notDone.has(n.nodeId));
+  if (undecided.length > 0) {
+    ctx.err(en
+      ? `Still undecided: ${undecided.map((n) => n.nodeId).join(", ")}. Every step needs one answer.`
+      : `아직 안 정한 단계가 있습니다: ${undecided.map((n) => n.nodeId).join(", ")}. 모든 단계에 답이 필요합니다.`);
+    return 1;
+  }
+  const missingOutput = view.nodes.filter((n) => done.has(n.nodeId) && n.outputRequired && !outputs.has(n.nodeId));
+  if (missingOutput.length > 0) {
+    ctx.err(en
+      ? `These steps populate a value, so completing them needs it: ${missingOutput.map((n) => `--output ${n.nodeId}=<value>`).join(" ")}`
+      : `값을 만드는 단계라 "일어났다"로 두려면 값이 필요합니다: ${missingOutput.map((n) => `--output ${n.nodeId}=<값>`).join(" ")}`);
+    return 1;
+  }
+
+  try {
+    const result = reconciliation.apply({
+      automationId: view.automationId,
+      runId: view.runId,
+      occurrenceId: view.occurrenceId,
+      graphDigest: view.graphDigest,
+      checkpointDigest: view.checkpointDigest,
+      expectedUpdatedAt: view.updatedAt,
+      eventId: view.triggerEvent ? view.triggerEvent.id : null,
+      expectedEventUpdatedAt: view.triggerEvent ? view.triggerEvent.updatedAt : null,
+      decisions: view.nodes.map((n) => (done.has(n.nodeId)
+        ? { nodeId: n.nodeId, resolution: "completed", ...(outputs.has(n.nodeId) ? { output: outputs.get(n.nodeId) } : {}) }
+        : { nodeId: n.nodeId, resolution: "retry" })),
+    });
+    ctx.out(en
+      ? `Reconciled. ${result.completedNodeIds.length} step(s) marked as done, ${result.retryNodeIds.length} to redo.`
+      : `재조정했습니다. ${result.completedNodeIds.length}개는 일어난 것으로, ${result.retryNodeIds.length}개는 다시 하는 것으로 두었습니다.`);
+    ctx.out(ctx.ui.dim(en
+      ? `Now run it: agentlas graph run "${row.name}"`
+      : `이제 실행하세요: agentlas graph run "${row.name}"`));
+    return 0;
+  } catch (error) {
+    ctx.err(en
+      ? `Reconciliation was refused: ${String(error && error.message || error)}`
+      : `재조정이 거절됐습니다: ${String(error && error.message || error)}`);
+    return 1;
+  }
+}
+
+/** 같은 깃발이 여러 번 올 수 있다 — 하나든 여럿이든 배열로 본다. */
+function asList(value) {
+  if (value == null) return [];
+  return Array.isArray(value) ? value.map(String) : [String(value)];
+}
+
 function showGraph(ctx, needle) {
   const db = ctx.db();
   const rows = graphRows(ctx, db);
@@ -1154,6 +1264,23 @@ async function run(ctx, args = []) {
     //   실제로는 한 번도 동작한 적이 없었다(실사용 실측 2026-08-06).
     if (arg === "--name" || arg === "-n") { flags.name = String(args[i + 1] ?? "").trim(); i += 1; continue; }
     if (arg.startsWith("--name=")) { flags.name = arg.slice("--name=".length).trim(); continue; }
+    // 재조정 판단 — 같은 깃발이 여러 번 올 수 있으므로 모아 둔다. 값을 함께 걷어내지
+    // 않으면 위 --name 사고와 똑같이 그래프 이름에 붙어 "맞는 그래프가 없다"가 된다.
+    {
+      const multi = { "--done": "done", "--not-done": "not-done", "--output": "output" };
+      let matched = false;
+      for (const [token, key] of Object.entries(multi)) {
+        if (arg === token) {
+          (flags[key] || (flags[key] = [])).push(String(args[i + 1] ?? "").trim());
+          i += 1; matched = true; break;
+        }
+        if (arg.startsWith(`${token}=`)) {
+          (flags[key] || (flags[key] = [])).push(arg.slice(token.length + 1).trim());
+          matched = true; break;
+        }
+      }
+      if (matched) continue;
+    }
     rest.push(arg);
   }
   const sub = (rest[0] || "list").toLowerCase();
@@ -1165,6 +1292,7 @@ async function run(ctx, args = []) {
     ctx.out(en ? "  list                      what is saved" : "  list                      저장된 것 목록");
     ctx.out(en ? "  show \"<name>\"             steps, wiring, and problems" : "  show \"<이름>\"             단계·배선·문제점");
     ctx.out(en ? "  run \"<name>\" [--input \"<value>\"]  run locally with the included Desktop Core" : "  run \"<이름>\" [--input \"<값>\"]   포함된 Desktop Core로 로컬 실행");
+    ctx.out(en ? "  reconcile \"<name>\"       decide what already happened, when a run stopped unsure" : "  reconcile \"<이름>\"        멈춘 실행에서 무엇이 이미 일어났는지 정하기");
     ctx.out(en ? "  export \"<name>\" [file]    write a shareable package file" : "  export \"<이름>\" [파일]     남에게 줄 수 있는 파일로 저장");
     ctx.out(en ? "  inspect <file>            read a package file before installing" : "  inspect <파일>            설치 전에 패키지 파일 확인");
     ctx.out(en ? "  install <file> [--name \"<new name>\"]  install a package file" : "  install <파일> [--name \"<새 이름>\"]  패키지 파일 설치");
@@ -1184,6 +1312,15 @@ async function run(ctx, args = []) {
       return 1;
     }
     return showGraph(ctx, target);
+  }
+  if (sub === "reconcile") {
+    if (!target) {
+      ctx.err(en
+        ? "Usage: agentlas graph reconcile \"<name>\" [--done <node>] [--not-done <node>] [--output <node>=<value>]"
+        : "사용법: agentlas graph reconcile \"<이름>\" [--done <노드>] [--not-done <노드>] [--output <노드>=<값>]");
+      return 1;
+    }
+    return reconcileGraph(ctx, target, flags, en);
   }
   if (sub === "export") {
     if (!target) {

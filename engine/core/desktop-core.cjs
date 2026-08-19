@@ -233,6 +233,24 @@ function loadDesktopCore(options = {}) {
     runGraph: kernel.runGraph,
     graphFailureOf: kernel.graphFailureOf,
     planGraphLoops: kernel.planGraphLoops,
+    /*
+     * ★내는 오류가 있으면 푸는 길도 함께 준다. 실측 2026-08-20: 커널은
+     *   `automation_partial_reconciliation_required` 를 내는데, 그것을 푸는 모듈은
+     *   벤더에 실리지도 않았고 여기 표면에도 없었다 — CLI 만 쓰는 사람은 그 자동화를
+     *   영원히 못 돌린다. 옛 코어를 쓰는 동안에는 없을 수 있으므로 정직하게 null 로 둔다.
+     */
+    graphReconciliation: (() => {
+      try {
+        const mod = req("store/graph-reconciliation");
+        if (typeof mod.getAutomationGraphReconciliation !== "function") return null;
+        return {
+          get: mod.getAutomationGraphReconciliation,
+          apply: mod.reconcileAutomationGraph,
+        };
+      } catch {
+        return null;
+      }
+    })(),
   };
   return _cache;
 }

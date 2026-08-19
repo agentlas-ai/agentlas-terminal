@@ -38,6 +38,15 @@ const vendorRoot = path.resolve(__dirname, "..", "engine", "vendor", "desktop-co
 const distRoot = path.join(desktopRoot, "dist");
 const ROOT_ENTRY = path.join(distRoot, "electron", "workflow", "run-graph.js");
 
+// ★진입점은 하나가 아니다. 실측 2026-08-20: run-graph 하나만 기점으로 삼았더니
+//   재조정 모듈(store/graph-reconciliation.js)이 벤더에 아예 안 실렸다. 그래서 터미널은
+//   `automation_partial_reconciliation_required` 를 **낼 수는 있는데 풀 수단이 없는**
+//   상태였다 — CLI 만 쓰는 사람은 그 자동화를 영원히 못 돌린다.
+//   내는 오류가 있으면 푸는 길도 같이 실어야 한다.
+const EXTRA_ENTRIES = [
+  path.join(distRoot, "electron", "store", "graph-reconciliation.js"),
+];
+
 // 컴파일된 코드를 잘라내지 않는다(정적으로 도달 가능한 걸 손으로 프루닝하면, 그 가지가 실제로
 // 쓰이는 실행 경로 — 예: 에이전트 노드가 컴퓨터-use 도구를 쓰는 경우 — 를 조용히 깨뜨린다).
 // 진짜 도달 가능한 것은 전부 vendor 한다 — 크면 큰 대로 정직하게 보고한다.
@@ -70,11 +79,11 @@ function isPruned(file) {
 }
 
 /** run-graph.js 에서 정적으로 도달 가능한 {internalFiles, externalPkgs, missing}. */
-function computeClosure(rootFile) {
+function computeClosure(rootFiles) {
   const internal = new Set();
   const external = new Set();
   const missing = new Set();
-  const queue = [rootFile];
+  const queue = Array.isArray(rootFiles) ? [...rootFiles] : [rootFiles];
   while (queue.length) {
     const file = queue.pop();
     if (internal.has(file) || isPruned(file)) continue;
@@ -143,7 +152,8 @@ function main() {
     process.exit(1);
   }
   console.log(`Computing the static require-graph closure from ${path.relative(distRoot, ROOT_ENTRY)} …`);
-  const { internal, external, missing } = computeClosure(ROOT_ENTRY);
+  const entries = [ROOT_ENTRY, ...EXTRA_ENTRIES.filter((p) => fs.existsSync(p))];
+  const { internal, external, missing } = computeClosure(entries);
   if (missing.size) {
     console.error(`✖ ${missing.size} module(s) could not be resolved statically:`);
     for (const m of missing) console.error(`   - ${m}`);
