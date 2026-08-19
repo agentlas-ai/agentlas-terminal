@@ -184,6 +184,20 @@ const RULES = [
   "    the fact (kind:\"code\" or a read step with uses) into its own produces, then set the",
   "    check's evidence:\"<that name>\". The check then compares result against evidence.",
   "    Only ask when the goal itself is too vague to know what the result even is.",
+  "  · MUTATION RESULT — verify it landed, not that the model said so (REQUIRED for every",
+  "    effect:\"mutation\" step that acts on the outside world — posting, sending, saving,",
+  "    updating). A run that writes \"posted 3 replies\" has not posted anything; only an",
+  "    INDEPENDENT observation of the outside world proves it. So the mutation step must",
+  "    produce the identifiers needed to observe its result (the posted URLs/ids, the file",
+  "    path, the updated row id) — put that in its produces. Then add, AFTER it, a read step",
+  "    (effect:\"read\") that RE-OBSERVES the result from the outside — a fresh look, not the",
+  "    mutation's own report: open each returned URL, re-read the saved file, re-fetch the",
+  "    updated row — into its own produces. Then add a check whose subject is the mutation's",
+  "    result and whose evidence is that observation, with must-items like 'each posted item",
+  "    exists at its URL with the expected author and text' / 'the file exists and contains",
+  "    the expected fields' / 'the row was appended with the submitted values'. If the outside",
+  "    result genuinely cannot be re-observed, say so in the step instruction rather than",
+  "    skipping the check.",
   "  · repeatOn says which side loops. Write the condition the way the person said it and",
   "    put the loop on the side they meant — do not flip either one to make it fit.",
   "",
@@ -475,6 +489,57 @@ function validateBlueprint(bp, ctx = {}) {
           + `{"afterStep":${madeAt},"subject":"${name}","criteria":"${name}이(가) 비어있지 않고 요청대로 채워졌다",`
           + `"produces":"${name}_ok","items":[{"text":"${name}이(가) 실제 내용으로 채워졌다","kind":"must"},`
           + `{"text":"빈 값·자리표시자·지어낸 값이 아니다","kind":"mustNot"}]}`,
+        );
+      }
+    });
+  }
+
+  /*
+   * ★바깥을 바꾼 mutation의 **결과**는 독립 재조회로 확인해야 한다(입력이 아니라 결과).
+   *
+   * 위 블록은 mutation이 **소비하는 입력값**을 검증하게 한다(게시할 목록이 채워졌나).
+   * 하지만 "게시가 실제로 됐나"는 그것으로 답이 안 된다 — 모델이 "게시 완료"라고 써도
+   * 바깥에는 아무것도 없을 수 있다(실측 2026-08-19: X 자동화가 두 런타임에서 4/4로 끝나며
+   * "3건 게시"라고 적었지만 X엔 0건). 결과가 실제로 반영됐는지는 **바깥을 다시 관측한
+   * 근거**로만 판정된다.
+   *
+   * 데스크탑 정본(shared/graph-blueprint.ts)과 같은 규칙 — 플러그인(hep-graph)으로 만든
+   * 자동화도 같은 보장을 받아야 한다. 두 입구가 다른 그래프를 만들면 안 된다.
+   */
+  {
+    const resultChecks = new Map();
+    for (const check of bp.checks || []) {
+      const subj = (check.subject || "").trim();
+      if (subj) resultChecks.set(subj, check);
+    }
+    steps.forEach((step, index) => {
+      if (step.effect !== "mutation") return;
+      const result = String(step.produces || "").trim();
+      if (!result) {
+        push(
+          `"${step.title || `${index + 1}번째 단계`}"는 바깥을 바꾸는데 결과값(produces)이 없습니다. `
+          + `무엇이 반영됐는지(게시된 URL·저장된 경로·갱신된 행 id 등)를 produces로 내보내야 `
+          + `그 결과가 실제로 일어났는지 확인할 수 있습니다.`,
+        );
+        return;
+      }
+      const check = resultChecks.get(result);
+      const hasEvidence = !!check && !!String((check && check.evidence) || "").trim();
+      if (!hasEvidence) {
+        const madeBy = steps.findIndex(
+          (s, i) => i > index && s.effect === "read"
+            && (Array.isArray(s.consumes) ? s.consumes : []).map((v) => String(v).trim()).includes(result),
+        );
+        const evName = `${result}_observed`;
+        push(
+          `"${step.title || `${index + 1}번째 단계`}"는 바깥을 바꿨지만, 그 결과가 실제로 반영됐는지 `
+          + `**독립적으로 다시 관측해** 확인하는 검증이 없습니다. 모델이 "완료"라고 써도 바깥은 그대로일 수 `
+          + `있습니다. 단계를 지우지 말고: (1) 이 단계 뒤에 결과를 바깥에서 다시 보는 read 단계`
+          + `(게시 URL 열기·파일 다시 읽기·행 재조회)를 두어 그 관측을 "${evName}"으로 내보내고, `
+          + `(2) top-level checks[]에 {"afterStep":${madeBy >= 0 ? madeBy : index + 1},"subject":"${result}",`
+          + `"criteria":"${result}이(가) 바깥에 실제로 반영됐다","evidence":"${evName}",`
+          + `"produces":"${result}_ok","items":[{"text":"관측된 결과가 반영하려던 것과 일치한다","kind":"must"},`
+          + `{"text":"관측되지 않았거나 지어낸 확인이 아니다","kind":"mustNot"}]} 를 추가하세요.`,
         );
       }
     });

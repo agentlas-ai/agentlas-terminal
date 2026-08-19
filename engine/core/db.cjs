@@ -69,7 +69,16 @@ function storeMigrationRole() {
  * owner 로 명시 지정된 경우에만, 거절 대신 벤더 코어의 사다리를 한 번 돌려 승급한다.
  */
 function openDb() {
-  const file = dbPath();
+  /*
+   * ★AGENTLAS_STORE_PATH 를 존중한다 — 이 줄이 없어서 CLI 는 무슨 값을 주든 **항상 라이브
+   *   DB** 를 열었다. 실측 2026-08-19: 복사본 스토어를 지정하고 `graph new` 로 자동화를
+   *   만들었는데 사용자의 라이브 데이터베이스에 저장됐다. 벤더 코어(desktop-core.cjs:150)
+   *   와 데스크탑(store/db)은 이 환경변수를 이미 존중하므로, 이 모듈만 어긋나 있었다.
+   *
+   *   그 결과 (1) 격리 QA 가 불가능하고 (2) 같은 명령이 여는 파일이 코어 경로냐 이 경로냐에
+   *   따라 갈린다 — 같은 프로세스가 두 DB 를 동시에 보게 된다.
+   */
+  const file = process.env.AGENTLAS_STORE_PATH || dbPath();
   if (!fs.existsSync(file)) {
     throw new Error(`Agentlas database not found: ${file} (run via bin/agentlas.cjs)`);
   }
