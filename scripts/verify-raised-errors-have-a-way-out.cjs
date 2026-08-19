@@ -81,6 +81,27 @@ for (const flag of ["--done", "--not-done", "--output"]) {
   );
 }
 
+/*
+ * ★그래프를 고친 뒤 **실행도 재조정도 안 되는** 잠김이 있다. 실측 2026-08-20:
+ *   부수효과를 남기고 실패한 실행이 있는 상태에서 그래프를 고치면
+ *     · 실행 → automation_partial_graph_changed
+ *     · 재조정 → automation_graph_reconciliation_graph_drift
+ *   둘 다 옳은 거절인데 합치면 그 자동화는 영구히 잠긴다. 그래프를 편집한 사람은 누구나
+ *   이 상태에 빠질 수 있었고, 빠져나갈 문이 없었다. 문은 하나면 된다 —
+ *   사람이 "이전 실행은 잊고 처음부터"라고 말하는 것.
+ */
+check(
+  "an-edited-graph-is-not-a-permanent-lock",
+  /forgetStale/.test(surface) && /start-over/.test(graphCmd),
+  "그래프를 고친 뒤 잠긴 자동화를 사람이 풀 수단이 없습니다 — 실행도 재조정도 거절되는 상태가 "
+  + "영구히 남습니다. `graph reconcile --start-over` 와 코어 표면의 forgetStale 을 확인하세요.",
+);
+check(
+  "start-over-is-stripped-from-the-name",
+  graphCmd.includes('"--start-over"'),
+  "--start-over 가 인자 파서에서 걷어지지 않습니다 — 그 값이 그래프 이름에 붙어 엉뚱한 실패가 됩니다.",
+);
+
 for (const c of checks) console.log(`${c.ok ? "PASS" : "FAIL"} ${c.name}`);
 if (failures.length > 0) {
   console.error("\nway-out 게이트 실패:");

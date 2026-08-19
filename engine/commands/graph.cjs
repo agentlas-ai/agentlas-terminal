@@ -167,7 +167,28 @@ function listGraphs(ctx) {
  * 판단은 노드마다 둘 중 하나다 — "이미 일어났다(--done)" / "확실히 안 일어났다(--not-done)".
  * 아무 것도 주지 않으면 무엇을 정해야 하는지 보여 주기만 한다. 실행 중에 묻지 않는다.
  */
-function reconcileGraph(ctx, needle, flags, en) {
+/**
+ * 엔진을 손에 넣는다 — 캐시에 없으면 **받는다**.
+ *
+ * ★엔진이 필요한 명령은 전부 이 길을 지나야 한다. 실측 2026-08-20: `graph run` 은 이걸
+ *   고쳤는데, 바로 뒤에 만든 `graph reconcile` 이 동기 로더만 불러 같은 병을 반복했다 —
+ *   새로 설치한 사람에게는 "이 엔진에는 재조정 기능이 없습니다" 로 보인다(사실은 엔진이
+ *   아직 없는 것이다). 한 곳으로 모아 다음 명령이 또 빠뜨리지 않게 한다.
+ */
+async function acquireCore(ctx) {
+  const desktopCore = require("../core/desktop-core.cjs");
+  let core = ctx.desktopCore || desktopCore.loadDesktopCore();
+  if (!core || core.error || typeof core.runGraph !== "function") {
+    try {
+      core = await desktopCore.loadDesktopCoreAsync({ onNotice: (message) => ctx.err(message) });
+    } catch {
+      return null;
+    }
+  }
+  return core && !core.error ? core : null;
+}
+
+async function reconcileGraph(ctx, needle, flags, en) {
   const rows = graphRows(ctx, ctx.db());
   const row = findGraph(rows, needle);
   if (row?.ambiguous) { reportAmbiguous(ctx, needle, row.ambiguous, en); return 1; }
@@ -175,7 +196,7 @@ function reconcileGraph(ctx, needle, flags, en) {
     ctx.err(en ? `No graph matches "${needle}".` : `"${needle}"와 맞는 그래프가 없습니다.`);
     return 1;
   }
-  const core = ctx.desktopCore || require("../core/desktop-core.cjs").loadDesktopCore();
+  const core = await acquireCore(ctx);
   const reconciliation = core && core.graphReconciliation;
   if (!reconciliation || typeof reconciliation.get !== "function") {
     ctx.err(en
@@ -183,6 +204,35 @@ function reconcileGraph(ctx, needle, flags, en) {
       : "이 엔진에는 재조정 기능이 없습니다. CLI를 업데이트한 뒤(`npm i -g agentlas@latest`) 다시 시도하세요.");
     return 1;
   }
+  // 그래프를 고친 뒤에는 옛 좌표가 그 그래프의 것이 아니라 재조정도 거절된다. 그 상태는
+  // 실행도 재조정도 안 되는 잠김이므로, 사람이 스스로 나갈 문을 둔다.
+  if (flags && flags['start-over']) {
+    if (typeof reconciliation.forgetStale !== 'function') {
+      ctx.err(en ? 'This engine build cannot do that. Update the CLI and try again.' : '이 엔진에는 그 기능이 없습니다. CLI를 업데이트한 뒤 다시 시도하세요.');
+      return 1;
+    }
+    const graph = parseGraph(row);
+    const automation = core.getAutomation ? core.getAutomation(row.id) : null;
+    const digest = core.graphExecutionDigest && automation && graph
+      ? core.graphExecutionDigest(automation, graph)
+      : null;
+    if (!digest) {
+      ctx.err(en ? 'Could not compute the current graph identity.' : '지금 그래프의 신원을 계산하지 못했습니다.');
+      return 1;
+    }
+    const outcome = reconciliation.forgetStale(row.id, digest);
+    if (!outcome.forgot) {
+      ctx.err(en
+        ? `Nothing to forget (${outcome.reason}). If the graph has not changed, decide each step instead.`
+        : `잊을 것이 없습니다(${outcome.reason}). 그래프가 그대로라면, 단계마다 정하는 쪽이 맞습니다.`);
+      return 1;
+    }
+    ctx.out(en
+      ? 'The earlier run is forgotten. Note: whatever it already did can happen again on the next run.'
+      : '이전 실행을 잊었습니다. 그 실행이 이미 한 일은 다음 실행에서 다시 일어날 수 있습니다.');
+    return 0;
+  }
+
   const view = reconciliation.get(row.id);
   if (!view) {
     ctx.out(en
@@ -668,19 +718,10 @@ async function runGraph(ctx, needle, flags) {
    *
    *   받는 동안은 조용하지 않다(onNotice) — 12MB 를 말없이 끌어오지 않는다.
    */
-  let core = ctx.desktopCore || desktopCore.loadDesktopCore();
-  if (!core || core.error || typeof core.runGraph !== "function") {
-    try {
-      core = await desktopCore.loadDesktopCoreAsync({ onNotice: (message) => ctx.err(message) });
-    } catch (fetchError) {
-      ctx.err(JSON.stringify({
-        ok: false,
-        error: `graph-execution engine could not be fetched: ${fetchError instanceof Error ? fetchError.message : String(fetchError)}`,
-      }, null, 2));
-      return 1;
-    }
-  }
-  if (!core || core.error || typeof core.runGraph !== "function") {
+  // ★엔진을 얻는 법을 아는 곳은 acquireCore 하나뿐이다 — 둘이면 다음에 만드는 명령이
+  //   또 한쪽만 보고 캐시에서 끝난다(실측 2026-08-20: reconcile 이 정확히 그랬다).
+  let core = await acquireCore(ctx);
+  if (!core || typeof core.runGraph !== "function") {
     const cause = core?.error instanceof Error ? core.error.message : "vendored Desktop Core is unavailable";
     ctx.err(JSON.stringify({ ok: false, error: cause }, null, 2));
     return 1;
@@ -1257,6 +1298,7 @@ async function run(ctx, args = []) {
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (arg === "-y" || arg === "--yes") { flags.yes = true; continue; }
+    if (arg === "--start-over") { flags["start-over"] = true; continue; }
     if (arg === "--input" || arg === "-i") { flags.input = String(args[i + 1] ?? "").trim(); i += 1; continue; }
     if (arg.startsWith("--input=")) { flags.input = arg.slice("--input=".length).trim(); continue; }
     // ★--name 도 값을 하나 받는 플래그다. 걷어내지 않으면 그 값이 파일 경로에 붙어
@@ -1320,7 +1362,7 @@ async function run(ctx, args = []) {
         : "사용법: agentlas graph reconcile \"<이름>\" [--done <노드>] [--not-done <노드>] [--output <노드>=<값>]");
       return 1;
     }
-    return reconcileGraph(ctx, target, flags, en);
+    return await reconcileGraph(ctx, target, flags, en);
   }
   if (sub === "export") {
     if (!target) {

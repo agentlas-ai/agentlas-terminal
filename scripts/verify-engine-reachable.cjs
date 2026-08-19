@@ -66,6 +66,24 @@ check(
   "engine/core/desktop-core.cjs 에 fetch 경로가 없습니다 — 캐시 미스가 곧 막다른 길이 됩니다.",
 );
 
+/*
+ * ★엔진이 필요한 명령은 **전부** 받는 길을 지나야 한다. 실측 2026-08-20: `graph run` 을
+ *   고친 직후 만든 `graph reconcile` 이 동기 로더만 불러 같은 병을 반복했다 — 새로 설치한
+ *   사람에게는 "이 엔진에는 재조정 기능이 없습니다" 로 보였다(사실은 엔진이 아직 없었다).
+ *   그래서 코어를 만지는 자리 수와 받는 길을 지나는 자리 수를 맞춰 본다.
+ */
+{
+  const usesCore = (graphCmd.match(/\bcore\.(runGraph|graphReconciliation)\b/g) || []).length;
+  const goesThroughFetch = /acquireCore\s*\(/.test(graphCmd) || /loadDesktopCoreAsync\s*\(/.test(graphCmd);
+  const rawSyncLoads = (graphCmd.match(/loadDesktopCore\s*\(\s*\)/g) || []).length;
+  check(
+    "every-engine-user-goes-through-the-fetch",
+    usesCore === 0 || (goesThroughFetch && rawSyncLoads <= 1),
+    "엔진을 쓰는 자리 중 캐시만 보는 동기 로더로 끝나는 곳이 있습니다 — 새로 설치한 사람에게는 "
+    + `그 기능이 "없는 것"처럼 보입니다(동기 로드 ${rawSyncLoads}곳). acquireCore 를 쓰세요.`,
+  );
+}
+
 for (const c of checks) console.log(`${c.ok ? "PASS" : "FAIL"} ${c.name}`);
 if (failures.length > 0) {
   console.error("\nengine-reachable 게이트 실패:");

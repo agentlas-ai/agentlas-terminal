@@ -231,6 +231,12 @@ function loadDesktopCore(options = {}) {
     initStore: req("store/db").initStore,
     getDb: req("store/db").getDb,
     runGraph: kernel.runGraph,
+    getAutomation: req("store/automations").getAutomation,
+    // shared/ 는 electron/ 밖이라 req 로 못 닿는다 — 직접 해석한다.
+    graphExecutionDigest: (() => {
+      try { return require(path.join(root, "shared", "graph-execution-digest.js")).graphExecutionDigest; }
+      catch { return null; }
+    })(),
     graphFailureOf: kernel.graphFailureOf,
     planGraphLoops: kernel.planGraphLoops,
     /*
@@ -246,6 +252,7 @@ function loadDesktopCore(options = {}) {
         return {
           get: mod.getAutomationGraphReconciliation,
           apply: mod.reconcileAutomationGraph,
+          forgetStale: mod.forgetStaleGraphCheckpoint,
         };
       } catch {
         return null;
