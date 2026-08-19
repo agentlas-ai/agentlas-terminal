@@ -506,6 +506,47 @@ async function runGraph(ctx, needle, flags) {
     return 1;
   }
 
+  const fallbackRow = {
+    id: row.id,
+    name: row.name,
+    scheduleHuman: row.schedule,
+    targetType: row.target_type,
+    targetId: row.target_id,
+    enabled: Boolean(row.enabled),
+    createdBy: row.created_by || "terminal",
+    graph,
+  };
+  const initialVars = requirement && flags.input ? { [requirement.varName]: flags.input } : {};
+
+  /*
+   * ★데몬 우선 (Phase 3). 데몬이 떠 있으면 이 터미널은 코어를 **로드하지 않는다** —
+   * 64MB 벤더 사본도, 두 번째 DB 주인도 그 순간에는 없다. 그래프 실행은 완주 후
+   * 결과 JSON 하나라 요청/응답 소켓으로 손실 없이 옮겨진다.
+   *
+   * 데몬이 있는데 실행이 **실패한 것**은 폴백 사유가 아니다 — 같은 그래프를 코어로
+   * 다시 돌리면 부작용(외부 게시·파일 쓰기)이 두 번 난다. 폴백은 "데몬 없음"에만 걸린다.
+   */
+  const daemon = require("../core/daemon-client.cjs");
+  if (await daemon.daemonAvailable()) {
+    try {
+      const result = await daemon.callDaemon("graph.run", {
+        automationId: row.id,
+        automation: fallbackRow,
+        graph,
+        initialVars,
+      }, 30 * 60 * 1000);
+      ctx.out(JSON.stringify(result, null, 2));
+      return result && result.ok === true ? 0 : 1;
+    } catch (error) {
+      ctx.err(JSON.stringify({
+        ok: false,
+        via: "daemon",
+        error: error instanceof Error ? error.message : String(error),
+      }, null, 2));
+      return 1;
+    }
+  }
+
   const core = ctx.desktopCore || desktopCore.loadDesktopCore();
   if (!core || core.error || typeof core.runGraph !== "function") {
     const cause = core?.error instanceof Error ? core.error.message : "vendored Desktop Core is unavailable";
@@ -518,18 +559,8 @@ async function runGraph(ctx, needle, flags) {
       ? core.require("store/automations").getAutomation(row.id)
       : null;
   } catch { /* test/fallback row below */ }
-  automation ||= {
-    id: row.id,
-    name: row.name,
-    scheduleHuman: row.schedule,
-    targetType: row.target_type,
-    targetId: row.target_id,
-    enabled: Boolean(row.enabled),
-    createdBy: row.created_by || "terminal",
-    graph,
-  };
+  automation ||= fallbackRow;
   automation.graph = graph;
-  const initialVars = requirement && flags.input ? { [requirement.varName]: flags.input } : {};
   try {
     const result = await core.runGraph(automation, graph, { initialVars });
     ctx.out(JSON.stringify(result, null, 2));
