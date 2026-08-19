@@ -699,7 +699,17 @@ function humanSchedule(schedule, locale) {
 
 function hhmm(hour, minute, locale) {
   if (locale !== "ko") return `${hour}:${minute}`;
-  return `${hour}:${minute}`;
+  /*
+   * ★한국어는 사람이 말하는 대로 — "오전 8시", "오후 6시 30분" (오너 결정 2026-08-19).
+   *   정본은 데스크탑 shared/schedule-describe.ts 의 koClock 이고, 이 파일은 그 손복사본이다
+   *   (test/graph-interview-parity.cjs 가 두 벌이 갈리는 순간 실패한다).
+   */
+  const h = Number(hour);
+  const m = Number(minute);
+  if (!Number.isFinite(h) || !Number.isFinite(m)) return `${hour}:${minute}`;
+  const half = h < 12 ? "오전" : "오후";
+  const display = h % 12 === 0 ? 12 : h % 12;
+  return m === 0 ? `${half} ${display}시` : `${half} ${display}시 ${m}분`;
 }
 
 const DOW_KO = { "0": "일", "1": "월", "2": "화", "3": "수", "4": "목", "5": "금", "6": "토", "7": "일" };
