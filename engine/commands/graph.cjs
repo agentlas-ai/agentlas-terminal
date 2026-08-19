@@ -656,7 +656,7 @@ async function runGraph(ctx, needle, flags) {
   // 시작 값이 필요한 그래프는 값 없이 요청하지 않는다. 값 없이 보내면 빈 채로 실행돼,
   // 사용자가 요청한 적 없는 내용이 만들어진다.
   const requirement = graphInputRequirement(graph, en);
-  if (requirement && !flags.input) {
+  if (requirement && !flags.inputProvided && !flags.input) {
     ctx.err(en
       ? `"${row.name}" starts from a value you provide — ${requirement.label}.`
       : `"${row.name}"은(는) 시작할 때 값을 받습니다 — ${requirement.label}.`);
@@ -676,7 +676,7 @@ async function runGraph(ctx, needle, flags) {
     createdBy: row.created_by || "terminal",
     graph,
   };
-  const initialVars = requirement && flags.input ? { [requirement.varName]: flags.input } : {};
+  const initialVars = requirement && (flags.inputProvided || flags.input) ? { [requirement.varName]: flags.input } : {};
 
   /*
    * ★데몬 우선 (Phase 3). 데몬이 떠 있으면 이 터미널은 코어를 **로드하지 않는다** —
@@ -1299,8 +1299,10 @@ async function run(ctx, args = []) {
     const arg = args[i];
     if (arg === "-y" || arg === "--yes") { flags.yes = true; continue; }
     if (arg === "--start-over") { flags["start-over"] = true; continue; }
-    if (arg === "--input" || arg === "-i") { flags.input = String(args[i + 1] ?? "").trim(); i += 1; continue; }
-    if (arg.startsWith("--input=")) { flags.input = arg.slice("--input=".length).trim(); continue; }
+    // ★"안 줬다"와 "빈 값을 줬다"는 다르다. 그래프가 "비워 두면 최신 값을 씁니다"라고
+    //   안내해도, 빈 문자열을 못 줘서 그 선택지를 고를 수 없었다(실측 2026-08-20).
+    if (arg === "--input" || arg === "-i") { flags.input = String(args[i + 1] ?? "").trim(); flags.inputProvided = true; i += 1; continue; }
+    if (arg.startsWith("--input=")) { flags.input = arg.slice("--input=".length).trim(); flags.inputProvided = true; continue; }
     // ★--name 도 값을 하나 받는 플래그다. 걷어내지 않으면 그 값이 파일 경로에 붙어
     //   "그런 파일 없음"으로 죽는다 — `graph help`가 문법으로 광고하는 옵션인데
     //   실제로는 한 번도 동작한 적이 없었다(실사용 실측 2026-08-06).
