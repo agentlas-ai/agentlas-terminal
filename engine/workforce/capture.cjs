@@ -28,16 +28,9 @@ const { dbPath, userDataDir } = require("../core/paths.cjs");
 // 있지만 buildArgs/텍스트 추출 계약이 없으므로 캡처 검증 파생본만 쓴다 — 새 kind 를
 // 정본에 추가해도 capture:true 를 명시하기 전엔 여기 조용히 들어오지 않는다.
 const { CAPTURE_RUNTIME_BIN: RUNTIME_BIN } = require("../runtimes/kinds.cjs");
+const { readKeychainPassword } = require("../core/keychain-read.cjs");
 
 const SERVICE = "com.agentlas.desktop";
-
-function readKeytar() {
-  try {
-    return require("keytar");
-  } catch {
-    return null;
-  }
-}
 
 // v1 which 포팅: PATH + 알려진 설치 위치. detect.whichSync(spawn `which`)와 달리
 // 캡처 경로는 프로세스 spawn 없이 결정론적으로 실행 파일을 찾는다.
@@ -664,10 +657,11 @@ const ANTHROPIC_COMPAT_API = {
 const DEFAULT_CUSTOM_API_BASE_URL = "https://api.openai.com/v1";
 
 async function apiKey(backend) {
-  const keytar = readKeytar();
-  if (!keytar) return null;
-  // 키체인 접근 거부(서명 안 된 standalone Node)는 "키 없음"으로 조용히 처리.
-  return keytar.getPassword(SERVICE, "byok:" + backend).catch(() => null);
+  // ★거부가 아니라 **정지**가 실제 실패 모양이다. 예전에는 `.catch(() => null)` 하나로
+  //   "접근 거부는 키 없음" 이라 적어 두었는데, 화면 없는 호스트에서 keytar 는 거부하지 않고
+  //   영영 돌아오지 않는다(이벤트 루프째로). core/keychain-read 가 상한을 실제로 걸 수 있는
+  //   자식 프로세스에서 읽고, 못 읽으면 여기 계약대로 "키 없음"을 돌려준다.
+  return readKeychainPassword(SERVICE, "byok:" + backend);
 }
 
 // Custom BYOK 키가 전송될 origin 재검증: 공개 주소는 HTTPS만, HTTP는 localhost/LAN만.
