@@ -11,7 +11,9 @@
     "test:release-contracts": "npm run smoke",
     "sync:architecture": "node scripts/sync-architecture-from-desktop.cjs",
     "vendor:core": "node scripts/vendor-desktop-core.cjs",
-    "test:tool-access-notice-parity": "node test/tool-access-notice-parity.cjs"
+    "test:tool-access-notice-parity": "node test/tool-access-notice-parity.cjs",
+    "verify:engine-reachable": "node scripts/verify-engine-reachable.cjs",
+    "prepublishOnly": "npm run verify:engine-reachable"
   },
   "engines": {
     "node": ">=20.19"

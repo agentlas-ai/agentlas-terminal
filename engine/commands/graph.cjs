@@ -547,7 +547,29 @@ async function runGraph(ctx, needle, flags) {
     }
   }
 
-  const core = ctx.desktopCore || desktopCore.loadDesktopCore();
+  /*
+   * ★엔진이 아직 없으면 **받아 온다**. npm 패키지는 실행 엔진을 담지 않고
+   *   매니페스트가 가리키는 자산에서 내려받는데(desktop-core-fetch), 그 길을
+   *   부르는 곳이 **한 군데도 없었다**. 만들어만 두고 배선하지 않은 것이다.
+   *
+   *   실측 2026-08-19: 갓 `npm i -g agentlas` 한 상태에서 `graph run` 이
+   *   "vendored Desktop Core is unavailable" 로 즉시 죽었다. 새로 설치한 사람은
+   *   자동화를 한 번도 못 돌린다 — 캐시가 비어 있고, 채울 길을 아무도 안 밟는다.
+   *
+   *   받는 동안은 조용하지 않다(onNotice) — 12MB 를 말없이 끌어오지 않는다.
+   */
+  let core = ctx.desktopCore || desktopCore.loadDesktopCore();
+  if (!core || core.error || typeof core.runGraph !== "function") {
+    try {
+      core = await desktopCore.loadDesktopCoreAsync({ onNotice: (message) => ctx.err(message) });
+    } catch (fetchError) {
+      ctx.err(JSON.stringify({
+        ok: false,
+        error: `graph-execution engine could not be fetched: ${fetchError instanceof Error ? fetchError.message : String(fetchError)}`,
+      }, null, 2));
+      return 1;
+    }
+  }
   if (!core || core.error || typeof core.runGraph !== "function") {
     const cause = core?.error instanceof Error ? core.error.message : "vendored Desktop Core is unavailable";
     ctx.err(JSON.stringify({ ok: false, error: cause }, null, 2));

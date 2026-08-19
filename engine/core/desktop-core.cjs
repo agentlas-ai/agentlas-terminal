@@ -129,7 +129,16 @@ function installNativeModuleHook() {
   const Module = require("node:module");
   const terminalBetterSqlite3 = require("better-sqlite3"); // 터미널 ABI 로 빌드된 것
   let terminalKeytar = null;
-  try { terminalKeytar = require("keytar"); } catch { /* optionalDependency — 없을 수 있다 */ }
+  try {
+    terminalKeytar = require("keytar");
+    // ★훅은 require 를 가로채지만 resolve 는 못 가로챈다. 코어의 키체인 호스트는 자식
+    //   프로세스를 띄우려고 **경로**가 필요한데, 벤더 트리에는 keytar 가 일부러 없다
+    //   (아래 skip 목록). 그래서 우리 것의 실물 경로를 봉투에 담아 넘긴다.
+    //   실측 2026-08-20: 이게 없으면 `Cannot find module 'keytar'` 로 노드가 죽었다.
+    if (!process.env.AGENTLAS_KEYTAR_PATH) {
+      process.env.AGENTLAS_KEYTAR_PATH = require.resolve("keytar");
+    }
+  } catch { /* optionalDependency — 없을 수 있다 */ }
   const electronShim = makeElectronShim();                 // electron 없이 코어를 돌리는 셰임
   const orig = Module._load;
   Module._load = function (request, parent, isMain) {
