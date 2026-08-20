@@ -249,6 +249,28 @@ function loadDesktopCore(options = {}) {
       try { return require(path.join(root, "shared", "graph-execution-digest.js")).graphExecutionDigest; }
       catch { return null; }
     })(),
+    /*
+     * ★"이 노드가 바깥을 바꾸나" 는 판정이 **한 곳**에서만 나와야 한다. 벤더에는 이미
+     *   shared/graph-node-protocol.js 가 실려 있었는데 이 표면에 없어서, 터미널은
+     *   부를 수가 없었고 그래서 자기 사본을 들고 있었다(engine/graph/package.cjs,
+     *   engine/commands/graph.cjs). 사본은 게으름이 아니라 **정본에 못 닿아서** 생긴다.
+     *   옛 코어를 쓰는 동안에는 없을 수 있으므로 정직하게 null 로 둔다 — 부르는 쪽이
+     *   없으면 자기 판단을 쓰되, 그 사실이 보이게.
+     */
+    nodeEffectJudgments: (() => {
+      try {
+        const mod = require(path.join(root, "shared", "graph-node-protocol.js"));
+        return typeof mod.nodeCouldHaveActedOutside === "function" ? {
+          resolveNodeEffect: mod.resolveNodeEffect,
+          nodeDeclaresOutwardEffect: mod.nodeDeclaresOutwardEffect,
+          nodeCouldHaveActedOutside: mod.nodeCouldHaveActedOutside,
+        } : null;
+      } catch { return null; }
+    })(),
+    couldHaveChangedTheOutsideWorld: (() => {
+      try { return require(path.join(root, "shared", "tool-activity.js")).couldHaveChangedTheOutsideWorld; }
+      catch { return null; }
+    })(),
     graphFailureOf: kernel.graphFailureOf,
     planGraphLoops: kernel.planGraphLoops,
     /*

@@ -14,7 +14,8 @@
     "test:tool-access-notice-parity": "node test/tool-access-notice-parity.cjs",
     "verify:engine-reachable": "node scripts/verify-engine-reachable.cjs",
     "prepublishOnly": "npm run verify:engine-reachable && npm run verify:way-out",
-    "verify:way-out": "node scripts/verify-raised-errors-have-a-way-out.cjs"
+    "verify:way-out": "node scripts/verify-raised-errors-have-a-way-out.cjs",
+    "verify:node-effect-parity": "node scripts/verify-node-effect-parity.cjs"
   },
   "engines": {
     "node": ">=20.19"

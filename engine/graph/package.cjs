@@ -1,4 +1,6 @@
 "use strict";
+
+const { nodeDeclaresOutwardEffect: reachesOutside } = require("./node-effect.cjs");
 /*
  * .agentgraph 패키징 — 그래프를 남에게 줄 수 있는 형태로 만든다.
  *
@@ -30,6 +32,8 @@ const SECRET_KEY_RE = /(token|secret|password|passwd|apikey|api_key|credential|p
 
 /** 로컬 사용자 경로 — 남의 기계에서 의미가 없고, 계정명이 그대로 드러난다. */
 const PERSONAL_PATH_RE = /(\/Users\/[^/\s"']+|\/home\/[^/\s"']+|C:\\Users\\[^\\\s"']+)/g;
+
+
 
 function vaultKeyFor(nodeId, key) {
   return `${String(key).replace(/[^A-Za-z0-9]+/g, "_").toUpperCase()}`;
@@ -113,6 +117,7 @@ function buildPackage(input) {
     // 에이전트 참조는 핀으로 남긴다 — 받는 사람이 무엇을 빌려야 하는지 알아야 한다.
     // 노드가 ref를 선언하지 않으면 자동화의 대상 에이전트를 상속한다(제품의 실제 동작).
     // 그 경우를 빼면 패키지가 "채울 것 없음"이라고 거짓말한다.
+    // judgment-exempt: 이건 "바깥을 바꾸나"가 아니라 "이 단계가 에이전트를 굴리나"다.
     const isAgentish = node.type === "agent" || node.type === "action" || node.type === "output";
     const ref = typeof node.config?.ref === "string" && node.config.ref ? node.config.ref : null;
     const inheritedSlug = automation.target_id || null;
@@ -139,7 +144,7 @@ function buildPackage(input) {
   }
 
   const mutationNodes = nodes
-    .filter((n) => n.config?.effect === "mutation")
+    .filter((n) => reachesOutside(n))
     .map((n) => ({ nodeId: n.id, label: n.label || n.id }));
 
   const scrubbedGraph = { version: graph.version ?? 1, nodes, edges: graph.edges || [] };

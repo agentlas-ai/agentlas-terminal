@@ -1,4 +1,6 @@
 "use strict";
+
+const { nodeDeclaresOutwardEffect: reachesOutside } = require("../graph/node-effect.cjs");
 /*
  * graph — 저장된 자동화 그래프를 터미널에서 보고 vendored Desktop Core로 직접 실행한다.
  *
@@ -13,6 +15,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const pkgLib = require("../graph/package.cjs");
 const desktopCore = require("../core/desktop-core.cjs");
+
+
 
 function graphRows(ctx, db) {
   if (!ctx.tableExists(db, "automations")) return [];
@@ -441,7 +445,7 @@ function nodeLine(ctx, node, en) {
   //   묻지 않는다. "확인 후 실행" 표시는 거짓이므로 없앴다. 옛 그래프의 approval
   //   선언이 남아 있어도 마찬가지다. 사실 그대로의 고지는 "바깥을 바꿈" 하나다.
   const marks = [
-    effect === "mutation" ? (en ? "changes things outside" : "바깥을 바꿈") : null,
+    reachesOutside(node) ? (en ? "changes things outside" : "바깥을 바꿈") : null,
     node.config?.consumes ? `${en ? "uses" : "사용"} {{${node.config.consumes}}}` : null,
     node.config?.produces ? `${en ? "makes" : "생성"} {{${node.config.produces}}}` : null,
   ].filter(Boolean);
@@ -940,7 +944,7 @@ async function newGraph(ctx, request, flags) {
     ctx.out(ctx.ui.dim(`  ${bp.goal}`));
     ctx.out("");
     renderGraphTree(ctx, built.graph, en);
-    const mutations = built.graph.nodes.filter((n) => n.config && n.config.effect === "mutation");
+    const mutations = built.graph.nodes.filter((n) => reachesOutside(n));
     if (mutations.length) {
       ctx.out("");
       // ★사실 그대로의 고지 — 이 단계들은 실행 중에 멈춰 묻지 않는다(승인 게이트 폐지,
