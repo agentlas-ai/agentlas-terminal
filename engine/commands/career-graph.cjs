@@ -34,7 +34,7 @@ async function run(ctx, args) {
     });
   }
   try {
-    const lines = runCareerGraphCli(args, {
+    const lines = await runCareerGraphCli(args, {
       cwd: process.cwd(),
       projectPath: process.cwd(),
       lang: ctx.lang,

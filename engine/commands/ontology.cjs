@@ -5,9 +5,9 @@
  */
 const { runOntologyCli } = require("../project/ontology.cjs");
 
-function run(ctx, args) {
+async function run(ctx, args) {
   try {
-    const lines = runOntologyCli(args, {
+    const lines = await runOntologyCli(args, {
       cwd: process.cwd(),
       projectPath: process.cwd(),
       lang: ctx.lang,

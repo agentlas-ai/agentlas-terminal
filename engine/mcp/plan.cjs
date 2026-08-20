@@ -39,7 +39,10 @@ function syntheticRequirement(catalogId, required, priority) {
   };
 }
 
-// 이름 휴리스틱은 "추천 후보 회수"만 담당한다 — 최종 선택/attach 권한이 아니다.
+// 이름 휴리스틱은 "회수 힌트"로만 강등되었다(2026-08-20) — 판정기에 참고로 전달될 뿐,
+// 요구사항을 만들거나 선택 게이트로 동작하지 않는다. 데스크탑 need-resolver.ts가 폐기한
+// 것과 같은 계약: 선택은 판정기(engine/agentlas-judgment.cjs) 경유, 판정 불가면
+// 요구사항 없음(중립)이다.
 const HEURISTIC_GROUPS = [
   [/(browser|playwright|chrome|web)/i, /(?:browser|website|web page|웹|브라우저|사이트|페이지|로그인)/i],
   [/(github|gitlab|source)/i, /(?:github|gitlab|repository|pull request|issue|깃허브|레포|저장소)/i],
@@ -50,15 +53,56 @@ const HEURISTIC_GROUPS = [
   [/(search|research)/i, /(?:search|research|lookup|검색|리서치|조사)/i],
 ];
 
-function inferRequirements(request, inventory) {
-  const text = String(request || "");
-  const results = [];
+/** 회수 힌트: 판정기 guidance에만 실린다. 선택·attach 권한이 없다. */
+function lexicalRequirementHintIds(request, inventory) {
+  const text = String(request || "").toLowerCase();
+  const ids = [];
   for (const item of inventory) {
-    const direct = text.toLowerCase().includes(item.catalogId.toLowerCase()) || text.toLowerCase().includes(item.name.toLowerCase());
+    const direct = text.includes(String(item.catalogId).toLowerCase()) || text.includes(String(item.name || "").toLowerCase());
     const heuristic = HEURISTIC_GROUPS.some(([nameRe, taskRe]) => nameRe.test(`${item.catalogId} ${item.name}`) && taskRe.test(text));
-    if (direct || heuristic) results.push(syntheticRequirement(item.catalogId, false, results.length + 100));
+    if (direct || heuristic) ids.push(item.catalogId);
   }
-  return results.slice(0, 8);
+  return ids.slice(0, 8);
+}
+
+/**
+ * 요청 텍스트에서 MCP 요구사항을 추론한다 — 판정기(연결된 모델) 경유.
+ * 정규식/이름 매칭은 힌트로만 전달되며, 판정이 없으면 빈 목록(중립)이다.
+ * 반환: syntheticRequirement[] (전부 optional/recommended 등급).
+ */
+async function inferRequirements(request, inventory, options = {}) {
+  const text = String(request || "").trim();
+  const items = Array.isArray(inventory) ? inventory : [];
+  if (!text || !items.length) return [];
+  const judgment = options.judgment || require("../agentlas-judgment.cjs");
+  if (!judgment.hasJudgmentRunner()) return [];
+  const hintIds = lexicalRequirementHintIds(text, items);
+  const shelf = items
+    .map((item) => `- ${item.catalogId}: ${item.name || item.catalogId}`)
+    .join("\n");
+  const verdict = await judgment.judgeLabels({
+    kind: "terminal-mcp-need",
+    question:
+      "Which of the available MCP tools does this build request genuinely require in order to complete? Judge what the task actually does, not which words it contains.",
+    labels: items.map((item) => String(item.catalogId)),
+    input: `TASK:\n${text.slice(0, 4000)}\n\nAVAILABLE TOOLS:\n${shelf}`,
+    guidance: [
+      "Name a tool ONLY when the task cannot be completed without it.",
+      "Mentioning a topic is not a need: a task that says 'research'/'조사' in passing does not need a web-search tool.",
+      hintIds.length
+        ? `A deterministic name-heuristic suggested [${hintIds.join(", ")}] — treat that as a hint, never a gate.`
+        : "",
+      "An empty list is a valid and often correct answer. Err toward fewer tools.",
+    ].filter(Boolean).join(" "),
+    signal: options.signal,
+    timeoutMs: options.timeoutMs,
+  });
+  if (verdict.source !== "llm") return []; // 판정 불가 → 요구사항 없음(중립)
+  const known = new Set(items.map((item) => String(item.catalogId)));
+  return verdict.labels
+    .filter((catalogId) => known.has(catalogId))
+    .slice(0, 8)
+    .map((catalogId, index) => syntheticRequirement(catalogId, false, index + 100));
 }
 
 function indexInventory(inventory) {
@@ -119,7 +163,17 @@ function buildMcpPlan(options) {
     assertId(catalogId, "--recommend-mcp");
     if (!known.has(catalogId)) { requirements.push(syntheticRequirement(catalogId, false, 500)); known.add(catalogId); }
   }
-  if (!requirements.length) requirements.push(...inferRequirements(options.request, inventory));
+  // 2026-08-20: 휴리스틱 자동 추론이 여기서 직접 요구사항을 만들던 게이트를 제거.
+  // 추론은 비동기 판정(inferRequirements — 판정기 경유, 판정 불가면 빈 목록)을
+  // 호출자가 먼저 끝내고 그 결과를 넘긴다. 없으면 요구사항 없음(중립).
+  if (!requirements.length && Array.isArray(options.inferredRequirements)) {
+    for (const requirement of options.inferredRequirements.slice(0, 8)) {
+      if (requirement && requirement.catalogId && !known.has(requirement.catalogId)) {
+        requirements.push(requirement);
+        known.add(requirement.catalogId);
+      }
+    }
+  }
   const entries = requirements
     .map((requirement) => {
       const resolution = resolveMcpRequirement(requirement, inventoryById);
@@ -275,6 +329,7 @@ function renderBuildMcpResult(plan, approvedIds, runtimeAllowlist = null) {
 module.exports = {
   MAX_BUILD_DIRECTIVE_CHARS,
   syntheticRequirement,
+  lexicalRequirementHintIds,
   inferRequirements,
   indexInventory,
   resolveMcpRequirement,

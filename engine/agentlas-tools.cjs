@@ -322,12 +322,55 @@ function allowedTools(permission) {
   return TOOLS.filter((t) => (PERM_RANK[t.minPerm] ?? 0) <= rank);
 }
 
+/*
+ * ── 능력 규칙(공유 capability_grants)이 등급보다 먼저다 ──────────────────────
+ *
+ * 오너 결정(2026-08-20): 승인은 행동 기준이고 데스크탑·터미널이 **공유**한다.
+ *  · 데스크탑에서 "항상 허용"한 행동 → 터미널에서 등급이 낮아도 통과(다시 묻지 않는다).
+ *  · 데스크탑에서 영구 거부한 행동  → 터미널에서 full 권한이어도 거부.
+ * 규칙이 없을 때만 아래의 기존 등급 게이트가 답한다(기존 동작 그대로).
+ *
+ * ctx.db 가 없으면(단위 테스트·DB 없는 호출) 규칙을 못 읽으므로 종전 등급 게이트만 돈다.
+ */
+function toolAskFor(tool, args) {
+  const kind = tool.minPerm === "read" ? "read" : tool.name === "bash" ? "execute" : "edit";
+  const detail = tool.name === "bash"
+    ? String((args && args.command) || "").trim()
+    : String((args && args.path) || "").trim();
+  return { tool: tool.name, kind, detail: detail || undefined, mutating: kind !== "read" };
+}
+
 // 툴 1개 실행 → { ok, content }. 권한 부족/에러는 ok:false 문자열로.
 function runTool(name, args, ctx) {
   const tool = BY_NAME[name];
   if (!tool) return { ok: false, content: `unknown tool: ${name}` };
+  const ask = toolAskFor(tool, args);
+  let ruled = null;
+  if (ctx && ctx.db) {
+    try {
+      const permissions = require("./agentlas-permissions.cjs");
+      const verdict = permissions.decideCapability(ctx.db, {
+        ...ask,
+        permission: ctx.permission,
+        agentId: ctx.agentId,
+        chatId: ctx.chatId,
+      });
+      ruled = verdict.ruled;
+      if (ruled === "deny") {
+        return {
+          ok: false,
+          content:
+            `capability denied: '${name}'${ask.detail ? ` (${ask.detail})` : ""} is permanently denied by a shared ` +
+            "capability rule (Desktop/Terminal share capability_grants). Remove that rule to allow it.",
+        };
+      }
+    } catch {
+      // 규칙을 못 읽는 것이 허용이 되면 안 되고, 실행을 죽여서도 안 된다 — 기존 등급 게이트로 간다.
+      ruled = null;
+    }
+  }
   const rank = PERM_RANK[ctx.permission] ?? 0;
-  if ((PERM_RANK[tool.minPerm] ?? 0) > rank) {
+  if (ruled !== "allow" && (PERM_RANK[tool.minPerm] ?? 0) > rank) {
     return {
       ok: false,
       content: `permission denied: '${name}' requires '${tool.minPerm}' but current is '${ctx.permission}'. Ask the user to run /permission ${tool.minPerm}.`,
@@ -355,4 +398,4 @@ function openaiTools(permission) {
   }));
 }
 
-module.exports = { TOOLS, BY_NAME, allowedTools, runTool, anthropicTools, openaiTools, PERM_RANK };
+module.exports = { TOOLS, BY_NAME, allowedTools, runTool, anthropicTools, openaiTools, PERM_RANK, toolAskFor };

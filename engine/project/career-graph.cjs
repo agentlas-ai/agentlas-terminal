@@ -173,7 +173,7 @@ function registerCareerGraphSourceCli(paths, source, kind, scope, cwd, lang) {
       ];
 }
 
-function runCareerGraphCli(args, opts) {
+async function runCareerGraphCli(args, opts) {
   opts = opts || {};
   const ko = opts.lang === "ko";
   const cwd = path.resolve(opts.cwd || process.cwd());
@@ -203,10 +203,8 @@ function runCareerGraphCli(args, opts) {
   }
   const directCareerCommand = ["open", "add"].includes(String(sub));
   if (!directCareerCommand) {
-    const parsed = parseOntologyNaturalArgsCli(normalizedArgs.join(" "), cwd);
-    if (!parsed) throw new Error(ko
-      ? "사용법: /career-graph status|list|open|add <경로>"
-      : "usage: /career-graph status|list|open|add <path>");
+    // 자연어는 판정기 경유로 액션을 정한다. 판정 불가면 ["help"](사용법 안내).
+    const parsed = await parseOntologyNaturalArgsCli(normalizedArgs.join(" "), cwd);
     return runCareerGraphCli(parsed, opts);
   }
   const paths = ensureCareerGraphCli(projectPath, opts.lang);
@@ -226,12 +224,9 @@ function runCareerGraphCli(args, opts) {
     : "usage: /career-graph status|list|open|add <path>");
 }
 
-function runCareerGraphNaturalCli(text, opts) {
+async function runCareerGraphNaturalCli(text, opts) {
   const cwd = path.resolve((opts && opts.cwd) || process.cwd());
-  const parsed = parseOntologyNaturalArgsCli(text, cwd);
-  if (!parsed) throw new Error((opts && opts.lang) === "ko"
-    ? "사용법: /career-graph status|list|open|add <경로>"
-    : "usage: /career-graph status|list|open|add <path>");
+  const parsed = await parseOntologyNaturalArgsCli(text, cwd);
   return runCareerGraphCli(parsed, { ...(opts || {}), cwd });
 }
 

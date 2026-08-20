@@ -7,21 +7,70 @@
  * 링버퍼에 쌓는다. 백그라운드 세션의 턴 종료는 'notice' 이벤트로 전면 세션에
  * 한 줄 알림된다.
  *
- * 동시 실행 상한: AGENTLAS_MAX_PARALLEL (기본 4). 상한 초과 스폰은 대기가 아니라
- * 정직한 거부 — 사용자가 세션을 정리하거나 상한을 올리게 안내한다.
+ * 동시 실행 상한: 공유 DB 의 agent_concurrency(데스크탑 슬라이더와 같은 값)가 기본이고,
+ * AGENTLAS_MAX_PARALLEL 은 **override**다(명시했을 때만 이긴다 — 예전엔 이 env 가
+ * 유일한 소스라 데스크탑과 터미널이 같은 머신에서 다른 예산을 들고 있었다).
+ * 상한 초과 스폰은 대기가 아니라 정직한 거부 — 사용자가 세션을 정리하거나 상한을 올리게 안내한다.
  */
+const os = require("node:os");
 const { EventEmitter } = require("node:events");
 const { Session } = require("./session.cjs");
 
+// 데스크탑 electron/store/concurrency.ts 와 같은 상수/공식 — 값이 갈리면 같은 머신의
+// 두 제품이 다른 예산을 말한다. 바꿀 때는 반드시 양쪽을 함께 바꿀 것.
+const AGENT_CONCURRENCY_HARD_MAX = 32;
+
+/** 사양 기반 추천 동시성(데스크탑 recommendedConcurrency 와 동일 공식). */
+function recommendedConcurrency() {
+  let cores = 4;
+  let totalMemGB = 8;
+  try { cores = Math.max(1, os.cpus().length); } catch { /* fall back */ }
+  try { totalMemGB = os.totalmem() / 1024 ** 3; } catch { /* fall back */ }
+  const coreBound = Math.max(1, cores - 2);
+  const memBound = Math.max(1, Math.floor((totalMemGB - 4) / 2));
+  return Math.max(1, Math.min(coreBound, memBound, AGENT_CONCURRENCY_HARD_MAX));
+}
+
+/*
+ * 공유 DB 핸들 — Orchestrator 생성 시 등록된다. maxParallel 이 배너 출력 등에서
+ * 오케스트레이터 없이도 불리므로(ui/shell.cjs), 핸들이 없을 때는 추천값으로 답한다.
+ */
+let _concurrencyDb = null;
+function setConcurrencyDb(db) {
+  _concurrencyDb = db || null;
+}
+
+function sharedDbConcurrency() {
+  if (!_concurrencyDb) return null;
+  try {
+    const row = _concurrencyDb.prepare("SELECT value FROM meta WHERE key='agent_concurrency'").get();
+    if (!row || row.value == null || row.value === "") return null;
+    const parsed = Number(row.value);
+    if (!Number.isFinite(parsed) || parsed <= 0) return null;
+    return Math.max(1, Math.min(Math.floor(parsed), AGENT_CONCURRENCY_HARD_MAX));
+  } catch {
+    // meta 테이블이 없는 옛/부분 DB — 추천값으로 폴백(조용한 실패가 아니라 설계된 폴백).
+    return null;
+  }
+}
+
 function maxParallel() {
+  // 1) env 는 명시적 override — 사람이 이번 셸에서 일부러 정한 값이 항상 이긴다.
   const n = Number(process.env.AGENTLAS_MAX_PARALLEL);
-  return Number.isInteger(n) && n > 0 ? Math.min(n, 16) : 4;
+  if (Number.isInteger(n) && n > 0) return Math.min(n, AGENT_CONCURRENCY_HARD_MAX);
+  // 2) 공유 DB 의 사용자 슬라이더 값(데스크탑과 동일 예산).
+  const shared = sharedDbConcurrency();
+  if (shared !== null) return shared;
+  // 3) 둘 다 없으면 사양 기반 추천값(데스크탑의 미설정 동작과 동일).
+  return recommendedConcurrency();
 }
 
 class Orchestrator extends EventEmitter {
   constructor({ db, lang }) {
     super();
     this.db = db;
+    // 공유 DB 를 동시성 기본값의 소스로 등록 — 데스크탑 슬라이더와 같은 예산을 쓴다.
+    if (db) setConcurrencyDb(db);
     this.lang = lang || "en";
     this.sessions = new Map(); // "s1" -> Session
     this._seq = 0;
@@ -189,4 +238,4 @@ class Orchestrator extends EventEmitter {
   }
 }
 
-module.exports = { Orchestrator, maxParallel };
+module.exports = { Orchestrator, maxParallel, setConcurrencyDb };

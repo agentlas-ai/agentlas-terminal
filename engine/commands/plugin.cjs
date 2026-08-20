@@ -11,7 +11,11 @@ const {
   planPluginMcpInstall,
   installPluginMcpRows,
   listHubPlugins,
+  planPluginSkillInstall,
+  installPluginSkills,
+  listInstalledLocalPlugins,
 } = require("../hub/plugins.cjs");
+const { webBaseUrl } = require("../cloud/hub-client.cjs");
 const { terminalProjectCandidateCli, initializedAgentlasProjectPathCli } = require("../project/state.cjs");
 
 async function pluginAdd(ctx, slug) {
@@ -31,43 +35,80 @@ async function pluginAdd(ctx, slug) {
     return 1;
   }
   const { rows, refused } = planPluginMcpInstall(slug, manifest);
+  // 스킬 번들 절반 — 실콘텐츠(files[])가 실린 스킬은 ~/.agentlas/plugins/<slug>/ 에
+  // 파일로 착지한다(오너 결정 2026-08-20: 플러그인 = MCP와 별개의 능력 패키지).
+  const skillPlan = planPluginSkillInstall(slug, manifest);
   const docsLink = manifest.docs || manifest.source?.repo || manifest.source?.homepage || null;
-  if (!rows.length) {
-    const reasonLines = refused.map((item) => `  ✗ ${item.name}: ${item.reason}${item.source ? ` (${item.source})` : ""}`);
+  if (!rows.length && !skillPlan.skills.length) {
+    const reasonLines = [
+      ...refused.map((item) => `  ✗ ${item.name}: ${item.reason}${item.source ? ` (${item.source})` : ""}`),
+      ...skillPlan.refused.map((item) => `  ✗ skill ${item.name}: ${item.reason}`),
+      ...(skillPlan.declaredOnly.length
+        ? [`  ✗ skills declared without content payloads: ${skillPlan.declaredOnly.join(", ")}`]
+        : []),
+    ];
     ctx.err(
       [
-        `${slug} ships no machine-connectable MCP endpoint yet. Nothing was registered.`,
+        `${slug} ships no machine-connectable MCP endpoint and no installable skill payload. Nothing was installed.`,
         ...reasonLines,
         docsLink ? `  docs: ${docsLink} (upstream project page — not an MCP endpoint)` : null,
-        "  When the catalog gains verified connection info for this plugin, re-run: agentlas plugin add " + slug,
+        "  When the catalog gains verified connection info or skill payloads for this plugin, re-run: agentlas plugin add " + slug,
       ].filter(Boolean).join("\n"),
     );
     return 1;
   }
-  let installed, reused, needsApproval;
-  try {
-    ({ installed, reused, needsApproval } = installPluginMcpRows(ctx.db(), rows));
-  } catch (e) {
-    ctx.err(String((e && e.message) || e));
-    return 1;
+  let installed = 0, reused = 0, needsApproval = [];
+  if (rows.length) {
+    try {
+      ({ installed, reused, needsApproval } = installPluginMcpRows(ctx.db(), rows));
+    } catch (e) {
+      ctx.err(String((e && e.message) || e));
+      return 1;
+    }
+  }
+  let skillResult = null;
+  if (skillPlan.skills.length) {
+    skillResult = installPluginSkills(slug, skillPlan, {
+      manifestUrl: `${webBaseUrl()}/api/plugins/${encodeURIComponent(slug)}`,
+      meta: { name: manifest.name, family: manifest.family, version: manifest.version },
+    });
+    if (!skillResult.installed.length && !rows.length) {
+      // 스킬만 실린 매니페스트인데 하나도 못 썼다 — 조용한 성공 금지.
+      for (const item of skillResult.failed) ctx.err(`  ✗ skill ${item.name}: ${item.reason}`);
+      ctx.err(`${slug}: no skill could be installed.`);
+      return 1;
+    }
   }
   ctx.out(`${ctx.ui.green("✓")} Plugin installed ${ctx.ui.accent(manifest.slug)} — ${manifest.name}`);
   for (const item of refused) {
     ctx.out(`  ⚠ skipped ${item.name}: ${item.reason}${item.source ? ` (${item.source})` : ""}`);
   }
-  ctx.out(`  MCP servers: ${installed} added${reused ? `, ${reused} already present` : ""}`);
-  // 데스크탑 hub-plugin-bridge.ts:219-227 동형: stdio는 비활성 등록 + 승인 필요 표면화.
+  if (rows.length) {
+    ctx.out(`  MCP servers: ${installed} added${reused ? `, ${reused} already present` : ""}`);
+  }
+  // 데스크탑 hub-plugin-bridge.ts 동형: stdio는 비활성 등록 + 승인 필요 표면화.
   for (const name of needsApproval || []) {
     ctx.out(`  ⚠ needs-approval ${name}: local execution requires one-click approval in MCP settings`);
+  }
+  if (skillResult) {
+    ctx.out(`  skills installed: ${skillResult.installed.join(", ")} → ${skillResult.dir}`);
+    if (!skillResult.verified) {
+      ctx.out(ctx.ui.dim("  (no content hash declared — manifest URL recorded as provenance)"));
+    }
+    for (const item of skillResult.failed) {
+      ctx.out(`  ⚠ skipped skill ${item.name}: ${item.reason}`);
+    }
+  }
+  if (skillPlan.declaredOnly.length) {
+    ctx.out(`  skills declared (no payload yet): ${skillPlan.declaredOnly.join(", ")}`);
   }
   const authKind = manifest.auth?.kind;
   if (authKind && authKind !== "none") {
     ctx.out(`  ⚠ Requires ${authKind} — set credentials before use (agentlas creds).`);
   }
-  if (Array.isArray(manifest.skills) && manifest.skills.length) {
-    ctx.out(`  skills declared: ${manifest.skills.map((skill) => skill.name).filter(Boolean).join(", ")}`);
+  if (rows.length) {
+    ctx.out(ctx.ui.dim("  Only full-access turns wire active stdio servers into the runtime (agentlas mcp)."));
   }
-  ctx.out(ctx.ui.dim("  Only full-access turns wire active stdio servers into the runtime (agentlas mcp)."));
   return 0;
 }
 
@@ -83,8 +124,12 @@ async function pluginList(ctx) {
     ctx.out("No Hub plugins are available.");
     return 0;
   }
+  // 설치 여부는 ~/.agentlas/plugins/<slug>/plugin.json 마커(3채널 공유 규약)로 판정한다.
+  const installedSlugs = new Set(listInstalledLocalPlugins().map((entry) => entry.slug.toLowerCase()));
   for (const plugin of plugins.slice(0, 60)) {
-    ctx.out(`${ctx.ui.accent(String(plugin.slug || "").padEnd(32).slice(0, 32))} ${String(plugin.name || "").slice(0, 44)}`);
+    const slugText = String(plugin.slug || "");
+    const installedMark = installedSlugs.has(slugText.toLowerCase()) ? ctx.ui.green(" [installed]") : "";
+    ctx.out(`${ctx.ui.accent(slugText.padEnd(32).slice(0, 32))} ${String(plugin.name || "").slice(0, 44)}${installedMark}`);
   }
   ctx.out("");
   ctx.out(ctx.ui.dim("Install: agentlas plugin add <slug>"));

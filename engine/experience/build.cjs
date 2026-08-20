@@ -114,9 +114,17 @@ async function cmdBuild(options) {
   const emit = options.out || console.log;
   const inventory = mcp.collectSystemMcpInventory(options.db, { userDataDir: options.userDataDir, env: options.env || process.env });
   const policy = mcp.loadProjectMcpPolicy(options.cwd || process.cwd());
+  // 명시적 요구(정책/플래그)가 하나도 없을 때만 추론 — 판정기(연결 모델) 경유이며,
+  // 판정 불가면 빈 목록(중립)이다. 휴리스틱 정규식은 판정 힌트로만 실린다.
+  const explicitRequirementCount =
+    ((policy && policy.requirements) || []).length + parsed.requiredIds.length + parsed.recommendedIds.length;
+  const inferredRequirements = explicitRequirementCount === 0
+    ? await mcp.inferRequirements(parsed.request, inventory)
+    : [];
   const plan = mcp.buildMcpPlan({
     inventory, policy, request: parsed.request,
     requiredIds: parsed.requiredIds, recommendedIds: parsed.recommendedIds,
+    inferredRequirements,
   });
   emit(parsed.json ? JSON.stringify(plan, null, 2) : mcp.renderMcpPlan(plan));
   if (parsed.planOnly) return { plan, approvedIds: [], invoked: false };

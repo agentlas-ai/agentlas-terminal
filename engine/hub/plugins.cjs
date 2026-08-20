@@ -15,6 +15,9 @@
  *    런타임이 통째로 죽는다(Runtime Doctor가 반복해서 잡던 사고 계열).
  */
 const crypto = require("node:crypto");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 const { callHubTool, fetchHub, parseHubJson, webBaseUrl } = require("../cloud/hub-client.cjs");
 
 // 레포/홈페이지 HTML 페이지는 문서지 MCP 연결이 아니다. 이 URL들을 transport:"http"로
@@ -193,6 +196,163 @@ function installPluginMcpRows(db, rows) {
   return { installed, reused, needsApproval };
 }
 
+// ── 스킬 번들 설치 (플러그인 = MCP와 별개의 능력 패키지, 오너 결정 2026-08-20) ──
+//
+// manifest.skills 행이 files[]에 실콘텐츠를 실으면 ~/.agentlas/plugins/<slug>/ 아래에
+// 파일로 착지시키고 plugin.json 마커(schema agentlas.local-plugin/v1)를 남긴다.
+// 이 규약은 데스크탑 electron/mcp-tools/hub-plugin-bridge.ts(installSkillBundle)와
+// Agentlas-OS agentlas_cloud/plugin_discovery.py 스캔이 공유한다 — mcp_servers 등록이
+// 아니라 파일시스템이 채널 간 공유 지점이다.
+
+const PLUGIN_SKILL_SLUG_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/i;
+const PLUGIN_SKILL_FILE_MAX_BYTES = 512 * 1024;
+
+/** 세 채널이 공유하는 로컬 플러그인 저장소 루트. homeDir 주입은 테스트 격리용. */
+function agentlasPluginsDir({ homeDir } = {}) {
+  return path.join(homeDir || os.homedir(), ".agentlas", "plugins");
+}
+
+/** 스킬 파일 상대 경로 검증 — 절대경로·상위 탈출·널바이트·백슬래시 거부 (데스크탑 동형). */
+function pluginSkillSafeRelativePath(value) {
+  if (typeof value !== "string" || !value || value.length > 260) return false;
+  if (value.includes("\0") || value.includes("\\")) return false;
+  if (value.startsWith("/") || value.endsWith("/")) return false;
+  return value.split("/").every((part) => part.length > 0 && part !== "." && part !== ".." && !part.startsWith("~"));
+}
+
+/**
+ * manifest.skills 를 설치 계획으로 정규화: 실콘텐츠가 실린 스킬과 정직하게 거른 항목 분리.
+ * 이름뿐인 레거시 행({name}만)은 refused가 아니라 declaredOnly로 남긴다 — 결함이 아니라
+ * 과거 스키마의 정상 모양이다.
+ */
+function planPluginSkillInstall(slug, manifest) {
+  const entries = Array.isArray(manifest?.skills) ? manifest.skills : [];
+  const skills = [];
+  const declaredOnly = [];
+  const refused = [];
+  for (const entry of entries) {
+    const name = typeof entry?.name === "string" ? entry.name.trim() : "";
+    if (!name) continue;
+    const rawFiles = Array.isArray(entry?.files) ? entry.files : [];
+    if (rawFiles.length === 0) {
+      declaredOnly.push(name);
+      continue;
+    }
+    if (!PLUGIN_SKILL_SLUG_RE.test(name)) {
+      refused.push({ name, reason: "invalid skill name" });
+      continue;
+    }
+    const files = [];
+    let bad = null;
+    for (const file of rawFiles) {
+      const filePath = typeof file?.path === "string" ? file.path.trim() : "";
+      const content = typeof file?.content === "string" ? file.content : "";
+      if (!pluginSkillSafeRelativePath(filePath)) { bad = `unsafe file path "${filePath}"`; break; }
+      if (!content.trim()) { bad = `empty content for ${filePath}`; break; }
+      if (Buffer.byteLength(content, "utf8") > PLUGIN_SKILL_FILE_MAX_BYTES) { bad = `${filePath} exceeds the file size cap`; break; }
+      const sha256 = typeof file?.sha256 === "string" && /^[0-9a-f]{64}$/i.test(file.sha256)
+        ? file.sha256.toLowerCase()
+        : null;
+      files.push({ path: filePath, content, sha256 });
+    }
+    if (bad) { refused.push({ name, reason: bad }); continue; }
+    skills.push({ name, description: typeof entry?.description === "string" ? entry.description : null, files });
+  }
+  return { skills, declaredOnly, refused };
+}
+
+/**
+ * 계획된 스킬들을 ~/.agentlas/plugins/<slug>/skills/<name>/ 에 쓴다.
+ *
+ * 무결성: 행이 sha256을 선언하면 쓰기 전에 검증하고, 불일치 스킬은 설치하지 않는다.
+ * 해시와 콘텐츠가 같은 매니페스트 응답으로 오므로 이 검증은 전송 무결성이지 발행자
+ * 서명이 아니다 — 마커의 source.manifestUrl이 출처 기록이다(정직한 한계).
+ */
+function installPluginSkills(slug, plan, { homeDir, manifestUrl, meta } = {}) {
+  if (!PLUGIN_SKILL_SLUG_RE.test(String(slug || ""))) {
+    return { dir: "", installed: [], failed: [{ name: String(slug || ""), reason: "invalid plugin slug" }], verified: false };
+  }
+  const pluginDir = path.join(agentlasPluginsDir({ homeDir }), slug);
+  const installed = [];
+  const failed = [];
+  const markerSkills = [];
+  let allDeclared = true;
+  for (const skill of plan.skills || []) {
+    const written = [];
+    let mismatch = null;
+    for (const file of skill.files) {
+      const actual = crypto.createHash("sha256").update(file.content, "utf8").digest("hex");
+      if (file.sha256 && file.sha256 !== actual) { mismatch = `sha256 mismatch for ${file.path}`; break; }
+      if (!file.sha256) allDeclared = false;
+      written.push({ path: file.path, sha256: actual, verified: Boolean(file.sha256) });
+    }
+    if (mismatch) { failed.push({ name: skill.name, reason: mismatch }); continue; }
+    try {
+      const skillDir = path.join(pluginDir, "skills", skill.name);
+      for (const file of skill.files) {
+        const target = path.join(skillDir, file.path);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, file.content, "utf8");
+      }
+      installed.push(skill.name);
+      markerSkills.push({ name: skill.name, files: written });
+    } catch (e) {
+      failed.push({ name: skill.name, reason: String((e && e.message) || e).slice(0, 160) });
+    }
+  }
+  const verified = installed.length > 0 && allDeclared;
+  if (installed.length > 0) {
+    // 마커는 마지막에 쓴다 — 마커가 있으면 스킬 파일도 있다는 뜻이어야 한다.
+    const marker = {
+      schema: "agentlas.local-plugin/v1",
+      slug,
+      name: (meta && meta.name) || slug,
+      family: (meta && meta.family) || null,
+      version: (meta && meta.version) || null,
+      installedAt: new Date().toISOString(),
+      installedBy: "agentlas-terminal",
+      source: { manifestUrl: manifestUrl || null, contentVerification: verified ? "manifest-sha256" : "none" },
+      skills: markerSkills,
+    };
+    try {
+      fs.mkdirSync(pluginDir, { recursive: true });
+      fs.writeFileSync(path.join(pluginDir, "plugin.json"), `${JSON.stringify(marker, null, 2)}\n`, "utf8");
+    } catch (e) {
+      failed.push({ name: "plugin.json", reason: String((e && e.message) || e).slice(0, 160) });
+    }
+  }
+  return { dir: pluginDir, installed, failed, verified };
+}
+
+/** ~/.agentlas/plugins/<slug>/plugin.json 마커들을 읽는다 — list의 설치 여부 표시용. */
+function listInstalledLocalPlugins({ homeDir } = {}) {
+  const root = agentlasPluginsDir({ homeDir });
+  let names;
+  try {
+    names = fs.readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const name of names) {
+    if (name.startsWith(".")) continue;
+    try {
+      const marker = JSON.parse(fs.readFileSync(path.join(root, name, "plugin.json"), "utf8"));
+      out.push({
+        slug: String(marker.slug || name),
+        name: String(marker.name || name),
+        installedAt: marker.installedAt || null,
+        installedBy: marker.installedBy || null,
+        skills: Array.isArray(marker.skills) ? marker.skills.map((s) => String(s?.name || "")).filter(Boolean) : [],
+        dir: path.join(root, name),
+      });
+    } catch {
+      // 마커 없는 디렉터리는 다른 도구의 산출물일 수 있다 — 조용히 건너뛴다.
+    }
+  }
+  return out;
+}
+
 /** Hub 플러그인 카탈로그 목록 (marketplace.list_plugins). 실패는 그대로 throw — 폴백 카탈로그 금지. */
 async function listHubPlugins({ callTool } = {}) {
   const call = callTool || callHubTool;
@@ -210,4 +370,9 @@ module.exports = {
   planPluginMcpInstall,
   installPluginMcpRows,
   listHubPlugins,
+  agentlasPluginsDir,
+  pluginSkillSafeRelativePath,
+  planPluginSkillInstall,
+  installPluginSkills,
+  listInstalledLocalPlugins,
 };

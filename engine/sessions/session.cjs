@@ -242,6 +242,14 @@ class Session extends EventEmitter {
             cwd: this.cwd,
             permission: this.permission,
             env: process.env,
+            /*
+             * 공유 능력 규칙(capability_grants)을 도구 관문이 읽을 수 있게 한다 —
+             * 데스크탑에서 "항상 허용"/"영구 거부"한 행동이 여기서도 그대로 적용된다
+             * (agentlas-tools.runTool). 이 세 칸이 없으면 관문은 등급만 보고 판단한다.
+             */
+            db: this.db,
+            chatId: this.chatId,
+            agentId: this.agent && this.agent.id,
           },
           ui: this._sink,
           signal: ctrl.signal,

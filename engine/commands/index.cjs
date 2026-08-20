@@ -18,6 +18,10 @@ const COMMANDS = {
   mcp: () => require("./mcp.cjs"),
   help: () => require("./help.cjs"),
   run: () => require("./run.cjs"),
+  // One 축 — 데스크탑/모바일과 **같은 공유 DB 의 One 대화**를 이어간다.
+  // (2026-08-20까지 DESKTOP_ONLY_SURFACES 에 있었다. 대화는 이미 공유 DB 에 있었고
+  //  터미널만 그것을 못 봤을 뿐이다 — 표면 부재를 제품 경계로 착각한 선언이었다.)
+  one: () => require("./one.cjs"),
   login: () => require("./login.cjs"),
   logout: () => require("./logout.cjs"),
   whoami: () => require("./whoami.cjs"),
@@ -97,7 +101,6 @@ const DESKTOP_ONLY_SURFACES = {
   apps: "Apps surface is Desktop-only.",
   quests: "Quests are Desktop-only.",
   bookmarks: "Hub bookmarks: run `AGENTLAS_TUI=1 agentlas` then /marketplace.",
-  one: "Agentlas One is a separate Desktop/Mobile product surface.",
 };
 
 /*

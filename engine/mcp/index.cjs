@@ -27,6 +27,7 @@ module.exports = {
   probeSystemMcpServerConnection: probe.probeSystemMcpServerConnection,
   // plan — 요구사항 해소 + 빌드 플랜 + 빌더 지시문
   resolveMcpRequirement: plan.resolveMcpRequirement,
+  inferRequirements: plan.inferRequirements,
   buildMcpPlan: plan.buildMcpPlan,
   renderMcpPlan: plan.renderMcpPlan,
   fitApprovedMcpIds: plan.fitApprovedMcpIds,

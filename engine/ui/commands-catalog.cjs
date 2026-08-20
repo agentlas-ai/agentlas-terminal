@@ -47,6 +47,7 @@ const CATALOG = [
   { name: "help", group: "start", tier: "core", surfaces: BOTH, args: "[all|<command>]", argsKo: "[all|<명령>]", ko: "명령 보기 (all = 전체 목록)", en: "Show commands (all = the full list)" },
 
   // ── 2 work ────────────────────────────────────────────────────────────────
+  { name: "one", group: "work", tier: "core", surfaces: CLI, args: '["<prompt>"] [--list|--new]', argsKo: '["<프롬프트>"] [--list|--new]', ko: "개인 에이전트 One — 같은 One 대화를 이어감", en: "Your personal agent One — continues the same One conversation" },
   { name: "run", group: "work", tier: "core", surfaces: CLI, args: '[agent] "<task>"', argsKo: '[에이전트] "<작업>"', ko: "이 프로젝트 컨트롤러로 1회 실행", en: "Run once with this project's controller" },
   { name: "project", group: "work", tier: "core", surfaces: BOTH, args: "[status|use <agent>]", argsKo: "[status|use <에이전트>]", ko: "이 폴더를 프로젝트로 연결", en: "Connect this folder to a project" },
   { name: "storm", group: "work", tier: "core", surfaces: BOTH, args: '"<goal>"', argsKo: '"<목표>"', ko: "목표 하나를 계획→실행→검증까지", en: "Drive one goal: plan, execute, verify" },

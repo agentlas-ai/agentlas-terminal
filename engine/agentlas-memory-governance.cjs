@@ -146,13 +146,53 @@ function normalizeOutcome(value) {
   return "completed";
 }
 
-function ownerPolicyFromPrompt(prompt) {
-  const text = String(prompt || "");
-  const explicitMemory = /\b(?:remember|memorize|save|record|store|keep)\b|기억|메모리|저장|기록|남겨/i.test(text);
-  const explicitGlobal = /\b(?:global(?:ly)?|all projects|every project|across projects|user profile|account-wide)\b|전역|모든\s*프로젝트|프로젝트\s*전체|사용자\s*프로필/i.test(text);
-  return {
-    globalWriteAuthorized: explicitMemory && explicitGlobal,
-  };
+/*
+ * 2026-08-20: ownerPolicyFromPrompt(단어장 — remember/전역 등 regex AND) 제거.
+ * 전역 메모리 쓰기 권한을 부여하는 길은 둘뿐이다:
+ *   1) 호스트가 넘긴 구조화 플래그(beginTurn input.ownerPolicy) — 기계 표식이 우선.
+ *   2) 판정기(agentlas-judgment) 경유 — resolveGlobalWriteAuthorization.
+ * 판정 불가면 부여하지 않는다(fail-closed). 단어장은 어떤 언어도 다 못 세는 데다,
+ * 제3언어의 명시적 요청을 영구히 거부하고 우연한 단어 일치로 권한을 넓혔다.
+ */
+function normalizeOwnerPolicy(value) {
+  return { globalWriteAuthorized: Boolean(value && value.globalWriteAuthorized === true) };
+}
+
+async function resolveGlobalWriteAuthorization(prompt, options = {}) {
+  const text = String(prompt || "").trim();
+  if (!text) return { authorized: false, source: "unavailable" };
+  // 호스트가 판정 함수를 주입할 수 있다(세션이 자기 연결 런타임으로 감쌈).
+  if (typeof options.judge === "function") {
+    try {
+      const judged = await options.judge(text);
+      return judged && judged.source === "llm"
+        ? { authorized: judged.authorized === true, source: "llm" }
+        : { authorized: false, source: "unavailable" };
+    } catch {
+      return { authorized: false, source: "unavailable" };
+    }
+  }
+  let judgment;
+  try {
+    judgment = options.judgment || require("./agentlas-judgment.cjs");
+  } catch {
+    return { authorized: false, source: "unavailable" };
+  }
+  if (!judgment.hasJudgmentRunner()) return { authorized: false, source: "unavailable" };
+  const verdict = await judgment.judgeLabels({
+    kind: "terminal-memory-global-write",
+    question:
+      "Does this request EXPLICITLY ask to save or remember something as a GLOBAL memory that applies across all projects (user profile / account-wide), rather than only this project, session, or task?",
+    labels: ["authorize_global_memory_write"],
+    input: text,
+    multi: false,
+    guidance:
+      "Authorize only an explicit, unambiguous request to persist a memory globally, in any language. Ordinary task prompts, project-scoped notes, or incidental mentions of memory do NOT authorize. When uncertain, select nothing.",
+    signal: options.signal,
+    timeoutMs: options.timeoutMs,
+  });
+  if (verdict.source !== "llm") return { authorized: false, source: "unavailable" };
+  return { authorized: verdict.labels.includes("authorize_global_memory_write"), source: "llm" };
 }
 
 function tableExists(db, name) {
@@ -245,7 +285,9 @@ function beginTurn(db, input = {}) {
   const pKey = projectKey(input.projectPath);
   const oKey = ownerKey(input.agentId);
   const explicitTurnId = validTurnId(input.stableTurnId);
-  const policy = ownerPolicyFromPrompt(input.prompt);
+  // 시작 시점 정책은 호스트 구조화 플래그만 반영한다(없으면 fail-closed false).
+  // 판정 경유 승격은 completeTurn에서, 실제로 user_global 후보가 나왔을 때만 1회 수행된다.
+  const policy = normalizeOwnerPolicy(input.ownerPolicy);
   const conversationDigest = sha256(input.conversationRef || "none");
   const priorDigest = sha256(input.priorContextDigest || input.priorContext || "none");
   const contextKey = sha256(stableJson({
@@ -823,6 +865,28 @@ async function completeTurn(db, input = {}) {
     };
   }
 
+  // 전역 쓰기 승격은 필요할 때만 1회 — 어떤 후보가 실제로 user_global 스코프를
+  // 청했고, 시작 시점 정책(호스트 플래그)이 승인하지 않았을 때. 판정기(또는 호스트가
+  // 주입한 judge)가 명시적 요청이라고 판정한 경우에만 켠다. 판정 불가 = 부여 안 함.
+  if (
+    turn.ownerPolicy?.globalWriteAuthorized !== true
+    && normalizePermission(turn.permission) !== "read"
+    && parsed.candidates.some(
+      (candidate) => candidate.suggestedScope === "user_global" && candidate.preGateReasons.length === 0,
+    )
+  ) {
+    const judged = await resolveGlobalWriteAuthorization(input.requestText, {
+      judge: input.judgeGlobalAuthorization,
+    });
+    if (judged.authorized === true && judged.source === "llm") {
+      turn.ownerPolicy = { ...turn.ownerPolicy, globalWriteAuthorized: true };
+      try {
+        db.prepare("UPDATE terminal_memory_turn_intents SET owner_policy_json=? WHERE turn_id=?")
+          .run(JSON.stringify(turn.ownerPolicy), turnId);
+      } catch { /* 감사 기록 실패가 이번 완결을 막지는 않는다 */ }
+    }
+  }
+
   const payload = buildCuratorPayload(turn, parsed, input);
   let curatorStatus = "unavailable";
   let semantic = { status: "unavailable", decisions: new Map() };
@@ -1010,7 +1074,8 @@ module.exports = {
   DEFAULT_EVENTS_HEADING,
   CURATOR_SYSTEM_PROMPT,
   ensureGovernanceSchema,
-  ownerPolicyFromPrompt,
+  normalizeOwnerPolicy,
+  resolveGlobalWriteAuthorization,
   projectKey,
   ownerKey,
   contentGateReasons,

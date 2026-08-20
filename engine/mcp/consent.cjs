@@ -36,6 +36,82 @@ const {
 const MCP_CONSENT_STATE_SCHEMA = "agentlas.terminal-mcp-consents.v1";
 const MCP_CONSENT_RECEIPT_SCHEMA = "agentlas.terminal-mcp-consent.v1";
 
+/*
+ * ── 통합 능력 승인(데스크탑 capability_grants)과의 합류 ───────────────────────
+ *
+ * 이 파일의 v1 계약(지문 일치 영수증)은 그대로다. 그 **위에** 공유 능력 규칙이 얹힌다:
+ *   · 규칙이 deny 면 영수증이 있어도 붙이지 않는다(영구 거부는 어디서도 뚫리지 않는다).
+ *   · 규칙이 allow 면 다시 묻지 않는다(데스크탑에서 누른 "항상 허용"이 여기서도 항상).
+ *   · 규칙이 없으면 종전대로 1회 동의 프롬프트가 돈다.
+ * 터미널에서 "항상"을 고르면 같은 표에 써서 데스크탑에도 반영된다.
+ *
+ * MCP 서버를 붙이는 것은 외부 프로세스를 띄우는 일이라 능력 클래스는 execute 다.
+ * 규칙 키는 `tool:mcp:<catalogId>` + 패턴 없음(그 서버 전체) — 데스크탑의 도구 규칙과
+ * 같은 표·같은 판정 함수를 쓴다.
+ */
+const MCP_CAPABILITY_CLASS = "execute";
+
+function mcpCapabilityQuery(catalogId) {
+  return { capability: MCP_CAPABILITY_CLASS, tool: `mcp:${String(catalogId)}`, detail: String(catalogId) };
+}
+
+function capabilityGrantsModule() {
+  return require("../core/capability-grants.cjs");
+}
+
+/**
+ * 계획의 후보들을 공유 능력 규칙으로 미리 가른다.
+ * @returns {{available:string[], preApproved:string[], denied:string[],
+ *            grantsAvailable:boolean, fallbackReason:string|null}}
+ *   grantsAvailable=false 는 표가 없는 구버전 공유 DB — 사유를 담아 돌려주고 기존 동작으로 간다.
+ */
+function partitionMcpConsentByCapabilityGrants(db, catalogIds) {
+  const ids = [...new Set((catalogIds || []).map((id) => String(id)).filter(Boolean))];
+  const grants = capabilityGrantsModule();
+  if (!db || !grants.capabilityGrantsAvailable(db)) {
+    return {
+      available: ids,
+      preApproved: [],
+      denied: [],
+      grantsAvailable: false,
+      fallbackReason: db ? grants.UNAVAILABLE_REASON : null,
+    };
+  }
+  const available = [];
+  const preApproved = [];
+  const denied = [];
+  let fallbackReason = null;
+  for (const id of ids) {
+    let ruling;
+    try {
+      ruling = grants.readCapabilityDecision(db, mcpCapabilityQuery(id));
+    } catch (error) {
+      fallbackReason = `capability_grants read failed: ${(error && error.message) || error}`;
+      available.push(id);
+      continue;
+    }
+    if (!ruling.available) {
+      fallbackReason = fallbackReason || ruling.reason;
+      available.push(id);
+    } else if (ruling.decision === "deny") denied.push(id);
+    else if (ruling.decision === "allow") preApproved.push(id);
+    else available.push(id);
+  }
+  return { available, preApproved, denied, grantsAvailable: true, fallbackReason };
+}
+
+/** 터미널에서 고른 "항상"을 데스크탑과 같은 표에 남긴다. 표가 없으면 정직한 실패. */
+function rememberMcpCapabilityGrant(db, catalogId, decision = "allow") {
+  const grants = capabilityGrantsModule();
+  return grants.recordCapabilityGrant(db, {
+    capability: `tool:mcp:${String(catalogId)}`,
+    pattern: null,
+    decision: decision === "deny" ? "deny" : "allow",
+    scope: "global",
+    source: "terminal-mcp-consent",
+  });
+}
+
 function mcpConsentStatePath(userDataDir) {
   return path.join(userDataDir, "terminal", "mcp-consents-v1.json");
 }
@@ -113,10 +189,16 @@ function readConsentedSystemMcpServers(db, options = {}) {
   let state;
   try { state = loadMcpConsentState(options.userDataDir); }
   catch { return []; }
+  // 영구 거부(deny)는 옛 동의 영수증을 이긴다 — 규칙이 영수증보다 위다.
+  const partition = partitionMcpConsentByCapabilityGrants(
+    db,
+    state.receipts.map((receipt) => receipt.catalogId),
+  );
+  const denied = new Set(partition.denied);
   const servers = [];
   const seen = new Set();
   for (const receipt of state.receipts) {
-    if (seen.has(receipt.catalogId)) continue;
+    if (seen.has(receipt.catalogId) || denied.has(receipt.catalogId)) continue;
     let row = null;
     try {
       row = db.prepare(
@@ -134,26 +216,66 @@ function readConsentedSystemMcpServers(db, options = {}) {
   return servers;
 }
 
-function normalizeConsentAnswer(answer, availableIds) {
+/**
+ * 답 한 줄을 해석한다. `always`/`a` 는 "전부 붙이고 **다시는 묻지 마라**" — 그 선택만
+ * 공유 능력 규칙(capability_grants)에 영구 기록된다. y/n/ids 는 종전 그대로 1회 한정이다.
+ */
+function parseConsentAnswer(answer, availableIds) {
   const text = String(answer || "").trim();
-  if (/^(?:y|yes|all|전체)$/i.test(text)) return [...availableIds];
-  if (!text || /^(?:n|no|none|없이|아니)$/i.test(text)) return [];
-  const requested = parseIdList(text);
+  if (/^(?:a|always|항상)$/i.test(text)) return { ids: [...availableIds], always: true };
+  if (/^(?:y|yes|all|전체)$/i.test(text)) return { ids: [...availableIds], always: false };
+  if (!text || /^(?:n|no|none|없이|아니)$/i.test(text)) return { ids: [], always: false };
+  const requested = parseIdList(text.replace(/^always\s+/i, ""));
   const allowed = new Set(availableIds);
-  return requested.filter((id) => allowed.has(id));
+  return { ids: requested.filter((id) => allowed.has(id)), always: /^always\s+/i.test(text) };
+}
+
+function normalizeConsentAnswer(answer, availableIds) {
+  return parseConsentAnswer(answer, availableIds).ids;
 }
 
 function askMcpConsentOnce(plan, options = {}) {
   const input = options.input || process.stdin;
   const output = options.output || process.stderr;
-  // TTY가 아니면(파이프/자동화) 묻지 않고 빈 승인 — 조용한 전체 승인 금지.
-  if (!input.isTTY || !output.isTTY || !plan.availableCatalogIds.length) return Promise.resolve([]);
+  /*
+   * 공유 능력 규칙을 먼저 본다(오너 결정 2026-08-20):
+   *   deny → 후보에서 제외하고 묻지 않는다.  allow → 묻지 않고 통과.
+   * 남은 후보만 사람에게 묻는다. 규칙이 없으면 목록이 그대로라 종전 동작과 동일하다.
+   */
+  const partition = partitionMcpConsentByCapabilityGrants(options.db, plan.availableCatalogIds || []);
+  const askable = partition.available;
+  const preApproved = partition.preApproved;
+  const notify = typeof options.onNotice === "function" ? options.onNotice : null;
+  if (notify) {
+    if (partition.denied.length) {
+      notify(`MCP blocked by a shared capability rule (Desktop/Terminal): ${partition.denied.join(", ")}`);
+    }
+    if (preApproved.length) {
+      notify(`MCP already allowed always (shared capability rule): ${preApproved.join(", ")}`);
+    }
+    if (partition.fallbackReason) notify(partition.fallbackReason);
+  }
+  // TTY가 아니면(파이프/자동화) 묻지 않는다 — 조용한 전체 승인 금지.
+  // 이미 "항상 허용"된 것만은 사람에게 물을 필요가 없으므로 그대로 통과시킨다.
+  if (!input.isTTY || !output.isTTY || !askable.length) return Promise.resolve([...preApproved]);
   const rl = readline.createInterface({ input, output, terminal: true });
   return new Promise((resolve) => {
-    rl.question("Attach the available MCP recommendations? [y=all / n=none / comma-separated ids] ", (answer) => {
-      rl.close();
-      resolve(normalizeConsentAnswer(answer, plan.availableCatalogIds));
-    });
+    rl.question(
+      "Attach the available MCP recommendations? [y=once / a=always / n=none / comma-separated ids] ",
+      (answer) => {
+        rl.close();
+        const parsed = parseConsentAnswer(answer, askable);
+        if (parsed.always && parsed.ids.length && options.db) {
+          for (const id of parsed.ids) {
+            const written = rememberMcpCapabilityGrant(options.db, id, "allow");
+            if (!written.ok && notify) notify(`"always" was not persisted for ${id}: ${written.reason}`);
+          }
+        } else if (parsed.always && parsed.ids.length && notify) {
+          notify("\"always\" was not persisted: no shared database handle was given to the consent prompt.");
+        }
+        resolve([...new Set([...preApproved, ...parsed.ids])]);
+      },
+    );
   });
 }
 
@@ -284,6 +406,12 @@ module.exports = {
   persistMcpConsentReceipts,
   readConsentedSystemMcpServers,
   normalizeConsentAnswer,
+  parseConsentAnswer,
   askMcpConsentOnce,
   resolveApprovedMcpRuntimeAllowlist,
+  // 공유 능력 승인(데스크탑 capability_grants) 합류 표면.
+  MCP_CAPABILITY_CLASS,
+  mcpCapabilityQuery,
+  partitionMcpConsentByCapabilityGrants,
+  rememberMcpCapabilityGrant,
 };

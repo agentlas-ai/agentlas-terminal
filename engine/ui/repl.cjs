@@ -792,7 +792,9 @@ function handleSlash(ctx, cmdline, api) {
        */
       // help/agents/list/mcp/doctor 등은 위 케이스에서 이미 처리된다.
       // acp: stdout becomes the protocol wire — meaningless (and destructive) inside the REPL.
-      const REPL_EXCLUDED = new Set(["firm", "setup", "run", "acp"]);
+      // `one` 도 자기 readline 루프를 여는 대화형 명령이라 셸 안에서 중첩하지 않는다
+      // (run/firm/setup/acp 와 같은 이유). 셸에서는 `agentlas one` 을 밖에서 연다.
+      const REPL_EXCLUDED = new Set(["firm", "setup", "run", "acp", "one"]);
       if (!REPL_EXCLUDED.has(cmd) && commands.COMMANDS[cmd]) {
         const result = commands.COMMANDS[cmd]().run(ctx, rest);
         if (result && typeof result.then === "function") {

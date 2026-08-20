@@ -258,9 +258,7 @@ function isOntologyPathishCli(token, cwd, allowExistingName) {
   return false;
 }
 
-function findOntologyPathTokenCli(tokens, cwd, text) {
-  const lower = String(text || "").toLowerCase();
-  const addIntent = /(add|register|attach|source|folder|watch|sync|추가|등록|붙|연결|폴더|자료|문서)/i.test(lower);
+function findOntologyPathTokenCli(tokens, cwd, addIntent) {
   const skip = new Set([
     "add", "register", "attach", "source", "sources", "folder", "folders", "watch", "sync", "use",
     "company", "personal", "project", "private", "internal", "public", "work", "business",
@@ -274,25 +272,74 @@ function findOntologyPathTokenCli(tokens, cwd, text) {
   return null;
 }
 
-function parseOntologyNaturalArgsCli(text, cwd) {
+/*
+ * 자연어 → 온톨로지 CLI 액션 (2026-08-20: 전면 판정기 경유로 교체).
+ * 예전에는 액션·kind·scope 전부 ko/en 정규식이 확정했다 — 제3언어는 영구 미도달,
+ * 우연한 단어 일치("register a canon decision")는 오폭. 이제:
+ *   - 액션(status/open/add/help)은 판정기(engine/agentlas-judgment.cjs)가 뜻으로 고른다.
+ *   - add의 kind/scope도 같은 판정기 경유(불가 시 안전 기본값 project/private).
+ *   - 판정 불가면 ["help"] — 단어장 폴백 없음.
+ * 경로 토큰 추출(findOntologyPathTokenCli)은 fs 실존 검사 기반의 구조 증거라 유지한다.
+ */
+const ONTOLOGY_NATURAL_ACTIONS = ["status", "open", "add", "help"];
+const ONTOLOGY_ADD_FACETS = ["company", "personal", "project", "public", "internal", "private", "current-directory"];
+
+async function judgeOntologyNaturalCli(raw, options = {}) {
+  let judgment;
+  try {
+    judgment = options.judgment || require("../agentlas-judgment.cjs");
+  } catch {
+    return { action: null, kind: null, scope: null };
+  }
+  if (!judgment.hasJudgmentRunner()) return { action: null, kind: null, scope: null };
+  const actionVerdict = await judgment.judgeLabels({
+    kind: "terminal-ontology-natural-action",
+    question:
+      "Which single ontology CLI action does this natural-language request ask for? status = show the current ontology state or list registered sources; open = open the ontology inbox folder; add = register a folder, file, or document collection as an ontology source; help = explain usage.",
+    labels: ONTOLOGY_NATURAL_ACTIONS,
+    input: raw,
+    multi: false,
+    guidance:
+      "Judge meaning in any language. Naming a concrete folder/path/material to attach or watch means add. Enabling/starting the ontology means status. When the request is not an ontology action at all, choose help.",
+    signal: options.signal,
+    timeoutMs: options.timeoutMs,
+  });
+  if (actionVerdict.source !== "llm" || actionVerdict.labels.length !== 1) {
+    return { action: null, kind: null, scope: null };
+  }
+  const action = actionVerdict.labels[0];
+  if (action !== "add") return { action, kind: null, scope: null };
+  const facetVerdict = await judgment.judgeLabels({
+    kind: "terminal-ontology-add-facets",
+    question:
+      "For this source-registration request, which facets apply? Material kind: company (work/organization material), personal (private-life material), project (this project's material). Sharing scope: public, internal (team/company shared), private (only this user). Location: current-directory when the request refers to the folder the user is currently in ('this folder', 'here').",
+    labels: ONTOLOGY_ADD_FACETS,
+    input: raw,
+    guidance:
+      "Judge meaning in any language. Pick at most one kind and at most one scope; pick nothing for a facet the request does not state. Pick current-directory only for an explicit reference to the present folder, not for a named path.",
+    signal: options.signal,
+    timeoutMs: options.timeoutMs,
+  });
+  const facets = facetVerdict.source === "llm" ? facetVerdict.labels : [];
+  const kind = ["company", "personal", "project"].find((label) => facets.includes(label)) || null;
+  const scope = ["public", "internal", "private"].find((label) => facets.includes(label)) || null;
+  return { action, kind, scope, currentDirectory: facets.includes("current-directory") };
+}
+
+async function parseOntologyNaturalArgsCli(text, cwd, options = {}) {
   const raw = String(text || "").trim();
   if (!raw) return ["status"];
-  const lower = raw.toLowerCase();
-  if (/^(?:help|\?|도움|사용법)\b/i.test(raw)) return ["help"];
-  if (/(?:^|\s)(?:list|ls|sources?|status|show|상태|목록|리스트)(?:\s|$)/i.test(raw)) return ["list"];
-  if (/(?:^|\s)(?:open|inbox|finder|열어|열기|인박스)(?:\s|$)/i.test(raw)) return ["open"];
+  const judged = await judgeOntologyNaturalCli(raw, options);
+  if (judged.action === null || judged.action === "help") return ["help"];
+  if (judged.action === "status") return ["list"];
+  if (judged.action === "open") return ["open"];
   const tokens = shellSplitCli(raw);
-  const kind = inferOntologyKindCli(null, raw);
-  const scope = inferOntologyScopeCli(null, raw, kind);
-  let source = findOntologyPathTokenCli(tokens, cwd, raw);
-  if (!source && /(?:this folder|current folder|here|이\s*폴더|현재\s*폴더|지금\s*폴더|여기)/i.test(raw)) source = ".";
-  const wantsAdd = Boolean(source) || /(add|register|attach|source|watch|sync|추가|등록|붙|연결)/i.test(lower);
-  if (wantsAdd) {
-    if (!source) return ["add"];
-    return ["add", source, "--kind", kind, "--scope", scope];
-  }
-  if (/(enable|activate|start|turn on|켜|시작|활성)/i.test(lower)) return ["status"];
-  return null;
+  let source = findOntologyPathTokenCli(tokens, cwd, true);
+  if (!source && judged.currentDirectory) source = ".";
+  if (!source) return ["add"];
+  const kind = judged.kind || "project";
+  const scope = judged.scope || "private";
+  return ["add", source, "--kind", kind, "--scope", scope];
 }
 
 function formatOntologyStatusCli(paths, lang) {
@@ -374,7 +421,7 @@ function openLocalPathCli(targetPath, notify) {
   }
 }
 
-function runOntologyCli(args, opts) {
+async function runOntologyCli(args, opts) {
   opts = opts || {};
   const ko = opts.lang === "ko";
   const cwd = path.resolve(opts.cwd || process.cwd());
@@ -397,10 +444,8 @@ function runOntologyCli(args, opts) {
   const directOntologyCommand = ["open", "add", "company", "personal", "project"].includes(String(sub).toLowerCase())
     || isOntologyPathishCli(sub, cwd, true);
   if (!directOntologyCommand) {
-    const parsed = parseOntologyNaturalArgsCli(normalizedArgs.join(" "), cwd);
-    if (!parsed) throw new Error(ko
-      ? "사용법: /ontology status|list|open|add <경로>"
-      : "usage: /ontology status|list|open|add <path>");
+    // 자연어는 판정기 경유로 액션을 정한다. 판정 불가면 ["help"](사용법 안내).
+    const parsed = await parseOntologyNaturalArgsCli(normalizedArgs.join(" "), cwd);
     return runOntologyCli(parsed, opts);
   }
   const paths = ensureOntologyCli(projectPath, opts.lang);
@@ -429,12 +474,9 @@ function runOntologyCli(args, opts) {
     : "usage: /ontology status|list|open|add <path>");
 }
 
-function runOntologyNaturalCli(text, opts) {
+async function runOntologyNaturalCli(text, opts) {
   const cwd = path.resolve((opts && opts.cwd) || process.cwd());
-  const parsed = parseOntologyNaturalArgsCli(text, cwd);
-  if (!parsed) throw new Error((opts && opts.lang) === "ko"
-    ? "사용법: /ontology status|list|open|add <경로>"
-    : "usage: /ontology status|list|open|add <path>");
+  const parsed = await parseOntologyNaturalArgsCli(text, cwd);
   return runOntologyCli(parsed, { ...(opts || {}), cwd });
 }
 
