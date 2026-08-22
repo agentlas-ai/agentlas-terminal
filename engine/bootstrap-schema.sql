@@ -1,4 +1,4 @@
--- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-08-20T00:38:33Z)
+-- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-08-22T21:40:39Z)
 --
 -- ★생성물이다. 손으로 고치지 말고 재생성하라:
 --     node scripts/gen-bootstrap-schema.cjs
@@ -6,7 +6,7 @@
 -- 정본은 Desktop 의 마이그레이션 사다리(agentlas_desktop/electron/store/db.ts, SCHEMA_VERSION).
 -- 이 파일은 그 사다리를 **빈 DB** 에 끝까지 돌린 결과의 덤프이므로, 터미널이 만든 DB 는
 -- 처음부터 사다리 머리에 있다 — 데스크탑이 나중에 승급할 것이 남지 않는다.
-PRAGMA user_version=98;
+PRAGMA user_version=100;
 CREATE TABLE active_runtime (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         kind TEXT NOT NULL
@@ -989,6 +989,59 @@ CREATE TABLE model_roles (
         updated_at TEXT NOT NULL,
         CHECK(role = 'worker' OR inherit = 0)
       );
+CREATE TABLE one_org_completion_cache (
+      installed_agent_id TEXT PRIMARY KEY,
+      run_id TEXT,
+      summary_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+CREATE TABLE one_org_members (
+      id TEXT PRIMARY KEY,
+      agent_slug TEXT NOT NULL,
+      installed_agent_id TEXT NOT NULL,
+      display_name TEXT,
+      icon TEXT NOT NULL DEFAULT 'one-puppy',
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      source TEXT NOT NULL CHECK(source IN ('local','cloud','hub')),
+      lease_expires_at TEXT,
+      added_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      archived_at TEXT,
+      status_kind TEXT NOT NULL DEFAULT 'new',
+      status_line TEXT NOT NULL DEFAULT '아직 맡은 일 없음',
+      last_activity_at TEXT,
+      pending_count INTEGER NOT NULL DEFAULT 0,
+      pending_kind TEXT NOT NULL DEFAULT 'approval' CHECK(pending_kind IN ('approval','review','input')),
+      unread_count INTEGER NOT NULL DEFAULT 0,
+      credit_state TEXT NOT NULL DEFAULT 'unknown' CHECK(credit_state IN ('ok','insufficient','unknown')),
+      auto_select_tools INTEGER NOT NULL DEFAULT 1 CHECK(auto_select_tools IN (0,1)),
+      collaboration_style TEXT NOT NULL DEFAULT 'default' CHECK(collaboration_style IN ('default','concise','warm','direct')),
+      handover_note TEXT,
+      revision INTEGER NOT NULL DEFAULT 1
+    );
+CREATE TABLE one_taskforces (
+      id TEXT PRIMARY KEY,
+      chat_id TEXT NOT NULL UNIQUE,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      member_agent_ids_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      revision INTEGER NOT NULL DEFAULT 1,
+      FOREIGN KEY(chat_id) REFERENCES chats(id) ON DELETE CASCADE
+    );
+CREATE TABLE plugin_builder_sessions (
+        id TEXT PRIMARY KEY,
+        chat_id TEXT NOT NULL,
+        slug TEXT,
+        phase TEXT NOT NULL CHECK(phase IN ('interview','draft','verify','install','prove','discarded')),
+        staging_dir TEXT,
+        answers_json TEXT,
+        gate_report_json TEXT,
+        seed_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
 CREATE TABLE project_agent_rent_allow (
       project_id TEXT NOT NULL,
       slug TEXT NOT NULL,
@@ -1319,6 +1372,16 @@ CREATE INDEX idx_memory_tickets_project_created
         ON memory_tickets(project_id, created_at DESC);
 CREATE INDEX idx_memory_tickets_status_created
         ON memory_tickets(emitter_status, state, created_at DESC);
+CREATE INDEX idx_one_org_members_agent
+      ON one_org_members(installed_agent_id);
+CREATE INDEX idx_one_org_members_order
+      ON one_org_members(archived_at, sort_order, added_at);
+CREATE INDEX idx_one_taskforces_updated
+      ON one_taskforces(updated_at DESC);
+CREATE INDEX idx_plugin_builder_sessions_chat_updated
+        ON plugin_builder_sessions(chat_id, updated_at DESC);
+CREATE INDEX idx_plugin_builder_sessions_slug_phase
+        ON plugin_builder_sessions(slug, phase);
 CREATE INDEX idx_run_events_agent_kind_ts
           ON run_events(agent_id, kind, ts DESC);
 CREATE INDEX idx_run_events_agent_ts ON run_events(agent_id, ts DESC);
