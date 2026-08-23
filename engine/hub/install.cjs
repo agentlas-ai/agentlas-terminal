@@ -27,8 +27,17 @@ const { runWriteTransaction } = require("../agentlas-sqlite-policy.cjs");
 const { callHubTool } = require("../cloud/hub-client.cjs");
 
 // ── 패키지 상한/식별 상수 (서버 package-contract와 동일) ──
-const CLOUD_MAX_TOTAL_BYTES = 3 * 1024 * 1024;
-const CLOUD_MAX_FILE_BYTES = 512 * 1024;
+// 진짜 벽은 네트워크가 아니라 문서다: 서버는 패키지 바이트를 매니페스트 레코드
+// 하나(ScanManifest.cloudPackage.files[].contentBase64) 안에 넣고, 그 레코드는
+// MongoDB 문서 1건이라 BSON 상한 16 MiB가 걸린다. base64로 저장하므로 문서는 이
+// 전송 바이트의 4/3을 담는다 — 10 MiB면 약 13.3 MiB + 매니페스트 자체 필드.
+// 더 올리려면 바이트를 문서 밖으로 빼야 하는데, 오브젝트 스토리지에 세워둔
+// 에이전트는 라우팅할 수 없어 레코드 안에 둔다(오너 결정 2026-08-23).
+// 엔진(agentlas_cloud/upload.py)·데스크탑(cloud-agents/package.ts, restore.ts)·
+// 서버(register, package-integrity.ts)가 같은 수를 손으로 들고 있다. 하나 바꾸면
+// 전부 바꾸고, 서버를 먼저 배포한다.
+const CLOUD_MAX_TOTAL_BYTES = 10 * 1024 * 1024;
+const CLOUD_MAX_FILE_BYTES = 2 * 1024 * 1024;
 const CLOUD_MAX_FILES = 400;
 const CLOUD_PACKAGE_HASH_V1 = "path-sha256-v1";
 const CLOUD_PACKAGE_HASH_V2 = "path-sha256-executable-v2";
