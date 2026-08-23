@@ -1,4 +1,4 @@
--- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-08-22T21:40:39Z)
+-- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-08-23T12:54:11Z)
 --
 -- ★생성물이다. 손으로 고치지 말고 재생성하라:
 --     node scripts/gen-bootstrap-schema.cjs
@@ -6,7 +6,7 @@
 -- 정본은 Desktop 의 마이그레이션 사다리(agentlas_desktop/electron/store/db.ts, SCHEMA_VERSION).
 -- 이 파일은 그 사다리를 **빈 DB** 에 끝까지 돌린 결과의 덤프이므로, 터미널이 만든 DB 는
 -- 처음부터 사다리 머리에 있다 — 데스크탑이 나중에 승급할 것이 남지 않는다.
-PRAGMA user_version=100;
+PRAGMA user_version=102;
 CREATE TABLE active_runtime (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         kind TEXT NOT NULL
@@ -522,16 +522,18 @@ CREATE TABLE chat_runtime_sessions (
         PRIMARY KEY (chat_id, kind),
         FOREIGN KEY(chat_id) REFERENCES chats(id) ON DELETE CASCADE
       );
-CREATE TABLE chats (
-        id TEXT PRIMARY KEY,
-        project_id TEXT,
-        agent_id TEXT NOT NULL,
-        title TEXT NOT NULL DEFAULT 'New chat',
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL, firm_id TEXT REFERENCES firms(id) ON DELETE SET NULL, archived_at TEXT, working_folder TEXT, kind TEXT NOT NULL DEFAULT 'user', parent_chat_id TEXT, used_at TEXT, continuous_mode INTEGER NOT NULL DEFAULT 0, swarm_mode INTEGER NOT NULL DEFAULT 0, last_viewed_at TEXT, hired_agents TEXT, origin_surface TEXT NOT NULL DEFAULT 'work', runtime_selection_json TEXT, goal_id TEXT,
-        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL,
-        FOREIGN KEY(agent_id) REFERENCES installed_agents(id) ON DELETE CASCADE
-      );
+CREATE TABLE "chats" (
+            id TEXT PRIMARY KEY,
+            project_id TEXT,
+            seat_id TEXT,
+            agent_id TEXT,
+            title TEXT NOT NULL DEFAULT 'New chat',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL,
+            FOREIGN KEY(seat_id) REFERENCES one_seats(id) ON DELETE CASCADE,
+            FOREIGN KEY(agent_id) REFERENCES installed_agents(id) ON DELETE SET NULL
+          );
 CREATE TABLE experience_auto_intake_receipts (
         id TEXT PRIMARY KEY,
         agent_id TEXT NOT NULL,
@@ -989,6 +991,27 @@ CREATE TABLE model_roles (
         updated_at TEXT NOT NULL,
         CHECK(role = 'worker' OR inherit = 0)
       );
+CREATE TABLE one_artifact_bindings (
+      id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      task_version INTEGER NOT NULL,
+      bound_task_version INTEGER NOT NULL,
+      chat_id TEXT NOT NULL,
+      run_id TEXT NOT NULL,
+      manifest_id TEXT NOT NULL,
+      artifact_ref TEXT NOT NULL,
+      source_path TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      mime_type TEXT NOT NULL,
+      size_bytes INTEGER NOT NULL,
+      file_dev TEXT NOT NULL,
+      file_ino TEXT NOT NULL,
+      file_mtime_ns TEXT NOT NULL,
+      file_ctime_ns TEXT NOT NULL,
+      sha256 TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(task_id, chat_id, run_id, manifest_id, artifact_ref)
+    );
 CREATE TABLE one_org_completion_cache (
       installed_agent_id TEXT PRIMARY KEY,
       run_id TEXT,
@@ -1008,7 +1031,9 @@ CREATE TABLE one_org_members (
       updated_at TEXT NOT NULL,
       archived_at TEXT,
       status_kind TEXT NOT NULL DEFAULT 'new',
-      status_line TEXT NOT NULL DEFAULT '아직 맡은 일 없음',
+      -- PRD §4.33 — 스키마에 사람이 읽는 문구(그것도 한 언어)를 박지 않는다.
+      -- 빈 값이면 투영이 로케일 표에서 "아직 맡은 일 없음 / No work assigned yet"을 만든다.
+      status_line TEXT NOT NULL DEFAULT '',
       last_activity_at TEXT,
       pending_count INTEGER NOT NULL DEFAULT 0,
       pending_kind TEXT NOT NULL DEFAULT 'approval' CHECK(pending_kind IN ('approval','review','input')),
@@ -1019,6 +1044,24 @@ CREATE TABLE one_org_members (
       handover_note TEXT,
       revision INTEGER NOT NULL DEFAULT 1
     );
+CREATE TABLE one_seat_occupants (
+        seat_id      TEXT NOT NULL REFERENCES one_seats(id) ON DELETE CASCADE,
+        slot         INTEGER NOT NULL DEFAULT 0,
+        agent_id     TEXT,
+        display_name TEXT NOT NULL DEFAULT '',
+        since        TEXT NOT NULL,
+        until        TEXT,
+        PRIMARY KEY (seat_id, slot, since)
+      );
+CREATE TABLE one_seats (
+        id          TEXT PRIMARY KEY,
+        kind        TEXT NOT NULL CHECK(kind IN ('solo','group')),
+        title       TEXT NOT NULL DEFAULT '',
+        project_id  TEXT REFERENCES projects(id) ON DELETE SET NULL,
+        created_at  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL,
+        archived_at TEXT
+      );
 CREATE TABLE one_taskforces (
       id TEXT PRIMARY KEY,
       chat_id TEXT NOT NULL UNIQUE,
@@ -1276,13 +1319,9 @@ CREATE INDEX idx_chat_message_attachments_message
       ON chat_message_attachments(message_id, created_at, id);
 CREATE INDEX idx_chat_messages_chat_created
         ON chat_messages(chat_id, created_at);
-CREATE INDEX idx_chats_archived_updated ON chats(archived_at, updated_at DESC);
-CREATE INDEX idx_chats_firm_updated ON chats(firm_id, updated_at DESC);
-CREATE INDEX idx_chats_parent ON chats(parent_chat_id);
-CREATE INDEX idx_chats_project_updated
-        ON chats(project_id, updated_at DESC);
+CREATE INDEX idx_chats_project_updated ON chats(project_id, updated_at DESC);
+CREATE INDEX idx_chats_seat_updated ON chats(seat_id, updated_at DESC);
 CREATE INDEX idx_chats_updated ON chats(updated_at DESC);
-CREATE INDEX idx_chats_used_updated ON chats(used_at, updated_at DESC);
 CREATE INDEX idx_experience_auto_intake_agent_status
         ON experience_auto_intake_receipts(agent_id, status, created_at DESC);
 CREATE INDEX idx_experience_auto_intake_run
@@ -1372,10 +1411,15 @@ CREATE INDEX idx_memory_tickets_project_created
         ON memory_tickets(project_id, created_at DESC);
 CREATE INDEX idx_memory_tickets_status_created
         ON memory_tickets(emitter_status, state, created_at DESC);
+CREATE INDEX idx_one_artifact_binding_chat
+      ON one_artifact_bindings(chat_id, created_at);
+CREATE INDEX idx_one_artifact_binding_exact
+      ON one_artifact_bindings(task_id, chat_id, run_id, manifest_id, artifact_ref);
 CREATE INDEX idx_one_org_members_agent
       ON one_org_members(installed_agent_id);
 CREATE INDEX idx_one_org_members_order
       ON one_org_members(archived_at, sort_order, added_at);
+CREATE INDEX idx_one_seats_updated ON one_seats(updated_at DESC);
 CREATE INDEX idx_one_taskforces_updated
       ON one_taskforces(updated_at DESC);
 CREATE INDEX idx_plugin_builder_sessions_chat_updated
@@ -1394,6 +1438,10 @@ CREATE INDEX idx_run_events_run_seq
 CREATE INDEX idx_run_events_ts
         ON run_events(ts DESC);
 CREATE INDEX idx_run_history_automation ON run_history(automation_id);
+CREATE INDEX idx_seat_occupants_agent
+        ON one_seat_occupants(agent_id) WHERE agent_id IS NOT NULL;
+CREATE UNIQUE INDEX idx_seat_occupants_current
+        ON one_seat_occupants(seat_id, slot) WHERE until IS NULL;
 CREATE INDEX idx_task_participants_agent ON task_agent_participants(agent_id);
 CREATE INDEX idx_tasks_firm_updated ON tasks(firm_id, updated_at DESC);
 CREATE INDEX idx_tasks_origin_chat ON tasks(origin_chat_id);
@@ -1411,7 +1459,8 @@ CREATE INDEX idx_telegram_bindings_chat
         ON telegram_bindings(telegram_chat_id);
 CREATE INDEX idx_telegram_bindings_enabled
         ON telegram_bindings(enabled, status);
-CREATE UNIQUE INDEX idx_telegram_bindings_one_singleton
-        ON telegram_bindings(target_kind) WHERE target_kind = 'one';
+CREATE UNIQUE INDEX idx_telegram_bindings_one_room
+        ON telegram_bindings(telegram_chat_id)
+        WHERE target_kind = 'one' AND telegram_chat_id IS NOT NULL;
 CREATE INDEX idx_telegram_bindings_target
         ON telegram_bindings(target_kind, target_id);
