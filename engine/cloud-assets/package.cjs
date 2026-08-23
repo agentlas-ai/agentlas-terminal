@@ -368,6 +368,34 @@ function cloudPortableExecutableForFile(relativePath, statMode, restoredExecutab
   return Boolean(statMode & 0o111);
 }
 
+// 잘라내기는 에이전트의 능력을 대가로 하면 안 된다 (오너 결정 2026-08-18).
+//
+// 한도에 닿으면 폴더에서 나오는 순서대로 잘렸다. 그 순서엔 의미가 없어서,
+// 벤치마크 파일이 살고 skills/ 가 통째로 빠지는 일이 실제로 일어난다(데스크탑에서
+// 실측: 벤치마크 13개 실림, skills 3개 전멸). 순위 0은 에이전트 자신이므로 절대
+// 버리지 않고, 자리가 없으면 이미 넣은 낮은 순위 중 가장 큰 것을 대신 빼서 만든다.
+// 뺀 파일은 전부 영수증(trimmed-for-package-limits)을 남긴다.
+// 엔진(agentlas_cloud/upload.py)·데스크탑(cloud-agents/package.ts)의 rankOf와 같은 축.
+const CLOUD_CAPABILITY_DIR_RE = /(^|\/)(knowledge|skills?|prompts?|presets?|agents|workers|contracts|shotplans|playbooks|templates)\//;
+const CLOUD_BUILD_OUTPUT_RE = /(^|\/)(node_modules|dist|build|out|coverage|\.next|\.venv|__pycache__|\.git)\//;
+const CLOUD_MEDIA_RE = /\.(png|jpe?g|gif|webp|svg|mp4|mov|mp3|wav|pdf|zip|tar|gz|tgz|bin|so|dylib|dll|wasm|sqlite|db)$/;
+const CLOUD_SIDE_MATERIAL_RE = /(^|\/)(tests?|__tests__|fixtures?|benchmarks?|logs?|examples?)\//;
+const CLOUD_BULK_DATA_RE = /\.(log|jsonl|csv|tsv|lock)$/;
+
+function cloudTrimRank(rel, bytes) {
+  const lower = String(rel || "").toLowerCase();
+  const base = lower.split("/").pop() || lower;
+  if (CLOUD_AGENT_FILES.has(base)) return 0;
+  if (lower.startsWith(".agentlas/")) return 0;
+  if (base === "agentlas.json" || base === "manifest.json" || base === "package.json") return 0;
+  if (CLOUD_CAPABILITY_DIR_RE.test(lower)) return 0;
+  if (CLOUD_BUILD_OUTPUT_RE.test(lower)) return 1;
+  if (CLOUD_MEDIA_RE.test(lower)) return 2;
+  if (CLOUD_SIDE_MATERIAL_RE.test(lower)) return 3;
+  if (CLOUD_BULK_DATA_RE.test(lower)) return 4;
+  return bytes > 64 * 1024 ? 5 : 6;
+}
+
 // ── 폴더 스캔 (TOCTOU-안전) ──
 
 function scanCloudFolder(rootPath) {
@@ -391,6 +419,37 @@ function scanCloudFolder(rootPath) {
       sourceSha256: String(source?.sha256 || sha(`unavailable:${relativePath}:${reason}`)).toLowerCase(),
       sourceHashKind: source?.hashKind || "unavailable-observation",
     });
+  }
+  /** 순위 0 파일이 들어갈 자리를, 이미 넣은 낮은 순위 중 큰 것부터 빼서 만든다.
+   *  뺀 바이트 수를 돌려준다(0이면 뺄 것이 없었다는 뜻). */
+  function evictLowestRankToFit(rel, needBytes) {
+    if (cloudTrimRank(rel, needBytes) !== 0) return 0;
+    let freed = 0;
+    while (totalBytes - freed + needBytes > CLOUD_MAX_TOTAL_BYTES) {
+      let victimIndex = -1;
+      let victimRank = 0;
+      let victimBytes = -1;
+      for (let index = 0; index < included.length; index += 1) {
+        const candidate = included[index];
+        const rank = cloudTrimRank(candidate.path, candidate.bytes);
+        if (rank === 0) continue;
+        if (rank > victimRank || (rank === victimRank && candidate.bytes > victimBytes)) {
+          victimIndex = index;
+          victimRank = rank;
+          victimBytes = candidate.bytes;
+        }
+      }
+      if (victimIndex < 0) return freed;
+      const victim = included.splice(victimIndex, 1)[0];
+      freed += victim.bytes;
+      addOmission(victim.path, "trimmed-for-package-limits", { bytes: victim.bytes, sha256: victim.sha256, hashKind: "content" });
+      const record = files.find((item) => item.path === victim.path && item.included);
+      if (record) {
+        record.included = false;
+        record.reason = "trimmed-for-package-limits";
+      }
+    }
+    return freed;
   }
   function insideRoot(candidate) {
     const relative = path.relative(rootPath, candidate);
@@ -598,6 +657,10 @@ function scanCloudFolder(rootPath) {
           files.push({ path: rel, bytes: content.length, sha256: digest, kind: "text", executable, included: false, reason: "remote-shell-pattern-redacted" });
           continue;
         }
+      }
+      if (totalBytes + content.length > CLOUD_MAX_TOTAL_BYTES) {
+        // 순위 0(에이전트 정의·카드·skills·knowledge …)이면 자리를 만든다.
+        totalBytes -= evictLowestRankToFit(rel, content.length);
       }
       if (totalBytes + content.length > CLOUD_MAX_TOTAL_BYTES) {
         addFinding("package-size-limit", "blocker", "size", `Including this file would exceed ${CLOUD_MAX_TOTAL_BYTES} package bytes.`, rel, "Publish a smaller agent folder.");

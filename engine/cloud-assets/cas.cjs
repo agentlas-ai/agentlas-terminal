@@ -154,11 +154,21 @@ async function registerCloudAgent(manifest, bundlePath, review, visibility, opti
     etag,
     updatedAt: json.savedAt || json.registeredAt,
   }, "registration receipt");
+  // 서버가 자기 스캔으로 뺀 파일은 사용자에게 보여야 한다. 영수증 안에만 있으면
+  // "내 파일이 안 올라갔다"는 사실을 아무도 읽지 않는다.
+  const serverWithheld = (() => {
+    const receipt = json && typeof json === "object" ? json.uploadReceipt : null;
+    const omissions = receipt && Array.isArray(receipt.omissions) ? receipt.omissions : [];
+    return omissions
+      .map((entry) => (entry && typeof entry.path === "string" ? entry.path : ""))
+      .filter(Boolean);
+  })();
   return {
     ...descriptor,
     operation: json.operation,
     ...(typeof json.url === "string" ? { url: json.url } : {}),
     ...(typeof json.marketplaceUrl === "string" ? { marketplaceUrl: json.marketplaceUrl } : {}),
+    ...(serverWithheld.length ? { serverWithheld } : {}),
     registeredAt: json.registeredAt,
     dryRun: false,
   };
