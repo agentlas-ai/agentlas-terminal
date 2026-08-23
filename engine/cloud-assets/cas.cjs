@@ -68,6 +68,22 @@ function cloudCasResponseError(response, label) {
 }
 
 /** 등록(생성/갱신). 성공 시 검증된 리비전 디스크립터(+operation/url)를 반환한다. */
+// 서버는 받은 것보다 적게 저장할 수 있고, 그건 증명 실패가 아니다.
+//
+// 등록은 제출 해시를 검증한 뒤, 자체 스캔이 자격증명으로 판정한 파일을 빼고
+// 나머지를 새 해시로 저장한다(uploadReceipt.omissions가 뺀 경로를 전부 적는다).
+// 저장 해시만 대조하면, 이미 허브에 게시가 끝난 뒤에 "잘못된 등록 영수증"으로
+// 실패하게 된다 — 에이전트는 검색·호출되는데 올린 사람은 실패로 듣는다.
+// 증명의 목적은 "서버가 바로 이 패키지를 봤다"이고 submittedPackageHash가 그
+// 증거이므로, 둘 중 하나가 우리 해시와 같으면 통과시킨다. 둘 다 아니면 그대로 실패.
+function registrationSawOurPackage(json, manifest) {
+  const ours = String(manifest.packageHash || "").toLowerCase();
+  if (String(json.packageHash || "").toLowerCase() === ours) return true;
+  const receipt = json && typeof json === "object" ? json.uploadReceipt : null;
+  if (!receipt || typeof receipt !== "object") return false;
+  return String(receipt.submittedPackageHash || "").toLowerCase() === ours;
+}
+
 async function registerCloudAgent(manifest, bundlePath, review, visibility, options = {}) {
   const cookie = await cloudSessionCookie();
   if (!cookie) throw new Error("Agent Cloud sign-in is required. Sign in through Desktop or set AGENTLAS_SESSION.");
@@ -119,7 +135,7 @@ async function registerCloudAgent(manifest, bundlePath, review, visibility, opti
     json.dryRun !== false ||
     typeof json.cloudId !== "string" || !json.cloudId.trim() ||
     json.slug !== manifest.slug ||
-    json.packageHash !== manifest.packageHash ||
+    !registrationSawOurPackage(json, manifest) ||
     json.packageHashVersion !== manifest.packageHashVersion ||
     typeof json.revision !== "string" || etag !== cloudRevisionEtag(json.revision) ||
     typeof json.registeredAt !== "string" || !Number.isFinite(Date.parse(json.registeredAt)) ||
