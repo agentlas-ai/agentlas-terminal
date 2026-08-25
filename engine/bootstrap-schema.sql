@@ -1,4 +1,4 @@
--- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-08-23T12:54:11Z)
+-- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-08-25T08:38:50Z)
 --
 -- ★생성물이다. 손으로 고치지 말고 재생성하라:
 --     node scripts/gen-bootstrap-schema.cjs
@@ -6,7 +6,7 @@
 -- 정본은 Desktop 의 마이그레이션 사다리(agentlas_desktop/electron/store/db.ts, SCHEMA_VERSION).
 -- 이 파일은 그 사다리를 **빈 DB** 에 끝까지 돌린 결과의 덤프이므로, 터미널이 만든 DB 는
 -- 처음부터 사다리 머리에 있다 — 데스크탑이 나중에 승급할 것이 남지 않는다.
-PRAGMA user_version=102;
+PRAGMA user_version=103;
 CREATE TABLE active_runtime (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         kind TEXT NOT NULL
@@ -513,23 +513,40 @@ CREATE TABLE chat_messages (
         created_at TEXT NOT NULL,
         FOREIGN KEY(chat_id) REFERENCES chats(id) ON DELETE CASCADE
       );
-CREATE TABLE chat_runtime_sessions (
-        chat_id TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        fingerprint TEXT NOT NULL,
-        updated_at TEXT NOT NULL, reported_output_tokens INTEGER, reported_input_tokens INTEGER, reported_cached_input_tokens INTEGER,
-        PRIMARY KEY (chat_id, kind),
-        FOREIGN KEY(chat_id) REFERENCES chats(id) ON DELETE CASCADE
-      );
+CREATE TABLE "chat_runtime_sessions" (
+                chat_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                agent_id TEXT NOT NULL DEFAULT '',
+                session_id TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                reported_output_tokens INTEGER,
+                reported_input_tokens INTEGER,
+                reported_cached_input_tokens INTEGER,
+                PRIMARY KEY (chat_id, kind, agent_id),
+                FOREIGN KEY(chat_id) REFERENCES chats(id) ON DELETE CASCADE
+              );
 CREATE TABLE "chats" (
             id TEXT PRIMARY KEY,
             project_id TEXT,
-            seat_id TEXT,
-            agent_id TEXT,
             title TEXT NOT NULL DEFAULT 'New chat',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
+            firm_id TEXT,
+            archived_at TEXT,
+            working_folder TEXT,
+            kind TEXT NOT NULL DEFAULT 'user',
+            parent_chat_id TEXT,
+            used_at TEXT,
+            continuous_mode INTEGER NOT NULL DEFAULT 0,
+            swarm_mode INTEGER NOT NULL DEFAULT 0,
+            last_viewed_at TEXT,
+            hired_agents TEXT,
+            origin_surface TEXT NOT NULL DEFAULT 'work',
+            runtime_selection_json TEXT,
+            goal_id TEXT,
+            seat_id TEXT,
+            agent_id TEXT, seat_label TEXT, seat_kind TEXT, participants_json TEXT,
             FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL,
             FOREIGN KEY(seat_id) REFERENCES one_seats(id) ON DELETE CASCADE,
             FOREIGN KEY(agent_id) REFERENCES installed_agents(id) ON DELETE SET NULL
@@ -1061,7 +1078,7 @@ CREATE TABLE one_seats (
         created_at  TEXT NOT NULL,
         updated_at  TEXT NOT NULL,
         archived_at TEXT
-      );
+      , dissolved_at TEXT);
 CREATE TABLE one_taskforces (
       id TEXT PRIMARY KEY,
       chat_id TEXT NOT NULL UNIQUE,
@@ -1229,7 +1246,7 @@ CREATE TABLE "telegram_bindings" (
         designated_project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
         designated_graph_id TEXT,
         legacy_notice_at TEXT
-      );
+      , seat_id TEXT);
 CREATE INDEX idx_agent_app_ops_app_created
         ON agent_app_operations(app_id, created_at DESC);
 CREATE INDEX idx_agent_apps_chat_updated
@@ -1319,9 +1336,14 @@ CREATE INDEX idx_chat_message_attachments_message
       ON chat_message_attachments(message_id, created_at, id);
 CREATE INDEX idx_chat_messages_chat_created
         ON chat_messages(chat_id, created_at);
-CREATE INDEX idx_chats_project_updated ON chats(project_id, updated_at DESC);
+CREATE INDEX idx_chats_archived_updated ON chats(archived_at, updated_at DESC);
+CREATE INDEX idx_chats_firm_updated ON chats(firm_id, updated_at DESC);
+CREATE INDEX idx_chats_parent ON chats(parent_chat_id);
+CREATE INDEX idx_chats_project_updated
+        ON chats(project_id, updated_at DESC);
 CREATE INDEX idx_chats_seat_updated ON chats(seat_id, updated_at DESC);
 CREATE INDEX idx_chats_updated ON chats(updated_at DESC);
+CREATE INDEX idx_chats_used_updated ON chats(used_at, updated_at DESC);
 CREATE INDEX idx_experience_auto_intake_agent_status
         ON experience_auto_intake_receipts(agent_id, status, created_at DESC);
 CREATE INDEX idx_experience_auto_intake_run
@@ -1411,6 +1433,7 @@ CREATE INDEX idx_memory_tickets_project_created
         ON memory_tickets(project_id, created_at DESC);
 CREATE INDEX idx_memory_tickets_status_created
         ON memory_tickets(emitter_status, state, created_at DESC);
+CREATE INDEX idx_occupants_seat_time ON one_seat_occupants(seat_id, since);
 CREATE INDEX idx_one_artifact_binding_chat
       ON one_artifact_bindings(chat_id, created_at);
 CREATE INDEX idx_one_artifact_binding_exact
