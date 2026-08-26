@@ -76,7 +76,7 @@ class Session extends EventEmitter {
     this.fingerprint = crypto.createHash("sha256")
       .update(`${this.runtime.kind}\n${this.agent.id}\n${this.agent.systemPrompt || ""}`)
       .digest("hex");
-    this.runtimeSession = store.loadRuntimeSession(this.db, this.chatId, this.runtime.kind, this.fingerprint);
+    this.runtimeSession = store.loadRuntimeSession(this.db, this.chatId, this.runtime.kind, this.fingerprint, this.agent.id);
 
     this._sink = new EventSink({
       lang: this.lang,
@@ -378,7 +378,7 @@ class Session extends EventEmitter {
     if (persistText) store.appendMessage(this.db, this.chatId, "assistant", persistText);
     if (res && res.session && res.session.id) {
       this.runtimeSession = { id: res.session.id };
-      store.saveRuntimeSession(this.db, this.chatId, this.runtime.kind, this.runtimeSession, this.fingerprint);
+      store.saveRuntimeSession(this.db, this.chatId, this.runtime.kind, this.runtimeSession, this.fingerprint, this.agent.id);
     }
     if (res && res.usage) this.usage = res.usage;
 
