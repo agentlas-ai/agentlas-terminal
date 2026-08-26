@@ -1,4 +1,4 @@
--- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-08-25T08:38:50Z)
+-- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-08-26T06:15:58Z)
 --
 -- ★생성물이다. 손으로 고치지 말고 재생성하라:
 --     node scripts/gen-bootstrap-schema.cjs
@@ -6,7 +6,7 @@
 -- 정본은 Desktop 의 마이그레이션 사다리(agentlas_desktop/electron/store/db.ts, SCHEMA_VERSION).
 -- 이 파일은 그 사다리를 **빈 DB** 에 끝까지 돌린 결과의 덤프이므로, 터미널이 만든 DB 는
 -- 처음부터 사다리 머리에 있다 — 데스크탑이 나중에 승급할 것이 남지 않는다.
-PRAGMA user_version=103;
+PRAGMA user_version=104;
 CREATE TABLE active_runtime (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         kind TEXT NOT NULL
@@ -97,6 +97,16 @@ CREATE TABLE agent_evolution_receipts (
         FOREIGN KEY(proposal_id) REFERENCES agent_evolution_proposals(id) ON DELETE CASCADE,
         FOREIGN KEY(agent_id) REFERENCES installed_agents(id) ON DELETE CASCADE,
         UNIQUE(proposal_id, action)
+      );
+CREATE TABLE agent_identity_map (
+        local_id       TEXT PRIMARY KEY REFERENCES installed_agents(id) ON DELETE RESTRICT,
+        agent_id       TEXT NOT NULL,
+        agent_version  INTEGER NOT NULL DEFAULT 1,
+        -- package: 패키지 agentlas.json 에서 읽음 (정본)
+        -- builtin-reserved: 앱에 구워진 에이전트 — 패키지가 없어 예약 네임스페이스를 쓴다
+        -- minted-local: 출처가 없어 이 기기에서 발급 (다음에 패키지를 받으면 package 가 이긴다)
+        mapping_source TEXT NOT NULL,
+        bound_at       TEXT NOT NULL
       );
 CREATE TABLE agent_mcp_servers (
         agent_id TEXT NOT NULL,
@@ -1265,6 +1275,8 @@ CREATE INDEX idx_agent_evolution_receipts_agent
         ON agent_evolution_receipts(agent_id, created_at DESC);
 CREATE INDEX idx_agent_evolution_receipts_proposal
         ON agent_evolution_receipts(proposal_id, created_at ASC);
+CREATE INDEX idx_agent_identity_map_agent ON agent_identity_map(agent_id);
+CREATE INDEX idx_agent_identity_map_source ON agent_identity_map(mapping_source);
 CREATE INDEX idx_agent_mcp_agent ON agent_mcp_servers(agent_id);
 CREATE INDEX idx_agent_runtime_overrides_updated
         ON agent_runtime_overrides(updated_at DESC);
