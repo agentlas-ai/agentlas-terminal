@@ -9,6 +9,26 @@ const { findAgent } = require("../agents/registry.cjs");
 const { routesMap, saveRoutes } = require("../agents/routes.cjs");
 const { runWriteTransaction } = require("../agentlas-sqlite-policy.cjs");
 
+/**
+ * 이 DB 에서 에이전트를 지우면 그 대화도 함께 사라지는가.
+ *
+ * `chats.agent_id` 의 삭제 동작이 답이다. 좌석-세션 이전 스키마는 `CASCADE`(대화도 삭제),
+ * 이후는 `SET NULL`(자리만 비고 대화는 보존). 이 CLI 는 데스크탑과 같은 파일을 쓰고 그
+ * 파일의 사다리 위치는 기기마다 다르므로, 스키마 번호나 코드가 쓰인 시점이 아니라
+ * **열려 있는 파일**에 물어야 한다.
+ */
+function chatDeletionCascadesFromAgent(db) {
+  try {
+    const rows = db.prepare("SELECT \"table\" AS parent, \"from\" AS child, \"on_delete\" AS onDelete FROM pragma_foreign_key_list('chats')").all();
+    const link = rows.find((row) => row.child === "agent_id" && row.parent === "installed_agents");
+    // 관계가 없으면 지워도 대화가 따라가지 않는다 — 파괴를 예고하지 않는다.
+    return String(link && link.onDelete || "").toUpperCase() === "CASCADE";
+  } catch {
+    // 물어볼 수 없으면 보수적으로 파괴한다고 본다 — 동의를 한 번 더 묻는 쪽이 안전하다.
+    return true;
+  }
+}
+
 function run(ctx, args) {
   const ko = ctx.lang === "ko";
   // 동의 플래그를 슬러그보다 앞에 써도 되도록 첫 번째 비플래그 인자를 대상으로 본다.
@@ -47,17 +67,24 @@ function run(ctx, args) {
   }
 
   /*
-   * 대화 파괴 게이트 — bootstrap-schema.sql:50 chats.agent_id 는
-   * `ON DELETE CASCADE`, :61 chat_messages.chat_id 도 CASCADE 다. 즉
-   * installed_agents 행 하나를 지우면 그 에이전트의 모든 챗과 메시지가 같이
-   * 사라진다(데스크탑과 공유하는 SQLite라 데스크탑 쪽 이력도 함께 증발한다).
-   * 그런데 이 명령은 그 사실을 한 줄도 알리지 않고 `✓ 제거됨`만 찍었다 —
-   * 되돌릴 수 없는 삭제가 무고지·무확인으로 일어나던 자리다.
-   * 그래서 지우기 "전에" 파급 건수를 세고, 대화가 있으면 명시적 동의
-   * (--yes/-y/--force) 없이는 아무것도 지우지 않는다. 대화가 0건이면
-   * 파괴할 이력이 없으므로 종전대로 그냥 진행한다(불필요한 마찰 금지).
+   * 대화 파괴 게이트 — **파괴가 실제로 일어나는 스키마에서만.**
+   *
+   * 예전에는 `chats.agent_id` 가 `ON DELETE CASCADE` 였다. 그래서 에이전트 한 행을 지우면
+   * 그 대화와 메시지가 함께 사라졌고, 이 명령은 그 사실을 한 줄도 알리지 않고 `✓ 제거됨`만
+   * 찍었다 — 되돌릴 수 없는 삭제가 무고지로 일어나던 자리였고, 그래서 이 게이트가 생겼다.
+   *
+   * 좌석-세션 이후 그 제약은 `ON DELETE SET NULL` 로 내려갔다. 에이전트를 지우는 것은
+   * 이제 **자리를 비우는 일**이고 대화는 그대로 남는다(오너 정본: 봇 삭제 = 자리 비우기).
+   * 그런데 이 명령은 계속 "영구 삭제합니다" 라고 경고하고 "삭제됨" 이라고 보고했다 —
+   * 지켜지지 않는 약속의 반대, 즉 **일어나지 않은 파괴를 보고하는 거짓말**이다. 사용자는
+   * 남아 있는 이력을 잃었다고 믿고, 잃지 않아도 될 동의를 강요받는다.
+   *
+   * 그래서 문구를 새 스키마에 맞춰 바꿔 쓰지 않는다. 이 CLI 는 데스크탑과 **같은 파일**을
+   * 쓰고 그 파일의 스키마는 기기마다 다르다 — 아직 옛 사다리에 있는 기기에서는 파괴가
+   * 여전히 사실이다. 판단은 열려 있는 DB 의 외래키에서 읽는다.
    */
   const consented = args.some((a) => a === "--yes" || a === "-y" || a === "--force");
+  const cascades = ctx.tableExists(db, "chats") && chatDeletionCascadesFromAgent(db);
   let chatCount = 0;
   let messageCount = 0;
   if (ctx.tableExists(db, "chats")) {
@@ -68,7 +95,7 @@ function run(ctx, args) {
       ).get(agent.id).n;
     }
   }
-  if (chatCount && !consented) {
+  if (chatCount && cascades && !consented) {
     ctx.err(ko
       ? `"${agent.slug}" 제거는 대화 ${chatCount}개와 메시지 ${messageCount}개를 함께 영구 삭제합니다 (데스크탑 앱과 공유하는 DB이며 되돌릴 수 없습니다).\n계속하려면: agentlas uninstall ${agent.slug} --yes`
       : `Uninstalling "${agent.slug}" will also permanently delete ${chatCount} chat(s) and ${messageCount} message(s) (shared with the Desktop app; this cannot be undone).\nRe-run to confirm: agentlas uninstall ${agent.slug} --yes`);
@@ -89,9 +116,12 @@ function run(ctx, args) {
       }
     } catch { /* 라우트 정리는 best-effort */ }
     // 실제로 무엇이 사라졌는지 성공 줄에 남긴다 — 조용한 파괴 금지.
-    const cascade = chatCount
-      ? (ko ? ` (대화 ${chatCount}개 · 메시지 ${messageCount}개 삭제됨)` : ` (deleted ${chatCount} chat(s), ${messageCount} message(s))`)
-      : "";
+    // 실제로 무엇이 일어났는지만 적는다 — 지웠으면 지웠다고, 남겼으면 남겼다고.
+    const cascade = !chatCount
+      ? ""
+      : cascades
+        ? (ko ? ` (대화 ${chatCount}개 · 메시지 ${messageCount}개 삭제됨)` : ` (deleted ${chatCount} chat(s), ${messageCount} message(s))`)
+        : (ko ? ` (대화 ${chatCount}개 · 메시지 ${messageCount}개는 그대로 남습니다 — 자리만 비었습니다)` : ` (kept ${chatCount} chat(s) and ${messageCount} message(s) — the seat is now empty)`);
     ctx.out(`${ctx.ui.green("✓")} ${ko ? "제거됨" : "Uninstalled"}: ${agent.slug}${cascade}`);
     return 0;
   }
