@@ -149,6 +149,29 @@ function expandExternalDeps(pkgNames, nodeModulesRoot) {
 
 function main() {
   if (!fs.existsSync(ROOT_ENTRY)) {
+    /*
+     * ★데스크탑 소스가 아예 없는 곳에서는 할 일이 없다 — 실패가 아니다.
+     *
+     * `prepublishOnly` 가 이것을 부른다. 그 자리에서 무조건 실패하게 두었더니 CI 발행이
+     * 통째로 막혔다(실측: 1.0.61 npm 게시 실패). 러너에는 데스크탑 저장소가 체크아웃되지
+     * 않으니 당연히 없고, 애초에 **필요하지도 않다** — 무거운 tar.gz 는 패키지에 안 실리고,
+     * CLI 는 커밋된 매니페스트를 보고 실행 시점에 내려받는다. 발행에 필요한 것은 그
+     * 매니페스트뿐이고 그건 이미 저장소에 있다.
+     *
+     * 다만 "데스크탑 저장소는 있는데 빌드를 안 한" 개발 기계는 여전히 실패해야 한다.
+     * 그 경우는 진짜로 사본이 낡은 채 나갈 수 있는 자리다. 그래서 둘을 가른다:
+     * 저장소 자체가 없으면 건너뛰고, 있는데 dist 가 없으면 예전처럼 멈춘다.
+     */
+    if (!fs.existsSync(desktopRoot)) {
+      const manifestPath = path.join(__dirname, "..", "engine", "vendor", "desktop-core.manifest.json");
+      if (!fs.existsSync(manifestPath)) {
+        console.error("✖ no desktop source here and no committed engine manifest — the CLI would have no engine to fetch.");
+        process.exit(1);
+      }
+      console.log(`vendor:core: skipped — no desktop checkout at ${desktopRoot}.`);
+      console.log("  Nothing to do: the tarball is never packaged, and the committed manifest is what the CLI fetches.");
+      return;
+    }
     console.error(`✖ desktop core not found at ${distRoot} (expected electron/workflow/run-graph.js).`);
     console.error(`  Build it first: cd ${desktopRoot} && npm run build:electron`);
     process.exit(1);
