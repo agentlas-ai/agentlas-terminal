@@ -905,6 +905,54 @@ function cloudReadPublicCareerCard(snapshot, findings) {
   return cloudSanitizePublicCareerCard(parsed);
 }
 
+/**
+ * 업로드 사본의 `agentlas.json` 에 불변 신원을 채운다 — **사용자 폴더는 안 건드린다.**
+ *
+ * 터미널은 엔진(`upload.py`)을 부르지 않고 자체 포장기를 쓴다. 그래서 여기로 올린
+ * 패키지에는 지금까지 `agentId` 가 실린 적이 없고, 서버는 그 패키지의 신원을 바뀌는
+ * 문자열 다섯 개의 지문으로만 정할 수 있었다 — 같은 폴더를 `hep upload` 로 올리면
+ * 신원이 실리고 `agentlas upload` 로 올리면 안 실려 정의가 둘로 갈렸다.
+ *
+ * 엔진과 같은 규칙을 쓴다: 팀은 `agt_team_…`, 단일은 `agt_…`, 이름 해시로 결정론적.
+ * 이미 선언돼 있으면 절대 덮어쓰지 않는다.
+ */
+function cloudEnsureAgentIdentity(scan, snapshot, fallbackName) {
+  const relativePath = "agentlas.json";
+  const manifest = cloudReadSnapshotJson(snapshot, relativePath);
+  const declared = typeof manifest.agentId === "string" ? manifest.agentId.trim() : "";
+  if (declared) return declared;
+
+  const isTeam = scan.included.some((file) => /^agents\/[^/]+\/agent\.md$/.test(file.path));
+  const seed = String(
+    manifest.slug || manifest.name || fallbackName || "",
+  ).trim().toLowerCase();
+  if (!seed) return "";
+  const digest = crypto.createHash("sha256")
+    .update(`agentlas-upload-agent-id-v1\0${seed}`, "utf8")
+    .digest("hex");
+  const agentId = `agt_${isTeam ? "team_" : ""}${digest.slice(0, 32)}`;
+
+  const next = { ...manifest, agentId };
+  const bytes = Buffer.from(JSON.stringify(next, null, 2) + "\n", "utf8");
+  const replacement = {
+    path: relativePath,
+    bytes: bytes.length,
+    sha256: sha(bytes),
+    contentBase64: bytes.toString("base64"),
+    executable: false,
+  };
+  const index = scan.included.findIndex((file) => file.path === relativePath);
+  const existing = index >= 0 ? scan.included[index] : null;
+  if (index >= 0) scan.included.splice(index, 1);
+  scan.included.push(replacement);
+  scan.included.sort(cloudCodePointPathOrder);
+  scan.totalBytes += bytes.length - (existing?.bytes || 0);
+  const fileRecord = scan.files.find((file) => file.path === relativePath);
+  if (fileRecord) Object.assign(fileRecord, { bytes: bytes.length, sha256: replacement.sha256, kind: "text", executable: false, included: true, reason: undefined });
+  else scan.files.push({ path: relativePath, bytes: bytes.length, sha256: replacement.sha256, kind: "text", executable: false, included: true });
+  return agentId;
+}
+
 function cloudReplacePublicCareerCard(scan, card) {
   const relativePath = ".agentlas/public-career-card.json";
   const includedIndex = scan.included.findIndex((file) => file.path === relativePath);
@@ -1024,6 +1072,9 @@ async function packageCloudAgent(db, root, opts = {}) {
     cloudReplacePublicCareerCard(scan, careerGraph);
     snapshot = cloudPackageSnapshot(scan.included);
   }
+  // 신원은 해시 계산 전에 채운다 — 클라우드 해시는 agentlas.json 을 포함한다.
+  cloudEnsureAgentIdentity(scan, snapshot, rootPath.split("/").pop());
+  snapshot = cloudPackageSnapshot(scan.included);
   const routingCard = isPublicHubPublish ? readCloudRoutingCard(snapshot) : {};
   if (routingCard.finding) scan.findings.push(routingCard.finding);
   if (isPublicHubPublish) {
