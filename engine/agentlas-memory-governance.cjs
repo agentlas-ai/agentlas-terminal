@@ -942,7 +942,20 @@ async function completeTurn(db, input = {}) {
       if (!dbScope) continue;
       const scopedProjectId = decision.finalScope === "user_global" ? null : turn.projectKey;
       const scopedProjectPath = decision.finalScope === "user_global" ? null : boundProjectPath;
-      const scopedAgentId = ["team", "agent"].includes(decision.finalScope) ? boundAgentId : null;
+      /*
+       * ★팀 공유 기억에는 주인이 없다 (2026-08-26)
+       *
+       * 이 엔진은 데스크탑과 **같은 SQLite 파일의 같은 `memory_entries` 표**를 쓴다
+       * (engine/core/paths.cjs — 같은 userData 공유가 제품 계약이다). 그런데 같은 "팀 공유"
+       * 결정을 데스크탑은 `agent_id = NULL` 로, 여기서는 `agent_id = <agentId>` 로 넣고
+       * 있었다. 한 표에 두 관례가 섞이면 ① 같은 사실이 주인 다른 두 줄로 남아 중복 제거가
+       * 갈리고 ② 정리기가 그 줄을 개인 기억으로 오인한다.
+       *
+       * 정본은 데스크탑 쪽이다 — 팀 공유는 조직도가 바뀌어도 남아야 하므로 특정 에이전트에
+       * 매이지 않는다. 데스크탑의 같은 규칙: shared/memory-ownership.ts `memoryOwnerAgentId`
+       * (`agt_team_` 낙인이거나 신원이 없으면 개인 칸이 없다).
+       */
+      const scopedAgentId = decision.finalScope === "agent" ? boundAgentId : null;
       let memoryId = null;
       try {
         const duplicate = db.prepare(
