@@ -51,7 +51,7 @@ async function toPdf(ctx, args) {
   let page;
   try {
     if (typeof ctx.ui.startSpinner === "function") ctx.ui.startSpinner(ko ? "PDF 굽는 중…" : "Rendering PDF…");
-    page = await cdp.attachPage();
+    page = await cdp.attachPage({ selection: "new" });
     await page.navigate(url, { waitMs: 1800 });
     await page.waitFor("document.readyState === 'complete'", { timeoutMs: 8000 });
     const r = await page.printPdf(outPath, { landscape: flags.landscape });
@@ -63,7 +63,7 @@ async function toPdf(ctx, args) {
     ctx.err(`${ctx.ui.red("✖")} ${String((e && e.message) || e)}`);
     return 1;
   } finally {
-    if (page) page.close();
+    if (page) await page.close({ closeTarget: true });
   }
 }
 

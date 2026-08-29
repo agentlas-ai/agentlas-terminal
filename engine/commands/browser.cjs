@@ -93,12 +93,13 @@ async function browserLogin(ctx, rest) {
   const url = siteUrl(row.site);
 
   if (await cdp.cdpReady()) {
-    // 이미 열린 Agentlas 브라우저를 로그인 페이지로 몬다(조종). 로그인은 사용자가 직접.
+    // 사용자의 현재 탭을 건드리지 않고 Agentlas 브라우저의 새 탭을 연다.
+    // 로그인은 사용자가 직접 한다.
     try {
-      const page = await cdp.attachPage();
+      const page = await cdp.attachPage({ selection: "new" });
       try { await page.navigate(url, { waitMs: 1500 }); } finally { page.close(); }
       vault.logBrowserAction(db, { site: row.site, action: "login.open", target: url, result: "navigated" });
-      ctx.out(`${ctx.ui.green("✓")} ${ko ? "브라우저를 로그인 페이지로 옮겼습니다" : "moved the browser to the login page"}: ${url}`);
+      ctx.out(`${ctx.ui.green("✓")} ${ko ? "새 브라우저 탭을 로그인 페이지로 열었습니다" : "opened a new browser tab for login"}: ${url}`);
     } catch (e) {
       ctx.err(`${ctx.ui.red("✖")} ${String((e && e.message) || e)}`);
       return 1;
@@ -140,10 +141,10 @@ async function browserGo(ctx, rest) {
     return 1;
   }
   try {
-    const page = await cdp.attachPage();
+    const page = await cdp.attachPage({ selection: "new" });
     let title;
     try { await page.navigate(siteUrl(url), { waitMs: 1500 }); title = await page.evalExpr("document.title"); } finally { page.close(); }
-    ctx.out(`${ctx.ui.green("✓")} ${ko ? "이동했습니다" : "navigated"}: ${siteUrl(url)}${title ? ctx.ui.dim(` — ${title}`) : ""}`);
+    ctx.out(`${ctx.ui.green("✓")} ${ko ? "새 브라우저 탭에서 열었습니다" : "opened a new browser tab"}: ${siteUrl(url)}${title ? ctx.ui.dim(` — ${title}`) : ""}`);
     return 0;
   } catch (e) { ctx.err(`${ctx.ui.red("✖")} ${String((e && e.message) || e)}`); return 1; }
 }

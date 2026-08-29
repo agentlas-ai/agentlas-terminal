@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.65 — 2026-08-29
+
+- Browser, document, and Telegram CDP flows now create and track an Agentlas-owned
+  tab instead of attaching to the first page exposed by the debugging port. Existing
+  pages require explicit target selection, owned temporary pages are cleaned up, and
+  WebSocket attachment has a bounded open timeout.
+- First-run SQLite bootstrap now starts at schema `user_version=106`, generated from
+  the Desktop migration ladder, including the multimodal model-role constraint.
+
 ## 1.0.64 — 2026-08-29
 
 - First-run database bootstrap now refuses symbolic links and non-file entries

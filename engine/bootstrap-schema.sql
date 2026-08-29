@@ -1,4 +1,4 @@
--- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-08-29T07:55:23Z)
+-- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-08-29T13:29:10Z)
 --
 -- ★생성물이다. 손으로 고치지 말고 재생성하라:
 --     node scripts/gen-bootstrap-schema.cjs
@@ -6,7 +6,7 @@
 -- 정본은 Desktop 의 마이그레이션 사다리(agentlas_desktop/electron/store/db.ts, SCHEMA_VERSION).
 -- 이 파일은 그 사다리를 **빈 DB** 에 끝까지 돌린 결과의 덤프이므로, 터미널이 만든 DB 는
 -- 처음부터 사다리 머리에 있다 — 데스크탑이 나중에 승급할 것이 남지 않는다.
-PRAGMA user_version=105;
+PRAGMA user_version=106;
 CREATE TABLE active_runtime (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         kind TEXT NOT NULL
@@ -1015,7 +1015,7 @@ CREATE TABLE meta (
         value TEXT NOT NULL
       );
 CREATE TABLE model_role_members (
-        role TEXT NOT NULL CHECK(role IN ('orchestrator','worker')),
+        role TEXT NOT NULL CHECK(role IN ('orchestrator','worker','multimodal')),
         position INTEGER NOT NULL CHECK(position >= 1),
         kind TEXT NOT NULL,
         backend TEXT,
@@ -1027,7 +1027,7 @@ CREATE TABLE model_role_members (
         PRIMARY KEY(role, position)
       );
 CREATE TABLE model_roles (
-        role TEXT PRIMARY KEY CHECK(role IN ('orchestrator','worker')),
+        role TEXT PRIMARY KEY CHECK(role IN ('orchestrator','worker','multimodal')),
         kind TEXT NOT NULL,
         backend TEXT,
         source TEXT,

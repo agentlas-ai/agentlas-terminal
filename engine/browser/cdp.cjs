@@ -20,6 +20,8 @@
 const http = require("node:http");
 
 const DEFAULT_PORT = Number(process.env.AGENTLAS_CDP_PORT || 9222);
+const DEFAULT_WS_OPEN_TIMEOUT_MS = 5_000;
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 
 function httpJson(port, path, { timeout = 3000, method = "GET" } = {}) {
   return new Promise((resolve, reject) => {
@@ -46,16 +48,90 @@ async function cdpReady(port = DEFAULT_PORT) {
   } catch { return false; }
 }
 
-/** 조종할 page 타겟 하나를 고른다(없으면 새로 연다). 반환: webSocketDebuggerUrl. */
-async function pickPageTarget(port = DEFAULT_PORT) {
-  const targets = await httpJson(port, "/json");
-  let page = (Array.isArray(targets) ? targets : []).find((t) => t.type === "page" && t.webSocketDebuggerUrl);
-  if (!page) {
-    // 새 탭을 연다(DevTools HTTP: PUT /json/new).
-    page = await httpJson(port, "/json/new?about:blank", { method: "PUT" });
+function verifiedPageTarget(target, port, ownsTarget = false) {
+  if (!target || target.type !== "page" || typeof target.id !== "string" || typeof target.webSocketDebuggerUrl !== "string") return null;
+  try {
+    const socket = new URL(target.webSocketDebuggerUrl);
+    if (socket.protocol !== "ws:" || !LOOPBACK_HOSTS.has(socket.hostname.toLowerCase()) || Number(socket.port) !== port) return null;
+  } catch {
+    return null;
   }
-  if (!page || !page.webSocketDebuggerUrl) throw new Error("no CDP page target available");
-  return page.webSocketDebuggerUrl;
+  return { id: target.id, webSocketDebuggerUrl: target.webSocketDebuggerUrl, ownsTarget };
+}
+
+async function resolvePageTarget(port, { selection = "new", targetId = null } = {}) {
+  if (selection !== "new" && selection !== "existing") {
+    throw new Error(`unsupported CDP target selection: ${selection}`);
+  }
+  const rawTargets = await httpJson(port, "/json");
+  const pages = (Array.isArray(rawTargets) ? rawTargets : [])
+    .map((target) => verifiedPageTarget(target, port))
+    .filter(Boolean);
+
+  if (selection === "existing") {
+    if (!targetId) throw new Error("existing CDP target selection requires an explicit targetId");
+    const exact = pages.find((target) => target.id === String(targetId));
+    if (!exact) throw new Error(`no CDP page target matches targetId ${targetId}`);
+    return exact;
+  }
+
+  // Never reuse an arbitrary first page. It may be a user's active tab, and
+  // browser/document/Telegram flows must not navigate it behind their back.
+  // Create a target we own, then return its socket identity to the caller.
+  const created = await httpJson(port, `/json/new?${encodeURIComponent("about:blank")}`, { method: "PUT" });
+  const exact = verifiedPageTarget(created, port, true);
+  if (!exact) throw new Error("CDP did not return a verified page target for the new tab");
+  return exact;
+}
+
+/**
+ * Pick a page target without guessing ownership.
+ *
+ * The safe default is a fresh target. Reusing a page requires selection:
+ * `pickPageTarget(port, { selection: "existing", targetId })`.
+ */
+async function pickPageTarget(port = DEFAULT_PORT, options = {}) {
+  return (await resolvePageTarget(port, options)).webSocketDebuggerUrl;
+}
+
+function closePageTarget(port, targetId) {
+  return new Promise((resolve) => {
+    const req = http.request({
+      host: "127.0.0.1",
+      port,
+      path: `/json/close/${encodeURIComponent(String(targetId))}`,
+      timeout: 3_000,
+    }, (res) => {
+      res.resume();
+      res.once("end", resolve);
+    });
+    req.once("error", resolve);
+    req.once("timeout", () => { req.destroy(); resolve(); });
+    req.end();
+  });
+}
+
+function waitForWebSocketOpen(ws, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve();
+    };
+    timer = setTimeout(() => {
+      const error = new Error(`CDP websocket open timed out after ${timeoutMs}ms`);
+      error.code = "CDP_WEBSOCKET_OPEN_TIMEOUT";
+      try { ws.close(); } catch { /* already closed */ }
+      finish(error);
+    }, timeoutMs);
+    ws.addEventListener("open", () => finish(), { once: true });
+    ws.addEventListener("error", () => finish(new Error("CDP websocket failed to open")), { once: true });
+    ws.addEventListener("close", () => finish(new Error("CDP websocket closed before opening")), { once: true });
+  });
 }
 
 /**
@@ -65,16 +141,31 @@ async function pickPageTarget(port = DEFAULT_PORT) {
  *   evaluate(js, {awaitPromise})  Runtime.evaluate(returnByValue) — 값 반환
  *   waitFor(jsPredicate, {timeoutMs, pollMs})  predicate 가 truthy 될 때까지
  */
-async function attachPage({ port = DEFAULT_PORT, wsUrl } = {}) {
-  const url = wsUrl || (await pickPageTarget(port));
-  const ws = new WebSocket(url);
-  await new Promise((resolve, reject) => {
-    ws.addEventListener("open", resolve, { once: true });
-    ws.addEventListener("error", () => reject(new Error("CDP websocket failed to open")), { once: true });
-  });
+async function attachPage({ port = DEFAULT_PORT, wsUrl, selection = "new", targetId, connectTimeoutMs = DEFAULT_WS_OPEN_TIMEOUT_MS } = {}) {
+  const target = wsUrl
+    ? (() => {
+      try {
+        const socket = new URL(wsUrl);
+        if (socket.protocol !== "ws:" || !LOOPBACK_HOSTS.has(socket.hostname.toLowerCase()) || Number(socket.port) !== port) return null;
+      } catch { return null; }
+      return { id: null, webSocketDebuggerUrl: wsUrl, ownsTarget: false };
+    })()
+    : await resolvePageTarget(port, { selection, targetId });
+  if (!target) throw new Error(`invalid CDP websocket target for port ${port}`);
+
+  const url = target.webSocketDebuggerUrl;
+  let ws;
+  try {
+    ws = new WebSocket(url);
+    await waitForWebSocketOpen(ws, connectTimeoutMs);
+  } catch (error) {
+    if (target.ownsTarget) await closePageTarget(port, target.id);
+    throw error;
+  }
 
   let nextId = 0;
   const pending = new Map();
+  let closed = false;
   ws.addEventListener("message", (event) => {
     let msg;
     try { msg = JSON.parse(typeof event.data === "string" ? event.data : String(event.data)); } catch { return; }
@@ -85,8 +176,16 @@ async function attachPage({ port = DEFAULT_PORT, wsUrl } = {}) {
       else resolve(msg.result);
     }
   });
+  ws.addEventListener("close", () => {
+    for (const { reject, timer } of pending.values()) {
+      clearTimeout(timer);
+      reject(new Error("CDP websocket closed"));
+    }
+    pending.clear();
+  }, { once: true });
 
   function send(method, params = {}, { timeout = 30000 } = {}) {
+    if (closed) return Promise.reject(new Error("CDP page is closed"));
     const id = ++nextId;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => { pending.delete(id); reject(new Error(`CDP ${method} timed out`)); }, timeout);
@@ -94,7 +193,8 @@ async function attachPage({ port = DEFAULT_PORT, wsUrl } = {}) {
         resolve: (r) => { clearTimeout(timer); resolve(r); },
         reject: (e) => { clearTimeout(timer); reject(e); },
       });
-      ws.send(JSON.stringify({ id, method, params }));
+      try { ws.send(JSON.stringify({ id, method, params })); }
+      catch (error) { pending.delete(id); clearTimeout(timer); reject(error); }
     });
   }
 
@@ -186,9 +286,19 @@ async function attachPage({ port = DEFAULT_PORT, wsUrl } = {}) {
     return { path: outPath, bytes: buf.length };
   }
 
-  function close() { try { ws.close(); } catch { /* already closed */ } }
+  async function close({ closeTarget = false } = {}) {
+    if (closed) return;
+    closed = true;
+    try { ws.close(); } catch { /* already closed */ }
+    if (closeTarget && target.ownsTarget && target.id) await closePageTarget(port, target.id);
+  }
 
-  return { navigate, evaluate, evalExpr, waitFor, focusSelector, typeInto, pressKey, clickSelector, printPdf, close, send };
+  return {
+    navigate, evaluate, evalExpr, waitFor, focusSelector, typeInto, pressKey,
+    clickSelector, printPdf, close, send,
+    targetId: target.id,
+    ownsTarget: target.ownsTarget,
+  };
 }
 
-module.exports = { cdpReady, pickPageTarget, attachPage, DEFAULT_PORT };
+module.exports = { cdpReady, pickPageTarget, attachPage, DEFAULT_PORT, DEFAULT_WS_OPEN_TIMEOUT_MS };

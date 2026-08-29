@@ -192,7 +192,7 @@ async function captureBotTokenViaBrowser({ timeoutMs = 180_000, onWait } = {}) {
     err.code = "cdp_unavailable";
     throw err;
   }
-  const page = await cdp.attachPage();
+  const page = await cdp.attachPage({ selection: "new" });
   try {
     await page.navigate(BOTFATHER_WEB_URL, { waitMs: 2500 });
     const deadline = Date.now() + timeoutMs;
@@ -210,7 +210,7 @@ async function captureBotTokenViaBrowser({ timeoutMs = 180_000, onWait } = {}) {
     }
     return null;
   } finally {
-    page.close();
+    await page.close({ closeTarget: true });
   }
 }
 
