@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.63 — 2026-08-29
+
+- `agentlas update --json` now reads the centralized output-mode context after
+  global flags are consumed, so it emits the promised JSON document instead of
+  falling back to human-readable lines.
+
 ## 1.0.62 — 2026-08-29
 
 - Terminal sessions now preserve ACP conversation identity and history across

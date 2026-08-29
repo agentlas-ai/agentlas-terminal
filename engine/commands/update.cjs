@@ -48,9 +48,9 @@ async function checkNpmLatest({ fetch: fetchImpl, timeoutMs = 8_000 } = {}) {
   };
 }
 
-async function run(ctx, args) {
-  const json = args.includes("--json");
-  const status = await checkNpmLatest();
+async function run(ctx, args, deps = {}) {
+  const json = ctx.output?.format === "json" || args.includes("--json");
+  const status = await checkNpmLatest(deps);
   if (json) {
     ctx.out(JSON.stringify(status, null, 2));
     return 0;
