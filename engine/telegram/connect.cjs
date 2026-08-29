@@ -55,10 +55,15 @@ async function verifyBotToken(token, opts) {
 function tokenDir() {
   const dir = path.join(userDataDir(), "telegram");
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") fs.chmodSync(dir, 0o700);
   return dir;
 }
 function tokenFile(id) { return path.join(tokenDir(), `${id}.token`); }
-function saveToken(id, token) { fs.writeFileSync(tokenFile(id), token, { encoding: "utf8", mode: 0o600 }); }
+function saveToken(id, token) {
+  const file = tokenFile(id);
+  fs.writeFileSync(file, token, { encoding: "utf8", mode: 0o600 });
+  if (process.platform !== "win32") fs.chmodSync(file, 0o600);
+}
 function readToken(id) {
   try { return fs.readFileSync(tokenFile(id), "utf8").trim() || null; } catch { return null; }
 }
@@ -81,19 +86,31 @@ async function startConnection(db, targetKind, targetId, token, opts) {
   runWriteTransaction(db, () => {
     db.prepare(
       "INSERT INTO telegram_bindings (id, target_kind, target_id, bot_user_id, bot_username, bot_display_name, status, enabled, token_saved, token_fingerprint, created_at, updated_at) " +
-      "VALUES (?,?,?,?,?,?,'waiting_for_chat',1,1,?,?,?)",
+      "VALUES (?,?,?,?,?,?,'waiting_for_chat',1,0,?,?,?)",
     ).run(id, targetKind, targetId, me.id, me.username || null, me.first_name || null, tokenFingerprint(token), now, now);
   });
-  saveToken(id, token);
+  try {
+    saveToken(id, token);
+    runWriteTransaction(db, () => {
+      db.prepare("UPDATE telegram_bindings SET token_saved=1, updated_at=? WHERE id=?").run(new Date().toISOString(), id);
+    });
+  } catch (error) {
+    deleteToken(id);
+    try {
+      runWriteTransaction(db, () => db.prepare("DELETE FROM telegram_bindings WHERE id=?").run(id));
+    } catch { /* preserve the original storage failure */ }
+    throw error;
+  }
   // 남은 웹훅이 있으면 getUpdates가 막히므로 제거(있어도 무해).
   await telegramApi(token, "deleteWebhook", { drop_pending_updates: false }, opts).catch(() => null);
   return { id, botUsername: me.username || null };
 }
 
 /**
- * getUpdates 폴링으로 첫 private 메시지의 chat을 이 바인딩에 귀속한다.
- * 보안: 데스크탑과 같은 규칙 — 미페어링·enabled·waiting_for_chat 인 신선 바인딩
- * (30분 이내)에만, private 채팅만. 반환: 페어링된 바인딩 또는 null(시간초과).
+ * getUpdates 폴링으로 `/start <bindingId>`를 보낸 private chat을 이 바인딩에 귀속한다.
+ * 보안: 봇 이름을 발견한 제3자의 첫 메시지가 로컬 에이전트를 탈취하지 못하도록 정확한
+ * 페어링 토큰을 요구한다. 최종 UPDATE도 미페어링·enabled·waiting 상태를 조건으로 삼아
+ * 두 Terminal 프로세스가 같은 바인딩을 동시에 덮어쓰지 못하게 한다.
  */
 async function pairByPolling(db, id, { timeoutMs = 120_000, opts, onWait } = {}) {
   const token = readToken(id);
@@ -110,6 +127,8 @@ async function pairByPolling(db, id, { timeoutMs = 120_000, opts, onWait } = {})
       if (typeof update.update_id === "number") offset = Math.max(offset, update.update_id);
       const message = update.message;
       if (!message || !message.chat || message.chat.type !== "private") continue;
+      const pairingToken = String(message.text || "").match(/^\/start(?:@\w+)?\s+(\S+)/i)?.[1] || "";
+      if (pairingToken !== id) continue;
       // 신선 미페어링 바인딩인지 재확인(경합 방지) 후 귀속.
       const row = getBinding(db, id);
       if (!row || row.telegram_chat_id || row.status !== "waiting_for_chat") continue;
@@ -117,11 +136,13 @@ async function pairByPolling(db, id, { timeoutMs = 120_000, opts, onWait } = {})
       if (!Number.isFinite(createdAt) || Date.now() - createdAt > 30 * 60 * 1000) throw new Error("pairing window expired (30 min) — reconnect");
       const now = new Date().toISOString();
       const title = message.chat.title || [message.chat.first_name, message.chat.last_name].filter(Boolean).join(" ") || message.chat.username || String(message.chat.id);
-      runWriteTransaction(db, () => {
-        db.prepare("UPDATE telegram_bindings SET telegram_chat_id=?, telegram_chat_title=?, status='chat_paired', last_update_id=?, updated_at=? WHERE id=?")
-          .run(String(message.chat.id), title, offset, now, id);
+      const claimed = runWriteTransaction(db, () => {
+        return db.prepare(
+          "UPDATE telegram_bindings SET telegram_chat_id=?, telegram_chat_title=?, status='chat_paired', last_update_id=?, updated_at=? " +
+          "WHERE id=? AND telegram_chat_id IS NULL AND enabled=1 AND status='waiting_for_chat'",
+        ).run(String(message.chat.id), title, offset, now, id).changes === 1;
       });
-      return getBinding(db, id);
+      if (claimed) return getBinding(db, id);
     }
     if (offset) {
       runWriteTransaction(db, () => {

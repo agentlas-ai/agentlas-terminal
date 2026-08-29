@@ -117,6 +117,105 @@ function copyDir(src, dst) {
     else if (entry.isFile()) fs.copyFileSync(s, d);
   }
 }
+
+// npm dependency folders often include their own tests, fixtures, benchmarks,
+// examples, and CI metadata. They are not runtime dependencies and public
+// Agentlas artifacts must not redistribute private/recovery/test material just
+// because npm installed it beside the executable files.
+const EXTERNAL_DEV_DIRS = new Set([
+  ".github", ".circleci", "coverage", "test", "tests", "testing", "__tests__", "spec",
+  "fixture", "fixtures", "benchmark", "benchmarks", "bench", "example", "examples",
+]);
+const EXTERNAL_DEV_FILE_RE = /(?:^|\.)(?:test|spec)\.[^.]+$/i;
+
+function copyRuntimePackage(src, dst, relative = "") {
+  fs.mkdirSync(dst, { recursive: true });
+  let pruned = 0;
+  for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
+    const normalized = entry.name.toLowerCase();
+    const nextRelative = relative ? `${relative}/${entry.name}` : entry.name;
+    if (entry.isDirectory() && EXTERNAL_DEV_DIRS.has(normalized)) {
+      pruned += 1;
+      continue;
+    }
+    if (entry.isFile() && (
+      EXTERNAL_DEV_FILE_RE.test(entry.name) ||
+      /^(?:\.eslintrc|\.prettierrc|\.nycrc|jest\.config|vitest\.config|ava\.config)/i.test(entry.name)
+    )) {
+      pruned += 1;
+      continue;
+    }
+    const source = path.join(src, entry.name);
+    const target = path.join(dst, entry.name);
+    if (entry.isDirectory()) pruned += copyRuntimePackage(source, target, nextRelative);
+    else if (entry.isFile()) fs.copyFileSync(source, target);
+  }
+  return pruned;
+}
+
+function disallowedExternalArtifacts(root) {
+  const found = [];
+  const walk = (dir, relative = "") => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const next = relative ? `${relative}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        if (EXTERNAL_DEV_DIRS.has(entry.name.toLowerCase())) found.push(`${next}/`);
+        else walk(path.join(dir, entry.name), next);
+      } else if (entry.isFile() && EXTERNAL_DEV_FILE_RE.test(entry.name)) {
+        found.push(next);
+      }
+      if (found.length >= 20) return;
+    }
+  };
+  walk(root);
+  return found;
+}
+
+/**
+ * Built-in plugin manifests are runtime data, not CommonJS dependencies. The compiled
+ * `electron/plugins/builtin.js` loads them through relative `require()` paths, so the
+ * static module-graph walk cannot discover them. Copy every package declared by that
+ * module and keep its relative path under dist/ intact.
+ */
+function copyBuiltinPluginPackages(root) {
+  const builtinFile = path.join(distRoot, "electron", "plugins", "builtin.js");
+  if (!fs.existsSync(builtinFile)) {
+    throw new Error(`built-in plugin registry is missing: ${builtinFile}`);
+  }
+  const source = fs.readFileSync(builtinFile, "utf8");
+  const manifestPaths = new Set();
+  const literal = /["'](\.\.\/\.\.\/plugins\/[^"']+\/plugin\.json)["']/g;
+  let match;
+  while ((match = literal.exec(source))) manifestPaths.add(match[1]);
+  if (!manifestPaths.size) {
+    throw new Error("built-in plugin registry declared no literal plugin manifests");
+  }
+
+  const sourcePluginsRoot = path.join(distRoot, "plugins");
+  const copied = [];
+  for (const manifestPath of [...manifestPaths].sort()) {
+    const sourceManifest = path.resolve(path.dirname(builtinFile), manifestPath);
+    const sourcePackage = path.dirname(sourceManifest);
+    const relativePackage = path.relative(sourcePluginsRoot, sourcePackage);
+    if (!relativePackage || relativePackage.startsWith("..") || path.isAbsolute(relativePackage)) {
+      throw new Error(`unsafe built-in plugin manifest path: ${manifestPath}`);
+    }
+    if (!fs.existsSync(sourceManifest)) {
+      throw new Error(`built-in plugin manifest is missing from Desktop dist: ${sourceManifest}`);
+    }
+    const targetPackage = path.join(root, "dist", "plugins", relativePackage);
+    copyDir(sourcePackage, targetPackage);
+    const targetManifest = path.resolve(
+      path.join(root, "dist", "electron", "plugins"),
+      manifestPath,
+    );
+    if (!fs.existsSync(targetManifest)) {
+      throw new Error(`vendored built-in plugin manifest is unreachable: ${targetManifest}`);
+    }
+    copied.push(relativePackage.replace(/\\/g, "/"));
+  }
+  return copied;
+}
 function dirSizeMB(p) {
   let bytes = 0;
   const walk = (dir) => {
@@ -188,6 +287,7 @@ function main() {
 
   rmrf(vendorRoot);
   for (const f of internal) copyFileInto(vendorRoot, f);
+  const builtinPluginPackages = copyBuiltinPluginPackages(vendorRoot);
 
   const nodeModulesRoot = path.join(desktopRoot, "node_modules");
   const vendorNodeModules = path.join(vendorRoot, "node_modules");
@@ -198,26 +298,36 @@ function main() {
   const fullExternal = expandExternalDeps(external, nodeModulesRoot);
   console.log(`  external (재귀 확장): ${external.size} → ${fullExternal.size}`);
   let copied = 0;
+  let prunedExternalArtifacts = 0;
   for (const dep of [...fullExternal].sort()) {
     if (skip.has(dep)) continue;
     const src = path.join(nodeModulesRoot, dep);
     if (!fs.existsSync(src)) { console.error(`✖ missing external dep in desktop node_modules: ${dep}`); process.exit(1); }
-    copyDir(src, path.join(vendorNodeModules, dep));
+    prunedExternalArtifacts += copyRuntimePackage(src, path.join(vendorNodeModules, dep));
     copied += 1;
   }
+  const disallowed = disallowedExternalArtifacts(vendorNodeModules);
+  if (disallowed.length) {
+    console.error("✖ public desktop-core contains dependency test/fixture/benchmark artifacts:");
+    for (const item of disallowed) console.error(`   - ${item}`);
+    process.exit(1);
+  }
   console.log(`  vendored dist/  (${dirSizeMB(path.join(vendorRoot, "dist"))} MB)`);
+  console.log(`  built-in plugin packages: ${builtinPluginPackages.join(", ")}`);
   console.log(`  vendored node_modules/  (${copied} packages, ${dirSizeMB(vendorNodeModules)} MB)`);
 
   fs.writeFileSync(
     path.join(vendorRoot, "VENDORED.json"),
     JSON.stringify({
       vendoredAt: new Date().toISOString(),
-      sourceDesktopRoot: desktopRoot,
+      source: "agentlas-desktop-dist",
       rootEntry: path.relative(distRoot, ROOT_ENTRY),
       internalFileCount: internal.size,
       externalDeps: [...fullExternal].filter((d) => !skip.has(d)).sort(),
       directExternalDeps: [...external].sort(),
+      builtinPluginPackages,
       prunedInternal: PRUNE_INTERNAL,
+      prunedExternalArtifacts,
     }, null, 2) + "\n",
   );
   console.log(`✓ Vendored desktop core (static closure) → ${vendorRoot} (total ${dirSizeMB(vendorRoot)} MB)`);

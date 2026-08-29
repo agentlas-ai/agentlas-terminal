@@ -116,20 +116,22 @@ function claimAutomation(db, id, now = new Date(), owner = LEASE_OWNER) {
  */
 function renewAutomationLease(db, id, now = new Date(), owner = LEASE_OWNER) {
   if (!leaseSupported(db)) return false;
-  try {
-    const result = db
-      .prepare("UPDATE automations SET claimed_at = ? WHERE id = ? AND lease_owner = ?")
-      .run(now.toISOString(), id, owner);
-    return (result.changes ?? result.rowsAffected ?? 0) > 0;
-  } catch {
-    return false;
-  }
+  // false means definitive ownership loss. SQLite busy/I/O errors must throw
+  // so the caller can retry instead of killing a valid run as if a peer had
+  // taken the lease (Desktop renewAutomationRunLease contract).
+  const result = db
+    .prepare("UPDATE automations SET claimed_at = ? WHERE id = ? AND lease_owner = ? AND claimed_at IS NOT NULL")
+    .run(now.toISOString(), id, owner);
+  return (result.changes ?? result.rowsAffected ?? 0) > 0;
 }
 
-function releaseAutomation(db, id) {
+function releaseAutomation(db, id, owner = LEASE_OWNER) {
   try {
-    db.prepare("UPDATE automations SET claimed_at = NULL, lease_owner = NULL WHERE id = ?").run(id);
-  } catch { /* best-effort */ }
+    const result = db
+      .prepare("UPDATE automations SET claimed_at = NULL, lease_owner = NULL WHERE id = ? AND lease_owner = ?")
+      .run(id, owner);
+    return (result.changes ?? result.rowsAffected ?? 0) > 0;
+  } catch { return false; }
 }
 
 /**

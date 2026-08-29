@@ -185,19 +185,21 @@ function cliMemoryContext(db, projectPath, agentId = null, task = "") {
             WHERE superseded_at IS NULL AND (
               (scope='user_identity' AND project_path IS NULL)
               OR (scope='project' AND project_path=?)
-              OR (scope IN ('team_memory','agent_team','agent_repo') AND agent_id=? AND (project_path IS NULL OR project_path=?))
+              OR (scope IN ('team_memory','agent_team') AND (agent_id IS NULL OR agent_id=?) AND (project_path IS NULL OR project_path=?))
+              OR (scope='agent_repo' AND agent_id=? AND (project_path IS NULL OR project_path=?))
             )
             ORDER BY created_at DESC LIMIT 16
-          `).all(projectPath, agentId, projectPath)
+          `).all(projectPath, agentId, projectPath, agentId, projectPath)
         : db.prepare(`
             SELECT id,kind,content,confidence,context_json,created_at
             FROM memory_entries
             WHERE superseded_at IS NULL AND (
               (scope='user_identity' AND project_path IS NULL)
-              OR (scope IN ('team_memory','agent_team','agent_repo') AND agent_id=? AND project_path IS NULL)
+              OR (scope IN ('team_memory','agent_team') AND (agent_id IS NULL OR agent_id=?) AND project_path IS NULL)
+              OR (scope='agent_repo' AND agent_id=? AND project_path IS NULL)
             )
             ORDER BY created_at DESC LIMIT 16
-          `).all(agentId);
+          `).all(agentId, agentId);
       // R21 W2d — confidence was stored (governance normalizeConfidence) but
       // never reached retrieval: no ranking function existed and the render
       // dropped the column, so a one-off guess and a high-confidence procedure
@@ -268,9 +270,10 @@ function curateCliReply(db, text, ctx) {
     if (scope === "discard" || scope === "session") { logCli(ctx.projectPath, { action: scope, kind, content, at: now }); continue; }
     if (scope === "project" && !ctx.projectPath) scope = "team_memory";
     const ppath = scope === "project" ? ctx.projectPath : null;
+    const scopedAgentId = scope === "agent_repo" ? (ctx.agentId || null) : null;
     const requestContext = normalizeRequestContext(ev, ctx, ppath);
     try {
-      const dup = db.prepare("SELECT id,scope,kind,content,confidence,sensitivity,context_json FROM memory_entries WHERE scope=? AND kind=? AND lower(trim(content))=? AND superseded_at IS NULL AND (project_path IS ? OR project_path=?) LIMIT 1").get(scope, kind, content.toLowerCase(), ppath, ppath);
+      const dup = db.prepare("SELECT id,scope,kind,content,confidence,sensitivity,context_json FROM memory_entries WHERE scope=? AND kind=? AND lower(trim(content))=? AND superseded_at IS NULL AND (project_path IS ? OR project_path=?) AND (agent_id IS ? OR agent_id=?) LIMIT 1").get(scope, kind, content.toLowerCase(), ppath, ppath, scopedAgentId, scopedAgentId);
       if (dup) {
         rememberCurated({ ...dup, requestContext });
         continue;
@@ -278,7 +281,7 @@ function curateCliReply(db, text, ctx) {
       const memoryId = randomUUID();
       const confidence = ev.confidence || "medium";
       const sensitivity = ev.sensitivity || "internal";
-      db.prepare("INSERT INTO memory_entries (id,scope,kind,content,project_id,project_path,agent_id,chat_id,confidence,sensitivity,evidence_json,context_json,superseded_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)").run(memoryId, scope, kind, content, ctx.projectId || null, ppath, ctx.agentId || null, null, confidence, sensitivity, JSON.stringify(Array.isArray(ev.evidence_refs) ? ev.evidence_refs : []), JSON.stringify(requestContext), now);
+      db.prepare("INSERT INTO memory_entries (id,scope,kind,content,project_id,project_path,agent_id,chat_id,confidence,sensitivity,evidence_json,context_json,superseded_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)").run(memoryId, scope, kind, content, ctx.projectId || null, ppath, scopedAgentId, null, confidence, sensitivity, JSON.stringify(Array.isArray(ev.evidence_refs) ? ev.evidence_refs : []), JSON.stringify(requestContext), now);
       rememberCurated({ id: memoryId, scope, kind, content, confidence, sensitivity, requestContext });
       logCli(ctx.projectPath, { action: "written", scope, kind, content, request_context: requestContext, at: now });
     } catch { /* ignore */ }

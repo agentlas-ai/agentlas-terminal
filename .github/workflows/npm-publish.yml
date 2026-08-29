@@ -129,8 +129,11 @@ jobs:
           node - "$RUNNER_TEMP/npm-pack.json" <<'NODE'
           const fs = require('node:fs');
           const manifest = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'))[0];
-          const forbidden = /^(test|tests|benchmarks?|docs?|fixtures|scripts|output|artifacts|evidence|\.env)(\/|$)/i;
-          const hits = manifest.files.map((entry) => entry.path).filter((path) => forbidden.test(path));
+          const forbiddenRoot = /^(test|tests|benchmarks?|docs?|fixtures|scripts|output|artifacts|evidence|\.env)(\/|$)/i;
+          const forbiddenDesktopCore = /^engine\/vendor\/desktop-core(?:\/|\.tar\.gz$)/i;
+          const hits = manifest.files
+            .map((entry) => entry.path)
+            .filter((path) => forbiddenRoot.test(path) || forbiddenDesktopCore.test(path));
           if (hits.length) {
             console.error('npm artifact contains development-only paths:\n' + hits.join('\n'));
             process.exit(1);

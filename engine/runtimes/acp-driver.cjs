@@ -10,6 +10,7 @@
  * 조용히 다른 런타임으로 넘어가지 않는다.
  */
 const { loadCoreAcpRuntime } = require("../core/desktop-core.cjs");
+const permissions = require("../agentlas-permissions.cjs");
 
 // 정본(runtimes/kinds.cjs)의 ACP 3종에서 파생 — resolve.cjs의 ACP_CLI_KINDS와 같은 원소.
 const ACP_KINDS = new Set(require("./kinds.cjs").ACP_CLI_KINDS);
@@ -47,6 +48,28 @@ async function runAcpTurn(req) {
     return { text: "", session: req.session || {}, error: `runtime '${kind}' is not an ACP agent in this core`, errorKind: "unsupported", errorSource: "marker" };
   }
   const runner = mod.createAcpRunner(spec);
+  let mcpConfigPath;
+  try {
+    // ACP runner consumes the same Claude-compatible MCP config shape as Desktop.
+    // Reuse native-host's content-addressed, credential-isolating materializer so
+    // Cursor/Grok/Kimi receive exactly the already-consented Terminal allowlist.
+    const nativeHost = require("../agentlas-native-host.cjs");
+    const allowedMcpServers = permissions.normalize(req.permission) === "full"
+      ? (req.mcpServers || [])
+      : [];
+    mcpConfigPath = nativeHost.cliMcpConfigPath(allowedMcpServers, {
+      exactAllowlist: req.mcpAllowlistMode === "exact",
+      env: req.env || process.env,
+    }).file;
+  } catch (error) {
+    return {
+      text: "",
+      session: req.session || {},
+      error: `ACP MCP configuration failed: ${error && error.message ? error.message : error}`,
+      errorKind: "configuration",
+      errorSource: "marker",
+    };
+  }
   const locale = req.locale === "ko" ? "ko" : "en";
   let streaming = false;
   let lastText = "";
@@ -69,7 +92,12 @@ async function runAcpTurn(req) {
   try {
     const result = await runner({
       systemPrompt: req.systemPrompt || "",
-      history: [],
+      history: Array.isArray(req.history)
+        ? req.history.map((entry) => ({
+          role: entry && entry.role === "assistant" ? "assistant" : "user",
+          text: String((entry && (entry.text ?? entry.content)) || ""),
+        }))
+        : [],
       userPrompt: req.prompt || "",
       backendLabel: spec.label,
       locale,
@@ -78,10 +106,20 @@ async function runAcpTurn(req) {
       cwd: req.cwd,
       env: req.env || process.env,
       signal: req.signal,
+      mcpConfigPath,
+      runtimeSessionId: (req.session && (req.session.id || req.session.acpSessionId)) || undefined,
+      chatId: req.chatId,
+      approvalChatId: req.chatId,
+      agentId: req.agentId,
+      sessionFingerprintSeed: req.sessionFingerprintSeed,
+      unattended: req.unattended === true,
       ...(req.model ? { model: req.model } : {}),
     }, events);
     if (streaming) ui.streamEnd();
-    const session = { ...(req.session || {}), ...(result.sessionId ? { acpSessionId: result.sessionId } : {}) };
+    const session = {
+      ...(req.session || {}),
+      ...(result.sessionId ? { id: result.sessionId, acpSessionId: result.sessionId } : {}),
+    };
     if (result.failure) {
       return { text: result.text || "", session, usage: null, error: result.failure.message, errorKind: result.failure.kind, errorSource: result.failure.source };
     }
@@ -89,7 +127,8 @@ async function runAcpTurn(req) {
   } catch (e) {
     if (streaming) ui.streamEnd();
     const message = e && e.message ? e.message : String(e);
-    return { text: "", session: req.session || {}, usage: null, error: message, errorKind: /abort/i.test(message) ? "cancelled" : "exit", errorSource: "marker" };
+    const detail = process.env.AGENTLAS_DEBUG && e && e.stack ? e.stack : message;
+    return { text: "", session: req.session || {}, usage: null, error: detail, errorKind: /abort/i.test(message) ? "cancelled" : "exit", errorSource: "marker" };
   }
 }
 

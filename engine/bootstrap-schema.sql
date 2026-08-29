@@ -1,4 +1,4 @@
--- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-08-26T07:56:09Z)
+-- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-08-29T07:55:23Z)
 --
 -- ★생성물이다. 손으로 고치지 말고 재생성하라:
 --     node scripts/gen-bootstrap-schema.cjs
@@ -6,7 +6,7 @@
 -- 정본은 Desktop 의 마이그레이션 사다리(agentlas_desktop/electron/store/db.ts, SCHEMA_VERSION).
 -- 이 파일은 그 사다리를 **빈 DB** 에 끝까지 돌린 결과의 덤프이므로, 터미널이 만든 DB 는
 -- 처음부터 사다리 머리에 있다 — 데스크탑이 나중에 승급할 것이 남지 않는다.
-PRAGMA user_version=104;
+PRAGMA user_version=105;
 CREATE TABLE active_runtime (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         kind TEXT NOT NULL
@@ -867,6 +867,20 @@ CREATE TABLE installed_agents (
         installed_at TEXT NOT NULL,
         tone TEXT NOT NULL
       , env_requirements_json TEXT NOT NULL DEFAULT '[]', name_en TEXT NOT NULL DEFAULT '', tagline_en TEXT NOT NULL DEFAULT '', builtin INTEGER NOT NULL DEFAULT 0, role TEXT, visibility TEXT NOT NULL DEFAULT 'visible' CHECK(visibility IN ('visible','background','private')), entity_kind TEXT, local_display_name TEXT, bookmarked_at TEXT NULL, parent_team_id TEXT NULL);
+CREATE TABLE invocation_steers (
+      id TEXT PRIMARY KEY,
+      chat_id TEXT NOT NULL,
+      original_run_id TEXT NOT NULL,
+      prompt_text TEXT NOT NULL,
+      prompt_hash TEXT NOT NULL,
+      request_json TEXT NOT NULL,
+      workspace_binding_json TEXT,
+      execution_context_json TEXT,
+      status TEXT NOT NULL CHECK(status IN ('queued','draining','started','cancelled','failed')),
+      drained_run_id TEXT,
+      queued_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
 CREATE TABLE judgment_verdicts (
       kind          TEXT NOT NULL,
       signature     TEXT NOT NULL,
@@ -1071,6 +1085,7 @@ CREATE TABLE one_org_members (
       pending_count INTEGER NOT NULL DEFAULT 0,
       pending_kind TEXT NOT NULL DEFAULT 'approval' CHECK(pending_kind IN ('approval','review','input')),
       unread_count INTEGER NOT NULL DEFAULT 0,
+      unread_generation INTEGER NOT NULL DEFAULT 0,
       credit_state TEXT NOT NULL DEFAULT 'unknown' CHECK(credit_state IN ('ok','insufficient','unknown')),
       auto_select_tools INTEGER NOT NULL DEFAULT 1 CHECK(auto_select_tools IN (0,1)),
       collaboration_style TEXT NOT NULL DEFAULT 'default' CHECK(collaboration_style IN ('default','concise','warm','direct')),
@@ -1135,6 +1150,13 @@ CREATE TABLE projects (
         updated_at TEXT NOT NULL, folder_path TEXT, system_prompt TEXT, agent_pool_json TEXT NOT NULL DEFAULT '[]', source_type TEXT NOT NULL DEFAULT 'local', source_ref TEXT,
         FOREIGN KEY(default_agent_id) REFERENCES installed_agents(id) ON DELETE SET NULL
       );
+CREATE TABLE prompt_chat_start_intents (
+      intent_id TEXT PRIMARY KEY,
+      chat_id TEXT NOT NULL UNIQUE,
+      prompt_digest TEXT NOT NULL,
+      seed_only INTEGER NOT NULL CHECK(seed_only IN (0,1)),
+      created_at TEXT NOT NULL
+    );
 CREATE TABLE run_events (
         id TEXT PRIMARY KEY,
         run_id TEXT NOT NULL,
@@ -1426,6 +1448,10 @@ CREATE INDEX idx_installed_agent_hub_binding_exact
         ON installed_agent_hub_bindings(agent_definition_id, agent_release_id);
 CREATE INDEX idx_installed_agents_parent_team ON installed_agents(parent_team_id) WHERE parent_team_id IS NOT NULL;
 CREATE INDEX idx_installed_agents_visibility ON installed_agents(visibility, installed_at DESC);
+CREATE INDEX idx_invocation_steers_chat
+      ON invocation_steers(chat_id, queued_at, id);
+CREATE INDEX idx_invocation_steers_queue
+      ON invocation_steers(status, queued_at, id);
 CREATE INDEX idx_judgment_verdicts_recency ON judgment_verdicts(last_hit_at);
 CREATE INDEX idx_memory_agent ON memory_entries(agent_id, superseded_at);
 CREATE INDEX idx_memory_chat ON memory_entries(chat_id);
@@ -1467,6 +1493,8 @@ CREATE INDEX idx_plugin_builder_sessions_chat_updated
         ON plugin_builder_sessions(chat_id, updated_at DESC);
 CREATE INDEX idx_plugin_builder_sessions_slug_phase
         ON plugin_builder_sessions(slug, phase);
+CREATE INDEX idx_prompt_chat_start_chat
+      ON prompt_chat_start_intents(chat_id);
 CREATE INDEX idx_run_events_agent_kind_ts
           ON run_events(agent_id, kind, ts DESC);
 CREATE INDEX idx_run_events_agent_ts ON run_events(agent_id, ts DESC);

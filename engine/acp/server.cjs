@@ -50,8 +50,20 @@ function textOfPrompt(blocks) {
  * events: { onDelta(text), onTool(name, summary, id), onToolResult(text, ok, id), onStatus(text) }
  * cancel(sessionKey) → void
  */
-function productionTurnRunner() {
-  const sessions = new Map(); // acp sessionId → { session, agent, runtime }
+function productionTurnRunner(options = {}) {
+  const sessions = new Map(); // currently running acp sessionId → Session
+  const createSession = options.createSession || ((ctx, spec, prompt) => {
+    const { Orchestrator } = require("../sessions/orchestrator.cjs");
+    const orch = new Orchestrator({ db: ctx.db(), lang: ctx.lang });
+    const session = orch.spawn({
+      agent: spec.agent,
+      runtime: spec.runtime,
+      permission: spec.permission,
+      cwd: spec.cwd,
+      title: prompt.slice(0, 60),
+    });
+    return { orch, session };
+  });
   return {
     async newSession(ctx, { cwd, runtimeKind, agentSlug }) {
       const { projectCwd } = require("../project/paths.cjs");
@@ -81,9 +93,17 @@ function productionTurnRunner() {
       return { agent, runtime, permission, cwd: workdir, project: resolved ? resolved.project : null };
     },
     async runTurn(ctx, spec, prompt, events) {
-      const { Orchestrator } = require("../sessions/orchestrator.cjs");
-      const orch = new Orchestrator({ db: ctx.db(), lang: ctx.lang });
-      const session = orch.spawn({ agent: spec.agent, runtime: spec.runtime, permission: spec.permission, cwd: spec.cwd, title: prompt.slice(0, 60) });
+      // An ACP session is conversational. Recreating Terminal's Session here on
+      // every prompt gave each editor turn a new chat/runtime fingerprint even
+      // though the client kept sending the same ACP sessionId. Keep one Session
+      // on the session spec so DB history and provider resume state survive.
+      if (!spec.session) {
+        const created = await createSession(ctx, spec, prompt);
+        spec.orch = created && created.orch || null;
+        spec.session = created && created.session || created;
+      }
+      const session = spec.session;
+      if (!session || typeof session.send !== "function") throw new Error("ACP session runner failed to create a Terminal session");
       sessions.set(spec.acpSessionId, session);
       const listener = (ev) => {
         try {
@@ -104,7 +124,7 @@ function productionTurnRunner() {
         };
       } finally {
         session.removeListener("event", listener);
-        sessions.delete(spec.acpSessionId);
+        if (sessions.get(spec.acpSessionId) === session) sessions.delete(spec.acpSessionId);
       }
     },
     cancel(acpSessionId) {
@@ -207,9 +227,15 @@ class AcpAgentServer {
         case "session/prompt": {
           const spec = this.sessions.get(String(params.sessionId));
           if (!spec) return this.error(id, -32602, "unknown sessionId");
+          // readline dispatches messages concurrently. Session.send() queues a
+          // second prompt and returns the first turn's promise, which would make
+          // both JSON-RPC requests stream each other's events and settle with the
+          // wrong result. ACP clients must wait for the current prompt response.
+          if (spec.promptInFlight) return this.error(id, -32001, "session prompt already in progress");
           const prompt = textOfPrompt(params.prompt).trim();
           if (!prompt) return this.reply(id, { stopReason: "end_turn" });
           const sid = spec.acpSessionId;
+          spec.promptInFlight = true;
           let streamed = false;
           const events = {
             onDelta: (text) => {
@@ -232,18 +258,22 @@ class AcpAgentServer {
             },
             onStatus: () => {},
           };
-          const res = await this.runner.runTurn(this.ctx, spec, prompt, events);
-          if (res && res.cancelled) return this.reply(id, { stopReason: "cancelled" });
-          if (res && res.error) {
-            const kind = String(res.errorKind || "");
-            if (kind === "refused") return this.reply(id, { stopReason: "refusal" });
-            if (kind === "auth") return this.error(id, -32000, `auth_required: ${res.error}`);
-            // Non-marker failures: surface the runtime's own words as the answer, then end the turn.
-            if (!streamed) events.onDelta(String(res.error));
-            return this.reply(id, { stopReason: "end_turn", _meta: { agentlas: { error: String(res.error), errorKind: kind || null } } });
+          try {
+            const res = await this.runner.runTurn(this.ctx, spec, prompt, events);
+            if (res && res.cancelled) return this.reply(id, { stopReason: "cancelled" });
+            if (res && res.error) {
+              const kind = String(res.errorKind || "");
+              if (kind === "refused") return this.reply(id, { stopReason: "refusal" });
+              if (kind === "auth") return this.error(id, -32000, `auth_required: ${res.error}`);
+              // Non-marker failures: surface the runtime's own words as the answer, then end the turn.
+              if (!streamed) events.onDelta(String(res.error));
+              return this.reply(id, { stopReason: "end_turn", _meta: { agentlas: { error: String(res.error), errorKind: kind || null } } });
+            }
+            if (!streamed && res && res.text) events.onDelta(res.text);
+            return this.reply(id, { stopReason: "end_turn" });
+          } finally {
+            spec.promptInFlight = false;
           }
-          if (!streamed && res && res.text) events.onDelta(res.text);
-          return this.reply(id, { stopReason: "end_turn" });
         }
         case "session/cancel": {
           const spec = this.sessions.get(String(params.sessionId));

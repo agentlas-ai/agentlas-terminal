@@ -48,7 +48,7 @@ async function run(ctx, args, deps) {
       case "ls":
         return list(io);
       case "open":
-        return open(io, rest);
+        return open(io, rest, deps || {});
       case "help":
       case "--help":
       case "-h":

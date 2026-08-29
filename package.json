@@ -1,6 +1,6 @@
 {
   "name": "agentlas",
-  "version": "1.0.61",
+  "version": "1.0.62",
   "description": "Agentlas project terminal — run project controllers and task-scoped agent teams from the terminal. Standalone: no desktop app process required.",
   "bin": {
     "agentlas": "bin/agentlas.cjs"
@@ -27,6 +27,8 @@
   "files": [
     "bin/",
     "engine/",
+    "!engine/vendor/desktop-core/",
+    "!engine/vendor/desktop-core.tar.gz",
     "install.sh",
     "install.ps1",
     "CHANGELOG.md",

@@ -10,14 +10,35 @@
 const { compareSemVer } = require("../semver.cjs");
 const { readVersion } = require("../agentlas-banner.cjs");
 
-async function checkNpmLatest({ fetch: fetchImpl } = {}) {
+async function checkNpmLatest({ fetch: fetchImpl, timeoutMs = 8_000 } = {}) {
   const f = fetchImpl || globalThis.fetch;
   const currentVersion = readVersion();
   let latestVersion = null;
+  const controller = new AbortController();
+  const boundedTimeoutMs = Math.min(60_000, Math.max(10, Number(timeoutMs) || 8_000));
+  let timeout;
   try {
-    const resp = await f("https://registry.npmjs.org/agentlas/latest", { headers: { accept: "application/json" } });
-    if (resp.ok) latestVersion = String((await resp.json()).version || "");
-  } catch { /* offline 등 — 호출부에서 안내 */ }
+    // Bound both the connection and body parse. Some injected/custom fetch
+    // implementations ignore AbortSignal, so the explicit race is required to
+    // keep `agentlas update` from hanging the entire CLI indefinitely.
+    const request = Promise.resolve().then(async () => {
+      const resp = await f("https://registry.npmjs.org/agentlas/latest", {
+        headers: { accept: "application/json" },
+        signal: controller.signal,
+      });
+      return resp.ok ? String((await resp.json()).version || "") : null;
+    });
+    const expired = new Promise((_, reject) => {
+      timeout = setTimeout(() => {
+        const error = new Error(`npm update check timed out after ${boundedTimeoutMs}ms`);
+        error.code = "AGENTLAS_UPDATE_TIMEOUT";
+        try { controller.abort(error); } catch { controller.abort(); }
+        reject(error);
+      }, boundedTimeoutMs);
+    });
+    latestVersion = await Promise.race([request, expired]);
+  } catch { /* offline/timeout 등 — 호출부에서 안내 */ }
+  finally { if (timeout) clearTimeout(timeout); }
   const comparison = latestVersion ? compareSemVer(currentVersion, latestVersion) : null;
   return {
     currentVersion,

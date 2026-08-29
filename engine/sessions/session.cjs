@@ -183,6 +183,13 @@ class Session extends EventEmitter {
     this.lastError = null;
     this._privateRecoveryEvidence.length = 0;
     this._record({ type: "turn-start", at: Date.now(), prompt });
+    // ACP agents that cannot load a provider-side session need prior conversation
+    // reattached on a fresh session. Capture it before appending this turn so the
+    // current user prompt is not duplicated in both history and userPrompt.
+    const priorHistory = store.chatHistory(this.db, this.chatId).map((row) => ({
+      role: row.role,
+      text: row.text,
+    }));
     store.appendMessage(this.db, this.chatId, "user", prompt);
     let governedTurn = null;
     try {
@@ -260,6 +267,9 @@ class Session extends EventEmitter {
         this._apiAbort = null;
       }
     } else {
+      const isAcpRuntime = require("../runtimes/acp-driver.cjs").ACP_KINDS.has(this.runtime.kind);
+      const turnAbort = isAcpRuntime ? new AbortController() : null;
+      if (turnAbort) this._apiAbort = turnAbort;
       const req = {
         kind: this.runtime.kind,
         bin: this.runtime.bin,
@@ -269,6 +279,11 @@ class Session extends EventEmitter {
         systemPrompt,
         permission: this.permission,
         session: { ...this.runtimeSession },
+        history: priorHistory,
+        chatId: this.chatId,
+        agentId: this.agent.id,
+        locale: this.lang,
+        sessionFingerprintSeed: this.fingerprint,
         model: this.runtime.model,
         effort: this.runtime.effort,
         // 사용자가 이미 동의한 MCP 서버를 턴에 싣는다.
@@ -286,6 +301,7 @@ class Session extends EventEmitter {
         mcpServers: this._consentedMcpServers(),
         onSpawn: (child) => { this._child = child; },
       };
+      if (turnAbort) req.signal = turnAbort.signal;
       if (this._spawnImpl) req.spawn = this._spawnImpl;
       if (this._timeoutConfig) req.timeoutConfig = this._timeoutConfig;
       try {
@@ -325,6 +341,8 @@ class Session extends EventEmitter {
         }
       } catch (e) {
         res = { text: "", session: req.session, error: (e && e.message) || String(e) };
+      } finally {
+        if (turnAbort && this._apiAbort === turnAbort) this._apiAbort = null;
       }
     }
     this._child = null;

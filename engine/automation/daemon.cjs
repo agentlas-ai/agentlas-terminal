@@ -185,9 +185,30 @@ async function runAutomationOnce(ctx, db, row, opts = {}) {
   // 데스크탑 스케줄러는 60초마다 리스를 갱신한다. 여기는 한 번 잡고 끝이라
   // TTL(15분)을 넘긴 실행은 프로세스가 살아 있어도 회수 대상이 됐다 — 같은
   // 자동화가 두 실행기에서 겹쳐 도는 경로. 같은 주기로 심장박동을 보낸다.
+  let activeSession = null;
+  let leaseOwnershipLost = false;
+  let leaseRenewWarningEmitted = false;
   const leaseHeartbeat = setInterval(() => {
-    try { store.renewAutomationLease(db, row.id); } catch { /* best-effort */ }
-  }, 60_000);
+    try {
+      const renewed = store.renewAutomationLease(db, row.id);
+      if (!renewed) {
+        leaseOwnershipLost = true;
+        if (activeSession && typeof activeSession.kill === "function") activeSession.kill();
+      } else {
+        leaseRenewWarningEmitted = false;
+      }
+    } catch (error) {
+      // One SQLITE_BUSY/I/O miss is not ownership loss. Keep the run alive and
+      // retry on the next heartbeat, while surfacing the first deferred renewal.
+      if (!leaseRenewWarningEmitted) {
+        leaseRenewWarningEmitted = true;
+        const code = error && typeof error === "object" && "code" in error
+          ? String(error.code || "transient")
+          : "transient";
+        ctx.err(`automation lease heartbeat deferred (${code.slice(0, 80)})`);
+      }
+    }
+  }, Math.max(10, Number(opts.leaseHeartbeatMs) || 60_000));
   if (typeof leaseHeartbeat.unref === "function") leaseHeartbeat.unref();
 
   try {
@@ -244,9 +265,18 @@ async function runAutomationOnce(ctx, db, row, opts = {}) {
       timeoutConfig: opts.timeoutConfig,
       ...(markerChatId ? { chatId: markerChatId } : {}),
     });
+    activeSession = session;
+    if (leaseOwnershipLost) {
+      session.kill();
+      return { ok: false, skipped: true, reason: "lease-lost", error: "Automation execution lease ownership lost" };
+    }
     if (typeof opts.onSession === "function") opts.onSession(session);
 
     const res = await session.send(row.prompt_template);
+    if (leaseOwnershipLost) {
+      ctx.err("Automation execution lease ownership lost");
+      return { ok: false, skipped: true, reason: "lease-lost", error: "Automation execution lease ownership lost" };
+    }
     const finalText = (res && (res.finalText || res.text)) || "";
     const failed = session.status === "failed";
     const errMsg = failed ? String(session.lastError || "runtime turn failed").slice(0, 500) : null;
@@ -265,12 +295,15 @@ async function runAutomationOnce(ctx, db, row, opts = {}) {
   } catch (e) {
     const msg = String((e && e.message) || e).slice(0, 500);
     ctx.err(msg);
+    if (leaseOwnershipLost) {
+      return { ok: false, skipped: true, reason: "lease-lost", error: "Automation execution lease ownership lost" };
+    }
     store.recordRun(db, row.id, "error", msg, opts.scheduledFor);
     store.advanceAfterRun(db, row, { ok: false, advanceSchedule: !!opts.advanceSchedule });
     return { ok: false, error: msg };
   } finally {
     clearInterval(leaseHeartbeat);
-    store.releaseAutomation(db, row.id);
+    store.releaseAutomation(db, row.id, store.LEASE_OWNER);
   }
 }
 

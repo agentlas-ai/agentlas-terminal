@@ -175,13 +175,24 @@ function tableExists(db, name) {
 
 function appendRunEvent(db, input) {
   if (!db || !tableExists(db, "run_events")) return false;
-  const id = input.id;
-  if (db.prepare("SELECT 1 FROM run_events WHERE id=?").get(id)) return false;
-  const seqRow = db.prepare("SELECT COALESCE(MAX(seq), -1) + 1 AS seq FROM run_events WHERE run_id=?").get(input.runId);
-  db.prepare(
-    "INSERT OR IGNORE INTO run_events (id,run_id,seq,ts,kind,chat_id,automation_id,node_id,agent_id,payload_json) VALUES (?,?,?,?,?,NULL,NULL,NULL,?,?)",
-  ).run(id, input.runId, Number(seqRow?.seq || 0), input.ts, input.kind, input.agentId || null, JSON.stringify(input.payload));
-  return true;
+  // Allocate seq and insert in one SQLite statement. The old SELECT(MAX)+INSERT
+  // pair allowed two Terminal processes to choose the same (run_id, seq); one
+  // INSERT OR IGNORE then vanished while this function still reported success.
+  const inserted = db.prepare(
+    `INSERT OR IGNORE INTO run_events
+       (id,run_id,seq,ts,kind,chat_id,automation_id,node_id,agent_id,payload_json)
+     SELECT ?,?,COALESCE(MAX(seq) + 1, 0),?,?,NULL,NULL,NULL,?,?
+       FROM run_events WHERE run_id=?`,
+  ).run(
+    input.id,
+    input.runId,
+    input.ts,
+    input.kind,
+    input.agentId || null,
+    JSON.stringify(input.payload),
+    input.runId,
+  );
+  return Number(inserted?.changes || 0) === 1;
 }
 
 function persistRunReceipt(db, receipt, agentId) {
@@ -200,7 +211,9 @@ function persistRunReceipt(db, receipt, agentId) {
 function recordIntakeDecision(db, input) {
   const sourceHash = digestHex(INTAKE_POLICY_VERSION, input.agentId, input.memoryId || "none", input.exactBase?.agentReleaseId || "none", input.environmentKey || "none");
   appendRunEvent(db, {
-    id: opaqueId("event", "experience-intake", sourceHash),
+    // The same curated memory can be observed by many distinct runs. Preserve
+    // retry idempotency within one run without collapsing later run evidence.
+    id: opaqueId("event", "experience-intake", input.runId, sourceHash),
     runId: input.runId,
     ts: input.ts,
     kind: input.kind || "experience-intake-decision",

@@ -30,7 +30,10 @@ function localCoreBin() {
   if (process.platform === "win32") return null;
   for (const candidate of candidates) {
     try {
-      if (candidate && fs.existsSync(candidate)) return candidate;
+      if (!candidate) continue;
+      const stat = fs.statSync(candidate);
+      fs.accessSync(candidate, fs.constants.X_OK);
+      if (stat.isFile()) return candidate;
     } catch { /* keep looking */ }
   }
   return null;
@@ -69,12 +72,25 @@ function createLocalCoreClient({ cwd, timeoutMs = 60_000 } = {}) {
   const pending = new Map();
   let exited = false;
 
-  child.on("exit", () => {
+  const failPending = (code, message) => {
+    if (exited) return;
     exited = true;
     for (const [, entry] of pending) {
-      entry.reject(coreError("local_core_exited", "the local core process exited before responding"));
+      entry.reject(coreError(code, message));
     }
     pending.clear();
+  };
+  child.once("error", (error) => {
+    failPending("local_core_spawn_failed", `the local core process could not start: ${(error && error.message) || error}`);
+  });
+  child.on("exit", () => {
+    failPending("local_core_exited", "the local core process exited before responding");
+  });
+  // Always drain stderr. Leaving the pipe unread lets a verbose Core fill the
+  // kernel buffer and deadlock an otherwise healthy tools/call.
+  child.stderr.on("data", () => {});
+  child.stdin.on("error", (error) => {
+    failPending("local_core_transport_error", `the local core input stream failed: ${(error && error.message) || error}`);
   });
   child.stdout.on("data", (chunk) => {
     buffer += chunk;
@@ -104,16 +120,35 @@ function createLocalCoreClient({ cwd, timeoutMs = 60_000 } = {}) {
       resolve: (message) => { clearTimeout(timer); resolve(message); },
       reject: (error) => { clearTimeout(timer); reject(error); },
     });
-    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+    try {
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`, (error) => {
+        if (!error) return;
+        const entry = pending.get(id);
+        if (!entry) return;
+        pending.delete(id);
+        entry.reject(coreError("local_core_transport_error", `${method} could not be written to the local core: ${error.message}`));
+      });
+    } catch (error) {
+      const entry = pending.get(id);
+      pending.delete(id);
+      if (entry) entry.reject(coreError("local_core_transport_error", `${method} could not be written to the local core: ${error.message}`));
+    }
   });
 
   async function ensureInitialized() {
     if (!initialized) {
-      initialized = rpc("initialize", {
-        protocolVersion: "2024-11-05",
-        capabilities: {},
-        clientInfo: { name: "agentlas-terminal", version: "2" },
-      });
+      initialized = (async () => {
+        const response = await rpc("initialize", {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "agentlas-terminal", version: "2" },
+        });
+        if (response.error) {
+          throw coreError("local_core_initialize_failed", `initialize: ${response.error.message || JSON.stringify(response.error)}`);
+        }
+        child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} })}\n`);
+        return response;
+      })();
     }
     return initialized;
   }

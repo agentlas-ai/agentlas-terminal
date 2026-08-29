@@ -11,6 +11,8 @@
  *  - 모든 화면은 ctx.out 이 아니라 ui 를 직접 받아 pi 프레임 안에 그린다.
  */
 
+const path = require("node:path");
+
 function table(ui, rows, opts = {}) {
   // rows: [[col, col, …]] — 첫 행이 헤더. 폭은 CJK 셀 폭으로 계산한다.
   const { visWidth, truncateWidth } = require("./width.cjs");
@@ -52,6 +54,28 @@ function rows(db, sql, args = []) {
 }
 const shortTs = (v) => (v ? String(v).replace("T", " ").slice(0, 16) : "");
 
+const ATTENTION_RUN_WHERE = `
+  r.id = (
+    SELECT r2.id FROM automation_runs r2
+     WHERE r2.automation_id IS r.automation_id
+     ORDER BY COALESCE(r2.started_at,'') DESC, r2.rowid DESC LIMIT 1
+  )
+  AND (
+    r.status IN ('error','partial','blocked','needs_input')
+    OR r.outcome IN ('needs_input','blocked','rejected')
+    OR (r.status = 'running' AND julianday(r.last_activity_at) < julianday('now','-15 minutes'))
+  )`;
+
+function pathContains(root, candidate) {
+  if (!root) return false;
+  try {
+    const relative = path.relative(path.resolve(String(root)), path.resolve(String(candidate)));
+    return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+  } catch {
+    return false;
+  }
+}
+
 /* ── /dashboard — 데스크탑 dashboard 의 관제 패널 집합 ── */
 function dashboard(ui, db, en) {
   const chip = (paint, s) => paint(` ${s} `);
@@ -66,11 +90,12 @@ function dashboard(ui, db, en) {
   ui.line(`  ${chip(ui.c.inverse, `${en ? "agents" : "에이전트"} ${local}`)} ${chip(ui.c.dim, `builtin ${builtin}`)} ${chip(ui.c.inverse, `${en ? "firms" : "회사"} ${firms}`)} ${chip(ui.c.dim, `${en ? "bookmarks" : "북마크"} ${marks}`)} ${chip(ui.c.dim, `${en ? "borrowed" : "대여"} ${borrowed}`)}`);
 
   // ── 확인 필요 (D1 숨은 계약 2: 없으면 실행이 조용히 멈춘 채 정상처럼 보인다) ──
-  const pending = count(db, "SELECT COUNT(*) n FROM automation_node_approvals WHERE decision NOT IN ('approved','rejected')");
+  const pending = count(db, `SELECT COUNT(*) n FROM automation_runs r WHERE ${ATTENTION_RUN_WHERE}`);
   const stalled = rows(db,
     `SELECT r.id, a.name, r.status, r.last_activity_at
        FROM automation_runs r LEFT JOIN automations a ON a.id = r.automation_id
-      WHERE r.status NOT IN ('ok','error','cancelled') ORDER BY COALESCE(r.last_activity_at,'') DESC LIMIT 5`);
+      WHERE ${ATTENTION_RUN_WHERE}
+      ORDER BY COALESCE(r.last_activity_at,'') DESC LIMIT 5`);
   ui.line("");
   ui.line(ui.c.bold(en ? "Needs attention" : "확인 필요"));
   if (!pending && !stalled.length) {
@@ -242,10 +267,10 @@ function projects(ui, db, en) {
   if (list.length) {
     table(ui, [[en ? "project" : "프로젝트", en ? "source" : "소스", en ? "chats" : "채팅", en ? "tasks" : "작업", en ? "updated" : "수정"],
       ...list.map((p) => [
-        (p.folder_path && cwd.startsWith(p.folder_path) ? "▸ " : "  ") + (p.name || p.id),
+        (pathContains(p.folder_path, cwd) ? "▸ " : "  ") + (p.name || p.id),
         p.source_type || "local", String(p.chats), String(p.tasks), shortTs(p.updated_at)])],
       { cap: [30, 10, 6, 6, 16] });
-    const here = list.find((p) => p.folder_path && cwd.startsWith(p.folder_path));
+    const here = list.find((p) => pathContains(p.folder_path, cwd));
     ui.line("");
     ui.line(here
       ? ui.c.dim(en ? `▸ this folder is connected to "${here.name}"` : `▸ 이 폴더는 "${here.name}"에 연결돼 있습니다`)
@@ -350,5 +375,4 @@ function firms(ui, db, en, ctx, arg) {
   void ctx;
 }
 
-module.exports = { dashboard, library, marketplace, settings, projects, automations, firms, table };
-
+module.exports = { dashboard, library, marketplace, settings, projects, automations, firms, table, pathContains, ATTENTION_RUN_WHERE };

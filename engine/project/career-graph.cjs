@@ -209,8 +209,10 @@ async function runCareerGraphCli(args, opts) {
   }
   const paths = ensureCareerGraphCli(projectPath, opts.lang);
   if (sub === "open") {
-    if (!opts.noOpen) openLocalPathCli(paths.inboxPath, opts.notify);
-    return [`${ko ? "커리어 그래프 수신함을 열었습니다" : "Opened Career Graph inbox"}: ${paths.inboxPath}`];
+    const opened = opts.noOpen ? true : openLocalPathCli(paths.inboxPath, opts.notify);
+    return [`${opened
+      ? (ko ? "커리어 그래프 수신함을 열었습니다" : "Opened Career Graph inbox")
+      : (ko ? "커리어 그래프 수신함을 자동으로 열지 못했습니다. 직접 여세요" : "Could not open Career Graph inbox automatically; open it manually")}: ${paths.inboxPath}`];
   }
   if (sub === "add") {
     const flags = parseFlagsCli(normalizedArgs.slice(1));

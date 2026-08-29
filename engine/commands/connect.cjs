@@ -13,6 +13,7 @@
  * 하위 명령:
  *   connect                           상태 표
  *   connect telegram <agent|firm>     이 대상에 봇을 연결(토큰 stdin) + 방 페어링
+ *   connect pair <id>                 타임아웃된 방 페어링을 다시 기다림
  *   connect test <id>                 연결된 방에 확인 메시지
  *   connect remove <id>               연결 제거(토큰 파일도 삭제)
  */
@@ -23,8 +24,8 @@ const readline = require("node:readline");
 
 function usage(ko) {
   return ko
-    ? "사용법: agentlas connect [ status | telegram <agent|firm> [--auto] | test <id> | remove <id> ]"
-    : "Usage: agentlas connect [ status | telegram <agent|firm> [--auto] | test <id> | remove <id> ]";
+    ? "사용법: agentlas connect [ status | telegram <agent|firm> [--auto] | pair <id> | test <id> | remove <id> ]"
+    : "Usage: agentlas connect [ status | telegram <agent|firm> [--auto] | pair <id> | test <id> | remove <id> ]";
 }
 
 function resolveTarget(db, token) {
@@ -111,8 +112,8 @@ async function connectTelegram(ctx, targetToken, { auto = false } = {}) {
   const botAt = started.botUsername ? "@" + started.botUsername : "(bot)";
   ctx.out(`${ctx.ui.green("✓")} ${ko ? "봇 확인됨" : "bot verified"}: ${botAt} → ${target.name}`);
   ctx.out(ko
-    ? `이제 텔레그램에서 ${botAt} 에게 아무 메시지나 보내세요 (예: /start). 방을 기다립니다…`
-    : `Now message ${botAt} on Telegram (e.g. /start). Waiting for the chat…`);
+    ? `이제 텔레그램에서 ${botAt} 에게 정확히 \`/start ${started.id}\` 를 보내세요. 방을 기다립니다…`
+    : `Now send exactly \`/start ${started.id}\` to ${botAt} on Telegram. Waiting for the chat…`);
 
   let paired;
   try {
@@ -127,8 +128,8 @@ async function connectTelegram(ctx, targetToken, { auto = false } = {}) {
 
   if (!paired) {
     ctx.out(ctx.ui.dim(ko
-      ? `방을 못 받았습니다(2분 초과). ${botAt} 에게 메시지를 보낸 뒤 다시: agentlas connect test ${started.id}`
-      : `No chat received (2 min). Message ${botAt}, then retry: agentlas connect test ${started.id}`));
+      ? `방을 못 받았습니다(2분 초과). ${botAt} 에게 \`/start ${started.id}\` 를 보낸 뒤 다시: agentlas connect pair ${started.id}`
+      : `No chat received (2 min). Send \`/start ${started.id}\` to ${botAt}, then retry: agentlas connect pair ${started.id}`));
     return 0;
   }
   ctx.out(`${ctx.ui.green("✓")} ${ko ? "방 연결됨" : "chat paired"}: ${paired.telegram_chat_title || paired.telegram_chat_id}`);
@@ -151,6 +152,33 @@ async function run(ctx, args) {
     const targetToken = rest.find((a) => a && !String(a).startsWith("-"));
     if (!targetToken) { ctx.err(usage(ko)); return 1; }
     return connectTelegram(ctx, targetToken, { auto });
+  }
+  if (sub === "pair") {
+    if (!args[1]) { ctx.err(ko ? "사용법: agentlas connect pair <id>" : "Usage: agentlas connect pair <id>"); return 1; }
+    const row = tg.getBinding(ctx.db(), args[1]);
+    if (!row) { ctx.err(ko ? "연결을 찾을 수 없습니다." : "connection not found."); return 1; }
+    if (row.telegram_chat_id) {
+      ctx.out(`${ctx.ui.green("✓")} ${ko ? "이미 방이 연결돼 있습니다" : "chat already paired"}: ${row.telegram_chat_title || row.telegram_chat_id}`);
+      return 0;
+    }
+    ctx.out(ko
+      ? `텔레그램에서 @${row.bot_username || "bot"} 에게 정확히 \`/start ${row.id}\` 를 보내세요.`
+      : `Send exactly \`/start ${row.id}\` to @${row.bot_username || "bot"} on Telegram.`);
+    try {
+      if (typeof ctx.ui.startSpinner === "function") ctx.ui.startSpinner(ko ? "방 연결 대기 중…" : "Waiting for the chat…");
+      const paired = await tg.pairByPolling(ctx.db(), row.id, { timeoutMs: 120_000 });
+      if (typeof ctx.ui.stopSpinner === "function") ctx.ui.stopSpinner();
+      if (!paired) {
+        ctx.err(ko ? "방을 못 받았습니다(2분 초과). 같은 명령으로 다시 기다릴 수 있습니다." : "No chat received (2 min). Run the same command to wait again.");
+        return 1;
+      }
+      ctx.out(`${ctx.ui.green("✓")} ${ko ? "방 연결됨" : "chat paired"}: ${paired.telegram_chat_title || paired.telegram_chat_id}`);
+      return 0;
+    } catch (e) {
+      if (typeof ctx.ui.stopSpinner === "function") ctx.ui.stopSpinner();
+      ctx.err(`${ctx.ui.red("✖")} ${String((e && e.message) || e)}`);
+      return 1;
+    }
   }
   if (sub === "test") {
     if (!args[1]) { ctx.err(ko ? "사용법: agentlas connect test <id>" : "Usage: agentlas connect test <id>"); return 1; }

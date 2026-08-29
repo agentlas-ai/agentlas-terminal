@@ -6,7 +6,7 @@
  */
 const fs = require("node:fs");
 const path = require("node:path");
-const { spawn } = require("node:child_process");
+const { spawnSync } = require("node:child_process");
 const { userDataDir } = require("../core/paths.cjs");
 const { fail } = require("./common.cjs");
 
@@ -58,11 +58,18 @@ function list(io) {
 }
 
 // `oberon open [path]` — 산출물 폴더를 OS 파일 매니저로 연다.
-function open(io, args) {
+function open(io, args, options = {}) {
   const target = args[0] ? path.resolve(args[0]) : oberonHome();
   if (!fs.existsSync(target)) fail(`Path not found: ${target}`);
   const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "explorer" : "xdg-open";
-  spawn(opener, [target], { detached: true, stdio: "ignore" }).unref();
+  // `spawn(...).unref()` reported success before the OS opener had even spawned;
+  // a missing xdg-open/explorer then emitted an unhandled error and crashed the CLI
+  // after printing "Opening". The opener command is short-lived, so wait for its
+  // launch result and only claim success on exit 0.
+  const launch = options.spawnSyncImpl || spawnSync;
+  const result = launch(opener, [target], { stdio: "ignore", windowsHide: true });
+  if (result && result.error) fail(`Could not open ${target}: ${result.error.message}`);
+  if (!result || result.status !== 0) fail(`Could not open ${target} (opener exit ${result && result.status != null ? result.status : "unknown"})`);
   io.out(`Opening folder: ${target}`);
   return 0;
 }

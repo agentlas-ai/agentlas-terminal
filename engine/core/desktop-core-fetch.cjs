@@ -27,7 +27,17 @@ function readManifest() {
   try { return JSON.parse(fs.readFileSync(manifestPath(), "utf8")); } catch { return null; }
 }
 
-function cacheDir(version) { return path.join(userDataDir(), "desktop-core-cache", String(version)); }
+function cacheRoot() { return path.join(userDataDir(), "desktop-core-cache"); }
+function normalizedCacheVersion(version) {
+  const value = String(version ?? "").trim();
+  if (!value || value === "." || value === "..") return null;
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value) ? value : null;
+}
+function cacheDir(version) {
+  const normalized = normalizedCacheVersion(version);
+  if (!normalized) throw new TypeError("Desktop core manifest has an unsafe cache version");
+  return path.join(cacheRoot(), normalized);
+}
 function cacheDistDir(version) { return path.join(cacheDir(version), "dist"); }
 
 function sha256File(file) {
@@ -38,11 +48,46 @@ function sha256File(file) {
 
 /** 이미 캐시에 온전히 풀려 있으면 그 dist 경로, 아니면 null. */
 function cachedCoreRoot(manifest = readManifest()) {
-  if (!manifest) return null;
-  const dist = cacheDistDir(manifest.version);
-  const marker = path.join(cacheDir(manifest.version), ".complete");
-  if (fs.existsSync(marker) && fs.existsSync(path.join(dist, "electron", "workflow", "run-graph.js"))) return dist;
+  const version = normalizedCacheVersion(manifest?.version);
+  if (!version || !manifest?.sha256) return null;
+  const dist = cacheDistDir(version);
+  const marker = path.join(cacheDir(version), ".complete");
+  if (!fs.existsSync(path.join(dist, "electron", "workflow", "run-graph.js"))) return null;
+  try {
+    const completed = JSON.parse(fs.readFileSync(marker, "utf8"));
+    if (
+      completed?.schemaVersion === 2
+      && String(completed.version) === version
+      && completed.sha256 === manifest.sha256
+    ) return dist;
+  } catch {
+    // Timestamp-only and malformed markers predate the content-bound cache
+    // contract. They must be refreshed instead of trusted as executable code.
+  }
   return null;
+}
+
+/**
+ * Remove only cache entries that are recognizably old engine downloads.
+ * Unknown files under the dedicated root are preserved: cleanup must never
+ * widen from a versioned engine cache into arbitrary user data.
+ */
+function pruneStaleCaches(keepVersion) {
+  const root = cacheRoot();
+  let removed = 0;
+  let entries = [];
+  try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return removed; }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name === String(keepVersion) || entry.name.includes(".partial-")) continue;
+    const dir = path.join(root, entry.name);
+    const recognizable = fs.existsSync(path.join(dir, ".complete"))
+      || fs.existsSync(path.join(dir, "desktop-core.tar.gz"))
+      || fs.existsSync(path.join(dir, "dist", "electron", "workflow", "run-graph.js"));
+    if (!recognizable) continue;
+    fs.rmSync(dir, { recursive: true, force: true });
+    removed += 1;
+  }
+  return removed;
 }
 
 /**
@@ -52,47 +97,75 @@ function cachedCoreRoot(manifest = readManifest()) {
  */
 async function fetchDesktopCore({ onNotice } = {}) {
   const manifest = readManifest();
-  if (!manifest || !manifest.url || !manifest.sha256) return null;
+  const version = normalizedCacheVersion(manifest?.version);
+  if (!manifest || !version || !manifest.url || !manifest.sha256) return null;
 
-  const existing = cachedCoreRoot(manifest);
+  const existing = cachedCoreRoot({ ...manifest, version });
   if (existing) return existing;
 
   const say = (t) => { if (typeof onNotice === "function") onNotice(t); };
   say(`Downloading the graph-execution engine (${manifest.sizeBytes ? Math.round(manifest.sizeBytes / 1024 / 1024) + " MB" : "one-time"}) from ${manifest.url} …`);
 
-  const dir = cacheDir(manifest.version);
-  fs.rmSync(dir, { recursive: true, force: true });
-  fs.mkdirSync(dir, { recursive: true });
-  const tarPath = path.join(dir, "desktop-core.tar.gz");
+  const dir = cacheDir(version);
+  const partialDir = path.join(
+    cacheRoot(),
+    `${version}.partial-${process.pid}-${crypto.randomBytes(6).toString("hex")}`,
+  );
+  fs.mkdirSync(partialDir, { recursive: true });
+  const tarPath = path.join(partialDir, "desktop-core.tar.gz");
 
-  const res = await fetch(manifest.url);
-  if (!res.ok) { say(`Download failed: HTTP ${res.status}`); return null; }
+  let res;
+  try {
+    res = await fetch(manifest.url);
+  } catch (error) {
+    say(`Download failed: ${error?.message || error}`);
+    fs.rmSync(partialDir, { recursive: true, force: true });
+    return null;
+  }
+  if (!res.ok) {
+    say(`Download failed: HTTP ${res.status}`);
+    fs.rmSync(partialDir, { recursive: true, force: true });
+    return null;
+  }
   const buf = Buffer.from(await res.arrayBuffer());
   fs.writeFileSync(tarPath, buf);
 
   const digest = sha256File(tarPath);
   if (digest !== manifest.sha256) {
     say(`Checksum mismatch (expected ${manifest.sha256.slice(0, 12)}…, got ${digest.slice(0, 12)}…) — refusing to use it.`);
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(partialDir, { recursive: true, force: true });
+    return null;
+  }
+  if (Number.isFinite(Number(manifest.sizeBytes)) && Number(manifest.sizeBytes) !== buf.length) {
+    say(`Size mismatch (expected ${manifest.sizeBytes} bytes, got ${buf.length}) — refusing to use it.`);
+    fs.rmSync(partialDir, { recursive: true, force: true });
     return null;
   }
 
-  const extract = spawnSync("tar", ["-xzf", tarPath, "-C", dir], { encoding: "utf8" });
+  const extract = spawnSync("tar", ["-xzf", tarPath, "-C", partialDir], { encoding: "utf8" });
   if (extract.status !== 0) {
     say(`Extraction failed: ${extract.stderr || extract.error || "unknown error"}`);
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(partialDir, { recursive: true, force: true });
     return null;
   }
   fs.rmSync(tarPath);
 
-  if (!fs.existsSync(path.join(cacheDistDir(manifest.version), "electron", "workflow", "run-graph.js"))) {
+  if (!fs.existsSync(path.join(partialDir, "dist", "electron", "workflow", "run-graph.js"))) {
     say("Downloaded archive did not contain the expected engine files.");
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(partialDir, { recursive: true, force: true });
     return null;
   }
-  fs.writeFileSync(path.join(dir, ".complete"), new Date().toISOString());
+  fs.writeFileSync(path.join(partialDir, ".complete"), JSON.stringify({
+    schemaVersion: 2,
+    version,
+    sha256: manifest.sha256,
+    completedAt: new Date().toISOString(),
+  }) + "\n");
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.renameSync(partialDir, dir);
+  pruneStaleCaches(version);
   say("Engine ready.");
-  return cacheDistDir(manifest.version);
+  return cacheDistDir(version);
 }
 
-module.exports = { readManifest, cachedCoreRoot, fetchDesktopCore, cacheDistDir };
+module.exports = { readManifest, cachedCoreRoot, fetchDesktopCore, cacheDistDir, pruneStaleCaches };

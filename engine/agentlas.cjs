@@ -213,8 +213,8 @@ function main() {
      * 에서 ls -la 실행 실증). 가장 가까운 명령을 제안하고 정직하게 멈춘다.
      * 진짜 한 단어 작업은 따옴표+run -p 로 그대로 실행된다.
      */
-    if (normalized.length === 1 && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(normalized[0])) {
-      const token = normalized[0];
+    if (commandArgv.length === 1 && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(commandArgv[0])) {
+      const token = commandArgv[0];
       const names = Object.keys(commands.COMMANDS)
         .concat(Object.keys(commands.COMMAND_ALIASES || {}))
         .concat(commands.NOT_YET_PORTED || []);
@@ -228,7 +228,10 @@ function main() {
         : `See: agentlas help  ·  to run it as a task: agentlas run -p "${token}"`);
       process.exit(1);
     }
-    code = commands.COMMANDS.run().run(ctx, normalized);
+    // 전역 출력 플래그는 이미 parseOutputFlags 가 소비했다. 원래 normalized argv 를
+    // 다시 넘기면 `agentlas --json "do work"`가 모델에게 "--json do work"라고
+    // 지시하는 꼴이 된다. 실제 명령/작업 토큰만 실행 경로로 보낸다.
+    code = commands.COMMANDS.run().run(ctx, commandArgv);
   }
 
   Promise.resolve(code).then(

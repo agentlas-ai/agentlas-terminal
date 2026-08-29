@@ -24,6 +24,12 @@ const LOGIN_CALLBACK_PATH = "/callback";
 const LOGIN_TIMEOUT_MS = 180_000;
 const MAX_LOGIN_SESSION_BYTES = 16 * 1024;
 
+function validLoginSessionValue(value) {
+  return typeof value === "string" && value.length > 0 &&
+    Buffer.byteLength(value, "utf8") <= MAX_LOGIN_SESSION_BYTES &&
+    !/[\u0000-\u0020\u007f;,]/.test(value);
+}
+
 function webBaseUrl() {
   return (process.env.AGENTLAS_WEB_BASE_URL || "https://agentlas.cloud").replace(/\/$/, "");
 }
@@ -97,13 +103,13 @@ function createLoginCallbackGuard(expectedState) {
           message: "The callback did not include a session value.",
         };
       }
-      if (Buffer.byteLength(value, "utf8") > MAX_LOGIN_SESSION_BYTES) {
+      if (!validLoginSessionValue(value)) {
         return {
           handled: true,
           final: true,
           ok: false,
           statusCode: 400,
-          message: "The login session value is too large.",
+          message: "The login session value is invalid.",
         };
       }
       return { handled: true, final: true, ok: true, statusCode: 200, value, message: "Agentlas login complete" };
@@ -120,6 +126,9 @@ function openInBrowser(url) {
     : ["xdg-open", url];
   try {
     const child = spawn(argv[0], argv.slice(1), { stdio: "ignore", detached: true });
+    // spawn failures such as a missing xdg-open arrive asynchronously. Without
+    // a listener Node treats them as an uncaught process error.
+    child.once("error", () => {});
     child.unref();
   } catch { /* ignore */ }
 }
@@ -220,18 +229,35 @@ function cliSessionPath() {
 
 function readCliSessionValue() {
   try {
-    const j = JSON.parse(fs.readFileSync(cliSessionPath(), "utf8"));
-    return (j && typeof j.value === "string" && j.value) || null;
+    const p = cliSessionPath();
+    const stat = fs.lstatSync(p);
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.size > MAX_LOGIN_SESSION_BYTES * 2) return null;
+    const j = JSON.parse(fs.readFileSync(p, "utf8"));
+    return j && validLoginSessionValue(j.value) ? j.value : null;
   } catch {
     return null;
   }
 }
 
 function saveCliSession(value) {
+  if (!validLoginSessionValue(value)) throw new Error("Refusing to save an invalid Agentlas login session value.");
   const p = cliSessionPath();
   // 디렉터리 0700 + 파일 0600 — 기본 umask(0644)로 세션이 world-readable 이 되는 것을 막는다.
-  fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(p, JSON.stringify({ version: 1, value, updatedAt: new Date().toISOString() }, null, 2) + "\n", { mode: 0o600 });
+  const dir = path.dirname(p);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(dir, 0o700); } catch { /* win32 */ }
+  const temp = path.join(dir, `.cli-session.${process.pid}.${crypto.randomUUID()}.tmp`);
+  try {
+    fs.writeFileSync(temp, JSON.stringify({ version: 1, value, updatedAt: new Date().toISOString() }, null, 2) + "\n", {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+    fs.renameSync(temp, p);
+  } catch (error) {
+    try { fs.rmSync(temp, { force: true }); } catch { /* preserve original */ }
+    throw error;
+  }
   try { fs.chmodSync(p, 0o600); } catch { /* win32 */ }
   return p;
 }
@@ -246,7 +272,7 @@ function deleteCliSession() {
 // 쿠키 해석 순서 계약: AGENTLAS_SESSION env → 세션 파일. (v1의 keytar 폴백은
 // 데스크탑이 세션을 keytar에 두지 않아 항상 비어 있었다 — v2에서는 싣지 않는다.)
 function cloudSessionCookie() {
-  if (process.env.AGENTLAS_SESSION) return `agentlas_session=${process.env.AGENTLAS_SESSION}`;
+  if (validLoginSessionValue(process.env.AGENTLAS_SESSION)) return `agentlas_session=${process.env.AGENTLAS_SESSION}`;
   const fileValue = readCliSessionValue();
   if (fileValue) return `agentlas_session=${fileValue}`;
   return null;
@@ -275,5 +301,5 @@ module.exports = {
   deleteCliSession,
   cloudSessionCookie,
   fetchSessionMeta,
-  _test: { createLoginState, createLoginCallbackGuard },
+  _test: { createLoginState, createLoginCallbackGuard, validLoginSessionValue },
 };

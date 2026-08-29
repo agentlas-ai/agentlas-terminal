@@ -1,6 +1,23 @@
 # Changelog
 
-## Unreleased
+## 1.0.62 — 2026-08-29
+
+- Terminal sessions now preserve ACP conversation identity and history across
+  editor turns, propagate cancellation and consented MCP configuration to
+  Cursor/Grok/Kimi, and reject overlapping prompts instead of cross-streaming
+  two JSON-RPC requests.
+- Automation leases, Telegram pairing, cloud session storage, Local Core
+  transport, evolution writes, experience events, project path matching, and
+  memory ownership now fail closed under races and partial failures.
+- The on-demand Desktop core cache is bound to the exact release SHA, includes
+  every built-in plugin runtime package, and is published as the audited
+  `desktop-core-v15` asset without dependency tests, fixtures, or local paths.
+- npm packages exclude the generated Desktop core tree and tarball, shrinking
+  the install artifact from roughly 36 MB to under 1 MB while retaining the
+  checksummed v15 fetch manifest. The publication workflow enforces this
+  boundary.
+- `agentlas update` now bounds registry connection and body parsing so a stalled
+  npm request cannot hang the CLI indefinitely.
 
 - `agentlas acp` — Agentlas as an Agent Client Protocol agent (Phase B-3). Zed,
   JetBrains IDEs and other ACP clients can run the project controller (or an

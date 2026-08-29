@@ -11,9 +11,10 @@
  *    manifest/inbox를 만든다 — 초기화되지 않았으면 던진다.
  */
 const fs = require("node:fs");
+const crypto = require("node:crypto");
 const os = require("node:os");
 const path = require("node:path");
-const { spawn } = require("node:child_process");
+const { spawnSync } = require("node:child_process");
 const { loadArch } = require("../core/db.cjs");
 const { initializedAgentlasProjectPathCli } = require("./state.cjs");
 
@@ -64,7 +65,7 @@ function readJsonSafeCli(filePath, fallback) {
 }
 
 function writeJsonSafeCli(filePath, value) {
-  fs.writeFileSync(filePath, JSON.stringify(value, null, 2) + "\n", "utf8");
+  return writeJsonPrivateAtomicCli(filePath, value);
 }
 
 // 원자적(temp+rename) + 소유자 전용(0600) JSON 쓰기. 세션 ID/경로 등 민감 상태 파일용:
@@ -72,8 +73,12 @@ function writeJsonSafeCli(filePath, value) {
 // (2) 기본 umask(0644)로 cli-sessions.json/agent-routes.json이 world-readable이던 정보 노출을 함께 막는다.
 function writeJsonPrivateAtomicCli(filePath, value) {
   const dir = path.dirname(filePath);
-  const tmp = path.join(dir, `.${path.basename(filePath)}.${process.pid}.tmp`);
-  fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+  const tmp = path.join(dir, `.${path.basename(filePath)}.${process.pid}.${crypto.randomUUID()}.tmp`);
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n", {
+    encoding: "utf8",
+    mode: 0o600,
+    flag: "wx",
+  });
   try {
     fs.renameSync(tmp, filePath);
   } catch (e) {
@@ -415,9 +420,12 @@ function registerOntologySourceCli(paths, source, kind, scope, cwd, lang) {
 function openLocalPathCli(targetPath, notify) {
   const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "explorer.exe" : "xdg-open";
   try {
-    spawn(command, [targetPath], { detached: true, stdio: "ignore" }).unref();
+    const result = spawnSync(command, [targetPath], { stdio: "ignore", windowsHide: true });
+    if (result.error || result.status !== 0) throw result.error || new Error(`${command} exited ${result.status}`);
+    return true;
   } catch {
     if (typeof notify === "function") notify(`Open manually: ${targetPath}`);
+    return false;
   }
 }
 
@@ -450,8 +458,10 @@ async function runOntologyCli(args, opts) {
   }
   const paths = ensureOntologyCli(projectPath, opts.lang);
   if (sub === "open") {
-    if (!opts.noOpen) openLocalPathCli(paths.inboxPath, opts.notify);
-    return [`${ko ? "온톨로지 수신함을 열었습니다" : "Opened ontology inbox"}: ${paths.inboxPath}`];
+    const opened = opts.noOpen ? true : openLocalPathCli(paths.inboxPath, opts.notify);
+    return [`${opened
+      ? (ko ? "온톨로지 수신함을 열었습니다" : "Opened ontology inbox")
+      : (ko ? "온톨로지 수신함을 자동으로 열지 못했습니다. 직접 여세요" : "Could not open ontology inbox automatically; open it manually")}: ${paths.inboxPath}`];
   }
   if (sub === "add") {
     const flags = parseFlagsCli(normalizedArgs.slice(1));

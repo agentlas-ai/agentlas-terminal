@@ -110,6 +110,37 @@ function currentTargetHash(file) {
   }
 }
 
+function writeTargetAtomic(file, content) {
+  const dir = path.dirname(file);
+  fs.mkdirSync(dir, { recursive: true });
+  let mode = 0o600;
+  try {
+    const stat = fs.lstatSync(file);
+    if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("Evolution target must be a regular non-symbolic-link file");
+    mode = stat.mode & 0o777;
+  } catch (error) {
+    if (!error || error.code !== "ENOENT") throw error;
+  }
+  const temp = path.join(dir, `.${path.basename(file)}.${process.pid}.${randomUUID()}.tmp`);
+  try {
+    fs.writeFileSync(temp, content, { encoding: "utf8", mode, flag: "wx" });
+    fs.renameSync(temp, file);
+    try { fs.chmodSync(file, mode); } catch { /* Windows/ACL-only host */ }
+  } catch (error) {
+    try { fs.rmSync(temp, { force: true }); } catch { /* preserve original */ }
+    throw error;
+  }
+}
+
+function restoreTargetAfterFailure(file, before, expectedCurrentHash) {
+  const current = currentTargetHash(file);
+  if (current.hash !== expectedCurrentHash) {
+    throw new Error("Evolution persistence failed and the target changed again before rollback; manual repair is required");
+  }
+  if (before.exists) writeTargetAtomic(file, before.content);
+  else fs.rmSync(file, { force: true });
+}
+
 function printCard(out, entry, index) {
   const { row, source } = entry;
   const card = source.humanCard && typeof source.humanCard === "object" ? source.humanCard : null;
@@ -205,29 +236,37 @@ function cmdApply(db, id, out, fail, agentFolder) {
   const agent = agentById(db, row.agent_id);
   if (!agent) return fail(`Agent not found for proposal: ${row.agent_id}`);
   const file = targetFilePath(agentFolder, agent, row.target_path);
-  const current = currentTargetHash(file);
-  if (current.hash !== row.before_hash) {
+  const before = currentTargetHash(file);
+  if (before.hash !== row.before_hash) {
     return fail("Agent prompt changed after this proposal was created; review it in the desktop app and re-propose.");
   }
   const now = new Date().toISOString();
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, row.after_content, "utf8");
-  const verify = sha256(fs.readFileSync(file, "utf8"));
-  if (verify !== row.after_hash) {
-    // 원상복구 후 실패 노출(폴백 금지).
-    fs.writeFileSync(file, row.before_content, "utf8");
-    return fail("Applied content did not match the approved hash; restored the original.");
+  let wroteTarget = false;
+  try {
+    runWriteTransaction(db, () => {
+      const locked = db.prepare("SELECT status FROM agent_evolution_proposals WHERE id=?").get(row.id);
+      if (!locked || locked.status !== "candidate") throw new Error("Evolution proposal changed before apply; reload and review it again");
+      if (currentTargetHash(file).hash !== row.before_hash) throw new Error("Agent prompt changed before apply; reload and review it again");
+      writeTargetAtomic(file, row.after_content);
+      wroteTarget = true;
+      if (currentTargetHash(file).hash !== row.after_hash) throw new Error("Applied content did not match the approved hash");
+      db.prepare("UPDATE installed_agents SET system_prompt = ? WHERE id = ?").run(row.after_content, row.agent_id);
+      insertReceipt(db, row, "apply", row.before_hash, row.after_hash, now);
+      const changed = db.prepare(
+        `UPDATE agent_evolution_proposals
+           SET status = 'applied', applied_at = COALESCE(applied_at, ?),
+               last_error = NULL, updated_at = ?
+         WHERE id = ? AND status = 'candidate'`,
+      ).run(now, now, row.id).changes;
+      if (changed !== 1) throw new Error("Evolution proposal changed before apply; no receipt was committed");
+    });
+  } catch (error) {
+    if (wroteTarget) {
+      try { restoreTargetAfterFailure(file, before, sha256(row.after_content)); }
+      catch (rollbackError) { return fail(`${error.message}. ${rollbackError.message}`); }
+    }
+    return fail(`${error.message}; the original target was restored.`);
   }
-  runWriteTransaction(db, () => {
-    db.prepare("UPDATE installed_agents SET system_prompt = ? WHERE id = ?").run(row.after_content, row.agent_id);
-    insertReceipt(db, row, "apply", row.before_hash, row.after_hash, now);
-    db.prepare(
-      `UPDATE agent_evolution_proposals
-         SET status = 'applied', applied_at = COALESCE(applied_at, ?),
-             last_error = NULL, updated_at = ?
-       WHERE id = ? AND status = 'candidate'`,
-    ).run(now, now, row.id);
-  });
   out(`applied ${id} → ${row.target_path} (agent ${row.agent_id}). Revert with: agentlas evolve revert ${id}`);
 }
 
@@ -244,27 +283,37 @@ function cmdRevert(db, id, out, fail, agentFolder) {
   const agent = agentById(db, row.agent_id);
   if (!agent) return fail(`Agent not found for proposal: ${row.agent_id}`);
   const file = targetFilePath(agentFolder, agent, row.target_path);
-  const current = currentTargetHash(file);
-  if (current.hash !== row.after_hash) {
+  const before = currentTargetHash(file);
+  if (before.hash !== row.after_hash) {
     return fail("Agent prompt changed after this proposal was applied; revert blocked to avoid clobbering newer edits.");
   }
   const now = new Date().toISOString();
-  fs.writeFileSync(file, row.before_content, "utf8");
-  const verify = sha256(fs.readFileSync(file, "utf8"));
-  if (verify !== row.before_hash) {
-    fs.writeFileSync(file, row.after_content, "utf8");
-    return fail("Reverted content did not match the original hash; restored the applied version.");
+  let wroteTarget = false;
+  try {
+    runWriteTransaction(db, () => {
+      const locked = db.prepare("SELECT status FROM agent_evolution_proposals WHERE id=?").get(row.id);
+      if (!locked || !["applied", "measured"].includes(locked.status)) throw new Error("Evolution proposal changed before revert; reload it first");
+      if (currentTargetHash(file).hash !== row.after_hash) throw new Error("Agent prompt changed before revert; reload it first");
+      writeTargetAtomic(file, row.before_content);
+      wroteTarget = true;
+      if (currentTargetHash(file).hash !== row.before_hash) throw new Error("Reverted content did not match the original hash");
+      db.prepare("UPDATE installed_agents SET system_prompt = ? WHERE id = ?").run(row.before_content, row.agent_id);
+      insertReceipt(db, row, "rollback", row.after_hash, row.before_hash, now);
+      const changed = db.prepare(
+        `UPDATE agent_evolution_proposals
+           SET status = 'rolled_back', rolled_back_at = COALESCE(rolled_back_at, ?),
+               last_error = NULL, updated_at = ?
+         WHERE id = ? AND status IN ('applied','measured')`,
+      ).run(now, now, row.id).changes;
+      if (changed !== 1) throw new Error("Evolution proposal changed before revert; no receipt was committed");
+    });
+  } catch (error) {
+    if (wroteTarget) {
+      try { restoreTargetAfterFailure(file, before, sha256(row.before_content)); }
+      catch (rollbackError) { return fail(`${error.message}. ${rollbackError.message}`); }
+    }
+    return fail(`${error.message}; the applied target was restored.`);
   }
-  runWriteTransaction(db, () => {
-    db.prepare("UPDATE installed_agents SET system_prompt = ? WHERE id = ?").run(row.before_content, row.agent_id);
-    insertReceipt(db, row, "rollback", row.after_hash, row.before_hash, now);
-    db.prepare(
-      `UPDATE agent_evolution_proposals
-         SET status = 'rolled_back', rolled_back_at = COALESCE(rolled_back_at, ?),
-             last_error = NULL, updated_at = ?
-       WHERE id = ? AND status IN ('applied','measured')`,
-    ).run(now, now, row.id);
-  });
   out(`reverted ${id} → restored ${row.target_path} (agent ${row.agent_id}).`);
 }
 
