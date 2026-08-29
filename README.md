@@ -27,7 +27,9 @@ Agent Trust is our product principle: agent packages are treated as portable, ow
 | **Agent CLI** | Requires at least one supported runtime CLI: `agy` (Antigravity, preferred), `claude`, `codex`, or legacy `gemini` in your `PATH`. Halts honestly with `no_runtime` if none are found (no fake model responses). |
 | **OS** | macOS is verified by the current local release gate. Linux is covered by the public adapter/CI contract. A Windows launcher is provided, but this release does not claim independent end-to-end Windows verification. |
 
-*Note: `kimi`, `grok`, and `cursor-agent` are detected by diagnostics (`doctor`) but not yet executable (`has no v2 streaming driver yet`). Supported active runtimes are `claude-code`, `codex`, `agy` (Antigravity), and legacy `gemini`.*
+*Note: active runtimes include `claude-code`, `codex`, `agy` (Antigravity),
+legacy `gemini`, and the shared ACP-backed `kimi`, `grok`, and `cursor-agent`
+adapters. `doctor` reports the exact locally executable set.*
 
 ## Installation
 
@@ -278,7 +280,7 @@ agentlas doctor      # Checks database, PATH runtimes, active CLI drivers, and c
 agentlas --where     # Outputs JSON diagnostic of launcher, engine, DB paths, driver, and Node version
 ```
 
-- **`no_runtime: no agent CLI found`**: Connect Antigravity and put `agy` on `PATH` first, or install `claude`/`codex`; `gemini` remains available as a legacy CLI. Note that `kimi`/`grok`/`cursor-agent` are detected by `doctor` but do not yet have streaming execution drivers.
+- **`no_runtime: no agent CLI found`**: Connect Antigravity and put `agy` on `PATH` first, or install `claude`/`codex`; `gemini` remains available as a legacy CLI. Kimi, Grok, and Cursor use the shared ACP driver when their local CLIs are available.
 - **`runtime '<kind>' has no v2 streaming driver yet`**: Specified `--runtime` is not supported for active execution. Supported values: `claude-code`, `codex`, `agy` (Antigravity), `gemini` (legacy).
 - **`Node vX — Node 22+ (node:sqlite) is required when better-sqlite3 is unavailable`**: `better-sqlite3` native build failed on Node 20/21. Upgrade to Node 22+ or install build tools for native compilation.
 - **`storm`/`context`/`hep` halting due to missing runtime**: Agentlas OS core runtime is missing. Install Agentlas OS or set `HEPHAESTUS_BIN=<path>`.

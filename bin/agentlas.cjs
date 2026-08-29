@@ -68,6 +68,20 @@ function securePrivateMode(target, mode) {
   fs.chmodSync(target, mode);
 }
 
+function databaseFileStat(target) {
+  let stat;
+  try {
+    stat = fs.lstatSync(target);
+  } catch (error) {
+    if (error && error.code === "ENOENT") return null;
+    throw error;
+  }
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error(`Agentlas database path must be a regular file: ${target}`);
+  }
+  return stat;
+}
+
 // ── SQLite 로더 (부트스트랩용): better-sqlite3 → node:sqlite ──
 // require.resolve가 아니라 실제 로드로 판별한다 — ABI가 깨진 better-sqlite3나
 // node:sqlite가 아직 없는/플래그가 필요한 Node(≤22.4 등)를 정확히 걸러낸다.
@@ -141,14 +155,17 @@ function bootstrapDbIfMissing() {
   // 잡힌 파일이므로 없는 것으로 취급해 정상 부트스트랩 경로를 태운다. 내용이 있는데
   // 손상된 경우는 여기서 판단하지 않는다 — 그건 복구지 부트스트랩이 아니고, 멀쩡한
   // DB 를 빈 것으로 오판해 덮어쓰는 위험이 훨씬 크다.
-  if (exists(p)) {
-    let empty = false;
-    try { empty = fs.statSync(p).size === 0; } catch { empty = false; }
-    if (!empty) {
+  const existing = databaseFileStat(p);
+  if (existing) {
+    if (existing.size > 0) {
       securePrivateMode(p, 0o600);
       return { created: false, path: p };
     }
-    try { fs.rmSync(p, { force: true }); } catch { /* 지울 수 없으면 아래 link 가 EEXIST 로 알려준다 */ }
+    try {
+      fs.rmSync(p);
+    } catch (error) {
+      throw new Error(`Empty Agentlas database could not be replaced: ${error && error.message ? error.message : error}`);
+    }
   }
   const schemaFile = path.join(PKG_ROOT, "engine", "bootstrap-schema.sql");
   if (!exists(schemaFile)) {
@@ -189,11 +206,22 @@ function bootstrapDbIfMissing() {
     if (!e || e.code !== "EEXIST") {
       throw new Error(`Atomic database bootstrap failed: ${e && e.message ? e.message : e}`);
     }
+    // EEXIST only means another path entry won the name. It is a successful
+    // concurrent bootstrap only if that winner is already a real, non-empty
+    // database file; a symlink/directory/empty placeholder must fail closed.
+    const winner = databaseFileStat(p);
+    if (!winner || winner.size === 0) {
+      throw new Error(`Concurrent Agentlas database bootstrap produced an invalid file: ${p}`);
+    }
   } finally {
     try { fs.rmSync(temp, { force: true }); } catch { /* noop */ }
     try { fs.rmSync(temp + "-journal", { force: true }); } catch { /* noop */ }
     try { fs.rmSync(temp + "-wal", { force: true }); } catch { /* noop */ }
     try { fs.rmSync(temp + "-shm", { force: true }); } catch { /* noop */ }
+  }
+  const finalStat = databaseFileStat(p);
+  if (!finalStat || finalStat.size === 0) {
+    throw new Error(`Agentlas database bootstrap did not produce a valid file: ${p}`);
   }
   securePrivateMode(p, 0o600);
   return { created, path: p };

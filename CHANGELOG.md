@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.64 — 2026-08-29
+
+- First-run database bootstrap now refuses symbolic links and non-file entries
+  at `agentlas.sqlite` instead of following them for permission changes and
+  runtime access.
+- A competing bootstrap is accepted only after its winning database path is a
+  real, non-empty file; undeletable empty placeholders now fail with the exact
+  cause instead of being reported as a successful concurrent initialization.
+- The public runtime guidance now reflects that Kimi, Grok, and Cursor execute
+  through the shared ACP driver instead of describing their retired refusal.
+
 ## 1.0.63 — 2026-08-29
 
 - `agentlas update --json` now reads the centralized output-mode context after
