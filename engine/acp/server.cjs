@@ -170,8 +170,13 @@ class AcpAgentServer {
     this.output.write(JSON.stringify(obj) + "\n");
   }
   notify(method, params) { this.send({ jsonrpc: "2.0", method, params }); }
-  reply(id, result) { this.send({ jsonrpc: "2.0", id, result }); }
-  error(id, code, message, data) { this.send({ jsonrpc: "2.0", id, error: { code, message, ...(data !== undefined ? { data } : {}) } }); }
+  // JSON-RPC notifications have no response channel. Keep `id: null` as a
+  // request (the protocol distinguishes an absent id from an explicit null).
+  reply(id, result) { if (id === undefined) return; this.send({ jsonrpc: "2.0", id, result }); }
+  error(id, code, message, data) {
+    if (id === undefined) return;
+    this.send({ jsonrpc: "2.0", id, error: { code, message, ...(data !== undefined ? { data } : {}) } });
+  }
 
   start() {
     const rl = readline.createInterface({ input: this.input, crlfDelay: Infinity });

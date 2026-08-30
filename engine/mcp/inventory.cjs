@@ -185,11 +185,23 @@ function readCredentialNames(userDataDir, env = process.env) {
   return names;
 }
 
+function consentFingerprintForServer({ registryServerId, catalogId, transport, command, args, credentialKeyNames }) {
+  return crypto.createHash("sha256").update(JSON.stringify({
+    schemaVersion: "agentlas.terminal-mcp-consent-fingerprint.v1",
+    registryServerId,
+    catalogId,
+    transport,
+    command,
+    args,
+    credentialKeyNames,
+  }), "utf8").digest("hex");
+}
+
 function collectSystemMcpInventory(db, options = {}) {
   let rows = [];
   let registryStatus = "complete";
   try {
-    rows = db.prepare("SELECT id, catalog_id, name, name_en, transport, env_keys_json, enabled FROM mcp_servers ORDER BY installed_at ASC LIMIT 1025").all();
+    rows = db.prepare("SELECT id, catalog_id, name, name_en, transport, command, args_json, env_keys_json, enabled FROM mcp_servers ORDER BY installed_at ASC LIMIT 1025").all();
   } catch {
     // 읽을 수 없는 레지스트리는 "읽었더니 비어 있음"과 다른 사실이다.
     // 둘 다 empty-MCP로 fail-closed하지만, 사용자 플랜에는 원인을 보존한다.
@@ -235,6 +247,20 @@ function collectSystemMcpInventory(db, options = {}) {
       value: crypto.createHash("sha256").update(JSON.stringify(keyNames), "utf8").digest("hex"),
       enumerable: false,
     });
+    const args = parseRuntimeServerArgs(row.args_json || "[]");
+    Object.defineProperty(item, "consentFingerprint", {
+      value: typeof row.command === "string" && args
+        ? consentFingerprintForServer({
+          registryServerId: String(row.id),
+          catalogId,
+          transport: String(row.transport || ""),
+          command: row.command,
+          args,
+          credentialKeyNames: keyNames,
+        })
+        : null,
+      enumerable: false,
+    });
     inventory.push(item);
   }
   Object.defineProperty(inventory, "registryStatus", { value: registryStatus, enumerable: false });
@@ -276,15 +302,14 @@ function materializeTrustedSystemMcpServer(row, options = {}) {
     enumerable: false,
   });
   Object.defineProperty(server, "consentFingerprint", {
-    value: crypto.createHash("sha256").update(JSON.stringify({
-      schemaVersion: "agentlas.terminal-mcp-consent-fingerprint.v1",
+    value: consentFingerprintForServer({
       registryServerId,
       catalogId,
       transport: "stdio",
       command: row.command,
       args,
       credentialKeyNames,
-    }), "utf8").digest("hex"),
+    }),
     enumerable: false,
   });
   if (options.createRuntimeHome !== false) {
@@ -314,7 +339,8 @@ function readApprovedSystemMcpServer(db, entry, options = {}) {
   const server = materializeTrustedSystemMcpServer(row, options);
   if (
     !server || String(row.id) !== entry.registryServerId || server.catalog_id !== entry.resolvedCatalogId ||
-    !entry.credentialKeyFingerprint || server.credentialKeyFingerprint !== entry.credentialKeyFingerprint
+    !entry.credentialKeyFingerprint || server.credentialKeyFingerprint !== entry.credentialKeyFingerprint ||
+    !entry.consentFingerprint || server.consentFingerprint !== entry.consentFingerprint
   ) return null;
   return server;
 }

@@ -1111,6 +1111,7 @@ function validateCandidateSet(value, workOrder, now = new Date(), options = {}) 
   assertId(set.selectionSessionId, "candidateSet.selectionSessionId");
   if (set.workOrderId !== workOrder.workOrderId) fail("candidate_set_invalid", "candidate set workOrderId mismatch");
   assertId(set.ontologyVersion, "candidateSet.ontologyVersion");
+  if (set.ontologyVersion !== workOrder.ontologyVersion) fail("candidate_set_invalid", "candidate set ontologyVersion mismatch");
   assertHash(set.candidateSetDigest, "candidateSet.candidateSetDigest");
   if (set.decisionOwner !== "host_llm") fail("candidate_set_invalid", "Hub candidate set tried to take selection authority");
   if (set.historyInfluence !== "none") fail("candidate_set_invalid", "history/popularity influenced candidate retrieval");

@@ -276,18 +276,32 @@ function renderError(error, options = {}) {
 function parseOutputFlags(argv, env = process.env, isTty = Boolean(process.stdout.isTTY)) {
   const rest = [];
   const options = { ...DEFAULT_OPTIONS };
+  let sawJson = false;
+  let sawYaml = false;
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
     if (token === "--") {
       rest.push(...argv.slice(index + 1));
       break;
     }
-    if (token === "--json") options.format = "json";
-    else if (token === "--yaml") options.format = "yaml";
+    if (token === "--json") {
+      sawJson = true;
+      options.format = "json";
+    }
+    else if (token === "--yaml") {
+      sawYaml = true;
+      options.format = "yaml";
+    }
     else if (token === "--quiet" || token === "-q") options.quiet = true;
     else if (token === "--no-headers") options.noHeaders = true;
     else if (token === "--no-color") options.noColor = true;
     else rest.push(token);
+  }
+  if (sawJson && sawYaml) {
+    const error = new Error("--json and --yaml cannot be used together");
+    error.code = "INVALID_ARGUMENT";
+    error.details = { flags: ["--json", "--yaml"] };
+    throw error;
   }
   if (env && (env.NO_COLOR || env.AGENTLAS_NO_COLOR)) options.noColor = true;
   if (!isTty) options.noColor = true;

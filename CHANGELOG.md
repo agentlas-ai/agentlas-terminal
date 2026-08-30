@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.67 — 2026-08-30
+
+- Cloud local state, source markers, and project credential imports now use
+  anchored no-follow atomic publication and fail closed on directory/file swaps
+  or unexpected successors.
+- ACP JSON-RPC notifications no longer receive responses, while explicit
+  `id: null` requests retain normal request semantics.
+- CLI build/MCP output now keeps JSON, YAML, quiet, header, and color modes
+  consistent and returns typed errors for contradictory machine-format input.
+- Workforce candidate sets now require the exact WorkOrder ontology version,
+  and Experience packs reject duplicate MCP requirement identifiers before
+  they can persist invalid state.
+- MCP consent is bound to the command, arguments, and relevant environment
+  material at approval time, while Hub installs recheck managed parents and
+  publish atomically without following path swaps.
+
 ## 1.0.66 — 2026-08-30
 
 - API 스트리밍 요청이 연결·본문 읽기 중 실패하거나 취소돼도 부모 취소 리스너와 idle 타이머를 즉시 정리해, 오래 실행한 Terminal 세션에 실패한 요청의 리스너가 누적되지 않게 했습니다.

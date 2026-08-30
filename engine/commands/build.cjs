@@ -27,6 +27,12 @@ function usage(ko) {
     : "Usage: agentlas build \"<the agent you want>\"  [--runtime <kind>] [--print] [-- <request starting like an option>]";
 }
 
+function buildError(message, code = "INVALID_ARGUMENT") {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
 function parseArgs(args) {
   const flags = { runtime: null, print: false };
   const rest = [];
@@ -67,10 +73,22 @@ async function run(ctx, args) {
 
   let parsed;
   try { parsed = parseArgs(args); }
-  catch (error) { ctx.err(String((error && error.message) || error)); return 1; }
+  catch (error) {
+    const typed = error && typeof error === "object" && typeof error.code === "string"
+      ? error
+      : buildError(String((error && error.message) || error));
+    if (typeof ctx.fail === "function") ctx.fail(typed);
+    else ctx.err(String(typed.message || typed));
+    return 1;
+  }
   const { flags, rest } = parsed;
   const request = rest.join(" ").trim();
-  if (!request) { ctx.err("✖ " + usage(ko)); return 1; }
+  if (!request) {
+    const error = buildError("✖ " + usage(ko));
+    if (typeof ctx.fail === "function") ctx.fail(error);
+    else ctx.err(error.message);
+    return 1;
+  }
 
   const db = ctx.db();
   const cwd = projectCwd();
@@ -83,7 +101,12 @@ async function run(ctx, args) {
     });
   } catch (e) {
     // no_runtime 등 정직 정지 그대로.
-    ctx.err(String((e && e.message) || e));
+    const error = e && typeof e === "object" && typeof e.message === "string"
+      ? e
+      : buildError(String(e), "RUNTIME_RESOLUTION_FAILED");
+    if (typeof error.code !== "string") error.code = "RUNTIME_RESOLUTION_FAILED";
+    if (typeof ctx.fail === "function") ctx.fail(error);
+    else ctx.err(error.message);
     return 1;
   }
 
@@ -107,7 +130,12 @@ async function run(ctx, args) {
   if (flags.print && finalText) process.stdout.write(finalText.trimEnd() + "\n");
 
   if (session.status === "failed") {
-    if (session.lastError) ctx.err(session.lastError);
+    const error = session.lastError && typeof session.lastError === "object" && typeof session.lastError.message === "string"
+      ? session.lastError
+      : buildError(String(session.lastError || (ko ? "빌드 실행에 실패했습니다." : "The build session failed.")), "BUILD_FAILED");
+    if (typeof error.code !== "string") error.code = "BUILD_FAILED";
+    if (typeof ctx.fail === "function") ctx.fail(error);
+    else ctx.err(error.message);
     return 1;
   }
 

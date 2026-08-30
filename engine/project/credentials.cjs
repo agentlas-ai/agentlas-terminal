@@ -16,6 +16,144 @@ const { runCwd } = require("./paths.cjs");
 
 const MAX_MANAGED_CREDENTIAL_METADATA_BYTES = 1024 * 1024;
 const MAX_CREDENTIAL_FILE_BYTES = 16 * 1024 * 1024;
+const CREDENTIAL_NOFOLLOW = fs.constants.O_NOFOLLOW || 0;
+const credentialDestinationBindings = new Map();
+
+function credentialSameDirectoryIdentity(left, right) {
+  return Boolean(
+    left && right && left.isDirectory() && right.isDirectory() &&
+    !left.isSymbolicLink() && !right.isSymbolicLink() &&
+    left.dev === right.dev && left.ino === right.ino,
+  );
+}
+
+function credentialDirectoryAnchor(target, label, containedBy = null) {
+  const stat = fs.lstatSync(target);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`${label} must be a real managed directory`);
+  const realpath = fs.realpathSync.native(target);
+  if (containedBy && !(
+    realpath === containedBy.realpath || realpath.startsWith(`${containedBy.realpath}${path.sep}`)
+  )) throw new Error(`${label} escaped the managed project`);
+  return { path: target, realpath, dev: stat.dev, ino: stat.ino, stat };
+}
+
+function credentialAssertDirectoryAnchor(anchor, label, containedBy = null) {
+  const current = credentialDirectoryAnchor(anchor.path, label, containedBy);
+  if (!credentialSameDirectoryIdentity(anchor.stat || anchor, current.stat || current) || current.realpath !== anchor.realpath) {
+    throw new Error(`${label} changed while it was being used`);
+  }
+  return current;
+}
+
+function credentialSameFileIdentity(left, right) {
+  return Boolean(
+    left && right && left.isFile() && right.isFile() &&
+    !left.isSymbolicLink() && !right.isSymbolicLink() &&
+    left.dev === right.dev && left.ino === right.ino,
+  );
+}
+
+function credentialSameFileSnapshot(left, right) {
+  return credentialSameFileIdentity(left, right) && left.nlink === right.nlink &&
+    left.size === right.size && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
+}
+
+function credentialFileSnapshot(file, label, { allowMissing = false, allowHardLinks = false } = {}) {
+  let stat;
+  try { stat = fs.lstatSync(file); }
+  catch (error) {
+    if (allowMissing && error && error.code === "ENOENT") return null;
+    throw error;
+  }
+  if (!stat.isFile() || stat.isSymbolicLink() || (!allowHardLinks && stat.nlink !== 1) || stat.size > MAX_CREDENTIAL_FILE_BYTES) {
+    throw new Error(`${label} must be a bounded regular non-symbolic-link file`);
+  }
+  return stat;
+}
+
+function credentialRemoveOwnedFile(file, expected, { allowLinked = false } = {}) {
+  try {
+    const current = fs.lstatSync(file);
+    if (credentialSameFileIdentity(current, expected) && (current.nlink === 1 || (allowLinked && current.nlink >= 2))) {
+      fs.unlinkSync(file);
+    }
+  } catch { /* leave unknown successors and recovery artifacts untouched */ }
+}
+
+function credentialRestoreBackup(backup, target, expected, parent) {
+  try {
+    credentialAssertDirectoryAnchor(parent, "credential destination directory");
+    if (credentialFileSnapshot(target, "credential destination successor", { allowMissing: true })) return false;
+    const current = credentialFileSnapshot(backup, "credential destination backup");
+    if (!current || !credentialSameFileIdentity(current, expected) || current.nlink !== 1) return false;
+    fs.linkSync(backup, target);
+    const restored = credentialFileSnapshot(target, "credential destination restored", { allowHardLinks: true });
+    if (!restored || !credentialSameFileIdentity(restored, expected) || restored.nlink < 2) return false;
+    fs.unlinkSync(backup);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function credentialPublishFile(parent, targetName, temporary, expected) {
+  credentialAssertDirectoryAnchor(parent, "credential destination directory");
+  const target = path.join(parent.realpath, targetName);
+  const current = credentialFileSnapshot(target, "credential destination", { allowMissing: true });
+  if ((expected && (!current || !credentialSameFileSnapshot(current, expected))) || (!expected && current)) {
+    throw new Error("credential destination changed before replacement");
+  }
+  let backup = null;
+  let linked = false;
+  try {
+    if (expected) {
+      backup = `${target}.previous-${process.pid}-${crypto.randomUUID()}`;
+      fs.renameSync(target, backup);
+      const moved = credentialFileSnapshot(backup, "credential destination backup");
+      if (!moved || !credentialSameFileIdentity(moved, expected) || moved.nlink !== 1) {
+        credentialRestoreBackup(backup, target, expected, parent);
+        throw new Error("credential destination changed before replacement");
+      }
+      credentialAssertDirectoryAnchor(parent, "credential destination directory");
+      if (credentialFileSnapshot(target, "credential destination successor", { allowMissing: true })) {
+        throw new Error("credential destination successor appeared during replacement");
+      }
+    }
+    credentialAssertDirectoryAnchor(parent, "credential destination directory");
+    if (credentialFileSnapshot(target, "credential destination successor", { allowMissing: true })) {
+      throw new Error("credential destination successor appeared during replacement");
+    }
+    fs.linkSync(temporary.path, target);
+    linked = true;
+    const linkedTarget = credentialFileSnapshot(target, "credential destination", { allowHardLinks: true });
+    if (!linkedTarget || !credentialSameFileIdentity(linkedTarget, temporary.stat) || linkedTarget.nlink < 2) {
+      throw new Error("credential publication produced an unsafe target");
+    }
+    credentialAssertDirectoryAnchor(parent, "credential destination directory");
+    credentialRemoveOwnedFile(temporary.path, temporary.stat, { allowLinked: true });
+    const installed = credentialFileSnapshot(target, "credential destination");
+    if (!installed || !credentialSameFileIdentity(installed, temporary.stat) || installed.nlink !== 1) {
+      throw new Error("credential publication identity changed");
+    }
+    try { fs.chmodSync(target, 0o600); } catch { /* Windows/best-effort */ }
+    const final = credentialFileSnapshot(target, "credential destination");
+    if (!final || !credentialSameFileIdentity(final, temporary.stat) || final.nlink !== 1 ||
+        (process.platform !== "win32" && (final.mode & 0o777) !== 0o600)) {
+      throw new Error("credential publication mode or identity changed");
+    }
+    credentialAssertDirectoryAnchor(parent, "credential destination directory");
+    if (backup) {
+      const backupStat = credentialFileSnapshot(backup, "credential destination backup", { allowMissing: true });
+      if (backupStat && credentialSameFileIdentity(backupStat, expected) && backupStat.nlink === 1) fs.unlinkSync(backup);
+    }
+    return target;
+  } catch (error) {
+    if (linked) credentialRemoveOwnedFile(target, temporary.stat);
+    credentialRemoveOwnedFile(temporary.path, temporary.stat);
+    if (backup) credentialRestoreBackup(backup, target, expected, parent);
+    throw error;
+  }
+}
 
 function credentialProjectRootCli(projectPath) {
   const requested = path.resolve(projectPath || "");
@@ -373,6 +511,7 @@ function safeCredentialDestRelCli(destRel) {
 function resolveCredentialDestinationCli(projectPath, destRel) {
   const root = credentialProjectRootCli(projectPath);
   const rel = safeCredentialDestRelCli(destRel);
+  const rootAnchor = credentialDirectoryAnchor(root, "credential project root");
   const parentRel = path.dirname(rel);
   const parent = parentRel === "." ? root : ensureManagedDirectoryCli(root, parentRel);
   const realParent = fs.realpathSync.native(parent);
@@ -380,40 +519,71 @@ function resolveCredentialDestinationCli(projectPath, destRel) {
   if (path.isAbsolute(relativeParent) || relativeParent === ".." || relativeParent.startsWith(`..${path.sep}`)) {
     throw new Error("credential destination escaped the project");
   }
-  return path.join(realParent, path.basename(rel));
+  const parentAnchor = credentialDirectoryAnchor(realParent, "credential destination directory", rootAnchor);
+  const destination = path.join(parentAnchor.realpath, path.basename(rel));
+  credentialDestinationBindings.set(path.resolve(destination), {
+    root: rootAnchor,
+    parent: parentAnchor,
+  });
+  return destination;
 }
 
 function copyCredentialFileAtomicCli(sourcePath, destinationPath, options = {}) {
-  const source = fs.realpathSync.native(path.resolve(sourcePath));
-  const sourceStat = fs.statSync(source);
-  if (!sourceStat.isFile() || sourceStat.size <= 0 || sourceStat.size > MAX_CREDENTIAL_FILE_BYTES) {
-    throw new Error("credential source must be a non-empty regular file no larger than 16 MiB");
-  }
-  const snapshot = (() => {
-    try {
-      const stat = fs.lstatSync(destinationPath);
-      if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("credential destination must be a regular non-symbolic-link file");
-      if (!options.force) throw new Error("credential destination already exists (use --force to replace)");
-      return { exists: true, stat };
-    } catch (error) {
-      if (error && error.code === "ENOENT") return { exists: false };
-      throw error;
-    }
-  })();
-  const temp = path.join(path.dirname(destinationPath), `.${path.basename(destinationPath)}.${process.pid}.${crypto.randomUUID()}.tmp`);
+  const resolvedDestination = path.resolve(destinationPath);
+  const binding = credentialDestinationBindings.get(resolvedDestination) || null;
   try {
-    fs.copyFileSync(source, temp, fs.constants.COPYFILE_EXCL);
-    const copied = fs.lstatSync(temp);
-    if (!copied.isFile() || copied.isSymbolicLink() || copied.size !== sourceStat.size) {
-      throw new Error("credential copy did not produce the exact regular file");
+    const source = fs.realpathSync.native(path.resolve(sourcePath));
+    const sourceStat = fs.statSync(source);
+    if (!sourceStat.isFile() || sourceStat.size <= 0 || sourceStat.size > MAX_CREDENTIAL_FILE_BYTES) {
+      throw new Error("credential source must be a non-empty regular file no larger than 16 MiB");
     }
-    try { fs.chmodSync(temp, 0o600); } catch { /* Windows/best-effort */ }
-    replaceManagedFileCli(temp, destinationPath, snapshot);
-    try { fs.chmodSync(destinationPath, 0o600); } catch { /* Windows/best-effort */ }
+    const root = binding ? credentialAssertDirectoryAnchor(binding.root, "credential project root") : null;
+    const parent = binding
+      ? credentialAssertDirectoryAnchor(binding.parent, "credential destination directory", root)
+      : credentialDirectoryAnchor(path.dirname(resolvedDestination), "credential destination directory");
+    if (path.dirname(resolvedDestination) !== parent.path || path.basename(resolvedDestination).includes(path.sep)) {
+      throw new Error("credential destination path is not anchored to its managed directory");
+    }
+    const destination = path.join(parent.realpath, path.basename(resolvedDestination));
+    const snapshot = (() => {
+      try {
+        const stat = credentialFileSnapshot(destination, "credential destination");
+        if (!options.force) throw new Error("credential destination already exists (use --force to replace)");
+        return { exists: true, stat };
+      } catch (error) {
+        if (error && error.code === "ENOENT") return { exists: false };
+        throw error;
+      }
+    })();
+    const temp = path.join(parent.realpath, `.${path.basename(destination)}.${process.pid}.${crypto.randomUUID()}.tmp`);
+    let tempStat = null;
+    try {
+      credentialAssertDirectoryAnchor(parent, "credential destination directory", root);
+      fs.copyFileSync(source, temp, fs.constants.COPYFILE_EXCL);
+      tempStat = credentialFileSnapshot(temp, "credential temporary file");
+      if (!tempStat || tempStat.size !== sourceStat.size) {
+        throw new Error("credential copy did not produce the exact regular file");
+      }
+      let readFd;
+      try {
+        readFd = fs.openSync(temp, fs.constants.O_RDONLY | CREDENTIAL_NOFOLLOW);
+        const opened = fs.fstatSync(readFd);
+        if (!credentialSameFileSnapshot(opened, tempStat) || opened.size !== sourceStat.size) {
+          throw new Error("credential temporary file changed while opening");
+        }
+      } finally {
+        if (readFd !== undefined) try { fs.closeSync(readFd); } catch { /* preserve original failure */ }
+      }
+      try { fs.chmodSync(temp, 0o600); } catch { /* Windows/best-effort */ }
+      credentialAssertDirectoryAnchor(parent, "credential destination directory", root);
+      credentialPublishFile(parent, path.basename(destination), { path: temp, stat: tempStat }, snapshot.exists ? snapshot.stat : null);
+    } finally {
+      if (tempStat) credentialRemoveOwnedFile(temp, tempStat);
+    }
+    return destinationPath;
   } finally {
-    try { fs.rmSync(temp, { force: true }); } catch { /* best-effort cleanup */ }
+    if (binding) credentialDestinationBindings.delete(resolvedDestination);
   }
-  return destinationPath;
 }
 
 module.exports = {

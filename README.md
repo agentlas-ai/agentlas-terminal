@@ -17,6 +17,12 @@ Use this existing independent Terminal as the command-line runtime: inspect owne
 
 Agent Trust is our product principle: agent packages are treated as portable, owner-scoped, inspectable, and restorable assets. (It does not imply regulated financial or fiduciary services.) Agent Cloud stores package assets in your private cloud account, while Agentlas Terminal verifies and executes local runtime copies on your host machine.
 
+Current release: 1.0.67. It hardens local Cloud and credential storage against
+path races, keeps ACP notifications protocol-correct, aligns CLI machine output
+and typed errors, binds Workforce selections to exact ontology versions,
+rejects duplicate Experience requirements, and makes MCP consent and Hub
+installs race-safe.
+
 ---
 
 ## Requirements

@@ -189,7 +189,17 @@ function main() {
 
   // 전역 출력 플래그는 명령에 닿기 전에 한 곳에서 뜯어낸다 —
   // 명령마다 --json 유무가 갈리던 것을 구조로 막는다.
-  const { options: outputOptions, rest: commandArgv } = parseOutputFlags(normalized);
+  // --json + --yaml 은 모순된 요청이라 JSON/YAML 중 하나를 임의로 고르지 않고,
+  // 진입점에서 결정적인 평문 INVALID_ARGUMENT 로 멈춘다.
+  let parsedOutput;
+  try {
+    parsedOutput = parseOutputFlags(normalized);
+  } catch (error) {
+    process.stderr.write(renderError(error, { format: "table", noColor: true }) + "\n");
+    process.exitCode = 1;
+    return;
+  }
+  const { options: outputOptions, rest: commandArgv } = parsedOutput;
   const ctx = buildCtx();
   ctx.output = outputOptions;
   let code;

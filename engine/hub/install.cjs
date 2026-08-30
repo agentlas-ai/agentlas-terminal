@@ -255,20 +255,79 @@ function cloudApplyPortableFileMode(filePath, mode, platform = process.platform)
   ) throw new Error(`cloud restore file mode verification failed: ${filePath}`);
 }
 
+function cloudDirectoryAnchor(target, label, { allowMissing = true, containedBy = null } = {}) {
+  let stat;
+  try { stat = fs.lstatSync(target); } catch (error) {
+    if (allowMissing && error && error.code === "ENOENT") return null;
+    throw error;
+  }
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error(`${label} is not a safe managed directory`);
+  }
+  let realpath;
+  try { realpath = fs.realpathSync.native(target); }
+  catch (error) { throw new Error(`${label} could not be canonicalized: ${error.message}`); }
+  if (containedBy && !(
+    realpath === containedBy.realpath || realpath.startsWith(`${containedBy.realpath}${path.sep}`)
+  )) {
+    throw new Error(`${label} escapes its managed root`);
+  }
+  return { path: target, realpath, dev: stat.dev, ino: stat.ino, nlink: stat.nlink, stat };
+}
+
+function cloudAssertDirectoryAnchor(anchor, label, containedBy = null) {
+  const current = cloudDirectoryAnchor(anchor.path, label, { allowMissing: false, containedBy });
+  if (
+    current.realpath !== anchor.realpath || current.dev !== anchor.dev ||
+    current.ino !== anchor.ino || current.nlink !== anchor.nlink
+  ) {
+    throw new Error(`${label} changed while it was being used`);
+  }
+  return current;
+}
+
+function cloudRefreshDirectoryAnchor(anchor, label, containedBy = null) {
+  const current = cloudDirectoryAnchor(anchor.path, label, { allowMissing: false, containedBy });
+  if (
+    current.realpath !== anchor.realpath || current.dev !== anchor.dev ||
+    current.ino !== anchor.ino
+  ) {
+    throw new Error(`${label} changed while it was being used`);
+  }
+  return current;
+}
+
+function cloudSameRegularFile(left, right) {
+  return Boolean(
+    left && right && left.isFile() && right.isFile() &&
+    !left.isSymbolicLink() && !right.isSymbolicLink() &&
+    left.dev === right.dev && left.ino === right.ino && left.nlink === right.nlink,
+  );
+}
+
 function cloudEnsurePrivateSubdirectory(root, directory) {
   const relative = path.relative(root, directory);
   if (relative.startsWith("..") || path.isAbsolute(relative)) {
     throw new Error("cloud restore subdirectory escapes staging");
   }
   let current = root;
-  cloudManagedDirectoryState(root, "cloud restore staging", { allowMissing: false });
+  const rootAnchor = cloudDirectoryAnchor(root, "cloud restore staging", { allowMissing: false });
+  const managedPaths = [root];
   for (const part of relative.split(path.sep).filter(Boolean)) {
     current = path.join(current, part);
     try { fs.mkdirSync(current, { recursive: false, mode: 0o700 }); }
     catch (error) { if (!error || error.code !== "EEXIST") throw error; }
-    cloudManagedDirectoryState(current, "cloud restore package directory", { allowMissing: false });
     cloudApplyPrivateDirectoryMode(current);
+    managedPaths.push(current);
   }
+  // Directory nlink changes when a child directory is added, so take every
+  // anchor after the complete path is present rather than before a descendant
+  // mkdir can legitimately change an ancestor's nlink.
+  return managedPaths.map((managedPath, index) => cloudDirectoryAnchor(
+    managedPath,
+    index === 0 ? "cloud restore staging" : "cloud restore package directory",
+    { allowMissing: false, ...(index === 0 ? {} : { containedBy: rootAnchor }) },
+  ));
 }
 
 // ── 스테이징 스냅샷 전수 검증 (심링크/특수 엔트리/모드/무결성) ──
@@ -387,18 +446,43 @@ function cloudManagedDirectoryState(target, label, { allowMissing = true } = {})
   return stat;
 }
 
-function cloudRemoveManagedDirectory(target, label) {
-  if (!cloudManagedDirectoryState(target, label)) return false;
+function cloudRemoveManagedDirectory(target, label, { anchor = null, containedBy = null } = {}) {
+  if (anchor) {
+    let current;
+    try {
+      current = cloudDirectoryAnchor(target, label, { allowMissing: true, containedBy });
+    } catch (error) {
+      if (error && error.code === "ENOENT") return false;
+      throw error;
+    }
+    if (!current) return false;
+    if (
+      current.realpath !== anchor.realpath || current.dev !== anchor.dev ||
+      current.ino !== anchor.ino
+    ) throw new Error(`${label} changed while it was being removed`);
+  } else if (containedBy) {
+    if (!cloudDirectoryAnchor(target, label, { allowMissing: true, containedBy })) return false;
+  } else if (!cloudManagedDirectoryState(target, label)) return false;
   fs.rmSync(target, { recursive: true, force: false });
   return true;
 }
 
-function cloudRenameManagedDirectory(source, destination, label) {
-  cloudManagedDirectoryState(source, `${label} source`, { allowMissing: false });
+function cloudRenameManagedDirectory(source, destination, label, { sourceAnchor = null, parentAnchor = null } = {}) {
+  if (parentAnchor) cloudRefreshDirectoryAnchor(parentAnchor, `${label} parent`);
+  if (sourceAnchor) {
+    cloudRefreshDirectoryAnchor(sourceAnchor, `${label} source`, parentAnchor);
+  } else {
+    cloudManagedDirectoryState(source, `${label} source`, { allowMissing: false });
+  }
   if (cloudManagedDirectoryState(destination, `${label} destination`)) {
     throw new Error(`${label} destination already exists`);
   }
+  if (parentAnchor) cloudRefreshDirectoryAnchor(parentAnchor, `${label} parent`);
   fs.renameSync(source, destination);
+  if (parentAnchor) {
+    cloudRefreshDirectoryAnchor(parentAnchor, `${label} parent`);
+    cloudDirectoryAnchor(destination, `${label} destination`, { allowMissing: false, containedBy: parentAnchor });
+  }
 }
 
 function cloudReadInstallJournal(journalPath) {
@@ -472,12 +556,36 @@ function cloudFsyncDirectory(directory) {
   finally { if (fd !== undefined) try { fs.closeSync(fd); } catch { /* best-effort */ } }
 }
 
-function rollbackCloudInstallSwap({ destination, staging, backup, movedExisting, installed }) {
-  if (installed) cloudRemoveManagedDirectory(destination, "cloud install destination");
-  if (movedExisting && cloudManagedDirectoryState(backup, "cloud install backup")) {
-    cloudRenameManagedDirectory(backup, destination, "cloud install rollback");
+function rollbackCloudInstallSwap({
+  destination,
+  staging,
+  backup,
+  movedExisting,
+  installed,
+  parentAnchor = null,
+  stagingAnchor = null,
+  backupAnchor = null,
+  destinationAnchor = null,
+}) {
+  const safeParent = parentAnchor
+    ? cloudRefreshDirectoryAnchor(parentAnchor, "cloud install parent rollback")
+    : null;
+  if (installed) {
+    cloudRemoveManagedDirectory(destination, "cloud install destination", {
+      anchor: destinationAnchor,
+      containedBy: safeParent,
+    });
   }
-  cloudRemoveManagedDirectory(staging, "cloud install staging");
+  if (movedExisting && cloudManagedDirectoryState(backup, "cloud install backup")) {
+    cloudRenameManagedDirectory(backup, destination, "cloud install rollback", {
+      sourceAnchor: backupAnchor,
+      parentAnchor: safeParent,
+    });
+  }
+  cloudRemoveManagedDirectory(staging, "cloud install staging", {
+    anchor: stagingAnchor,
+    containedBy: safeParent,
+  });
   cloudFsyncDirectory(path.dirname(destination));
 }
 
@@ -660,17 +768,33 @@ function materializeCloudListing(agentId, slug, listing, options = {}) {
   if (pathConflict) throw new Error(pathConflict.message);
   const layout = cloudInstallLayout(slug, { createParent: true });
   const { destination: dir, parent, journalPath: journal } = layout;
+  let parentAnchor = cloudDirectoryAnchor(parent, "cloud install parent", { allowMissing: false });
   const nonce = `${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
   const staging = path.join(parent, `.${path.basename(dir)}.installing-${nonce}`);
   const backup = path.join(parent, `.${path.basename(dir)}.backup-${nonce}`);
+  const managedAnchors = new Map();
   const seen = new Set();
   const verifiedFiles = [];
   let verifiedTotalBytes = 0;
   let movedExisting = false;
   let installed = false;
+  let stagingAnchor = null;
+  let destinationAnchor = null;
+  let backupAnchor = null;
+  let installedDestinationAnchor = null;
   try {
+    cloudAssertDirectoryAnchor(parentAnchor, "cloud install parent");
     fs.mkdirSync(staging, { recursive: false, mode: 0o700 });
+    // Creating the staging directory legitimately changes the parent's nlink;
+    // refresh that field while retaining the original dev/ino/realpath anchor.
+    parentAnchor = cloudRefreshDirectoryAnchor(parentAnchor, "cloud install parent");
     cloudApplyPrivateDirectoryMode(staging);
+    stagingAnchor = cloudDirectoryAnchor(staging, "cloud install staging", {
+      allowMissing: false,
+      containedBy: parentAnchor,
+    });
+    managedAnchors.set(staging, stagingAnchor);
+    cloudAssertDirectoryAnchor(parentAnchor, "cloud install parent");
     for (const file of pkg.files) {
       const target = resolveCloudInstallPath(staging, file.path);
       const normalizedPath = path.relative(staging, target).split(path.sep).join("/");
@@ -700,19 +824,62 @@ function materializeCloudListing(agentId, slug, listing, options = {}) {
       });
       verifiedTotalBytes += bytes.length;
       if (verifiedTotalBytes > CLOUD_MAX_TOTAL_BYTES) throw new Error("cloud package exceeds total byte limit");
-      cloudEnsurePrivateSubdirectory(staging, path.dirname(target));
+      for (const anchor of cloudEnsurePrivateSubdirectory(staging, path.dirname(target))) {
+        managedAnchors.set(anchor.path, anchor);
+      }
+      stagingAnchor = managedAnchors.get(staging);
+      cloudAssertDirectoryAnchor(parentAnchor, "cloud install parent");
+      for (const anchor of managedAnchors.values()) {
+        cloudAssertDirectoryAnchor(anchor, "cloud install managed directory", stagingAnchor);
+      }
       const mode = packageHashVersion === CLOUD_PACKAGE_HASH_V2 && file.executable ? 0o700 : 0o600;
-      const fileFd = fs.openSync(
-        target,
-        fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0),
-        mode,
-      );
+      let fileFd;
+      let fileWritten = false;
       try {
+        fileFd = fs.openSync(
+          target,
+          fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0),
+          mode,
+        );
+        // A parent swap can happen during open. Do not write until the
+        // directory anchors and the opened file identity still agree.
+        cloudAssertDirectoryAnchor(parentAnchor, "cloud install parent");
+        // O_CREAT may legitimately change a directory's nlink on some
+        // filesystems, so refresh that field after the open while retaining
+        // the dev/ino/realpath identity and containment checks.
+        stagingAnchor = cloudRefreshDirectoryAnchor(stagingAnchor, "cloud install staging", parentAnchor);
+        managedAnchors.set(staging, stagingAnchor);
+        for (const [anchorPath, anchor] of managedAnchors.entries()) {
+          if (anchorPath === staging) continue;
+          managedAnchors.set(anchorPath, cloudRefreshDirectoryAnchor(
+            anchor,
+            "cloud install managed directory",
+            stagingAnchor,
+          ));
+        }
+        const opened = fs.fstatSync(fileFd);
+        const listed = fs.lstatSync(target);
+        if (!cloudSameRegularFile(opened, listed) || opened.size !== 0) {
+          throw new Error(`cloud package target changed while opening: ${file.path}`);
+        }
         fs.writeFileSync(fileFd, bytes);
         if (process.platform !== "win32") fs.fchmodSync(fileFd, mode);
         fs.fsyncSync(fileFd);
+        fileWritten = true;
       } finally {
-        fs.closeSync(fileFd);
+        if (fileFd !== undefined) {
+          if (!fileWritten) {
+            // O_EXCL creates a zero-byte file before the final anchor check
+            // can reject a swapped parent. Remove it only when the path still
+            // names the exact descriptor we opened; never unlink a successor.
+            try {
+              const opened = fs.fstatSync(fileFd);
+              const listed = fs.lstatSync(target);
+              if (cloudSameRegularFile(opened, listed)) fs.unlinkSync(target);
+            } catch { /* outer rollback retains any unknown successor */ }
+          }
+          fs.closeSync(fileFd);
+        }
       }
     }
     const expectedPackageHash = String(pkg.packageHash || "").toLowerCase().replace(/^sha256:/, "");
@@ -732,12 +899,33 @@ function materializeCloudListing(agentId, slug, listing, options = {}) {
     if (verifiedTotalBytes !== pkg.totalBytes) throw new Error("cloud package total byte count does not match its files");
     const restoredAt = new Date().toISOString();
     const markerPath = path.join(staging, CLOUD_RESTORE_MARKER_PATH);
-    const markerFd = fs.openSync(
-      markerPath,
-      fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0),
-      0o600,
-    );
+    stagingAnchor = cloudDirectoryAnchor(staging, "cloud install staging", {
+      allowMissing: false,
+      containedBy: parentAnchor,
+    });
+    managedAnchors.set(staging, stagingAnchor);
+    cloudAssertDirectoryAnchor(parentAnchor, "cloud install parent");
+    for (const anchor of managedAnchors.values()) {
+      cloudAssertDirectoryAnchor(anchor, "cloud install managed directory", stagingAnchor);
+    }
+    let markerFd;
+    let markerWritten = false;
     try {
+      markerFd = fs.openSync(
+        markerPath,
+        fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0),
+        0o600,
+      );
+      cloudAssertDirectoryAnchor(parentAnchor, "cloud install parent");
+      // As with package files, creating the marker can update the staging
+      // directory nlink; refresh it before writing and keep identity strict.
+      stagingAnchor = cloudRefreshDirectoryAnchor(stagingAnchor, "cloud install staging", parentAnchor);
+      managedAnchors.set(staging, stagingAnchor);
+      const opened = fs.fstatSync(markerFd);
+      const listed = fs.lstatSync(markerPath);
+      if (!cloudSameRegularFile(opened, listed) || opened.size !== 0) {
+        throw new Error("cloud restore marker changed while opening");
+      }
       fs.writeFileSync(markerFd, JSON.stringify({
         schemaVersion: 1,
         source: "agentlas-cloud",
@@ -761,8 +949,22 @@ function materializeCloudListing(agentId, slug, listing, options = {}) {
       }, null, 2) + "\n", "utf8");
       if (process.platform !== "win32") fs.fchmodSync(markerFd, 0o600);
       fs.fsyncSync(markerFd);
+      markerWritten = true;
     } finally {
-      fs.closeSync(markerFd);
+      if (markerFd !== undefined) {
+        if (!markerWritten) {
+          try {
+            const opened = fs.fstatSync(markerFd);
+            const listed = fs.lstatSync(markerPath);
+            if (cloudSameRegularFile(opened, listed)) fs.unlinkSync(markerPath);
+          } catch { /* outer rollback retains any unknown successor */ }
+        }
+        fs.closeSync(markerFd);
+      }
+    }
+    cloudAssertDirectoryAnchor(parentAnchor, "cloud install parent");
+    for (const anchor of managedAnchors.values()) {
+      cloudAssertDirectoryAnchor(anchor, "cloud install managed directory", stagingAnchor);
     }
     cloudVerifyRestoredSnapshot(staging, verifiedFiles, {
       slug,
@@ -773,6 +975,7 @@ function materializeCloudListing(agentId, slug, listing, options = {}) {
     });
 
     if (options.deferCommit) {
+      cloudAssertDirectoryAnchor(parentAnchor, "cloud install parent");
       writeCloudInstallJournal(journal, {
         schemaVersion: 1,
         slug,
@@ -783,15 +986,42 @@ function materializeCloudListing(agentId, slug, listing, options = {}) {
         hadExisting: Boolean(cloudManagedDirectoryState(dir, "cloud install destination")),
         dbExpected: options.dbExpected || {},
       });
+      // The recovery journal is a file in the managed parent and may update
+      // that directory's nlink; refresh the field before publication checks.
+      parentAnchor = cloudRefreshDirectoryAnchor(parentAnchor, "cloud install parent");
     }
 
     // A Cloud agent is an immutable asset snapshot. Replace the managed install
     // as a whole so removed files and local mutations cannot leak across versions.
-    if (cloudManagedDirectoryState(dir, "cloud install destination")) {
-      cloudRenameManagedDirectory(dir, backup, "cloud install snapshot swap");
-      movedExisting = true;
+    cloudAssertDirectoryAnchor(parentAnchor, "cloud install parent");
+    for (const anchor of managedAnchors.values()) {
+      cloudAssertDirectoryAnchor(anchor, "cloud install managed directory", stagingAnchor);
     }
-    cloudRenameManagedDirectory(staging, dir, "cloud install staging swap");
+    if (cloudManagedDirectoryState(dir, "cloud install destination")) {
+      destinationAnchor = cloudDirectoryAnchor(dir, "cloud install destination", {
+        allowMissing: false,
+        containedBy: parentAnchor,
+      });
+      cloudRenameManagedDirectory(dir, backup, "cloud install snapshot swap", {
+        sourceAnchor: destinationAnchor,
+        parentAnchor,
+      });
+      movedExisting = true;
+      backupAnchor = cloudDirectoryAnchor(backup, "cloud install backup", {
+        allowMissing: false,
+        containedBy: parentAnchor,
+      });
+    }
+    cloudAssertDirectoryAnchor(parentAnchor, "cloud install parent");
+    cloudRenameManagedDirectory(staging, dir, "cloud install staging swap", {
+      sourceAnchor: stagingAnchor,
+      parentAnchor,
+    });
+    cloudAssertDirectoryAnchor(parentAnchor, "cloud install parent");
+    installedDestinationAnchor = cloudDirectoryAnchor(dir, "cloud install destination", {
+      allowMissing: false,
+      containedBy: parentAnchor,
+    });
     cloudFsyncDirectory(parent);
     installed = true;
     if (options.deferCommit) {
@@ -807,12 +1037,34 @@ function materializeCloudListing(agentId, slug, listing, options = {}) {
       });
     }
   } catch (error) {
-    rollbackCloudInstallSwap({ destination: dir, staging, backup, movedExisting, installed });
+    rollbackCloudInstallSwap({
+      destination: dir,
+      staging,
+      backup,
+      movedExisting,
+      installed,
+      parentAnchor,
+      stagingAnchor,
+      backupAnchor,
+      destinationAnchor: installedDestinationAnchor,
+    });
     try { if (fs.existsSync(journal)) cloudUnlinkInstallJournal(journal); } catch { /* best-effort */ }
     throw error;
   } finally {
-    try { cloudRemoveManagedDirectory(staging, "cloud install staging"); } catch { /* best-effort */ }
-    try { if (!options.deferCommit && installed) cloudRemoveManagedDirectory(backup, "cloud install backup"); } catch { /* best-effort */ }
+    try {
+      cloudRemoveManagedDirectory(staging, "cloud install staging", {
+        anchor: stagingAnchor,
+        containedBy: parentAnchor,
+      });
+    } catch { /* best-effort */ }
+    try {
+      if (!options.deferCommit && installed) {
+        cloudRemoveManagedDirectory(backup, "cloud install backup", {
+          anchor: backupAnchor,
+          containedBy: parentAnchor,
+        });
+      }
+    } catch { /* best-effort */ }
   }
   if (!options.deferCommit) return dir;
   let settled = false;

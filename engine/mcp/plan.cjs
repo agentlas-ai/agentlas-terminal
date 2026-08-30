@@ -209,11 +209,16 @@ function buildMcpPlan(options) {
         value: resolution.selected?.credentialKeyFingerprint || null,
         enumerable: false,
       });
+      Object.defineProperty(entry, "consentFingerprint", {
+        value: resolution.selected?.consentFingerprint || null,
+        enumerable: false,
+      });
       Object.defineProperty(entry, "runtimeCandidates", {
         value: resolution.candidates.map((candidate) => ({
           resolvedCatalogId: candidate.item.catalogId,
           registryServerId: candidate.item.registryServerId || null,
           credentialKeyFingerprint: candidate.item.credentialKeyFingerprint || null,
+          consentFingerprint: candidate.item.consentFingerprint || null,
         })),
         enumerable: false,
       });

@@ -24,7 +24,6 @@ const {
   CLOUD_PACKAGE_HASH_V1,
   CLOUD_RESTORE_MARKER_PATH,
   cloudSlug,
-  cloudApplyPortableFileMode,
   cloudFsyncDirectory,
   normalizeCloudAssetDescriptor,
 } = require("../hub/install.cjs");
@@ -37,6 +36,265 @@ const CLOUD_ASSET_LOCK_WAIT_MS = 10_000;
 function waitSync(milliseconds) {
   const signal = new Int32Array(new SharedArrayBuffer(4));
   Atomics.wait(signal, 0, 0, milliseconds);
+}
+
+const STATE_NOFOLLOW = fs.constants.O_NOFOLLOW || 0;
+
+function stateSameDirectoryIdentity(left, right) {
+  return Boolean(
+    left && right && left.isDirectory() && right.isDirectory() &&
+    !left.isSymbolicLink() && !right.isSymbolicLink() &&
+    left.dev === right.dev && left.ino === right.ino,
+  );
+}
+
+function stateDirectoryAnchor(target, label, { allowMissing = false, containedBy = null } = {}) {
+  let stat;
+  try { stat = fs.lstatSync(target); }
+  catch (error) {
+    if (allowMissing && error && error.code === "ENOENT") return null;
+    throw error;
+  }
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error(`${label} is not a safe managed directory`);
+  }
+  let realpath;
+  try { realpath = fs.realpathSync.native(target); }
+  catch (error) { throw new Error(`${label} could not be canonicalized: ${error.message || error}`); }
+  if (containedBy && !(
+    realpath === containedBy.realpath || realpath.startsWith(`${containedBy.realpath}${path.sep}`)
+  )) {
+    throw new Error(`${label} escapes its managed root`);
+  }
+  return { path: target, realpath, dev: stat.dev, ino: stat.ino, stat };
+}
+
+function stateAssertDirectoryAnchor(anchor, label, containedBy = null) {
+  const current = stateDirectoryAnchor(anchor.path, label, { allowMissing: false, containedBy });
+  if (
+    !stateSameDirectoryIdentity(anchor.stat || anchor, current.stat || current) ||
+    current.realpath !== anchor.realpath
+  ) {
+    throw new Error(`${label} changed while it was being used`);
+  }
+  return current;
+}
+
+function stateEnsureDirectory(target, label) {
+  fs.mkdirSync(target, { recursive: true, mode: 0o700 });
+  const anchor = stateDirectoryAnchor(target, label);
+  try { fs.chmodSync(target, 0o700); } catch { /* Windows/best-effort */ }
+  stateAssertDirectoryAnchor(anchor, label);
+  return anchor;
+}
+
+function stateSameFileIdentity(left, right) {
+  return Boolean(
+    left && right && left.isFile() && right.isFile() &&
+    !left.isSymbolicLink() && !right.isSymbolicLink() &&
+    left.dev === right.dev && left.ino === right.ino,
+  );
+}
+
+function stateSameFileSnapshot(left, right) {
+  return stateSameFileIdentity(left, right) && left.nlink === right.nlink &&
+    left.size === right.size && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
+}
+
+function stateFileSnapshot(file, label, { allowMissing = false, maxBytes = CLOUD_ASSET_STATE_MAX_BYTES, allowHardLinks = false } = {}) {
+  let stat;
+  try { stat = fs.lstatSync(file); }
+  catch (error) {
+    if (allowMissing && error && error.code === "ENOENT") return null;
+    throw error;
+  }
+  if (!stat.isFile() || stat.isSymbolicLink() || (!allowHardLinks && stat.nlink !== 1) || stat.size > maxBytes) {
+    throw new Error(`${label} is not a bounded private file`);
+  }
+  return stat;
+}
+
+function stateRemoveOwnedFile(file, expected, { allowLinked = false } = {}) {
+  try {
+    const current = fs.lstatSync(file);
+    if (stateSameFileIdentity(current, expected) && (current.nlink === 1 || (allowLinked && current.nlink >= 2))) {
+      fs.unlinkSync(file);
+    }
+  } catch { /* leave unknown successors and recovery artifacts untouched */ }
+}
+
+function stateWriteTemp(directory, name, payload, label) {
+  stateAssertDirectoryAnchor(directory, `${label} directory`);
+  const file = path.join(directory.realpath, name);
+  let fd;
+  let created;
+  try {
+    fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | STATE_NOFOLLOW, 0o600);
+    created = fs.fstatSync(fd);
+    if (!created.isFile() || created.isSymbolicLink() || created.nlink !== 1) {
+      throw new Error(`${label} temporary file is unsafe`);
+    }
+    const bytes = Buffer.from(payload, "utf8");
+    let offset = 0;
+    while (offset < bytes.length) {
+      const written = fs.writeSync(fd, bytes, offset, bytes.length - offset, null);
+      if (!Number.isInteger(written) || written <= 0) throw new Error(`${label} temporary file write stalled`);
+      offset += written;
+    }
+    try { fs.fchmodSync(fd, 0o600); } catch { /* Windows/best-effort */ }
+    fs.fsyncSync(fd);
+    const written = fs.fstatSync(fd);
+    if (!stateSameFileIdentity(created, written) || written.nlink !== 1 || written.size !== bytes.length) {
+      throw new Error(`${label} temporary file changed while writing`);
+    }
+    return { path: file, stat: written };
+  } catch (error) {
+    if (created) stateRemoveOwnedFile(file, created);
+    throw error;
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch { /* preserve original failure */ }
+  }
+}
+
+function stateRestoreBackup(backup, target, expected, label) {
+  try {
+    if (stateFileSnapshot(target, `${label} successor`, { allowMissing: true })) return false;
+    const current = stateFileSnapshot(backup, `${label} backup`);
+    if (!current || !stateSameFileIdentity(current, expected) || current.nlink !== 1) return false;
+    fs.linkSync(backup, target);
+    const restored = stateFileSnapshot(target, `${label} restored`);
+    if (!restored || !stateSameFileIdentity(restored, expected) || restored.nlink < 2) return false;
+    fs.unlinkSync(backup);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Publish a state/marker file only after the managed directory and the
+ * previously observed target have remained the same. Existing targets are
+ * quarantined first, then the new file is linked with no-replace semantics;
+ * an unexpected successor is never overwritten.
+ */
+function statePublishFile(directory, targetName, temporary, expected, label) {
+  stateAssertDirectoryAnchor(directory, `${label} directory`);
+  const target = path.join(directory.realpath, targetName);
+  const current = stateFileSnapshot(target, `${label} target`, { allowMissing: true });
+  if ((expected && (!current || !stateSameFileSnapshot(current, expected))) || (!expected && current)) {
+    throw new Error(`${label} changed before publication`);
+  }
+  let backup = null;
+  let linked = false;
+  try {
+    if (expected) {
+      backup = `${target}.previous-${process.pid}-${crypto.randomBytes(4).toString("hex")}`;
+      fs.renameSync(target, backup);
+      const moved = stateFileSnapshot(backup, `${label} backup`);
+      if (!moved || !stateSameFileIdentity(moved, expected) || moved.nlink !== 1) {
+        stateRestoreBackup(backup, target, expected, label);
+        throw new Error(`${label} target changed before publication`);
+      }
+      stateAssertDirectoryAnchor(directory, `${label} directory`);
+      if (stateFileSnapshot(target, `${label} successor`, { allowMissing: true })) {
+        throw new Error(`${label} successor appeared during publication`);
+      }
+    }
+    stateAssertDirectoryAnchor(directory, `${label} directory`);
+    if (stateFileSnapshot(target, `${label} successor`, { allowMissing: true })) {
+      throw new Error(`${label} successor appeared during publication`);
+    }
+    fs.linkSync(temporary.path, target);
+    linked = true;
+    const linkedTarget = stateFileSnapshot(target, `${label} target`, { allowHardLinks: true });
+    if (!linkedTarget || !stateSameFileIdentity(linkedTarget, temporary.stat) || linkedTarget.nlink < 2) {
+      throw new Error(`${label} publication produced an unsafe target`);
+    }
+    stateAssertDirectoryAnchor(directory, `${label} directory`);
+    stateRemoveOwnedFile(temporary.path, temporary.stat, { allowLinked: true });
+    const installed = stateFileSnapshot(target, `${label} target`);
+    if (!installed || !stateSameFileIdentity(installed, temporary.stat) || installed.nlink !== 1) {
+      throw new Error(`${label} identity changed after publication`);
+    }
+    try { fs.chmodSync(target, 0o600); } catch { /* Windows/best-effort */ }
+    const final = stateFileSnapshot(target, `${label} target`);
+    if (!final || !stateSameFileIdentity(final, temporary.stat) || final.nlink !== 1 ||
+        (process.platform !== "win32" && (final.mode & 0o777) !== 0o600)) {
+      throw new Error(`${label} mode or identity changed after publication`);
+    }
+    stateAssertDirectoryAnchor(directory, `${label} directory`);
+    if (backup) {
+      const backupStat = stateFileSnapshot(backup, `${label} backup`, { allowMissing: true });
+      if (backupStat && stateSameFileIdentity(backupStat, expected) && backupStat.nlink === 1) {
+        fs.unlinkSync(backup);
+      }
+    }
+    return target;
+  } catch (error) {
+    if (linked) stateRemoveOwnedFile(target, temporary.stat);
+    stateRemoveOwnedFile(temporary.path, temporary.stat);
+    if (backup) stateRestoreBackup(backup, target, expected, label);
+    throw error;
+  }
+}
+
+function stateWriteLockOwner(lockParent, lock, owner) {
+  stateAssertDirectoryAnchor(lockParent, "Cloud asset lock parent");
+  stateAssertDirectoryAnchor(lock, "Cloud asset lock", lockParent);
+  const ownerPath = path.join(lock.realpath, "owner.json");
+  let fd;
+  let created;
+  try {
+    fd = fs.openSync(ownerPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | STATE_NOFOLLOW, 0o600);
+    created = fs.fstatSync(fd);
+    if (!created.isFile() || created.isSymbolicLink() || created.nlink !== 1) {
+      throw new Error("lock owner is not a bounded private file");
+    }
+    const payload = Buffer.from(JSON.stringify(owner) + "\n", "utf8");
+    let offset = 0;
+    while (offset < payload.length) {
+      const written = fs.writeSync(fd, payload, offset, payload.length - offset, null);
+      if (!Number.isInteger(written) || written <= 0) throw new Error("lock owner write stalled");
+      offset += written;
+    }
+    try { fs.fchmodSync(fd, 0o600); } catch { /* Windows/best-effort */ }
+    fs.fsyncSync(fd);
+    const written = fs.fstatSync(fd);
+    if (!stateSameFileIdentity(created, written) || written.nlink !== 1 || written.size !== payload.length) {
+      throw new Error("lock owner changed while it was written");
+    }
+  } catch (error) {
+    if (created) stateRemoveOwnedFile(ownerPath, created);
+    throw error;
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch { /* preserve original failure */ }
+  }
+  stateAssertDirectoryAnchor(lockParent, "Cloud asset lock parent");
+  stateAssertDirectoryAnchor(lock, "Cloud asset lock", lockParent);
+  const written = stateFileSnapshot(ownerPath, "Cloud asset lock owner", { maxBytes: 512 });
+  if (!written || !stateSameFileIdentity(written, created) || written.nlink !== 1 || (written.mode & 0o777) !== 0o600) {
+    throw new Error("lock owner changed while it was written");
+  }
+}
+
+function stateRemoveOwnedLockDirectory(directoryPath, expected) {
+  let current;
+  try { current = stateDirectoryAnchor(directoryPath, "Cloud asset lock cleanup"); }
+  catch { return false; }
+  if (!stateSameDirectoryIdentity(current.stat, expected.stat || expected)) return false;
+  const ownerPath = path.join(current.realpath, "owner.json");
+  const owner = stateFileSnapshot(ownerPath, "Cloud asset lock owner", { allowMissing: true, maxBytes: 512 });
+  if (owner) {
+    try { fs.unlinkSync(ownerPath); } catch { return false; }
+  }
+  try {
+    fs.rmdirSync(current.realpath);
+    return true;
+  } catch {
+    // Never recursively delete a lock directory after its identity is no
+    // longer provable; leave the artifact for bounded stale-lock recovery.
+    return false;
+  }
 }
 
 function processIsAlive(pid) {
@@ -52,13 +310,16 @@ function processIsAlive(pid) {
   }
 }
 
-function readLockOwner(lockPath) {
-  const ownerPath = path.join(lockPath, "owner.json");
+function readLockOwner(lockPath, lockAnchor = null) {
+  if (lockAnchor) stateAssertDirectoryAnchor(lockAnchor, "Cloud asset lock");
+  const ownerPath = path.join(lockAnchor ? lockAnchor.realpath : lockPath, "owner.json");
   let fd;
   try {
+    const listed = stateFileSnapshot(ownerPath, "Cloud asset lock owner", { allowMissing: true, maxBytes: 512 });
+    if (!listed) return null;
     fd = fs.openSync(ownerPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
     const before = fs.fstatSync(fd);
-    if (!before.isFile() || before.nlink !== 1 || before.size <= 0 || before.size > 512) {
+    if (!before.isFile() || before.nlink !== 1 || before.size <= 0 || before.size > 512 || !stateSameFileIdentity(before, listed)) {
       throw new Error("lock owner is not a bounded private file");
     }
     const raw = fs.readFileSync(fd, "utf8");
@@ -90,67 +351,98 @@ function readLockOwner(lockPath) {
 function withCloudAssetLock(targetPath, label, action) {
   const lockPath = `${targetPath}.lock`;
   const lockParent = path.dirname(lockPath);
-  fs.mkdirSync(lockParent, { recursive: true, mode: 0o700 });
-  try { fs.chmodSync(lockParent, 0o700); } catch { /* best effort */ }
+  const lockParentAnchor = stateEnsureDirectory(lockParent, `${label} lock parent`);
+  const lockName = path.basename(lockPath);
+  const lockActualPath = path.join(lockParentAnchor.realpath, lockName);
   const deadline = Date.now() + CLOUD_ASSET_LOCK_WAIT_MS;
   let acquired = false;
+  let lockAnchor = null;
   while (!acquired) {
+    let createdLock = false;
     try {
-      fs.mkdirSync(lockPath, { mode: 0o700 });
-    } catch (error) {
-      if (!error || (error.code !== "EEXIST" && error.code !== "ENOENT")) throw error;
-      if (error.code === "ENOENT") continue;
-      let stat;
-      try { stat = fs.lstatSync(lockPath); } catch (statError) {
-        if (statError && statError.code === "ENOENT") continue;
-        throw statError;
-      }
-      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`${label} lock is unsafe`);
-      let owner = null;
-      try { owner = readLockOwner(lockPath); } catch { owner = null; }
-      if (Date.now() - stat.mtimeMs > CLOUD_ASSET_LOCK_STALE_MS && (!owner || !processIsAlive(owner.pid))) {
-        const quarantine = `${lockPath}.stale-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
-        try {
-          fs.renameSync(lockPath, quarantine);
-          fs.rmSync(quarantine, { recursive: true, force: true });
-          continue;
-        } catch (reclaimError) {
-          if (reclaimError && reclaimError.code === "ENOENT") continue;
-          throw reclaimError;
-        }
-      }
-      if (Date.now() >= deadline) throw new Error(`${label} is busy; retry after the active operation finishes`);
-      waitSync(25);
-      continue;
-    }
-    try {
+      stateAssertDirectoryAnchor(lockParentAnchor, `${label} lock parent`);
+      fs.mkdirSync(lockActualPath, { mode: 0o700 });
+      createdLock = true;
+      lockAnchor = stateDirectoryAnchor(lockActualPath, `${label} lock`, { containedBy: lockParentAnchor });
+      try { fs.chmodSync(lockActualPath, 0o700); } catch { /* Windows/best-effort */ }
+      stateAssertDirectoryAnchor(lockParentAnchor, `${label} lock parent`);
+      stateAssertDirectoryAnchor(lockAnchor, `${label} lock`, lockParentAnchor);
       const owner = {
         pid: process.pid,
         nonce: crypto.randomBytes(16).toString("hex"),
         createdAt: new Date().toISOString(),
       };
-      fs.writeFileSync(path.join(lockPath, "owner.json"), JSON.stringify(owner) + "\n", {
-        encoding: "utf8",
-        mode: 0o600,
-        flag: "wx",
-      });
+      stateWriteLockOwner(lockParentAnchor, lockAnchor, owner);
       acquired = true;
     } catch (error) {
-      const abandoned = `${lockPath}.abandoned-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
-      try {
-        fs.renameSync(lockPath, abandoned);
-        fs.rmSync(abandoned, { recursive: true, force: true });
-      } catch { /* original owner-write error remains authoritative */ }
+      if (!createdLock && error && (error.code === "EEXIST" || error.code === "ENOENT")) {
+        if (error.code === "ENOENT") continue;
+        let lock = null;
+        try {
+          lock = stateDirectoryAnchor(lockActualPath, `${label} lock`, {
+            allowMissing: true,
+            containedBy: lockParentAnchor,
+          });
+        } catch (statError) {
+          if (statError && statError.code === "ENOENT") continue;
+          throw statError;
+        }
+        if (!lock) continue;
+        let owner = null;
+        try { owner = readLockOwner(lockActualPath, lock); } catch { owner = null; }
+        if (Date.now() - lock.stat.mtimeMs > CLOUD_ASSET_LOCK_STALE_MS && (!owner || !processIsAlive(owner.pid))) {
+          stateAssertDirectoryAnchor(lockParentAnchor, `${label} lock parent`);
+          stateAssertDirectoryAnchor(lock, `${label} lock`, lockParentAnchor);
+          const quarantine = path.join(
+            lockParentAnchor.realpath,
+            `${lockName}.stale-${process.pid}-${crypto.randomBytes(6).toString("hex")}`,
+          );
+          try {
+            fs.renameSync(lockActualPath, quarantine);
+            const moved = stateDirectoryAnchor(quarantine, `${label} stale lock`, { containedBy: lockParentAnchor });
+            if (stateSameDirectoryIdentity(moved.stat, lock.stat)) stateRemoveOwnedLockDirectory(quarantine, moved);
+          } catch (reclaimError) {
+            if (reclaimError && reclaimError.code === "ENOENT") continue;
+            throw reclaimError;
+          }
+          continue;
+        }
+        if (Date.now() >= deadline) throw new Error(`${label} is busy; retry after the active operation finishes`);
+        waitSync(25);
+        continue;
+      }
+      if (lockAnchor && !acquired) {
+        const abandoned = path.join(
+          lockParentAnchor.realpath,
+          `${lockName}.abandoned-${process.pid}-${crypto.randomBytes(6).toString("hex")}`,
+        );
+        try {
+          stateAssertDirectoryAnchor(lockParentAnchor, `${label} lock parent`);
+          stateAssertDirectoryAnchor(lockAnchor, `${label} lock`, lockParentAnchor);
+          fs.renameSync(lockActualPath, abandoned);
+          const moved = stateDirectoryAnchor(abandoned, `${label} abandoned lock`, { containedBy: lockParentAnchor });
+          if (stateSameDirectoryIdentity(moved.stat, lockAnchor.stat)) stateRemoveOwnedLockDirectory(abandoned, moved);
+        } catch { /* original owner-write error remains authoritative */ }
+      }
       throw error;
     }
   }
   try {
     return action();
   } finally {
-    const cleanup = `${lockPath}.done-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
+    const cleanup = path.join(
+      lockParentAnchor.realpath,
+      `${lockName}.done-${process.pid}-${crypto.randomBytes(6).toString("hex")}`,
+    );
     try {
-      fs.renameSync(lockPath, cleanup);
-      fs.rmSync(cleanup, { recursive: true, force: true });
+      stateAssertDirectoryAnchor(lockParentAnchor, `${label} lock parent`);
+      stateAssertDirectoryAnchor(lockAnchor, `${label} lock`, lockParentAnchor);
+      fs.renameSync(lockActualPath, cleanup);
+      const moved = stateDirectoryAnchor(cleanup, `${label} completed lock`, { containedBy: lockParentAnchor });
+      if (!stateSameDirectoryIdentity(moved.stat, lockAnchor.stat)) {
+        throw new Error(`${label} lock changed while it was being released`);
+      }
+      stateRemoveOwnedLockDirectory(cleanup, moved);
     } catch (error) {
       if (!error || error.code !== "ENOENT") throw error;
     }
@@ -244,23 +536,25 @@ function readCloudAssetState() {
 function writeCloudAssetStateUnlocked(state) {
   const statePath = cloudAssetStatePath();
   const normalized = normalizeCloudAssetState(state);
-  fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
-  try { fs.chmodSync(path.dirname(statePath), 0o700); } catch { /* best effort */ }
-  const temp = `${statePath}.tmp-${process.pid}-${crypto.randomBytes(4).toString("hex")}`;
-  let fd;
+  const directory = stateEnsureDirectory(path.dirname(statePath), "Cloud asset state directory");
+  const targetName = path.basename(statePath);
+  const target = path.join(directory.realpath, targetName);
+  const expected = stateFileSnapshot(target, "Cloud asset state", { allowMissing: true });
+  const payload = JSON.stringify(normalized, null, 2) + "\n";
+  if (Buffer.byteLength(payload, "utf8") > CLOUD_ASSET_STATE_MAX_BYTES) {
+    throw new Error("Cloud asset state exceeds its safety limit");
+  }
+  const temporary = stateWriteTemp(
+    directory,
+    `.${targetName}.tmp-${process.pid}-${crypto.randomBytes(4).toString("hex")}`,
+    payload,
+    "Cloud asset state",
+  );
   try {
-    try {
-      fd = fs.openSync(temp, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
-      fs.writeFileSync(fd, JSON.stringify(normalized, null, 2) + "\n", "utf8");
-      fs.fsyncSync(fd);
-    } finally {
-      if (fd !== undefined) try { fs.closeSync(fd); } catch { /* best effort */ }
-    }
-    fs.renameSync(temp, statePath);
-    cloudApplyPortableFileMode(statePath, 0o600);
-    cloudFsyncDirectory(path.dirname(statePath));
+    statePublishFile(directory, targetName, temporary, expected, "Cloud asset state");
+    cloudFsyncDirectory(directory.realpath);
   } finally {
-    try { fs.rmSync(temp, { force: true }); } catch { /* best effort */ }
+    stateRemoveOwnedFile(temporary.path, temporary.stat);
   }
   return normalized;
 }
@@ -398,14 +692,22 @@ function cloudBaseDescriptorForSource(marker, rootPath, slug, scope) {
 }
 
 function writeCloudSourceMarker(rootPath, scan, descriptor, options = {}) {
-  const markerPath = path.join(rootPath, CLOUD_RESTORE_MARKER_PATH);
   const lockTarget = path.join(
     userDataDir(),
     "cloud-source-marker-locks",
     crypto.createHash("sha256").update(path.resolve(rootPath)).digest("hex"),
   );
   return withCloudAssetLock(lockTarget, "Agent Cloud source marker", () => {
-    const previousMarker = readCloudSourceMarker(rootPath);
+    const rootAnchor = stateDirectoryAnchor(rootPath, "Cloud source marker root");
+    const markerPath = path.join(rootAnchor.realpath, CLOUD_RESTORE_MARKER_PATH);
+    const expectedMarker = stateFileSnapshot(markerPath, "Cloud source marker", { allowMissing: true });
+    const previousMarker = readCloudSourceMarker(rootAnchor.realpath);
+    stateAssertDirectoryAnchor(rootAnchor, "Cloud source marker root");
+    const currentMarker = stateFileSnapshot(markerPath, "Cloud source marker", { allowMissing: true });
+    if ((expectedMarker && (!currentMarker || !stateSameFileSnapshot(currentMarker, expectedMarker))) ||
+        (!expectedMarker && currentMarker)) {
+      throw new Error("Cloud source marker changed while it was read");
+    }
     const descriptors = cloudMarkerDescriptors(previousMarker);
     if (descriptor) descriptors[descriptor.scope] = descriptor;
     if (options.removeDescriptor) {
@@ -430,21 +732,17 @@ function writeCloudSourceMarker(rootPath, scan, descriptor, options = {}) {
       savedAt: new Date().toISOString(),
     };
     for (const key of Object.keys(marker)) if (marker[key] === undefined) delete marker[key];
-    const temp = path.join(rootPath, `.${CLOUD_RESTORE_MARKER_PATH}.tmp-${process.pid}-${crypto.randomBytes(4).toString("hex")}`);
-    let fd;
+    const temporary = stateWriteTemp(
+      rootAnchor,
+      `.${CLOUD_RESTORE_MARKER_PATH}.tmp-${process.pid}-${crypto.randomBytes(4).toString("hex")}`,
+      JSON.stringify(marker, null, 2) + "\n",
+      "Cloud source marker",
+    );
     try {
-      try {
-        fd = fs.openSync(temp, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
-        fs.writeFileSync(fd, JSON.stringify(marker, null, 2) + "\n", "utf8");
-        fs.fsyncSync(fd);
-      } finally {
-        if (fd !== undefined) try { fs.closeSync(fd); } catch { /* best effort */ }
-      }
-      fs.renameSync(temp, markerPath);
-      cloudApplyPortableFileMode(markerPath, 0o600);
-      cloudFsyncDirectory(rootPath);
+      statePublishFile(rootAnchor, CLOUD_RESTORE_MARKER_PATH, temporary, expectedMarker, "Cloud source marker");
+      cloudFsyncDirectory(rootAnchor.realpath);
     } finally {
-      try { fs.rmSync(temp, { force: true }); } catch { /* best effort */ }
+      stateRemoveOwnedFile(temporary.path, temporary.stat);
     }
     return marker;
   });

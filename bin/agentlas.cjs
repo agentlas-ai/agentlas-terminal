@@ -72,7 +72,7 @@ function dbPath() {
 // Keep the launcher's no-database path identical to the engine's CLI grammar.
 // A plain word "help" is valid task content (`agentlas run -p help`); only the
 // actual help/version command forms may skip first-run database bootstrap.
-function isMetadataOnlyInvocation(argv) {
+function isMetadataOnlyInvocation(argv, parsedOutput) {
   const args = Array.isArray(argv) ? argv : [];
   const helpRequested = args.some((arg) => arg === "--help" || arg === "-h");
   const helpCommand = args.find((arg) => arg !== "--help" && arg !== "-h" && !String(arg).startsWith("-"));
@@ -83,7 +83,7 @@ function isMetadataOnlyInvocation(argv) {
     if (arg === "--version" || arg === "-V") return "version";
     return arg;
   });
-  const { rest } = parseOutputFlags(normalized);
+  const { rest } = parsedOutput || parseOutputFlags(normalized);
   const [rawCommand, ...commandArgs] = rest;
   if (rawCommand === "help" || rawCommand === "version") return true;
   return SELF_HELP_COMMANDS.has(resolveCommandName(rawCommand)) && commandArgs[0] === "help";
@@ -556,8 +556,21 @@ function bootstrapDbIfMissing() {
 
 function main() {
   const args = process.argv.slice(2);
-  const { options: outputOptions } = parseOutputFlags(args);
-  const metadataOnly = isMetadataOnlyInvocation(args);
+  const normalized = args.map((arg) => {
+    if (arg === "--help" || arg === "-h") return "help";
+    if (arg === "--version" || arg === "-V") return "version";
+    return arg;
+  });
+  let parsedOutput;
+  try {
+    parsedOutput = parseOutputFlags(normalized);
+  } catch (error) {
+    process.stderr.write(renderError(error, { format: "table", noColor: true }) + "\n");
+    process.exitCode = 1;
+    return;
+  }
+  const { options: outputOptions } = parsedOutput;
+  const metadataOnly = isMetadataOnlyInvocation(args, parsedOutput);
   const sqliteDriver = probeSqliteDriver();
   const engineFound = exists(ENGINE);
 

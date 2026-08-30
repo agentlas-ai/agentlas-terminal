@@ -192,6 +192,12 @@ function validateExperiencePack(value) {
   assertUniqueIds(value.evidenceReceiptIds, "experience pack.evidenceReceiptIds");
   if (!Array.isArray(value.mcpRequirements) || value.mcpRequirements.length > 64) throw new Error("experience pack.mcpRequirements is invalid");
   value.mcpRequirements.forEach((requirement, index) => validateMcpRequirement(requirement, `experience pack.mcpRequirements[${index}]`));
+  const requirementIds = value.mcpRequirements.map((requirement) => requirement.requirementId);
+  if (new Set(requirementIds).size !== requirementIds.length) {
+    const error = new Error("experience pack.mcpRequirements requirementId values must be unique");
+    error.code = "duplicate_mcp_requirement_id";
+    throw error;
+  }
   // base 패키지 복사 반입 금지 — 참조만 허용(오너 결정, 완화 불가).
   if (value.containsBasePackageMaterial !== false) throw new Error("experience pack must reference the base release; copied base material is forbidden");
   if (!HASH_RE.test(String(value.contentHash || ""))) throw new Error("experience pack.contentHash is invalid");
