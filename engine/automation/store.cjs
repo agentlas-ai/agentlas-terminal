@@ -14,7 +14,7 @@
  */
 const crypto = require("node:crypto");
 const os = require("node:os");
-const { columnExists, tableExists } = require("../core/db.cjs");
+const { columnExists, tableExists, runWriteTransaction } = require("../core/db.cjs");
 const { nextAutomationRun } = require("./schedule.cjs");
 
 const LEASE_TTL_MS = 15 * 60 * 1000; // 앱 store/automations.ts LEASE_TTL_MS와 동일
@@ -31,7 +31,49 @@ function listAutomations(db) {
 
 function getAutomationByPrefix(db, idPrefix) {
   if (!tableExists(db, "automations")) return null;
-  return db.prepare("SELECT * FROM automations WHERE id LIKE ?").get(String(idPrefix) + "%") || null;
+  const prefix = String(idPrefix || "").trim();
+  if (!prefix) return null;
+  const exact = db.prepare("SELECT * FROM automations WHERE id = ?").get(prefix);
+  if (exact) return exact;
+  // LIKE를 쓰면 사용자가 입력한 %/_가 와일드카드가 되어 전혀 다른 행을 고른다.
+  // 두 행 이상이면 임의의 첫 행을 mutation 대상으로 삼지 않고 전체 ID를 요구한다.
+  const matches = db.prepare(
+    "SELECT * FROM automations WHERE substr(id, 1, length(?)) = ? ORDER BY id LIMIT 2",
+  ).all(prefix, prefix);
+  if (matches.length > 1) throw new Error(`automation id prefix is ambiguous: ${prefix}`);
+  return matches[0] || null;
+}
+
+function resultChanges(result) {
+  return Number(result && (result.changes ?? result.rowsAffected) || 0);
+}
+
+function validLease(lease) {
+  return Boolean(
+    lease && typeof lease.owner === "string" && lease.owner &&
+    typeof lease.claimedAt === "string" && lease.claimedAt,
+  );
+}
+
+/**
+ * Build the fencing predicate for a post-claim write. When a legacy caller has
+ * no lease token, only an actually-unclaimed row may be updated; an active
+ * successor lease is never touched. The daemon always supplies the exact
+ * owner+claimed_at pair returned by claimAutomationLease().
+ */
+function leaseFence(db, id, lease = null, row = null) {
+  const parts = ["id = ?"];
+  const params = [id];
+  if (!leaseSupported(db)) return { sql: parts.join(" AND "), params };
+  if (validLease(lease)) {
+    parts.push("lease_owner = ?", "claimed_at = ?");
+    params.push(lease.owner, lease.claimedAt);
+  } else if (row && row.lease_owner == null && row.claimed_at == null) {
+    parts.push("lease_owner IS NULL", "claimed_at IS NULL");
+  } else {
+    parts.push("0");
+  }
+  return { sql: parts.join(" AND "), params };
 }
 
 /**
@@ -75,17 +117,21 @@ function addAutomation(db, spec, next) {
 
 /** on: next_run_at 재계산 후 활성화. off: 비활성화(스케줄 보존). */
 function setEnabled(db, row, enabled) {
+  return setEnabledChecked(db, row, enabled).next;
+}
+
+function setEnabledChecked(db, row, enabled) {
   if (enabled) {
     const next = nextAutomationRun(row) || null;
-    db.prepare("UPDATE automations SET enabled=1, next_run_at=? WHERE id=?").run(next ? next.toISOString() : null, row.id);
-    return next;
+    const result = db.prepare("UPDATE automations SET enabled=1, next_run_at=? WHERE id=?").run(next ? next.toISOString() : null, row.id);
+    return { changed: resultChanges(result) > 0, next };
   }
-  db.prepare("UPDATE automations SET enabled=0 WHERE id=?").run(row.id);
-  return null;
+  const result = db.prepare("UPDATE automations SET enabled=0 WHERE id=?").run(row.id);
+  return { changed: resultChanges(result) > 0, next: null };
 }
 
 function removeAutomation(db, id) {
-  db.prepare("DELETE FROM automations WHERE id=?").run(id);
+  return resultChanges(db.prepare("DELETE FROM automations WHERE id=?").run(id)) > 0;
 }
 
 /**
@@ -94,15 +140,21 @@ function removeAutomation(db, id) {
  * @returns {boolean} true = 이 프로세스가 배타 실행권을 가짐
  */
 function claimAutomation(db, id, now = new Date(), owner = LEASE_OWNER) {
+  return Boolean(claimAutomationLease(db, id, now, owner));
+}
+
+/** Claim and return the exact owner+claimed_at fence used by this run. */
+function claimAutomationLease(db, id, now = new Date(), owner = LEASE_OWNER) {
   // 리스 열이 없으면 배타성을 증명할 수 없다 — 중복 실행 위험을 감수하지 않고 거부.
-  if (!leaseSupported(db)) return false;
+  if (!leaseSupported(db)) return null;
   const cutoff = new Date(now.getTime() - LEASE_TTL_MS).toISOString();
+  const claimedAt = now.toISOString();
   const result = db
     .prepare(
       "UPDATE automations SET claimed_at = ?, lease_owner = ? WHERE id = ? AND enabled = 1 AND (claimed_at IS NULL OR claimed_at < ?)",
     )
-    .run(now.toISOString(), owner, id, cutoff);
-  return (result.changes ?? result.rowsAffected ?? 0) > 0;
+    .run(claimedAt, owner, id, cutoff);
+  return resultChanges(result) > 0 ? { owner, claimedAt } : null;
 }
 
 /**
@@ -115,6 +167,7 @@ function claimAutomation(db, id, now = new Date(), owner = LEASE_OWNER) {
  * 리스를 되빼앗지는 않는다.
  */
 function renewAutomationLease(db, id, now = new Date(), owner = LEASE_OWNER) {
+  if (arguments.length >= 5) return Boolean(renewAutomationLeaseToken(db, id, now, { owner, claimedAt: arguments[4] }));
   if (!leaseSupported(db)) return false;
   // false means definitive ownership loss. SQLite busy/I/O errors must throw
   // so the caller can retry instead of killing a valid run as if a peer had
@@ -122,15 +175,30 @@ function renewAutomationLease(db, id, now = new Date(), owner = LEASE_OWNER) {
   const result = db
     .prepare("UPDATE automations SET claimed_at = ? WHERE id = ? AND lease_owner = ? AND claimed_at IS NOT NULL")
     .run(now.toISOString(), id, owner);
-  return (result.changes ?? result.rowsAffected ?? 0) > 0;
+  return resultChanges(result) > 0;
 }
 
-function releaseAutomation(db, id, owner = LEASE_OWNER) {
+/** Renew an exact fence and return its new claimed_at value. */
+function renewAutomationLeaseToken(db, id, now = new Date(), lease) {
+  if (!leaseSupported(db) || !validLease(lease)) return null;
+  const claimedAt = now.toISOString();
+  const result = db
+    .prepare("UPDATE automations SET claimed_at = ? WHERE id = ? AND lease_owner = ? AND claimed_at = ?")
+    .run(claimedAt, id, lease.owner, lease.claimedAt);
+  return resultChanges(result) > 0 ? { owner: lease.owner, claimedAt } : null;
+}
+
+function releaseAutomation(db, id, owner = LEASE_OWNER, claimedAt = null) {
   try {
+    if (owner && typeof owner === "object") {
+      claimedAt = owner.claimedAt || null;
+      owner = owner.owner || LEASE_OWNER;
+    }
+    const token = typeof claimedAt === "string" && claimedAt ? " AND claimed_at = ?" : "";
     const result = db
-      .prepare("UPDATE automations SET claimed_at = NULL, lease_owner = NULL WHERE id = ? AND lease_owner = ?")
-      .run(id, owner);
-    return (result.changes ?? result.rowsAffected ?? 0) > 0;
+      .prepare(`UPDATE automations SET claimed_at = NULL, lease_owner = NULL WHERE id = ? AND lease_owner = ?${token}`)
+      .run(...(token ? [id, owner, claimedAt] : [id, owner]));
+    return resultChanges(result) > 0;
   } catch { return false; }
 }
 
@@ -138,22 +206,33 @@ function releaseAutomation(db, id, owner = LEASE_OWNER) {
  * 실행 기록 — run_history(v1/Desktop 스케줄러 패리티) + automation_runs(있으면) 양쪽.
  * best-effort: 기록 실패가 자동화 실행 자체를 죽이면 안 된다.
  */
-function recordRun(db, automationId, status, error, scheduledFor) {
+function recordRun(db, automationId, status, error, scheduledFor, lease) {
+  if (!leaseSupported(db) || !validLease(lease)) return { ok: false, leaseLost: true, recorded: false };
   const nowIso = new Date().toISOString();
   try {
-    if (tableExists(db, "run_history")) {
-      db.prepare(
-        "INSERT INTO run_history (id, automation_id, scheduled_for, ran_at, status, skipped_count, error) VALUES (?,?,?,?,?,0,?)",
-      ).run(crypto.randomUUID(), automationId, scheduledFor || null, nowIso, status, error || null);
-    }
-  } catch { /* best-effort */ }
-  try {
-    if (tableExists(db, "automation_runs")) {
-      db.prepare(
-        "INSERT INTO automation_runs (id, automation_id, started_at, status, node_states_json) VALUES (?,?,?,?,NULL)",
-      ).run(crypto.randomUUID(), automationId, nowIso, status);
-    }
-  } catch { /* best-effort */ }
+    return runWriteTransaction(db, () => {
+      const fence = leaseFence(db, automationId, lease);
+      let recorded = false;
+      if (tableExists(db, "run_history")) {
+        const result = db.prepare(
+          `INSERT INTO run_history (id, automation_id, scheduled_for, ran_at, status, skipped_count, error)
+             SELECT ?,?,?,?,?,0,? FROM automations WHERE ${fence.sql}`,
+        ).run(crypto.randomUUID(), automationId, scheduledFor || null, nowIso, status, error || null, ...fence.params);
+        recorded = recorded || resultChanges(result) > 0;
+      }
+      if (tableExists(db, "automation_runs")) {
+        const result = db.prepare(
+          `INSERT INTO automation_runs (id, automation_id, started_at, status, node_states_json)
+             SELECT ?,?,?,?,NULL FROM automations WHERE ${fence.sql}`,
+        ).run(crypto.randomUUID(), automationId, nowIso, status, ...fence.params);
+        recorded = recorded || resultChanges(result) > 0;
+      }
+      const stillOwned = db.prepare(`SELECT 1 FROM automations WHERE ${fence.sql}`).get(...fence.params);
+      return { ok: Boolean(stillOwned), leaseLost: !stillOwned, recorded };
+    });
+  } catch (error) {
+    return { ok: false, leaseLost: false, recorded: false, error: String((error && error.message) || error) };
+  }
 }
 
 function listRuns(db, limit = 15) {
@@ -174,8 +253,9 @@ function listRuns(db, limit = 15) {
  * ("Disabled: … morning" 을 보고 exit 0 인데도) 다음 예정 시각에 또 발화한다.
  * 그래서 enabled 는 "켜기"로는 절대 쓰지 않고, 종료 조건일 때만 0 으로 내린다.
  */
-function disableExhausted(db, id) {
-  db.prepare("UPDATE automations SET enabled = 0 WHERE id = ?").run(id);
+function disableExhausted(db, id, lease = null, row = null) {
+  const fence = leaseFence(db, id, lease, row);
+  return resultChanges(db.prepare(`UPDATE automations SET enabled = 0 WHERE ${fence.sql}`).run(...fence.params)) > 0;
 }
 
 /**
@@ -188,40 +268,61 @@ function disableExhausted(db, id) {
  * (같은 이유로 성공/실패 두 분기 모두 같은 규칙을 따라야 한다: 한쪽만 고치면
  *  실패로 끝난 실행이 여전히 끈 자동화를 부활시킨다.)
  */
-function advanceAfterRun(db, row, { ok, advanceSchedule, ranAt = new Date() } = {}) {
+function advanceAfterRun(db, row, { ok, advanceSchedule, ranAt = new Date(), lease = null } = {}) {
   const hasRunCount = columnExists(db, "automations", "run_count");
   const shouldAdvance = !!advanceSchedule && (row.trigger_type || "schedule") === "schedule";
   const advance = shouldAdvance ? nextAutomationRun(row, ranAt) : null;
-  if (ok) {
-    if (shouldAdvance) {
-      if (hasRunCount) {
-        db.prepare(
-          "UPDATE automations SET last_run_at = ?, run_count = run_count + 1, next_run_at = ? WHERE id = ?",
-        ).run(ranAt.toISOString(), advance ? advance.toISOString() : null, row.id);
+  try {
+    return runWriteTransaction(db, () => {
+      const fence = leaseFence(db, row.id, lease, row);
+      let result;
+      if (ok) {
+        if (shouldAdvance) {
+          const sql = hasRunCount
+            ? "UPDATE automations SET last_run_at = ?, run_count = run_count + 1, next_run_at = ?"
+            : "UPDATE automations SET last_run_at = ?, next_run_at = ?";
+          result = db.prepare(`${sql} WHERE ${fence.sql}`).run(
+            ranAt.toISOString(), advance ? advance.toISOString() : null, ...fence.params,
+          );
+        } else if (hasRunCount) {
+          result = db.prepare(`UPDATE automations SET last_run_at = ?, run_count = run_count + 1 WHERE ${fence.sql}`)
+            .run(ranAt.toISOString(), ...fence.params);
+        } else {
+          result = db.prepare(`UPDATE automations SET last_run_at = ? WHERE ${fence.sql}`).run(ranAt.toISOString(), ...fence.params);
+        }
+      } else if (shouldAdvance) {
+        result = db.prepare(`UPDATE automations SET last_run_at = ?, next_run_at = ? WHERE ${fence.sql}`)
+          .run(ranAt.toISOString(), advance ? advance.toISOString() : null, ...fence.params);
       } else {
-        db.prepare("UPDATE automations SET last_run_at = ?, next_run_at = ? WHERE id = ?")
-          .run(ranAt.toISOString(), advance ? advance.toISOString() : null, row.id);
+        result = db.prepare(`UPDATE automations SET last_run_at = ? WHERE ${fence.sql}`).run(ranAt.toISOString(), ...fence.params);
       }
-      if (!advance) disableExhausted(db, row.id);
-    } else if (hasRunCount) {
-      db.prepare("UPDATE automations SET last_run_at = ?, run_count = run_count + 1 WHERE id = ?")
-        .run(ranAt.toISOString(), row.id);
-    } else {
-      db.prepare("UPDATE automations SET last_run_at = ? WHERE id = ?").run(ranAt.toISOString(), row.id);
-    }
-    // max_runs 도달 시 비활성화 (앱과 동일한 종료 조건).
-    if (row.max_runs && (row.run_count || 0) + 1 >= row.max_runs) {
-      disableExhausted(db, row.id);
-      return { advance, maxRunsReached: true };
-    }
-  } else if (shouldAdvance) {
-    db.prepare("UPDATE automations SET last_run_at = ?, next_run_at = ? WHERE id = ?")
-      .run(ranAt.toISOString(), advance ? advance.toISOString() : null, row.id);
-    if (!advance) disableExhausted(db, row.id);
-  } else {
-    db.prepare("UPDATE automations SET last_run_at = ? WHERE id = ?").run(ranAt.toISOString(), row.id);
+      if (resultChanges(result) === 0) return { advance, maxRunsReached: false, updated: false, leaseLost: true };
+
+      let maxRunsReached = false;
+      if (shouldAdvance && !advance) {
+        if (!disableExhausted(db, row.id, lease, row)) {
+          return { advance, maxRunsReached: false, updated: false, leaseLost: true };
+        }
+        maxRunsReached = true;
+      }
+      // max_runs 도달 시 비활성화 (앱과 동일한 종료 조건).
+      if (ok && row.max_runs && (row.run_count || 0) + 1 >= row.max_runs) {
+        if (!disableExhausted(db, row.id, lease, row)) {
+          return { advance, maxRunsReached: false, updated: false, leaseLost: true };
+        }
+        maxRunsReached = true;
+      }
+      return { advance, maxRunsReached, updated: true, leaseLost: false };
+    });
+  } catch (error) {
+    return {
+      advance,
+      maxRunsReached: false,
+      updated: false,
+      leaseLost: false,
+      error: String((error && error.message) || error),
+    };
   }
-  return { advance, maxRunsReached: false };
 }
 
 /**
@@ -279,9 +380,12 @@ module.exports = {
   getAutomationByPrefix,
   addAutomation,
   setEnabled,
+  setEnabledChecked,
   removeAutomation,
   claimAutomation,
+  claimAutomationLease,
   renewAutomationLease,
+  renewAutomationLeaseToken,
   releaseAutomation,
   recordRun,
   listRuns,

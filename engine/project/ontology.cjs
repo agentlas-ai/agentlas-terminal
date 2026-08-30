@@ -20,23 +20,31 @@ const { initializedAgentlasProjectPathCli } = require("./state.cjs");
 
 const ONTOLOGY_SUPPORTED_EXTS = new Set([".txt", ".md", ".markdown", ".json", ".csv", ".tsv"]);
 
-/** `--key value` / `--flag` 파서 — v1 parseCloudFlags와 동일 규칙의 로컬 복사본. */
-function parseFlagsCli(args) {
+/** Ontology source registration options. Unknown/duplicate flags fail closed. */
+function parseFlagsCli(args, schema = {}) {
   const flags = { _: [] };
+  const values = new Set(schema.values || ["kind", "scope"]);
+  const booleans = new Set(schema.booleans || []);
+  let passthrough = false;
   for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a && a.startsWith("--")) {
-      const key = a.slice(2);
-      const next = args[i + 1];
-      if (next !== undefined && !String(next).startsWith("--")) {
-        flags[key] = next;
-        i++;
-      } else {
-        flags[key] = true;
-      }
-    } else {
-      flags._.push(a);
+    const token = String(args[i]);
+    if (passthrough) { flags._.push(token); continue; }
+    if (token === "--") { passthrough = true; continue; }
+    if (!token.startsWith("--")) { flags._.push(token); continue; }
+    const at = token.indexOf("=");
+    const key = token.slice(2, at > 2 ? at : undefined);
+    if (!values.has(key) && !booleans.has(key)) throw new Error(`unknown option: --${key}`);
+    if (Object.prototype.hasOwnProperty.call(flags, key)) throw new Error(`duplicate option: --${key}`);
+    if (booleans.has(key)) {
+      if (at > 2) throw new Error(`--${key} does not take a value`);
+      flags[key] = true;
+      continue;
     }
+    const value = at > 2 ? token.slice(at + 1) : args[++i];
+    if (value === undefined || value === "" || (at <= 2 && String(value).startsWith("--"))) {
+      throw new Error(`--${key} requires a value`);
+    }
+    flags[key] = String(value);
   }
   return flags;
 }
@@ -233,18 +241,24 @@ function resolveOntologyPathCli(value, cwd) {
 function inferOntologyKindCli(value, text) {
   const v = String(value || "").toLowerCase();
   const hay = String(text || "").toLowerCase();
-  if (["company", "work", "business", "corp", "team", "회사", "업무", "팀", "조직"].includes(v) || /(company|work|business|corp|team|회사|업무|조직)/i.test(hay)) return "company";
-  if (["personal", "private-life", "life", "me", "개인", "내자료", "일상"].includes(v) || /(personal|private-life|\bme\b|개인|내\s*자료|일상)/i.test(hay)) return "personal";
-  if (["project", "repo", "프로젝트", "레포"].includes(v) || /(project|repo|프로젝트|레포)/i.test(hay)) return "project";
+  if (["company", "work", "business", "corp", "team", "회사", "업무", "팀", "조직"].includes(v)) return "company";
+  if (["personal", "private-life", "life", "me", "개인", "내자료", "일상"].includes(v)) return "personal";
+  if (["project", "repo", "프로젝트", "레포"].includes(v)) return "project";
+  if (/(company|work|business|corp|team|회사|업무|조직)/i.test(hay)) return "company";
+  if (/(personal|private-life|\bme\b|개인|내\s*자료|일상)/i.test(hay)) return "personal";
+  if (/(project|repo|프로젝트|레포)/i.test(hay)) return "project";
   return "project";
 }
 
 function inferOntologyScopeCli(value, text, kind) {
   const v = String(value || "").toLowerCase();
   const hay = String(text || "").toLowerCase();
-  if (["public", "open", "공개"].includes(v) || /(public|open|공개)/i.test(hay)) return "public";
-  if (["internal", "team", "내부", "팀"].includes(v) || /(internal|team-only|company-wide|내부|팀\s*공유|회사\s*공유)/i.test(hay)) return "internal";
-  if (["private", "secret", "local", "비공개", "개인"].includes(v) || /(private|secret|local-only|비공개|개인만|나만)/i.test(hay)) return "private";
+  if (["public", "open", "공개"].includes(v)) return "public";
+  if (["internal", "team", "내부", "팀"].includes(v)) return "internal";
+  if (["private", "secret", "local", "비공개", "개인"].includes(v)) return "private";
+  if (/(public|open|공개)/i.test(hay)) return "public";
+  if (/(internal|team-only|company-wide|내부|팀\s*공유|회사\s*공유)/i.test(hay)) return "internal";
+  if (/(private|secret|local-only|비공개|개인만|나만)/i.test(hay)) return "private";
   return kind === "company" || kind === "personal" ? "private" : "private";
 }
 
@@ -366,7 +380,7 @@ function formatOntologyStatusCli(paths, lang) {
   lines.push("", `${ko ? "소스" : "Sources"} (${sources.length}):`);
   for (const source of sources) {
     const sourcePath = path.resolve(String(source.path || ""));
-    lines.push(`  ${fs.existsSync(sourcePath) ? "✓" : "!"} ${sourcePath}  ${source.kind || "project"} / ${source.scope || "internal"}`);
+    lines.push(`  ${fs.existsSync(sourcePath) ? "✓" : "!"} ${sourcePath}  ${source.kind || "project"} / ${source.scope || "private"}`);
   }
   if (!sources.length) lines.push(ko ? "  (없음)" : "  (none)");
   lines.push(
@@ -438,6 +452,7 @@ async function runOntologyCli(args, opts) {
   const sub = normalizedArgs[0] || "status";
   const passivePaths = ontologyPathsForCli(projectPath);
   if (sub === "status" || sub === "list") {
+    if (normalizedArgs.length > 1) throw new Error(`usage: agentlas ontology ${sub}`);
     if (!initializedAgentlasProjectPathCli(projectPath)) {
       return [
         ko ? "온톨로지: 초기화되지 않음" : "Ontology: not initialized",
@@ -448,13 +463,32 @@ async function runOntologyCli(args, opts) {
     }
     return formatOntologyStatusCli(passivePaths, opts.lang);
   }
-  if (sub === "help" || sub === "--help" || sub === "-h") return ontologyUsageLinesCli(opts.lang);
+  if (sub === "help" || sub === "--help" || sub === "-h") {
+    if (normalizedArgs.length > 1) throw new Error("usage: agentlas ontology help");
+    return ontologyUsageLinesCli(opts.lang);
+  }
   const directOntologyCommand = ["open", "add", "company", "personal", "project"].includes(String(sub).toLowerCase())
     || isOntologyPathishCli(sub, cwd, true);
   if (!directOntologyCommand) {
     // 자연어는 판정기 경유로 액션을 정한다. 판정 불가면 ["help"](사용법 안내).
     const parsed = await parseOntologyNaturalArgsCli(normalizedArgs.join(" "), cwd);
     return runOntologyCli(parsed, opts);
+  }
+  let directFlags = null;
+  if (sub === "open") {
+    if (normalizedArgs.length !== 1) throw new Error("usage: agentlas ontology open");
+  } else if (sub === "add") {
+    directFlags = parseFlagsCli(normalizedArgs.slice(1));
+    if (directFlags._.length < 1 || directFlags._.length > 3) throw new Error("usage: agentlas ontology add <path> [kind] [scope] [--kind <kind>] [--scope <scope>]");
+    if (directFlags.kind !== undefined && directFlags._[1] !== undefined) throw new Error("kind was provided twice; use either the positional value or --kind");
+    if (directFlags.scope !== undefined && directFlags._[2] !== undefined) throw new Error("scope was provided twice; use either the positional value or --scope");
+  } else if (["company", "personal", "project"].includes(String(sub).toLowerCase())) {
+    directFlags = parseFlagsCli(normalizedArgs.slice(1), { values: ["scope"] });
+    if (directFlags._.length < 1 || directFlags._.length > 2) throw new Error(`usage: agentlas ontology ${sub} <path> [scope] [--scope <scope>]`);
+    if (directFlags.scope !== undefined && directFlags._[1] !== undefined) throw new Error("scope was provided twice; use either the positional value or --scope");
+  } else if (isOntologyPathishCli(sub, cwd, true)) {
+    directFlags = parseFlagsCli(normalizedArgs.slice(1));
+    if (directFlags._.length) throw new Error("unexpected positional argument after ontology source path");
   }
   const paths = ensureOntologyCli(projectPath, opts.lang);
   if (sub === "open") {
@@ -464,20 +498,27 @@ async function runOntologyCli(args, opts) {
       : (ko ? "온톨로지 수신함을 자동으로 열지 못했습니다. 직접 여세요" : "Could not open ontology inbox automatically; open it manually")}: ${paths.inboxPath}`];
   }
   if (sub === "add") {
-    const flags = parseFlagsCli(normalizedArgs.slice(1));
+    const flags = directFlags;
     const source = flags._[0];
     const kind = inferOntologyKindCli(flags.kind || flags._[1], normalizedArgs.join(" "));
     const scope = inferOntologyScopeCli(flags.scope || flags._[2], normalizedArgs.join(" "), kind);
     return registerOntologySourceCli(paths, source, kind, scope, cwd, opts.lang);
   }
   if (["company", "personal", "project"].includes(String(sub).toLowerCase())) {
-    const flags = parseFlagsCli(normalizedArgs.slice(1));
+    const flags = directFlags;
     const kind = inferOntologyKindCli(sub, normalizedArgs.join(" "));
     const scope = inferOntologyScopeCli(flags.scope || flags._[1], normalizedArgs.join(" "), kind);
     return registerOntologySourceCli(paths, flags._[0], kind, scope, cwd, opts.lang);
   }
   if (isOntologyPathishCli(sub, cwd, true)) {
-    return registerOntologySourceCli(paths, sub, inferOntologyKindCli(null, normalizedArgs.join(" ")), inferOntologyScopeCli(null, normalizedArgs.join(" "), "project"), cwd, opts.lang);
+    return registerOntologySourceCli(
+      paths,
+      sub,
+      inferOntologyKindCli(directFlags.kind, normalizedArgs.join(" ")),
+      inferOntologyScopeCli(directFlags.scope, normalizedArgs.join(" "), directFlags.kind || "project"),
+      cwd,
+      opts.lang,
+    );
   }
   throw new Error(ko
     ? "사용법: /ontology status|list|open|add <경로>"

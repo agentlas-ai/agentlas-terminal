@@ -305,7 +305,7 @@ function readPrivateFeed(file, now) {
     if (error && error.code === "ENOENT") return { mode: "skip", reason: "desktop-loadout-feed-absent" };
     return { mode: "skip", reason: "desktop-loadout-feed-unreadable" };
   }
-  if (!stat.isFile() || stat.isSymbolicLink()) {
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
     return { mode: "skip", reason: "desktop-loadout-feed-not-private-regular-file" };
   }
   if (process.platform !== "win32") {
@@ -340,6 +340,7 @@ function readPrivateFeed(file, now) {
       const opened = fs.fstatSync(descriptor);
       if (
         !opened.isFile() ||
+        opened.nlink !== 1 ||
         opened.dev !== stat.dev ||
         opened.ino !== stat.ino ||
         opened.size !== stat.size ||
@@ -348,7 +349,19 @@ function readPrivateFeed(file, now) {
         return { mode: "skip", reason: "desktop-loadout-feed-changed-during-read" };
       }
       raw = fs.readFileSync(descriptor, "utf8");
-      if (Buffer.byteLength(raw, "utf8") > MAX_FILE_BYTES) {
+      const after = fs.fstatSync(descriptor);
+      if (
+        after.nlink !== 1 ||
+        after.dev !== opened.dev ||
+        after.ino !== opened.ino ||
+        after.size !== opened.size ||
+        after.mtimeMs !== opened.mtimeMs ||
+        after.ctimeMs !== opened.ctimeMs
+      ) {
+        return { mode: "skip", reason: "desktop-loadout-feed-changed-during-read" };
+      }
+      const rawBytes = Buffer.byteLength(raw, "utf8");
+      if (rawBytes !== after.size || rawBytes > MAX_FILE_BYTES) {
         return { mode: "skip", reason: "desktop-loadout-feed-size-invalid" };
       }
     } finally { fs.closeSync(descriptor); }
@@ -407,7 +420,8 @@ function exactLocalAuthority(db) {
 function sameExactList(value, expected) {
   if (value === undefined || value === null || (Array.isArray(value) && value.length === 0)) return true;
   if (!Array.isArray(value)) return false;
-  const normalized = [...new Set(value.map(String).filter(Boolean))];
+  const normalized = value.map(String);
+  if (normalized.some((item) => !item) || new Set(normalized).size !== normalized.length) return false;
   return normalized.length === expected.length && normalized.every((item, index) => item === expected[index]);
 }
 

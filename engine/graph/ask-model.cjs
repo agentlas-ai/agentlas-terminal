@@ -61,7 +61,7 @@ function consentedMcpServersFor(ctx) {
   try {
     const mcp = require("../mcp/index.cjs");
     if (typeof mcp.readConsentedSystemMcpServers !== "function") return [];
-    return mcp.readConsentedSystemMcpServers(ctx.db(), { env: process.env }) || [];
+    return mcp.readConsentedSystemMcpServers(ctx.db(), { env: process.env, createRuntimeHome: false }) || [];
   } catch {
     return [];
   }
@@ -85,7 +85,7 @@ async function askModel(ctx, prompt, opts = {}) {
 
   // 시도 순서: 사용자가 정한 것 먼저, 그다음 이 컴퓨터에 있는 나머지.
   const candidates = [];
-  if (primary && primary.kind && primary.bin) candidates.push(primary);
+  if (primary && primary.kind && (primary.bin || primary.kind === "ollama")) candidates.push(primary);
   if (!opts.runtime) {
     // listAvailableCliRuntimes()는 문자열이 아니라 {kind, bin, path} 객체를 돌려준다.
     // 문자열로 읽으면 후보가 하나도 안 쌓여 폴백이 통째로 죽는다(실측).
@@ -114,12 +114,23 @@ async function askModel(ctx, prompt, opts = {}) {
   for (const runtime of candidates) {
     let res;
     try {
-      res = await nativeHost.runNativeTurn({
-        kind: runtime.kind,
-        bin: runtime.bin,
-        ui: quietSink(),
-        cwd: opts.cwd || process.cwd(),
-        prompt,
+      const cwd = opts.cwd || process.cwd();
+      const ui = quietSink();
+      res = runtime.kind === "ollama"
+        ? await require("../agentlas-api-agent.cjs").runApiTurn({
+          backend: "ollama",
+          model: runtime.model || "llama3.1",
+          system: "",
+          messages: [{ role: "user", content: prompt }],
+          ctx: { cwd, permission: "read", env: process.env, db },
+          ui,
+        })
+        : await nativeHost.runNativeTurn({
+          kind: runtime.kind,
+          bin: runtime.bin,
+          ui,
+          cwd,
+          prompt,
         /*
          * 읽기 권한 — 만드는 동안 바깥을 바꾸지 않는다. 메일이 나가거나 글이 올라가면 안 된다.
          * ★런타임의 "read"는 **쓰기 금지가 아니라 도구 금지에 가깝다**(이 저장소 실측:
@@ -140,9 +151,9 @@ async function askModel(ctx, prompt, opts = {}) {
          *   새로 동의를 받지 않는다 — 이미 받아 둔 것만 그대로 쓴다(consent 영수증 기준).
          *   못 읽으면 빈 배열로 간다: 예전과 같아질 뿐 나빠지지 않는다.
          */
-        mcpServers: consentedMcpServersFor(ctx),
-        mcpAllowlistMode: "exact",
-      });
+          mcpServers: consentedMcpServersFor(ctx),
+          mcpAllowlistMode: "exact",
+        });
     } catch (err) {
       failures.push(`${runtime.kind}: ${(err && err.message) || err}`);
       continue;

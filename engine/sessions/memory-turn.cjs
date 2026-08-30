@@ -64,6 +64,52 @@ function curatorRuntimeEnv() {
   return env;
 }
 
+const OLLAMA_CURATOR_TIMEOUT_MS = 120_000;
+const OLLAMA_JUDGMENT_TIMEOUT_MS = 60_000;
+
+/**
+ * API-backed memory decisions run after the main Session turn, so Session's
+ * provider abort slot is no longer active. Keep this boundary self-contained:
+ * the race releases the turn even if a custom/fake fetch ignores AbortSignal,
+ * while the signal lets a real fetch stop immediately on timeout.
+ */
+async function runBoundedOllama(session, system, prompt, operation, timeoutMs) {
+  const limit = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+    ? Number(timeoutMs)
+    : OLLAMA_JUDGMENT_TIMEOUT_MS;
+  const controller = new AbortController();
+  let timer = null;
+  let timedOut = false;
+  let timeoutError = null;
+  const call = Promise.resolve().then(() => capture.runApi(
+    "ollama",
+    session.runtime.model,
+    system,
+    prompt,
+    { signal: controller.signal },
+  ));
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      timeoutError = new Error(`Ollama ${operation} timed out after ${limit}ms.`);
+      timeoutError.code = "AGENTLAS_MEMORY_JUDGMENT_TIMEOUT";
+      try { controller.abort(timeoutError); } catch { /* already aborted */ }
+      reject(timeoutError);
+    }, limit);
+  });
+  try {
+    return await Promise.race([call, deadline]);
+  } catch (error) {
+    if (timedOut) throw timeoutError;
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (!controller.signal.aborted) {
+      try { controller.abort(new Error(`Ollama ${operation} finished`)); } catch { /* already aborted */ }
+    }
+  }
+}
+
 function ensureGeminiNoToolsPolicy() {
   const dir = curatorRuntimeDir();
   const file = path.join(dir, "gemini-no-tools-policy.toml");
@@ -101,7 +147,7 @@ async function invokeCurator(session, payload, systemPrompt) {
     throw new Error("Memory Curator payload failed the pre-invocation privacy gate");
   }
   if (session.runtime.kind === "ollama") {
-    return capture.runApi("ollama", session.runtime.model, systemPrompt, serialized);
+    return runBoundedOllama(session, systemPrompt, serialized, "memory curator", OLLAMA_CURATOR_TIMEOUT_MS);
   }
   return capture.captureRuntime(session.runtime.kind, systemPrompt, serialized, {
     cwd: curatorRuntimeDir(),
@@ -146,7 +192,13 @@ async function resolveSessionTaskSignatures(session, prompt) {
   ].join("\n");
   let raw;
   if (session.runtime.kind === "ollama") {
-    raw = await capture.runApi("ollama", session.runtime.model, system, String(prompt || ""));
+    raw = await runBoundedOllama(
+      session,
+      system,
+      String(prompt || ""),
+      "task judgment",
+      OLLAMA_JUDGMENT_TIMEOUT_MS,
+    );
   } else {
     raw = await capture.captureRuntime(session.runtime.kind, system, String(prompt || ""), {
       cwd: curatorRuntimeDir(),
@@ -183,7 +235,13 @@ async function judgeGlobalMemoryAuthorization(session, promptText) {
   ].join("\n");
   let raw;
   if (session.runtime.kind === "ollama") {
-    raw = await capture.runApi("ollama", session.runtime.model, system, String(promptText || ""));
+    raw = await runBoundedOllama(
+      session,
+      system,
+      String(promptText || ""),
+      "global-memory judgment",
+      OLLAMA_JUDGMENT_TIMEOUT_MS,
+    );
   } else {
     raw = await capture.captureRuntime(session.runtime.kind, system, String(promptText || ""), {
       cwd: curatorRuntimeDir(),
@@ -242,4 +300,5 @@ module.exports = {
   beginSessionMemoryTurn,
   completeSessionMemoryTurn,
   resolveSessionTaskSignatures,
+  runBoundedOllama,
 };

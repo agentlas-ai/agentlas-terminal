@@ -429,16 +429,44 @@ function create(deps) {
   async function cmdSwarm(db, args, runtimeOverride, executionContext = {}) {
     const rest = [];
     let concurrency;
+    let parallelError = null;
+    let seenParallel = false;
+    let passthrough = false;
+    let strayFlag = null;
     for (let i = 0; i < args.length; i++) {
-      if (args[i] === "--parallel" || args[i] === "-n") concurrency = Number(args[++i]);
-      else rest.push(args[i]);
+      const token = String(args[i]);
+      if (passthrough) { rest.push(token); continue; }
+      if (token === "--") { passthrough = true; continue; }
+      if (token === "--parallel" || token === "-n" || token.startsWith("--parallel=")) {
+        if (seenParallel) {
+          parallelError = "duplicate option";
+          continue;
+        }
+        seenParallel = true;
+        const inline = token.startsWith("--parallel=");
+        const raw = inline ? token.slice(11) : args[++i];
+        const parsed = Number(raw);
+        if (raw === undefined || raw === "" || (!inline && String(raw).startsWith("--")) || !Number.isInteger(parsed) || parsed < 1) {
+          parallelError = raw === undefined ? "missing value" : String(raw);
+        } else {
+          concurrency = Math.min(8, parsed);
+        }
+      } else {
+        if (token.startsWith("-") && strayFlag === null) strayFlag = token;
+        rest.push(token);
+      }
+    }
+    if (parallelError !== null) {
+      const ui = executionContext.ui || newUi();
+      ui.error(`invalid --parallel value ${parallelError} — use a positive integer (maximum 8)`, { reveal: true });
+      process.exitCode = 1;
+      return { ok: false, error: "invalid-parallel" };
     }
     // storm.cjs stormRun 의 leading-dash 가드와 동일 계약. 여기서 안 막으면 미지원·
     // 오타 플래그(--permission, --model …)가 rest 에 남아 rest.join(" ") 로 목표가
     // 되어버린다: 유료 플래너가 플래그 텍스트를 목표로 실제 실행되고, 플래그가
     // 의도한 동작(예: 권한 상승)은 조용히 일어나지 않는다. 목표는 프롬프트까지
     // 오염된다. 그래서 소비되지 않은 대시 토큰은 실행 전에 fail-closed 로 거절한다.
-    const strayFlag = rest.find((token) => String(token).startsWith("-"));
     if (strayFlag) {
       const ui = executionContext.ui || newUi();
       ui.error(`unknown option ${strayFlag} — swarm accepts: --parallel N | -n N, --runtime <kind>`, { reveal: true });

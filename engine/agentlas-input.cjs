@@ -11,6 +11,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const readline = require("node:readline");
+const { randomUUID } = require("node:crypto");
 const i18n = require("./agentlas-i18n.cjs");
 
 function userDataDir() {
@@ -24,14 +25,27 @@ function userDataDir() {
 
 const HISTORY_MAX = 500;
 const HISTORY_SCHEMA_VERSION = 2;
+const HISTORY_MAX_FILE_BYTES = 8 * 1024 * 1024;
+const HISTORY_MAX_ENTRY_BYTES = 64 * 1024;
+const HISTORY_MAX_SCOPE_BYTES = 4 * 1024;
 const HISTORY_LOCK_WAIT_MS = 2_000;
 const HISTORY_LOCK_STALE_MS = 30_000;
+const HISTORY_LOCK_OWNER_MAX_BYTES = 1024;
+const HISTORY_LOCK_OWNER_RE = /^\.owner-(\d+)-([0-9a-f-]{36})\.json$/;
 function historyPath() {
   return path.join(userDataDir(), "cli-history.json");
 }
 
 function historyBackupPath() {
   return historyPath() + ".bak";
+}
+
+function validHistoryText(value) {
+  return typeof value === "string" && value.trim() && Buffer.byteLength(value, "utf8") <= HISTORY_MAX_ENTRY_BYTES;
+}
+
+function validHistoryScope(value) {
+  return typeof value === "string" && value && Buffer.byteLength(value, "utf8") <= HISTORY_MAX_SCOPE_BYTES && !/[\u0000-\u001f\u007f]/.test(value);
 }
 
 function normalizeHistoryDocument(raw) {
@@ -41,24 +55,51 @@ function normalizeHistoryDocument(raw) {
     return {
       version: HISTORY_SCHEMA_VERSION,
       entries: [],
-      legacyUnscoped: raw.filter((x) => typeof x === "string").slice(0, HISTORY_MAX),
+      legacyUnscoped: raw.filter(validHistoryText).slice(0, HISTORY_MAX),
     };
   }
   if (raw && raw.version === HISTORY_SCHEMA_VERSION && Array.isArray(raw.entries)) {
     return {
       version: HISTORY_SCHEMA_VERSION,
-      entries: raw.entries,
-      legacyUnscoped: Array.isArray(raw.legacyUnscoped) ? raw.legacyUnscoped.slice(0, HISTORY_MAX) : [],
+      entries: raw.entries.filter((entry) => (
+        entry && typeof entry === "object" && !Array.isArray(entry) &&
+        validHistoryText(entry.text) && validHistoryScope(entry.cwd) &&
+        Number.isFinite(Number(entry.ts)) && Number(entry.ts) >= 0
+      )).slice(0, HISTORY_MAX),
+      legacyUnscoped: Array.isArray(raw.legacyUnscoped) ? raw.legacyUnscoped.filter(validHistoryText).slice(0, HISTORY_MAX) : [],
     };
   }
   return null;
 }
 
 function readHistoryFile(file) {
+  let fd = null;
   try {
-    return normalizeHistoryDocument(JSON.parse(fs.readFileSync(file, "utf8")));
+    const before = fs.lstatSync(file);
+    if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1 || before.size <= 0 || before.size > HISTORY_MAX_FILE_BYTES) return null;
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.nlink !== 1 || opened.size > HISTORY_MAX_FILE_BYTES || !sameFileIdentity(before, opened)) return null;
+    const chunks = [];
+    let total = 0;
+    while (total <= HISTORY_MAX_FILE_BYTES) {
+      const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, HISTORY_MAX_FILE_BYTES + 1 - total));
+      const count = fs.readSync(fd, buffer, 0, buffer.length, null);
+      if (!count) break;
+      chunks.push(buffer.subarray(0, count));
+      total += count;
+    }
+    const after = fs.fstatSync(fd);
+    if (
+      total > HISTORY_MAX_FILE_BYTES || !after.isFile() || after.nlink !== 1 || !sameFileIdentity(opened, after) ||
+      after.size !== opened.size || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs || total !== after.size
+    ) return null;
+    const raw = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks, total));
+    return normalizeHistoryDocument(JSON.parse(raw));
   } catch {
     return null;
+  } finally {
+    if (fd !== null) try { fs.closeSync(fd); } catch { /* ignore */ }
   }
 }
 
@@ -83,23 +124,226 @@ function sleepSync(ms) {
   }
 }
 
+function sameFileIdentity(a, b) {
+  return Boolean(a && b && a.dev === b.dev && a.ino === b.ino);
+}
+
+function ensureHistoryDirectory({ create = false } = {}) {
+  const directory = path.resolve(userDataDir());
+  if (create) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const stat = fs.lstatSync(directory);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("history directory must be a real directory");
+  try { fs.chmodSync(directory, 0o700); } catch { /* win32 */ }
+  return { path: directory, stat };
+}
+
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error && error.code === "EPERM";
+  }
+}
+
+function readHistoryLockOwner(lock) {
+  let lockStat;
+  try {
+    lockStat = fs.lstatSync(lock);
+    if (!lockStat.isDirectory()) return null;
+  } catch {
+    return null;
+  }
+  let names;
+  try {
+    names = fs.readdirSync(lock);
+  } catch {
+    return null;
+  }
+  const ownerNames = names.filter((name) => HISTORY_LOCK_OWNER_RE.test(name));
+  if (ownerNames.length !== 1) return null;
+  const ownerName = ownerNames[0];
+  const match = HISTORY_LOCK_OWNER_RE.exec(ownerName);
+  const pid = Number(match[1]);
+  const nonce = match[2];
+  const ownerPath = path.join(lock, ownerName);
+  let ownerStat;
+  let ownerIdentity;
+  try {
+    ownerStat = fs.lstatSync(ownerPath);
+    if (!ownerStat.isFile() || ownerStat.nlink !== 1 || ownerStat.size <= 0 || ownerStat.size > HISTORY_LOCK_OWNER_MAX_BYTES) return null;
+  } catch {
+    return null;
+  }
+  let payload = null;
+  try {
+    const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
+    const fd = fs.openSync(ownerPath, flags);
+    try {
+      const current = fs.fstatSync(fd);
+      if (
+        !current.isFile() || current.nlink !== 1 || current.size <= 0 || current.size > HISTORY_LOCK_OWNER_MAX_BYTES ||
+        !sameFileIdentity(ownerStat, current)
+      ) return null;
+      ownerIdentity = current;
+      const buffer = Buffer.allocUnsafe(current.size);
+      let offset = 0;
+      while (offset < buffer.length) {
+        const count = fs.readSync(fd, buffer, offset, buffer.length - offset, null);
+        if (!count) break;
+        offset += count;
+      }
+      const after = fs.fstatSync(fd);
+      if (
+        offset !== buffer.length || !sameFileIdentity(current, after) || after.size !== current.size ||
+        after.mtimeMs !== current.mtimeMs || after.ctimeMs !== current.ctimeMs
+      ) return null;
+      payload = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(buffer));
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    // The filename still carries the owner PID, so a crashed process with a
+    // partially-written marker can be reaped once that PID is gone.
+  }
+  return {
+    pid,
+    nonce,
+    ownerPath,
+    identity: ownerIdentity || ownerStat,
+    valid: Boolean(
+      payload
+      && payload.version === 1
+      && Number(payload.pid) === pid
+      && payload.nonce === nonce,
+    ),
+  };
+}
+
+function removeHistoryLockMarker(lockState) {
+  try {
+    const current = fs.lstatSync(lockState.lock);
+    if (!sameFileIdentity(current, lockState.identity)) return false;
+    const marker = fs.lstatSync(lockState.ownerPath);
+    if (!marker.isFile() || marker.nlink !== 1) return false;
+    if (lockState.ownerIdentity && !sameFileIdentity(marker, lockState.ownerIdentity)) return false;
+    fs.unlinkSync(lockState.ownerPath);
+    fs.rmdirSync(lockState.lock);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function removeClaimedHistoryLock(lockState) {
+  try {
+    const current = fs.lstatSync(lockState.lock);
+    if (!sameFileIdentity(current, lockState.identity)) return false;
+    try {
+      const marker = fs.lstatSync(lockState.ownerPath);
+      if (!marker.isFile() || marker.nlink !== 1) return false;
+      fs.unlinkSync(lockState.ownerPath);
+    } catch (error) {
+      if (!error || error.code !== "ENOENT") return false;
+    }
+    fs.rmdirSync(lockState.lock);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function releaseHistoryLock(lockState) {
+  if (!lockState) return false;
+  const owner = readHistoryLockOwner(lockState.lock);
+  if (!owner || !owner.valid || owner.pid !== lockState.pid || owner.nonce !== lockState.nonce) return false;
+  return removeHistoryLockMarker({ ...lockState, ownerIdentity: owner.identity });
+}
+
+function reapStaleHistoryLock(lock, stat, owner) {
+  if (!owner) {
+    try {
+      const current = fs.lstatSync(lock);
+      if (!sameFileIdentity(current, stat) || !current.isDirectory()) return false;
+      // A process can die after mkdir and before writing its owner marker. Once
+      // that marker-less directory is stale, removing only the still-empty,
+      // identity-matched directory is safe; unknown contents remain fail-closed.
+      if (fs.readdirSync(lock).length !== 0) return false;
+      fs.rmdirSync(lock);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  if (isProcessAlive(owner.pid)) return false;
+  return removeHistoryLockMarker({
+    lock,
+    identity: stat,
+    ownerPath: owner.ownerPath,
+    ownerIdentity: owner.identity,
+  });
+}
+
+function claimHistoryLock(lock) {
+  const identity = fs.lstatSync(lock);
+  if (!identity.isDirectory()) throw new Error("history lock is not a directory");
+  const pid = process.pid;
+  const nonce = randomUUID();
+  const ownerPath = path.join(lock, `.owner-${pid}-${nonce}.json`);
+  const lockState = { lock, identity, ownerPath, pid, nonce };
+  let fd = null;
+  try {
+    fd = fs.openSync(ownerPath, "wx", 0o600);
+    fs.writeFileSync(fd, JSON.stringify({ version: 1, pid, nonce, createdAt: Date.now() }) + "\n", "utf8");
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+    const owner = readHistoryLockOwner(lock);
+    const verifiedIdentity = fs.lstatSync(lock);
+    if (!owner || !owner.valid || owner.pid !== pid || owner.nonce !== nonce || owner.ownerPath !== ownerPath) {
+      throw new Error("history lock owner verification failed");
+    }
+    if (!sameFileIdentity(identity, verifiedIdentity)) throw new Error("history lock identity changed");
+    return lockState;
+  } catch (error) {
+    if (fd != null) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+      fd = null;
+    }
+    removeClaimedHistoryLock(lockState);
+    throw error;
+  } finally {
+    if (fd != null) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+}
+
 function withHistoryLock(callback) {
   const lock = historyPath() + ".lock";
   const deadline = Date.now() + HISTORY_LOCK_WAIT_MS;
+  let lockState = null;
   while (true) {
+    let created = false;
     try {
       fs.mkdirSync(lock, { mode: 0o700 });
+      created = true;
+      lockState = claimHistoryLock(lock);
       break;
     } catch (error) {
+      if (created) throw error;
       if (!error || error.code !== "EEXIST") throw error;
       try {
-        const stat = fs.statSync(lock);
-        if (Date.now() - stat.mtimeMs > HISTORY_LOCK_STALE_MS) {
-          fs.rmdirSync(lock);
-          continue;
+        const stat = fs.lstatSync(lock);
+        if (stat.isDirectory() && Date.now() - stat.mtimeMs > HISTORY_LOCK_STALE_MS) {
+          const owner = readHistoryLockOwner(lock);
+          if (reapStaleHistoryLock(lock, stat, owner)) continue;
         }
-      } catch {
-        continue;
+      } catch (statError) {
+        // If the contender disappeared, retry immediately. Permission and I/O
+        // failures must still respect the bounded wait instead of busy-spinning.
+        if (statError && statError.code === "ENOENT") continue;
       }
       if (Date.now() >= deadline) throw new Error("history lock timeout");
       sleepSync(10);
@@ -108,21 +352,33 @@ function withHistoryLock(callback) {
   try {
     return callback();
   } finally {
-    try { fs.rmdirSync(lock); } catch { /* another process will recover a stale lock */ }
+    releaseHistoryLock(lockState);
   }
 }
 
 function atomicWriteHistoryFile(file, document) {
   const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
-  let fd;
+  const directory = ensureHistoryDirectory();
+  const payload = Buffer.from(JSON.stringify(document), "utf8");
+  if (payload.length <= 0 || payload.length > HISTORY_MAX_FILE_BYTES) throw new Error("history document exceeds its safety limit");
+  let fd = null;
   try {
-    fd = fs.openSync(tmp, "wx", 0o600);
-    fs.writeFileSync(fd, JSON.stringify(document), "utf8");
+    fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW || 0), 0o600);
+    const created = fs.fstatSync(fd);
+    if (!created.isFile() || created.nlink !== 1) throw new Error("history temp file is unsafe");
+    let offset = 0;
+    while (offset < payload.length) offset += fs.writeSync(fd, payload, offset, payload.length - offset);
     fs.fsyncSync(fd);
+    fs.fchmodSync(fd, 0o600);
+    const written = fs.fstatSync(fd);
+    if (!sameFileIdentity(created, written) || written.size !== payload.length) throw new Error("history temp file changed while writing");
     fs.closeSync(fd);
     fd = null;
+    const currentDirectory = fs.lstatSync(directory.path);
+    if (!sameFileIdentity(directory.stat, currentDirectory) || !currentDirectory.isDirectory() || currentDirectory.isSymbolicLink()) {
+      throw new Error("history directory changed while writing");
+    }
     fs.renameSync(tmp, file);
-    try { fs.chmodSync(file, 0o600); } catch { /* win32 */ }
   } finally {
     if (fd != null) {
       try { fs.closeSync(fd); } catch { /* ignore */ }
@@ -151,8 +407,8 @@ function loadHistory(cwd = process.cwd()) {
 
 function saveHistory(list, cwd = process.cwd()) {
   try {
-    fs.mkdirSync(userDataDir(), { recursive: true });
-    const clean = (list || []).filter((x) => typeof x === "string" && x.trim()).slice(0, HISTORY_MAX);
+    ensureHistoryDirectory({ create: true });
+    const clean = (list || []).filter(validHistoryText).slice(0, HISTORY_MAX);
     const scope = historyScope(cwd);
     return withHistoryLock(() => {
       const currentFileWasValid = Boolean(readHistoryFile(historyPath()));
@@ -263,7 +519,6 @@ const SLASH_COMMAND_META = [
   { command: "/help", description: "Show Agentlas terminal commands", category: "Help", usage: "/help", detail: "Open the command reference, shortcuts, and common flows." },
   { command: "/status", description: "Show model/runtime, agent, permission, and directory", category: "Session", usage: "/status", detail: "Print the current runtime, active agent or company, permission level, and cwd." },
   { command: "/skills", description: "List available Agentlas terminal skills", category: "Discovery", usage: "/skills", detail: "Show the slash-command skills Agentlas can run inside this terminal." },
-  { command: "/career-graph", description: "Show or add Career Graph source refs", category: "Knowledge", usage: "/career-graph add ./docs", detail: "Career Graph routes agents to source Markdown, JSONL ledgers, sitemap, and code map before broad scans.", examples: ["/career-graph status", "/career-graph add ./docs", "/career-graph open"] },
   { command: "/ontology", description: "Turn on, list, or add project ontology sources", category: "Knowledge", usage: "/ontology add ./docs", detail: "Also understands natural text like /ontology use ./docs as company knowledge.", examples: ["/ontology list", "/ontology use ./docs as company knowledge", "/ontology open"] },
   { command: "/agents", description: "List installed agents", category: "Routing", usage: "/agents", detail: "Show local agents and their routed runtime." },
   { command: "/team", description: "View or pin each agent runtime", category: "Routing", usage: "/team <agent> <runtime|auto>", detail: "Pin one agent to claude-code, codex, gemini, or automatic routing." },
@@ -314,7 +569,6 @@ const HELP_KEY_BY_COMMAND = {
   "/help": "help.help",
   "/status": "help.status",
   "/skills": "help.skills",
-  "/career-graph": "help.careerGraph",
   "/ontology": "help.ontology",
   "/agents": "help.agents",
   "/team": "help.team",
@@ -860,7 +1114,6 @@ function makeCompleter(ctx) {
         return [uniqStartsWith(RUNTIME_SPECS.concat(["auto"]), last), last];
       case "/cwd":
       case "/import":
-      case "/career-graph":
       case "/ontology":
         return [completePath(last, getCwd(), ""), last];
       default:

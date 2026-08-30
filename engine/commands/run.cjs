@@ -7,6 +7,7 @@
  *   --effort <level>      none | minimal | low | medium | high | xhigh | max
  *   --tier <tier>         economy | balanced | frontier (requires --model)
  *   --permission <level>  read | write | full
+ *   --                     뒤의 토큰은 옵션처럼 보여도 프롬프트로 전달
  * 프롬프트가 없고 stdin이 TTY가 아니면 stdin을 읽는다.
  *
  * 첫 토큰이 정확한 에이전트이면 고급 직접 호출이다. 그 외 일반 실행은 현재 폴더에
@@ -48,21 +49,53 @@ function parseArgs(args) {
     permission: null,
     rest: [],
   };
+  const seen = new Set();
+  const valueFlags = new Map([
+    ["--runtime", "runtime"],
+    ["--model", "model"],
+    ["--effort", "effort"],
+    ["--tier", "tier"],
+    ["--permission", "permission"],
+  ]);
+  let passthrough = false;
   for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a === "-p" || a === "--print") out.print = true;
-    else if (a === "--runtime") out.runtime = args[++i];
-    else if (a === "--model") out.model = args[++i];
-    else if (a === "--effort") out.effort = args[++i];
-    else if (a === "--tier") out.tier = args[++i];
-    else if (a === "--permission") out.permission = args[++i];
-    else out.rest.push(a);
+    const a = String(args[i]);
+    if (passthrough) { out.rest.push(a); continue; }
+    if (a === "--") { passthrough = true; continue; }
+    if (a === "-p" || a === "--print") {
+      if (seen.has("print")) throw new Error("duplicate option: --print");
+      seen.add("print");
+      out.print = true;
+      continue;
+    }
+    const equalAt = a.indexOf("=");
+    const option = equalAt >= 0 ? a.slice(0, equalAt) : a;
+    const field = valueFlags.get(option);
+    if (field) {
+      if (seen.has(field)) throw new Error(`duplicate option: ${option}`);
+      seen.add(field);
+      const value = equalAt >= 0 ? a.slice(equalAt + 1) : args[++i];
+      if (value === undefined || value === "" || (equalAt < 0 && String(value).startsWith("--"))) {
+        throw new Error(`${option} requires a value`);
+      }
+      out[field] = String(value);
+      continue;
+    }
+    if (a.startsWith("-")) {
+      throw new Error(`unknown option: ${a} (use -- before a prompt that starts with '-')`);
+    }
+    out.rest.push(a);
   }
   return out;
 }
 
 async function runOnce(ctx, args) {
-  const parsed = parseArgs(args);
+  let parsed;
+  try { parsed = parseArgs(args); }
+  catch (error) {
+    ctx.err(String((error && error.message) || error));
+    return 1;
+  }
   // 플래그 검증은 모델을 부르기 전에. normalize는 알 수 없는 값을 read로 fail-closed
   // 강등하는데, 조용히 강등하면 full을 요청한 사용자가 read로 도는 걸 모른다.
   if (parsed.permission && !["read", "write", "full"].includes(String(parsed.permission))) {

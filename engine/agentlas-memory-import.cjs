@@ -19,6 +19,49 @@ const SOURCE_TOKEN_PREFIX = "mem-import:v1";
 const MAX_FILES = 400;
 const MAX_CONTENT = 4000;
 
+function memoryArgumentError(message) {
+  const error = new Error(message);
+  error.code = "INVALID_ARGUMENT";
+  return error;
+}
+
+function parseMemoryArgs(args) {
+  const input = Array.isArray(args) ? args : [];
+  const sub = input[0] || "help";
+  if (["help", "--help", "-h"].includes(sub)) {
+    if (input.length > 1) throw memoryArgumentError("usage: agentlas memory import <folder-or-file> --agent <agentId> [--apply]");
+    return { help: true };
+  }
+  if (sub !== "import") throw memoryArgumentError(`Unknown memory subcommand: ${sub} (import)`);
+  let source = null;
+  let agentId = null;
+  let apply = false;
+  const seen = new Set();
+  for (let index = 1; index < input.length; index += 1) {
+    const token = input[index];
+    if (token === "--apply") {
+      if (seen.has("apply")) throw memoryArgumentError("duplicate option: --apply");
+      seen.add("apply");
+      apply = true;
+      continue;
+    }
+    if (token === "--agent") {
+      if (seen.has("agent")) throw memoryArgumentError("duplicate option: --agent");
+      const value = input[index + 1];
+      if (!value || String(value).startsWith("--")) throw memoryArgumentError("--agent requires a value");
+      seen.add("agent");
+      agentId = String(value).trim();
+      index += 1;
+      continue;
+    }
+    if (String(token).startsWith("-")) throw memoryArgumentError(`unknown option: ${token}`);
+    if (source !== null) throw memoryArgumentError("memory import accepts exactly one source path");
+    source = String(token);
+  }
+  if (!source || !agentId) throw memoryArgumentError("usage: agentlas memory import <folder-or-file> --agent <agentId> [--apply]");
+  return { help: false, source, agentId, apply };
+}
+
 // ── Section extraction (parity with electron/memory/import.ts) ───────────────
 const TEMPLATE_LINE =
   /^\s*[-*]?\s*(Add\b|Fill in\b|Example:|Record\b|Link\b|Prefer\b|Note\b|Which\b|Date:\s*$|Topic:\s*$|Decision:\s*$|Why:\s*$|Risk accepted:\s*$)/i;
@@ -234,21 +277,15 @@ function existsByToken(db, token) {
 function cmdMemory(ctx) {
   const { db, out, fail } = ctx;
   const args = Array.isArray(ctx.args) ? ctx.args : [];
-  const sub = args[0] || "help";
-  if (sub === "help" || sub === "--help" || sub === "-h") {
+  let parsed;
+  try { parsed = parseMemoryArgs(args); }
+  catch (error) { return fail(error.message); }
+  if (parsed.help) {
     out("usage: agentlas memory import <folder-or-file> --agent <agentId> [--apply]");
     out("  dry-run by default (prints the preview table); --apply writes to the shared DB.");
     return;
   }
-  if (sub !== "import") return fail(`Unknown memory subcommand: ${sub} (import)`);
-
-  const apply = args.includes("--apply");
-  const agentIdx = args.indexOf("--agent");
-  const agentId = agentIdx >= 0 ? String(args[agentIdx + 1] || "").trim() : "";
-  const positional = args.slice(1).filter((a, i, arr) => a !== "--apply" && a !== "--agent" && arr[i - 1] !== "--agent");
-  const rawPath = positional[0];
-  if (!rawPath) return fail('usage: agentlas memory import <folder-or-file> --agent <agentId> [--apply]');
-  if (!agentId) return fail("memory import requires --agent <agentId> (the single agent or team to import into).");
+  const { apply, agentId, source: rawPath } = parsed;
   const sourcePath = path.resolve(rawPath);
   if (!fs.existsSync(sourcePath)) return fail(`Import source not found: ${sourcePath}`);
 
@@ -307,4 +344,4 @@ function pad(value, width) {
   return s.length >= width ? s.slice(0, width - 1) + " " : s + " ".repeat(width - s.length);
 }
 
-module.exports = { cmdMemory, buildEntries, resolveTarget, decideOwner };
+module.exports = { cmdMemory, parseMemoryArgs, buildEntries, resolveTarget, decideOwner };

@@ -36,8 +36,14 @@ for (const stream of [process.stdout, process.stderr]) {
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
 const { configureSqliteConnection } = require("../engine/agentlas-sqlite-policy.cjs");
+const { parseOutputFlags, renderError } = require("../engine/cli-output.cjs");
+const { resolveCommandName, SELF_HELP_COMMANDS } = require("../engine/commands/index.cjs");
+
+const SQLITE_HEADER = Buffer.from("SQLite format 3\0", "ascii");
+const SQLITE_MIN_BYTES = 512;
 
 const REAL_SELF = (() => {
   try { return fs.realpathSync(__filename); } catch { return __filename; }
@@ -63,9 +69,59 @@ function dbPath() {
   return path.join(userDataDir(), "agentlas.sqlite");
 }
 
+// Keep the launcher's no-database path identical to the engine's CLI grammar.
+// A plain word "help" is valid task content (`agentlas run -p help`); only the
+// actual help/version command forms may skip first-run database bootstrap.
+function isMetadataOnlyInvocation(argv) {
+  const args = Array.isArray(argv) ? argv : [];
+  const helpRequested = args.some((arg) => arg === "--help" || arg === "-h");
+  const helpCommand = args.find((arg) => arg !== "--help" && arg !== "-h" && !String(arg).startsWith("-"));
+  if (helpRequested && helpCommand) return true;
+
+  const normalized = args.map((arg) => {
+    if (arg === "--help" || arg === "-h") return "help";
+    if (arg === "--version" || arg === "-V") return "version";
+    return arg;
+  });
+  const { rest } = parseOutputFlags(normalized);
+  const [rawCommand, ...commandArgs] = rest;
+  if (rawCommand === "help" || rawCommand === "version") return true;
+  return SELF_HELP_COMMANDS.has(resolveCommandName(rawCommand)) && commandArgs[0] === "help";
+}
+
 function securePrivateMode(target, mode) {
   if (process.platform === "win32") return;
   fs.chmodSync(target, mode);
+}
+
+function databaseStatsMatch(expected, actual) {
+  return Boolean(expected && actual) &&
+    expected.isFile() && actual.isFile() &&
+    !expected.isSymbolicLink() && !actual.isSymbolicLink() &&
+    expected.dev === actual.dev &&
+    expected.ino === actual.ino &&
+    expected.nlink === actual.nlink &&
+    expected.size === actual.size &&
+    expected.mtimeMs === actual.mtimeMs &&
+    expected.ctimeMs === actual.ctimeMs;
+}
+
+function databaseContentMatch(expected, actual) {
+  return Boolean(expected && actual) &&
+    expected.isFile() && actual.isFile() &&
+    !expected.isSymbolicLink() && !actual.isSymbolicLink() &&
+    expected.dev === actual.dev &&
+    expected.ino === actual.ino &&
+    expected.nlink === actual.nlink &&
+    expected.size === actual.size &&
+    expected.mtimeMs === actual.mtimeMs;
+}
+
+function directoryIdentityMatch(expected, actual) {
+  return Boolean(expected && actual) &&
+    expected.isDirectory() && actual.isDirectory() &&
+    !expected.isSymbolicLink() && !actual.isSymbolicLink() &&
+    expected.dev === actual.dev && expected.ino === actual.ino;
 }
 
 function databaseFileStat(target) {
@@ -76,10 +132,204 @@ function databaseFileStat(target) {
     if (error && error.code === "ENOENT") return null;
     throw error;
   }
-  if (stat.isSymbolicLink() || !stat.isFile()) {
-    throw new Error(`Agentlas database path must be a regular file: ${target}`);
+  if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1) {
+    const error = new Error(`Agentlas database path must be a regular file: ${target}`);
+    if (stat.nlink !== 1) error.code = "AGENTLAS_DATABASE_MULTILINK";
+    throw error;
   }
   return stat;
+}
+
+function quarantinePath(target) {
+  return `${target}.bootstrap-quarantine-${process.pid}-${crypto.randomUUID()}`;
+}
+
+function bootstrapRaceError(message) {
+  const error = new Error(message);
+  error.code = "AGENTLAS_BOOTSTRAP_CONCURRENT_RETRY";
+  return error;
+}
+
+function activeBootstrapOwnerExists(target) {
+  const dir = path.dirname(target);
+  const prefix = `${path.basename(target)}.bootstrap-quarantine-`;
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return false; }
+  for (const entry of entries) {
+    if (!entry || !entry.isFile() || !entry.name.startsWith(prefix)) continue;
+    const match = entry.name.slice(prefix.length).match(/^(\d+)-[0-9a-f-]+$/i);
+    if (!match) continue;
+    const ownerPid = Number(match[1]);
+    if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0 || ownerPid === process.pid) continue;
+    try {
+      process.kill(ownerPid, 0);
+      return true;
+    } catch (error) {
+      if (error && error.code === "EPERM") return true;
+    }
+  }
+  return false;
+}
+
+function activeBootstrapBuildExists(target) {
+  const dir = path.dirname(target);
+  const prefix = `${path.basename(target)}.bootstrap-`;
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return false; }
+  for (const entry of entries) {
+    if (!entry || !entry.isFile() || !entry.name.startsWith(prefix)) continue;
+    const match = entry.name.slice(prefix.length).match(/^(\d+)-/);
+    if (!match) continue;
+    const ownerPid = Number(match[1]);
+    if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0 || ownerPid === process.pid) continue;
+    try {
+      process.kill(ownerPid, 0);
+      return true;
+    } catch (error) {
+      if (error && error.code === "EPERM") return true;
+    }
+  }
+  return false;
+}
+
+function waitForBootstrapOwner() {
+  try {
+    const waitCell = new Int32Array(new SharedArrayBuffer(4));
+    Atomics.wait(waitCell, 0, 0, 25);
+  } catch { /* runtimes without Atomics.wait continue with the next check */ }
+}
+
+function stableSqliteWinner(target, before) {
+  let fd;
+  try {
+    if (!before || before.size < SQLITE_MIN_BYTES) return false;
+    fd = fs.openSync(target, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const opened = fs.fstatSync(fd);
+    if (!databaseStatsMatch(before, opened)) return false;
+    const header = Buffer.alloc(SQLITE_HEADER.length);
+    if (fs.readSync(fd, header, 0, header.length, 0) !== header.length || !header.equals(SQLITE_HEADER)) return false;
+    const afterRead = fs.fstatSync(fd);
+    const afterPath = databaseFileStat(target);
+    return databaseStatsMatch(opened, afterRead) && databaseStatsMatch(afterRead, afterPath);
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* best effort */ }
+    }
+  }
+}
+
+function quarantineEmptyDatabaseIfUnchanged(target, expected) {
+  const dir = path.dirname(target);
+  const noFollow = fs.constants.O_NOFOLLOW || 0;
+  const directoryFlags = fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY || 0) | noFollow;
+  let fd;
+  let directoryFd;
+  let quarantine;
+  try {
+    // Re-lstat immediately before opening the descriptor. The original lstat
+    // alone is stale as soon as another process can replace the pathname.
+    const current = databaseFileStat(target);
+    if (!current) throw bootstrapRaceError("database disappeared while another bootstrap was quarantining it");
+    if (!databaseStatsMatch(expected, current)) {
+      if (current.size > 0) throw bootstrapRaceError("database was replaced while another bootstrap was quarantining it");
+      throw new Error("database changed before empty-file removal");
+    }
+
+    const listedDirectory = fs.lstatSync(dir);
+    if (!listedDirectory.isDirectory() || listedDirectory.isSymbolicLink()) {
+      throw new Error("database parent directory is unsafe");
+    }
+    try {
+      directoryFd = fs.openSync(dir, directoryFlags);
+      const openedDirectory = fs.fstatSync(directoryFd);
+      if (!directoryIdentityMatch(listedDirectory, openedDirectory)) {
+        throw new Error("database parent directory changed before empty-file removal");
+      }
+    } catch (error) {
+      // Windows does not permit opening a directory with the same descriptor
+      // flags. The file descriptor identity checks below remain mandatory.
+      if (process.platform !== "win32" || !["EISDIR", "EINVAL", "ENOTSUP", "EPERM"].includes(error && error.code)) {
+        throw error;
+      }
+    }
+
+    // O_NOFOLLOW prevents a swapped symlink from being opened on POSIX. The
+    // fstat fields are compared to both lstat observations before quarantine.
+    try {
+      fd = fs.openSync(target, fs.constants.O_RDONLY | noFollow);
+    } catch (error) {
+      if (error && error.code === "ENOENT") throw bootstrapRaceError("database disappeared while opening empty file");
+      throw error;
+    }
+    const opened = fs.fstatSync(fd);
+    if (!databaseStatsMatch(expected, opened)) {
+      if (opened.size > 0) throw bootstrapRaceError("database was replaced while opening empty file");
+      throw new Error("database changed while opening empty file");
+    }
+    const beforeQuarantine = databaseFileStat(target);
+    if (!beforeQuarantine) throw bootstrapRaceError("database disappeared immediately before quarantine");
+    if (!databaseStatsMatch(expected, beforeQuarantine) || !databaseStatsMatch(opened, beforeQuarantine)) {
+      if (beforeQuarantine.size > 0) throw bootstrapRaceError("database was replaced immediately before quarantine");
+      throw new Error("database changed immediately before empty-file removal");
+    }
+    const currentDirectory = fs.lstatSync(dir);
+    if (!directoryIdentityMatch(listedDirectory, currentDirectory)) {
+      throw new Error("database parent directory changed immediately before empty-file removal");
+    }
+
+    // Never unlink the pathname after a check: a concurrent replacement could
+    // make that path name a different file. Move the checked candidate to a
+    // same-directory, recoverable quarantine name instead. A UUID plus an
+    // O_EXCL reservation makes accidental destination collisions negligible;
+    // the moved inode is verified again before bootstrap can continue.
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const candidate = quarantinePath(target);
+      try {
+        const reservation = fs.openSync(candidate, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+        fs.closeSync(reservation);
+        quarantine = candidate;
+        break;
+      } catch (error) {
+        if (!error || error.code !== "EEXIST") throw error;
+      }
+    }
+    if (!quarantine) throw new Error("could not allocate a unique database quarantine path");
+    try {
+      fs.renameSync(target, quarantine);
+    } catch (error) {
+      if (error && error.code === "ENOENT") throw bootstrapRaceError("database disappeared while quarantining empty file");
+      throw error;
+    }
+
+    // rename updates ctime on POSIX, so compare the pre-rename inode/content
+    // fields against the post-rename descriptor and verify the post-rename
+    // ctime/other stat fields against a fresh pathname observation.
+    const afterQuarantine = fs.fstatSync(fd);
+    const quarantined = databaseFileStat(quarantine);
+    if (!databaseContentMatch(expected, afterQuarantine) || !databaseStatsMatch(afterQuarantine, quarantined)) {
+      throw new Error(`database changed while quarantining empty file; preserved at ${quarantine}`);
+    }
+    const afterDirectory = fs.lstatSync(dir);
+    if (!directoryIdentityMatch(listedDirectory, afterDirectory)) {
+      throw new Error(`database parent directory changed while quarantining empty file; preserved at ${quarantine}`);
+    }
+    let targetAfter;
+    try { targetAfter = fs.lstatSync(target); } catch (error) {
+      if (!error || error.code !== "ENOENT") throw error;
+    }
+    if (targetAfter) {
+      throw new Error(`database path was replaced while quarantining empty file; preserved at ${quarantine}`);
+    }
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* best effort */ }
+    }
+    if (directoryFd !== undefined) {
+      try { fs.closeSync(directoryFd); } catch { /* best effort */ }
+    }
+  }
 }
 
 // ── SQLite 로더 (부트스트랩용): better-sqlite3 → node:sqlite ──
@@ -155,17 +405,71 @@ function bootstrapDbIfMissing() {
   // 잡힌 파일이므로 없는 것으로 취급해 정상 부트스트랩 경로를 태운다. 내용이 있는데
   // 손상된 경우는 여기서 판단하지 않는다 — 그건 복구지 부트스트랩이 아니고, 멀쩡한
   // DB 를 빈 것으로 오판해 덮어쓰는 위험이 훨씬 크다.
-  const existing = databaseFileStat(p);
-  if (existing) {
+  let waitingForConcurrentBootstrap = false;
+  let emptyCandidateResolved = false;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    let existing;
+    try {
+      existing = databaseFileStat(p);
+    } catch (error) {
+      // A winning bootstrap briefly has two hard links (its temp inode and the
+      // final name). Treat only that observable window as retryable when the
+      // owner process is still alive; a user-created hard link remains a hard
+      // failure.
+      if (error && error.code === "AGENTLAS_DATABASE_MULTILINK" && activeBootstrapBuildExists(p)) {
+        waitingForConcurrentBootstrap = true;
+        waitForBootstrapOwner();
+        continue;
+      }
+      throw error;
+    }
+    if (!existing) {
+      if (!waitingForConcurrentBootstrap) {
+        emptyCandidateResolved = true;
+        break;
+      }
+      if (!activeBootstrapOwnerExists(p)) {
+        throw new Error("Empty Agentlas database could not be replaced: concurrent bootstrap owner disappeared before publishing a database");
+      }
+      waitForBootstrapOwner();
+      continue;
+    }
     if (existing.size > 0) {
       securePrivateMode(p, 0o600);
       return { created: false, path: p };
     }
     try {
-      fs.rmSync(p);
+      quarantineEmptyDatabaseIfUnchanged(p, existing);
+      emptyCandidateResolved = true;
+      break;
     } catch (error) {
+      if (error && error.code === "AGENTLAS_BOOTSTRAP_CONCURRENT_RETRY") {
+        let winner;
+        try {
+          winner = databaseFileStat(p);
+        } catch (winnerError) {
+          if (!(winnerError && winnerError.code === "AGENTLAS_DATABASE_MULTILINK" && activeBootstrapBuildExists(p))) {
+            throw new Error(`Empty Agentlas database could not be replaced: ${winnerError && winnerError.message ? winnerError.message : winnerError}`);
+          }
+          waitingForConcurrentBootstrap = true;
+          waitForBootstrapOwner();
+          continue;
+        }
+        if (winner && winner.size >= SQLITE_MIN_BYTES && stableSqliteWinner(p, winner)) {
+          securePrivateMode(p, 0o600);
+          return { created: false, path: p };
+        }
+        if (activeBootstrapOwnerExists(p)) {
+          waitingForConcurrentBootstrap = true;
+          waitForBootstrapOwner();
+          continue;
+        }
+      }
       throw new Error(`Empty Agentlas database could not be replaced: ${error && error.message ? error.message : error}`);
     }
+  }
+  if (!emptyCandidateResolved) {
+    throw new Error("Empty Agentlas database could not be replaced: concurrent bootstrap did not publish a database");
   }
   const schemaFile = path.join(PKG_ROOT, "engine", "bootstrap-schema.sql");
   if (!exists(schemaFile)) {
@@ -209,9 +513,32 @@ function bootstrapDbIfMissing() {
     // EEXIST only means another path entry won the name. It is a successful
     // concurrent bootstrap only if that winner is already a real, non-empty
     // database file; a symlink/directory/empty placeholder must fail closed.
-    const winner = databaseFileStat(p);
-    if (!winner || winner.size === 0) {
-      throw new Error(`Concurrent Agentlas database bootstrap produced an invalid file: ${p}`);
+    let winnerAccepted = false;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      let winner;
+      try {
+        winner = databaseFileStat(p);
+      } catch (error) {
+        if (error && error.code === "AGENTLAS_DATABASE_MULTILINK" && activeBootstrapBuildExists(p)) {
+          waitForBootstrapOwner();
+          continue;
+        }
+        throw error;
+      }
+      if (stableSqliteWinner(p, winner)) {
+        winnerAccepted = true;
+        break;
+      }
+      if (winner.size < SQLITE_MIN_BYTES) {
+        throw new Error(`Concurrent Agentlas database bootstrap produced an invalid or changed file: ${p}`);
+      }
+      // The winning process can unlink its temporary hard link between the
+      // winner stat and the descriptor's final stat. Retry the bounded identity
+      // check once the link count settles; never accept an unstable winner.
+      waitForBootstrapOwner();
+    }
+    if (!winnerAccepted) {
+      throw new Error(`Concurrent Agentlas database bootstrap did not publish a stable database: ${p}`);
     }
   } finally {
     try { fs.rmSync(temp, { force: true }); } catch { /* noop */ }
@@ -229,10 +556,8 @@ function bootstrapDbIfMissing() {
 
 function main() {
   const args = process.argv.slice(2);
-  const metadataOnly = args.some((arg) => arg === "help" || arg === "--help" || arg === "-h")
-    || args[0] === "version"
-    || args[0] === "--version"
-    || args[0] === "-V";
+  const { options: outputOptions } = parseOutputFlags(args);
+  const metadataOnly = isMetadataOnlyInvocation(args);
   const sqliteDriver = probeSqliteDriver();
   const engineFound = exists(ENGINE);
 
@@ -259,18 +584,18 @@ function main() {
   }
 
   if (error) {
-    process.stderr.write(error + "\n");
+    process.stderr.write(renderError(new Error(error), outputOptions) + "\n");
     process.exit(1);
   }
 
   if (!metadataOnly) {
     try {
       const boot = bootstrapDbIfMissing();
-      if (boot.created) {
+      if (boot.created && outputOptions.format === "table" && !outputOptions.quiet) {
         process.stderr.write("First run: Agentlas data initialized.\n");
       }
     } catch (e) {
-      process.stderr.write(`${e.message}\n`);
+      process.stderr.write(renderError(e, outputOptions) + "\n");
       process.exit(1);
     }
   }
@@ -310,4 +635,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { bootstrapDbIfMissing, dbPath, userDataDir, probeSqliteDriver };
+module.exports = { bootstrapDbIfMissing, dbPath, userDataDir, probeSqliteDriver, isMetadataOnlyInvocation };

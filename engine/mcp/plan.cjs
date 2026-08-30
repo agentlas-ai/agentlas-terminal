@@ -58,7 +58,11 @@ function lexicalRequirementHintIds(request, inventory) {
   const text = String(request || "").toLowerCase();
   const ids = [];
   for (const item of inventory) {
-    const direct = text.includes(String(item.catalogId).toLowerCase()) || text.includes(String(item.name || "").toLowerCase());
+    const catalogId = String(item.catalogId || "").trim().toLowerCase();
+    const name = String(item.name || "").trim().toLowerCase();
+    // String#includes("") is always true. A registry row whose optional display
+    // name is empty must not become a hint for every unrelated build request.
+    const direct = Boolean((catalogId && text.includes(catalogId)) || (name && text.includes(name)));
     const heuristic = HEURISTIC_GROUPS.some(([nameRe, taskRe]) => nameRe.test(`${item.catalogId} ${item.name}`) && taskRe.test(text));
     if (direct || heuristic) ids.push(item.catalogId);
   }

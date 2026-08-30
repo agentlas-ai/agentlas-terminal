@@ -22,6 +22,8 @@ function sha256(content) {
 }
 
 const ABSENT_TARGET_HASH = sha256("agentlas:absent-agent-asset:v1");
+const MAX_EVOLUTION_CONTENT_BYTES = 512 * 1024;
+const SHA256_RE = /^[a-f0-9]{64}$/;
 const RULE_TARGETS = new Set([
   "system-prompt.md",
   "soul.md",
@@ -40,6 +42,15 @@ function parseSource(json) {
   } catch {
     return {};
   }
+}
+
+function terminalSafe(value, maxLength = 300) {
+  return String(value ?? "").replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, maxLength);
+}
+
+function normalizedListLimit(value) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) ? Math.max(1, Math.min(parsed, 200)) : 50;
 }
 
 /** 대기 중(사람 결정 필요) 고위험 성장 제안 개수 — 터미널 홈 배너용. */
@@ -68,19 +79,23 @@ function listGrowthProposals(db, limit = 50) {
           ORDER BY datetime(updated_at) DESC, datetime(created_at) DESC
           LIMIT ?`,
       )
-      .all(limit);
+      .all(normalizedListLimit(limit));
   } catch {
     rows = [];
   }
   const pending = [];
+  const applied = [];
   const autoApplied = [];
   for (const row of rows) {
     const source = parseSource(row.source_json);
     const entry = { row, source };
     if (row.status === "candidate") pending.push(entry);
-    else if (source._autoApplied === true) autoApplied.push(entry);
+    else {
+      applied.push(entry);
+      if (source._autoApplied === true) autoApplied.push(entry);
+    }
   }
-  return { pending, autoApplied };
+  return { pending, applied, autoApplied };
 }
 
 function agentById(db, id) {
@@ -145,27 +160,28 @@ function printCard(out, entry, index) {
   const { row, source } = entry;
   const card = source.humanCard && typeof source.humanCard === "object" ? source.humanCard : null;
   const tier = source.riskTier === "high" ? "high" : "low";
-  out(`  [${index}] ${row.id}  (${tier} · ${row.status} · ${row.agent_id})`);
+  const application = row.status === "candidate" ? "승인 전" : source._autoApplied === true ? "자동 반영" : "승인 후 반영";
+  out(`  [${index}] ${terminalSafe(row.id)}  (${tier} · ${terminalSafe(row.status)} · ${application} · ${terminalSafe(row.agent_id)})`);
   if (card) {
-    out(`      배운 것 : ${card.learned}`);
-    out(`      바뀌는 것: ${card.change}`);
-    out(`      되돌리기 : ${card.reversible}`);
+    out(`      배운 것 : ${terminalSafe(card.learned)}`);
+    out(`      바뀐 것 : ${terminalSafe(card.change)}`);
+    out(`      안전장치: ${terminalSafe(card.reversible)}`);
   } else {
-    out(`      ${row.summary}`);
+    out(`      ${terminalSafe(row.summary)}`);
   }
 }
 
 function cmdList(db, out) {
-  const { pending, autoApplied } = listGrowthProposals(db);
+  const { pending, applied } = listGrowthProposals(db);
   out("== agent growth proposals ==");
   out("");
   out(`대기(승인 필요) ${pending.length}건:`);
   if (!pending.length) out("  (없음)");
   pending.forEach((entry, i) => printCard(out, entry, i + 1));
   out("");
-  out(`자동 적용됨(저위험) ${autoApplied.length}건:`);
-  if (!autoApplied.length) out("  (없음)");
-  autoApplied.forEach((entry, i) => printCard(out, entry, i + 1));
+  out(`성장 반영 완료 ${applied.length}건 (필요할 때 되돌릴 수 있는 안전장치):`);
+  if (!applied.length) out("  (없음)");
+  applied.forEach((entry, i) => printCard(out, entry, i + 1));
   out("");
   out("적용:  agentlas evolve apply <id>   ·   되돌리기: agentlas evolve revert <id>");
 }
@@ -180,6 +196,36 @@ function loadProposal(db, id, fail) {
     return fail(`Unsupported evolution target: ${row.target_path}`);
   }
   return row;
+}
+
+function validateProposalPayload(row, fail) {
+  if (!SHA256_RE.test(String(row.before_hash)) || !SHA256_RE.test(String(row.after_hash))) {
+    fail("Evolution proposal contains an invalid content hash");
+    return false;
+  }
+  if (typeof row.before_content !== "string" || typeof row.after_content !== "string") {
+    fail("Evolution proposal content is invalid");
+    return false;
+  }
+  if (
+    Buffer.byteLength(row.before_content, "utf8") > MAX_EVOLUTION_CONTENT_BYTES ||
+    Buffer.byteLength(row.after_content, "utf8") > MAX_EVOLUTION_CONTENT_BYTES
+  ) {
+    fail("Evolution proposal exceeds the portable 512 KiB content limit");
+    return false;
+  }
+  if (sha256(row.after_content) !== row.after_hash) {
+    fail("Evolution proposal after-content does not match its approved hash");
+    return false;
+  }
+  if (
+    (row.before_hash === ABSENT_TARGET_HASH && row.before_content !== "") ||
+    (row.before_hash !== ABSENT_TARGET_HASH && sha256(row.before_content) !== row.before_hash)
+  ) {
+    fail("Evolution proposal before-content does not match its approved baseline hash");
+    return false;
+  }
+  return true;
 }
 
 // 터미널이 부트스트랩한 DB는 v45라 진화 영수증 테이블이 없을 수 있다(데스크탑 v51+ 마이그레이션이
@@ -206,7 +252,7 @@ function ensureReceiptTable(db) {
 
 function insertReceipt(db, row, action, hashBefore, hashAfter, now) {
   ensureReceiptTable(db);
-  db.prepare(
+  const inserted = db.prepare(
     `INSERT INTO agent_evolution_receipts (
        id, proposal_id, agent_id, action, target_path,
        version_before, version_after, target_hash_before, target_hash_after,
@@ -225,11 +271,13 @@ function insertReceipt(db, row, action, hashBefore, hashAfter, now) {
     hashAfter,
     now,
   );
+  if (inserted.changes !== 1) throw new Error(`Evolution ${action} receipt already exists; proposal state is inconsistent`);
 }
 
 function cmdApply(db, id, out, fail, agentFolder) {
   const row = loadProposal(db, id, fail);
   if (!row) return;
+  if (!validateProposalPayload(row, fail)) return;
   if (row.status !== "candidate") {
     return fail(`Only a pending candidate can be applied; ${id} is '${row.status}'.`);
   }
@@ -273,6 +321,7 @@ function cmdApply(db, id, out, fail, agentFolder) {
 function cmdRevert(db, id, out, fail, agentFolder) {
   const row = loadProposal(db, id, fail);
   if (!row) return;
+  if (!validateProposalPayload(row, fail)) return;
   if (row.status !== "applied" && row.status !== "measured") {
     return fail(`Only an applied proposal can be reverted; ${id} is '${row.status}'.`);
   }
@@ -294,7 +343,11 @@ function cmdRevert(db, id, out, fail, agentFolder) {
       const locked = db.prepare("SELECT status FROM agent_evolution_proposals WHERE id=?").get(row.id);
       if (!locked || !["applied", "measured"].includes(locked.status)) throw new Error("Evolution proposal changed before revert; reload it first");
       if (currentTargetHash(file).hash !== row.after_hash) throw new Error("Agent prompt changed before revert; reload it first");
-      writeTargetAtomic(file, row.before_content);
+      // A proposal may have created the prompt asset from an absent baseline.
+      // Restoring that baseline means removing the created file, not writing an
+      // empty file (whose sha256 can never equal ABSENT_TARGET_HASH).
+      if (row.before_hash === ABSENT_TARGET_HASH) fs.rmSync(file, { force: true });
+      else writeTargetAtomic(file, row.before_content);
       wroteTarget = true;
       if (currentTargetHash(file).hash !== row.before_hash) throw new Error("Reverted content did not match the original hash");
       db.prepare("UPDATE installed_agents SET system_prompt = ? WHERE id = ?").run(row.before_content, row.agent_id);
@@ -309,7 +362,7 @@ function cmdRevert(db, id, out, fail, agentFolder) {
     });
   } catch (error) {
     if (wroteTarget) {
-      try { restoreTargetAfterFailure(file, before, sha256(row.before_content)); }
+      try { restoreTargetAfterFailure(file, before, row.before_hash); }
       catch (rollbackError) { return fail(`${error.message}. ${rollbackError.message}`); }
     }
     return fail(`${error.message}; the applied target was restored.`);
@@ -326,19 +379,23 @@ function cmdEvolve(ctx) {
   const args = Array.isArray(ctx.args) ? ctx.args : [];
   const sub = args[0] || "list";
   if (sub === "help" || sub === "--help" || sub === "-h") {
+    if (args.length !== 1) return fail("usage: agentlas evolve [list | apply <id> | revert <id>]");
     out("usage: agentlas evolve [list | apply <id> | revert <id>]");
     out("  list          — review pending (approval-needed) and auto-applied agent growth proposals");
     out("  apply <id>    — approve and apply a pending proposal to the agent prompt");
     out("  revert <id>   — roll back an applied proposal");
     return;
   }
-  if (sub === "list" || sub === "ls") return cmdList(db, out);
+  if (sub === "list" || sub === "ls") {
+    if (args.length > 1) return fail("usage: agentlas evolve list");
+    return cmdList(db, out);
+  }
   if (sub === "apply") {
-    if (!args[1]) return fail("usage: agentlas evolve apply <id>");
+    if (args.length !== 2 || !args[1]) return fail("usage: agentlas evolve apply <id>");
     return cmdApply(db, args[1], out, fail, agentFolder);
   }
   if (sub === "revert" || sub === "rollback") {
-    if (!args[1]) return fail("usage: agentlas evolve revert <id>");
+    if (args.length !== 2 || !args[1]) return fail("usage: agentlas evolve revert <id>");
     return cmdRevert(db, args[1], out, fail, agentFolder);
   }
   return fail(`Unknown evolve subcommand: ${sub} (list|apply|revert)`);

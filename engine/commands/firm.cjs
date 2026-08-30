@@ -9,6 +9,42 @@
  */
 const { rowToAgent } = require("../agents/registry.cjs");
 
+function parseFirmArgs(args) {
+  const flags = { runtime: null, model: null, effort: null, tier: null, permission: null, task: [] };
+  const fields = new Map([
+    ["--runtime", "runtime"],
+    ["--model", "model"],
+    ["--effort", "effort"],
+    ["--tier", "tier"],
+    ["--permission", "permission"],
+  ]);
+  const seen = new Set();
+  let passthrough = false;
+  for (let i = 0; i < args.length; i += 1) {
+    const token = String(args[i]);
+    if (passthrough) { flags.task.push(token); continue; }
+    if (token === "--") { passthrough = true; continue; }
+    const at = token.indexOf("=");
+    const option = at >= 0 ? token.slice(0, at) : token;
+    const field = fields.get(option);
+    if (field) {
+      if (seen.has(field)) throw new Error(`duplicate option: ${option}`);
+      seen.add(field);
+      const value = at >= 0 ? token.slice(at + 1) : args[++i];
+      if (value === undefined || value === "" || (at < 0 && String(value).startsWith("--"))) {
+        throw new Error(`${option} requires a value`);
+      }
+      flags[field] = String(value);
+      continue;
+    }
+    if (token.startsWith("-")) {
+      throw new Error(`unknown option: ${token} (use -- before a task that starts with '-')`);
+    }
+    flags.task.push(token);
+  }
+  return flags;
+}
+
 function findFirm(db, token) {
   const q = String(token || "").trim().toLowerCase();
   if (!q) return null;
@@ -50,17 +86,11 @@ async function run(ctx, args) {
   }
   const ceo = rowToAgent(ceoRow);
 
-  // 간단 플래그 파싱 — 명령끼리 참조 금지 규칙상 run.cjs 미차용.
-  const rest = args.slice(1);
-  const flags = { runtime: null, model: null, effort: null, tier: null, permission: null, task: [] };
-  for (let i = 0; i < rest.length; i++) {
-    if (rest[i] === "--runtime") flags.runtime = rest[++i];
-    else if (rest[i] === "--model") flags.model = rest[++i];
-    else if (rest[i] === "--effort") flags.effort = rest[++i];
-    else if (rest[i] === "--tier") flags.tier = rest[++i];
-    else if (rest[i] === "--permission") flags.permission = rest[++i];
-    else flags.task.push(rest[i]);
-  }
+  // 명령끼리 참조 금지 규칙상 run.cjs 미차용. 오타 옵션은 CEO 계획 턴으로
+  // 흘리지 않고, 대시로 시작하는 실제 작업은 `--` 뒤에서만 받는다.
+  let flags;
+  try { flags = parseFirmArgs(args.slice(1)); }
+  catch (error) { ctx.err(String((error && error.message) || error)); return 1; }
   const task = flags.task.join(" ").trim();
   if (task) {
     // 3-tier 위임 실행 — PLAN → DELEGATE → SYNTHESIZE (firms/orchestrate.cjs).
@@ -176,4 +206,4 @@ async function run(ctx, args) {
   return startRepl(ctx, { agent: ceo.slug });
 }
 
-module.exports = { run, findFirm };
+module.exports = { run, findFirm, parseFirmArgs };

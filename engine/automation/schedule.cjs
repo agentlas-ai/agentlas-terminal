@@ -33,6 +33,7 @@ function cronField(expr, min, max) {
 
 const WEEKDAY_INDEX = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
 const zonedFormatterCache = new Map();
+const zonedCalendarFormatterCache = new Map();
 
 function zonedDateParts(date, timezone) {
   if (!timezone) {
@@ -69,6 +70,81 @@ function zonedDateParts(date, timezone) {
   };
 }
 
+function zonedCalendarParts(date, timezone) {
+  let formatter = zonedCalendarFormatterCache.get(timezone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone,
+      hourCycle: "h23",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+    zonedCalendarFormatterCache.set(timezone, formatter);
+  }
+  const parts = Object.fromEntries(
+    formatter.formatToParts(date).filter((part) => part.type !== "literal").map((part) => [part.type, part.value]),
+  );
+  return {
+    year: Number(parts.year),
+    month: Number(parts.month),
+    day: Number(parts.day),
+    hour: Number(parts.hour),
+    minute: Number(parts.minute),
+  };
+}
+
+function calendarDayNumber(parts) {
+  return Date.UTC(parts.year, parts.month - 1, parts.day);
+}
+
+function zonedCalendarTime(parts, timezone) {
+  const desired = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute);
+  let candidate = new Date(desired);
+  for (let i = 0; i < 4; i++) {
+    const actual = zonedCalendarParts(candidate, timezone);
+    const actualAsUtc = Date.UTC(actual.year, actual.month - 1, actual.day, actual.hour, actual.minute);
+    const corrected = desired - (actualAsUtc - candidate.getTime());
+    if (corrected === candidate.getTime()) return candidate;
+    candidate = new Date(corrected);
+  }
+  return candidate;
+}
+
+function nextLocalDayStart(date, timezone) {
+  if (!timezone) {
+    const next = new Date(date.getTime());
+    next.setHours(0, 0, 0, 0);
+    next.setDate(next.getDate() + 1);
+    return next;
+  }
+
+  const current = zonedCalendarParts(date, timezone);
+  const nextDay = new Date(Date.UTC(current.year, current.month - 1, current.day + 1));
+  const target = {
+    year: nextDay.getUTCFullYear(),
+    month: nextDay.getUTCMonth() + 1,
+    day: nextDay.getUTCDate(),
+    hour: 0,
+    minute: 0,
+  };
+  const targetDay = calendarDayNumber(target);
+  let candidate = zonedCalendarTime(target, timezone);
+
+  // Midnight can be skipped by a timezone transition. Accept the first instant
+  // that has reached the next local calendar day (or a later, non-existent day).
+  for (let i = 0; i < 48; i++) {
+    if (candidate.getTime() > date.getTime()) {
+      const actual = zonedCalendarParts(candidate, timezone);
+      if (calendarDayNumber(actual) >= targetDay) return candidate;
+    }
+    candidate = new Date(candidate.getTime() + 60 * 60 * 1000);
+  }
+  return null;
+}
+
 function nextCronRun(cron, from = new Date(), timezone = null) {
   const parts = String(cron).trim().split(/\s+/);
   if (parts.length !== 5) return null;
@@ -85,10 +161,13 @@ function nextCronRun(cron, from = new Date(), timezone = null) {
   } catch {
     return null;
   }
-  const t = new Date(from.getTime());
+  const fromMs = from.getTime();
+  if (!Number.isFinite(fromMs)) return null;
+  const t = new Date(fromMs);
   t.setSeconds(0, 0);
   t.setMinutes(t.getMinutes() + 1);
-  for (let i = 0; i < 366 * 24 * 60; i++) {
+  const searchUntil = fromMs + 8 * 366 * 24 * 60 * 60 * 1000;
+  while (t.getTime() <= searchUntil) {
     const local = zonedDateParts(t, timezone);
     const domOk = doms.has(local.day);
     const dowOk = dows.has(local.weekday);
@@ -96,7 +175,15 @@ function nextCronRun(cron, from = new Date(), timezone = null) {
     const domRestricted = domS !== "*";
     const dowRestricted = dowS !== "*";
     const dayOk = domRestricted && dowRestricted ? domOk || dowOk : domOk && dowOk;
-    if (mons.has(local.month) && dayOk && hours.has(local.hour) && mins.has(local.minute)) return t;
+    const monthOk = mons.has(local.month);
+    if (monthOk && dayOk && hours.has(local.hour) && mins.has(local.minute)) return t;
+    if (!monthOk || !dayOk) {
+      const dayStart = nextLocalDayStart(t, timezone);
+      if (dayStart && dayStart.getTime() > t.getTime()) {
+        t.setTime(dayStart.getTime());
+        continue;
+      }
+    }
     t.setMinutes(t.getMinutes() + 1);
   }
   return null;

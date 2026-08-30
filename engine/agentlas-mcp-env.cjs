@@ -68,31 +68,85 @@ function findEnvValue(source, key) {
   return match ? source[match] : undefined;
 }
 
-function ensurePrivateDirectory(directory) {
-  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const stat = fs.lstatSync(directory);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("MCP runtime home must be a real directory");
-  try { fs.chmodSync(directory, 0o700); } catch { /* Windows/best-effort */ }
-  return directory;
+function samePath(left, right) {
+  const a = path.normalize(String(left || ""));
+  const b = path.normalize(String(right || ""));
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+function sameDirectoryIdentity(left, right) {
+  return !!left && !!right
+    && left.isDirectory() && right.isDirectory()
+    && !left.isSymbolicLink() && !right.isSymbolicLink()
+    && left.dev === right.dev && left.ino === right.ino;
+}
+
+function realPath(directory) {
+  // Keep the non-native resolver on Windows so HOMEDRIVE/HOMEPATH retain the
+  // normal Win32 spelling; POSIX still gets the platform's canonical path.
+  return fs.realpathSync(path.resolve(directory));
+}
+
+function inspectPrivateDirectory(directory) {
+  const requestedPath = path.resolve(String(directory || ""));
+  const stat = fs.lstatSync(requestedPath);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error("MCP runtime home must be a real directory");
+  }
+  const realpath = realPath(requestedPath);
+  // A swap between the first lstat and realpath must not become the anchor
+  // returned to callers. Re-read the pathname and retain both identities.
+  const verified = fs.lstatSync(requestedPath);
+  if (!sameDirectoryIdentity(stat, verified)) {
+    throw new Error("MCP runtime directory changed during inspection");
+  }
+  return { requestedPath, stat: verified, realpath };
+}
+
+function assertPrivateDirectoryIdentity(expected, label = "MCP runtime directory") {
+  const actual = inspectPrivateDirectory(expected.requestedPath);
+  if (!sameDirectoryIdentity(expected.stat, actual.stat) || !samePath(expected.realpath, actual.realpath)) {
+    throw new Error(`${label} changed during setup`);
+  }
+  return actual;
+}
+
+function ensurePrivateDirectoryInfo(directory) {
+  const requestedPath = path.resolve(String(directory || ""));
+  fs.mkdirSync(requestedPath, { recursive: true, mode: 0o700 });
+  const before = inspectPrivateDirectory(requestedPath);
+  try { fs.chmodSync(requestedPath, 0o700); } catch { /* Windows/best-effort */ }
+  const after = inspectPrivateDirectory(requestedPath);
+  if (!sameDirectoryIdentity(before.stat, after.stat) || !samePath(before.realpath, after.realpath)) {
+    throw new Error("MCP runtime directory changed during setup");
+  }
+  return after;
+}
+
+function isStrictChild(parent, child) {
+  const relative = path.relative(parent, child);
+  return !!relative && !path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`);
 }
 
 function mcpRuntimeHome(dataDir, serverIdentity) {
-  const root = path.resolve(dataDir || path.join(os.tmpdir(), "agentlas-mcp-runtime"));
-  ensurePrivateDirectory(root);
-  const parent = path.join(root, "mcp-runtime-homes");
-  ensurePrivateDirectory(parent);
+  const root = ensurePrivateDirectoryInfo(path.resolve(dataDir || path.join(os.tmpdir(), "agentlas-mcp-runtime")));
+  const parent = ensurePrivateDirectoryInfo(path.join(root.realpath, "mcp-runtime-homes"));
+  if (!isStrictChild(root.realpath, parent.realpath)) throw new Error("MCP runtime home escaped its private root");
+  assertPrivateDirectoryIdentity(root, "MCP runtime root");
+  assertPrivateDirectoryIdentity(parent, "MCP runtime parent");
+
   const digest = crypto.createHash("sha256").update(String(serverIdentity || "mcp"), "utf8").digest("hex").slice(0, 32);
-  const target = path.join(parent, digest);
-  ensurePrivateDirectory(target);
-  const relative = path.relative(fs.realpathSync(parent), fs.realpathSync(target));
-  if (!relative || path.isAbsolute(relative) || relative === ".." || relative.startsWith(`..${path.sep}`)) {
-    throw new Error("MCP runtime home escaped its private root");
-  }
-  return target;
+  const target = ensurePrivateDirectoryInfo(path.join(parent.realpath, digest));
+  if (!isStrictChild(parent.realpath, target.realpath)) throw new Error("MCP runtime home escaped its private parent");
+  assertPrivateDirectoryIdentity(root, "MCP runtime root");
+  assertPrivateDirectoryIdentity(parent, "MCP runtime parent");
+  assertPrivateDirectoryIdentity(target, "MCP runtime target");
+  return target.realpath;
 }
 
 function safeBaseEnvironment(source, options = {}) {
-  const runtimeHome = ensurePrivateDirectory(path.resolve(options.runtimeHome || mcpRuntimeHome(null, options.serverIdentity)));
+  const home = ensurePrivateDirectoryInfo(path.resolve(options.runtimeHome || mcpRuntimeHome(null, options.serverIdentity)));
+  const runtimeHome = home.realpath;
   const result = {};
   for (const key of SAFE_BASE_ENV_KEYS) {
     const value = findEnvValue(source, key);
@@ -100,15 +154,22 @@ function safeBaseEnvironment(source, options = {}) {
   }
   // Never expose the user's real home through the environment. MCPs that need
   // credentials must use their declared registry key, not ambient dotfiles.
-  const runtimeTmp = ensurePrivateDirectory(path.join(runtimeHome, "tmp"));
-  result.HOME = runtimeHome;
+  // Anchor HOME before creating TMP so a target/parent swap cannot redirect
+  // the mkdir through a successor symlink.
+  assertPrivateDirectoryIdentity(home, "MCP runtime home");
+  const runtimeTmpInfo = ensurePrivateDirectoryInfo(path.join(runtimeHome, "tmp"));
+  assertPrivateDirectoryIdentity(home, "MCP runtime home");
+  const runtimeTmp = assertPrivateDirectoryIdentity(runtimeTmpInfo, "MCP runtime tmp").realpath;
+  if (!samePath(path.dirname(runtimeTmp), runtimeHome)) throw new Error("MCP runtime tmp escaped its private home");
+  const canonicalHome = assertPrivateDirectoryIdentity(home, "MCP runtime home").realpath;
+  result.HOME = canonicalHome;
   result.TMPDIR = runtimeTmp;
   result.TMP = runtimeTmp;
   result.TEMP = runtimeTmp;
   if (process.platform === "win32") {
-    result.USERPROFILE = runtimeHome;
-    result.HOMEDRIVE = path.parse(runtimeHome).root.replace(/[\\/]$/, "") || "C:";
-    result.HOMEPATH = runtimeHome.slice(result.HOMEDRIVE.length) || "\\";
+    result.USERPROFILE = canonicalHome;
+    result.HOMEDRIVE = path.parse(canonicalHome).root.replace(/[\\/]$/, "") || "C:";
+    result.HOMEPATH = canonicalHome.slice(result.HOMEDRIVE.length) || "\\";
   }
   return result;
 }

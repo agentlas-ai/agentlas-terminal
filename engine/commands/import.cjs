@@ -4,11 +4,12 @@ const { importLocalFolder } = require("../agents/import-local.cjs");
 
 function run(ctx, args) {
   const ko = ctx.lang === "ko";
-  const absPath = args[0];
-  if (!absPath) {
-    ctx.err(ko ? "사용법: agentlas import <폴더-경로>" : "Usage: agentlas import <folder-path>");
-    return 1;
+  if (args.length !== 1) {
+    const error = new Error(ko ? "사용법: agentlas import <폴더-경로>" : "Usage: agentlas import <folder-path>");
+    error.code = "INVALID_ARGUMENT";
+    throw error;
   }
+  const absPath = args[0];
   let r;
   try {
     r = importLocalFolder(ctx.db(), absPath);

@@ -8,6 +8,10 @@ function run(ctx, args) {
   const sub = String(args[0] || "help");
   const query = args[1];
   if (sub === "help" || sub === "--help" || sub === "-h") {
+    if (args.length > 1) {
+      ctx.err(ko ? "사용법: agentlas native help" : "usage: agentlas native help");
+      return 1;
+    }
     // SELF_HELP_COMMANDS 계약: --help 는 스텁이 아니라 실제 안내여야 한다 —
     // 무엇이 만들어지고 언제 필요한지까지 말한다.
     ctx.out(ko
@@ -29,7 +33,7 @@ function run(ctx, args) {
       ].join("\n"));
     return 0;
   }
-  if (sub !== "prepare" || !query) {
+  if (sub !== "prepare" || !query || args.length !== 2) {
     ctx.err(ko ? "사용법: agentlas native prepare <에이전트>" : "usage: agentlas native prepare <agent>");
     return 1;
   }

@@ -20,16 +20,34 @@ const { userDataDir } = require("../core/paths.cjs");
 const { runWriteTransaction } = require("../agentlas-sqlite-policy.cjs");
 
 const TELEGRAM_REQUEST_TIMEOUT_MS = 20_000;
+const TELEGRAM_TOKEN_MAX_BYTES = 1024;
+const TELEGRAM_BINDING_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function assertTelegramBindingId(id) {
+  const value = String(id || "");
+  if (!TELEGRAM_BINDING_ID_RE.test(value)) throw new Error("invalid Telegram binding id");
+  return value;
+}
 
 /** 순수 HTTPS. fetch 주입 가능(테스트). */
 async function telegramApi(token, method, payload, { fetchImpl } = {}) {
   const doFetch = fetchImpl || globalThis.fetch;
   if (typeof doFetch !== "function") throw new Error("this runtime has no fetch");
-  const longPoll = method === "getUpdates" && typeof payload.timeout === "number" ? Math.max(0, payload.timeout) : 0;
+  const safeToken = String(token || "");
+  const safeMethod = String(method || "");
+  if (!safeToken || Buffer.byteLength(safeToken, "utf8") > TELEGRAM_TOKEN_MAX_BYTES || !/^[A-Za-z0-9:_-]+$/.test(safeToken)) {
+    throw new Error("Telegram bot token has an unsafe format");
+  }
+  if (!/^[A-Za-z][A-Za-z0-9]{0,63}$/.test(safeMethod)) throw new Error("Telegram API method is invalid");
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("Telegram API payload must be an object");
+  const requestedLongPoll = safeMethod === "getUpdates" && Number.isFinite(Number(payload.timeout))
+    ? Number(payload.timeout)
+    : 0;
+  const longPoll = Math.max(0, Math.min(50, requestedLongPoll));
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error(`Telegram ${method} timed out`)), TELEGRAM_REQUEST_TIMEOUT_MS + longPoll * 1000);
+  const timer = setTimeout(() => controller.abort(new Error(`Telegram ${safeMethod} timed out`)), TELEGRAM_REQUEST_TIMEOUT_MS + longPoll * 1000);
   try {
-    const res = await doFetch(`https://api.telegram.org/bot${token}/${method}`, {
+    const res = await doFetch(`https://api.telegram.org/bot${safeToken}/${safeMethod}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
@@ -37,7 +55,11 @@ async function telegramApi(token, method, payload, { fetchImpl } = {}) {
     });
     const json = await res.json().catch(() => null);
     if (!res.ok || !json || json.ok !== true) {
-      throw new Error((json && json.description) || `Telegram ${method} failed (${res.status})`);
+      const raw = (json && json.description) || `Telegram ${safeMethod} failed (${res.status})`;
+      const message = String(raw).replaceAll(safeToken, "[redacted]").replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 1000);
+      const error = new Error(message || `Telegram ${safeMethod} failed`);
+      error.telegramStatus = Number(res.status) || null;
+      throw error;
     }
     return json.result;
   } finally {
@@ -52,23 +74,123 @@ async function verifyBotToken(token, opts) {
 }
 
 // ── 토큰 비밀 저장 (0600 파일) ─────────────────────────────────────────────
-function tokenDir() {
+function tokenDir({ create = true } = {}) {
   const dir = path.join(userDataDir(), "telegram");
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (create) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  let stat;
+  try { stat = fs.lstatSync(dir); }
+  catch (error) {
+    if (error && error.code === "ENOENT" && !create) return dir;
+    throw error;
+  }
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Telegram token directory must be a real directory");
   if (process.platform !== "win32") fs.chmodSync(dir, 0o700);
   return dir;
 }
-function tokenFile(id) { return path.join(tokenDir(), `${id}.token`); }
+function tokenFile(id, options) {
+  const bindingId = assertTelegramBindingId(id);
+  return path.join(tokenDir(options), `${bindingId}.token`);
+}
 function saveToken(id, token) {
   const file = tokenFile(id);
-  fs.writeFileSync(file, token, { encoding: "utf8", mode: 0o600 });
-  if (process.platform !== "win32") fs.chmodSync(file, 0o600);
+  const value = String(token || "");
+  if (!value || Buffer.byteLength(value, "utf8") > TELEGRAM_TOKEN_MAX_BYTES || !/^[A-Za-z0-9:_-]+$/.test(value)) {
+    throw new Error("Telegram bot token has an unsafe format");
+  }
+  let before = null;
+  try {
+    before = fs.lstatSync(file);
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1) throw new Error("Telegram token target must be a regular private file");
+  } catch (error) {
+    if (!error || error.code !== "ENOENT") throw error;
+  }
+  const temp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${crypto.randomUUID()}.tmp`);
+  try {
+    fs.writeFileSync(temp, value, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    if (before) {
+      const current = fs.lstatSync(file);
+      if (
+        !current.isFile() || current.isSymbolicLink() || current.nlink !== 1 ||
+        current.dev !== before.dev || current.ino !== before.ino || current.size !== before.size || current.mtimeMs !== before.mtimeMs
+      ) throw new Error("Telegram token target changed before replacement");
+    } else {
+      try {
+        fs.lstatSync(file);
+        throw new Error("Telegram token target appeared before replacement");
+      } catch (error) {
+        if (!error || error.code !== "ENOENT") throw error;
+      }
+    }
+    try {
+      fs.renameSync(temp, file);
+    } catch (error) {
+      if (
+        process.platform !== "win32" || !before ||
+        !["EEXIST", "EPERM", "EACCES"].includes(error && error.code)
+      ) throw error;
+      const backup = `${file}.${process.pid}.${crypto.randomUUID()}.bak`;
+      fs.renameSync(file, backup);
+      try {
+        fs.renameSync(temp, file);
+      } catch (replaceError) {
+        try { if (!fs.existsSync(file)) fs.renameSync(backup, file); } catch { /* leave recoverable backup */ }
+        throw replaceError;
+      }
+      try { fs.rmSync(backup, { force: true }); } catch { /* committed target is authoritative */ }
+    }
+    if (process.platform !== "win32") fs.chmodSync(file, 0o600);
+  } finally {
+    try { fs.rmSync(temp, { force: true }); } catch { /* best-effort cleanup */ }
+  }
 }
 function readToken(id) {
-  try { return fs.readFileSync(tokenFile(id), "utf8").trim() || null; } catch { return null; }
+  const file = tokenFile(id, { create: false });
+  let fd;
+  try {
+    const before = fs.lstatSync(file);
+    if (
+      !before.isFile() || before.isSymbolicLink() || before.nlink !== 1 ||
+      before.size <= 0 || before.size > TELEGRAM_TOKEN_MAX_BYTES ||
+      (process.platform !== "win32" && (before.mode & 0o077) !== 0)
+    ) throw new Error("Telegram token file is unsafe");
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== before.size) {
+      throw new Error("Telegram token file changed while opening");
+    }
+    const token = fs.readFileSync(fd, "utf8").trim();
+    if (!token || !/^[A-Za-z0-9:_-]+$/.test(token)) throw new Error("Telegram token file has an unsafe format");
+    return token;
+  } catch (error) {
+    if (error && error.code === "ENOENT") return null;
+    throw error;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
 }
-function deleteToken(id) { try { fs.rmSync(tokenFile(id)); } catch { /* gone */ } }
+function deleteToken(id) {
+  const file = tokenFile(id, { create: false });
+  try {
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw new Error("Telegram token target is unsafe");
+    fs.unlinkSync(file);
+    return true;
+  } catch (error) {
+    if (error && error.code === "ENOENT") return false;
+    throw error;
+  }
+}
 function tokenFingerprint(token) { return crypto.createHash("sha256").update(token).digest("hex").slice(0, 24); }
+
+function readBindingToken(row) {
+  if (!row) throw new Error("binding not found");
+  const token = readToken(row.id);
+  if (!token) throw new Error("no Terminal-owned token for this binding");
+  if (row.token_fingerprint && tokenFingerprint(token) !== row.token_fingerprint) {
+    throw new Error("stored Telegram token does not match the binding fingerprint");
+  }
+  return token;
+}
 
 // ── 바인딩 ─────────────────────────────────────────────────────────────────
 function listBindings(db) {
@@ -80,6 +202,10 @@ function getBinding(db, id) {
 
 /** 봇 토큰으로 바인딩을 만든다(방 미페어링). 반환: {id, botUsername}. */
 async function startConnection(db, targetKind, targetId, token, opts) {
+  if (!new Set(["agent", "firm", "one"]).has(String(targetKind))) throw new Error("invalid Telegram binding target kind");
+  if (typeof targetId !== "string" || !targetId.trim() || targetId.length > 512 || /[\u0000\r\n]/.test(targetId)) {
+    throw new Error("invalid Telegram binding target id");
+  }
   const me = await verifyBotToken(token, opts);
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
@@ -95,7 +221,7 @@ async function startConnection(db, targetKind, targetId, token, opts) {
       db.prepare("UPDATE telegram_bindings SET token_saved=1, updated_at=? WHERE id=?").run(new Date().toISOString(), id);
     });
   } catch (error) {
-    deleteToken(id);
+    try { deleteToken(id); } catch { /* preserve the original storage failure */ }
     try {
       runWriteTransaction(db, () => db.prepare("DELETE FROM telegram_bindings WHERE id=?").run(id));
     } catch { /* preserve the original storage failure */ }
@@ -113,16 +239,26 @@ async function startConnection(db, targetKind, targetId, token, opts) {
  * 두 Terminal 프로세스가 같은 바인딩을 동시에 덮어쓰지 못하게 한다.
  */
 async function pairByPolling(db, id, { timeoutMs = 120_000, opts, onWait } = {}) {
-  const token = readToken(id);
-  if (!token) throw new Error("no stored token for this binding");
+  assertTelegramBindingId(id);
+  const initialRow = getBinding(db, id);
+  if (!initialRow) throw new Error("binding not found");
+  const token = readBindingToken(initialRow);
   const deadline = Date.now() + timeoutMs;
-  let offset = (getBinding(db, id) || {}).last_update_id || 0;
+  let offset = Number.isSafeInteger(Number(initialRow.last_update_id)) && Number(initialRow.last_update_id) >= 0
+    ? Number(initialRow.last_update_id)
+    : 0;
+  let lastApiError = null;
   while (Date.now() < deadline) {
     if (typeof onWait === "function") onWait();
     let updates;
     try {
       updates = await telegramApi(token, "getUpdates", { offset: offset + 1, timeout: 25, allowed_updates: ["message"] }, opts);
-    } catch { updates = []; }
+      if (!Array.isArray(updates)) throw new Error("Telegram getUpdates returned an invalid result");
+      lastApiError = null;
+    } catch (error) {
+      lastApiError = error;
+      updates = [];
+    }
     for (const update of updates || []) {
       if (typeof update.update_id === "number") offset = Math.max(offset, update.update_id);
       const message = update.message;
@@ -150,25 +286,52 @@ async function pairByPolling(db, id, { timeoutMs = 120_000, opts, onWait } = {})
       });
     }
   }
+  if (lastApiError) throw lastApiError;
   return null;
 }
 
 /** 페어링된 방에 확인 메시지를 보낸다. */
 async function sendTest(db, id, text, opts) {
+  assertTelegramBindingId(id);
   const row = getBinding(db, id);
   if (!row) throw new Error("binding not found");
   if (!row.telegram_chat_id) throw new Error("this binding is not paired to a chat yet");
-  const token = readToken(id);
-  if (!token) throw new Error("no stored token for this binding");
+  const token = readBindingToken(row);
   await telegramApi(token, "sendMessage", { chat_id: row.telegram_chat_id, text }, opts);
   return true;
 }
 
 function removeBinding(db, id) {
-  runWriteTransaction(db, () => {
-    db.prepare("DELETE FROM telegram_bindings WHERE id=?").run(id);
-  });
-  deleteToken(id);
+  const bindingId = assertTelegramBindingId(id);
+  const row = getBinding(db, bindingId);
+  if (!row) throw new Error("binding not found");
+  const file = tokenFile(bindingId, { create: false });
+  let tokenExists = false;
+  try {
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw new Error("Telegram token target is unsafe");
+    tokenExists = true;
+  } catch (error) {
+    if (!error || error.code !== "ENOENT") throw error;
+  }
+  if (Number(row.token_saved) === 1 && !tokenExists) {
+    throw new Error("this binding secret is not Terminal-owned; remove it from Agentlas Desktop so its keychain secret is cleaned up");
+  }
+  const tombstone = `${file}.${process.pid}.${crypto.randomUUID()}.delete`;
+  if (tokenExists) fs.renameSync(file, tombstone);
+  try {
+    const removed = runWriteTransaction(db, () => {
+      return db.prepare("DELETE FROM telegram_bindings WHERE id=?").run(bindingId).changes === 1;
+    });
+    if (!removed) throw new Error("binding disappeared before removal");
+  } catch (error) {
+    if (tokenExists) {
+      try { if (!fs.existsSync(file)) fs.renameSync(tombstone, file); } catch { /* leave recoverable tombstone */ }
+    }
+    throw error;
+  }
+  if (tokenExists) fs.unlinkSync(tombstone);
+  return true;
 }
 
 /*

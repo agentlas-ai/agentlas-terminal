@@ -32,6 +32,7 @@ const CONFIDENCE_LEVELS = new Set(["high", "medium", "low"]);
 
 const { SECRET_PATTERNS } = require("./agentlas-secret-patterns.cjs");
 const { runWriteTransaction } = require("./agentlas-sqlite-policy.cjs");
+const permissions = require("./agentlas-permissions.cjs");
 const ABSOLUTE_PATH_PATTERNS = [
   /(?:^|[\s("'`])~\/[A-Za-z0-9._-]/,
   /(?:^|[\s("'`])\/(?:Users|home|private|var|tmp|opt|etc|Volumes|Applications|System|Library)\//,
@@ -67,7 +68,7 @@ function stableJson(value) {
 }
 
 function normalizePermission(value) {
-  return ["read", "write", "full"].includes(value) ? value : "write";
+  return permissions.normalize(value, "read");
 }
 
 function projectKey(projectPath) {

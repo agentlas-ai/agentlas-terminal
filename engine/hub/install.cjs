@@ -39,6 +39,12 @@ const CLOUD_PACKAGE_HASH_V2 = "path-sha256-executable-v2";
 const CLOUD_RESTORE_MARKER_PATH = ".agentlas-cloud-package.json";
 const CLOUD_ASSET_SCOPES = new Set(["owner-private", "hub-public"]);
 const CLOUD_LOCAL_EXPERIENCE_LINEAGE_PATH = ".agentlas/experience-relations.jsonl";
+const CLOUD_INSTALL_JOURNAL_MAX_BYTES = 128 * 1024;
+const CLOUD_INSTALL_DB_EXPECTED_KEYS = new Set([
+  "id", "slug", "name", "name_en", "tagline", "tagline_en", "system_prompt",
+  "mcp_servers_json", "env_requirements_json", "preferred_backend", "trust_grade",
+  "installed_at", "tone", "visibility",
+]);
 
 function sha(value) {
   return crypto.createHash("sha256").update(value).digest("hex");
@@ -221,16 +227,48 @@ function normalizeCloudAssetDescriptor(value, label = "cloud asset descriptor") 
 // ── 파일 모드 강제 (restore 스냅샷은 소유자 전용) ──
 function cloudApplyPrivateDirectoryMode(directoryPath, platform = process.platform) {
   if (platform === "win32") return;
+  const before = fs.lstatSync(directoryPath);
+  if (!before.isDirectory() || before.isSymbolicLink()) {
+    throw new Error(`cloud restore directory is unsafe: ${directoryPath}`);
+  }
   fs.chmodSync(directoryPath, 0o700);
-  const actual = fs.statSync(directoryPath).mode & 0o777;
-  if (actual !== 0o700) throw new Error(`cloud restore directory mode verification failed: ${directoryPath}`);
+  const after = fs.lstatSync(directoryPath);
+  if (
+    !after.isDirectory() || after.isSymbolicLink() ||
+    after.dev !== before.dev || after.ino !== before.ino ||
+    (after.mode & 0o777) !== 0o700
+  ) throw new Error(`cloud restore directory mode verification failed: ${directoryPath}`);
 }
 
 function cloudApplyPortableFileMode(filePath, mode, platform = process.platform) {
   if (platform === "win32") return;
+  const before = fs.lstatSync(filePath);
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1) {
+    throw new Error(`cloud restore file is unsafe: ${filePath}`);
+  }
   fs.chmodSync(filePath, mode);
-  const actual = fs.statSync(filePath).mode & 0o777;
-  if (actual !== mode) throw new Error(`cloud restore file mode verification failed: ${filePath}`);
+  const after = fs.lstatSync(filePath);
+  if (
+    !after.isFile() || after.isSymbolicLink() || after.nlink !== 1 ||
+    after.dev !== before.dev || after.ino !== before.ino ||
+    (after.mode & 0o777) !== mode
+  ) throw new Error(`cloud restore file mode verification failed: ${filePath}`);
+}
+
+function cloudEnsurePrivateSubdirectory(root, directory) {
+  const relative = path.relative(root, directory);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error("cloud restore subdirectory escapes staging");
+  }
+  let current = root;
+  cloudManagedDirectoryState(root, "cloud restore staging", { allowMissing: false });
+  for (const part of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, part);
+    try { fs.mkdirSync(current, { recursive: false, mode: 0o700 }); }
+    catch (error) { if (!error || error.code !== "EEXIST") throw error; }
+    cloudManagedDirectoryState(current, "cloud restore package directory", { allowMissing: false });
+    cloudApplyPrivateDirectoryMode(current);
+  }
 }
 
 // ── 스테이징 스냅샷 전수 검증 (심링크/특수 엔트리/모드/무결성) ──
@@ -309,10 +347,107 @@ function resolveCloudInstallPath(root, relPath) {
 }
 
 // ── 설치 저널 (crash-recovery 계약) ──
+function cloudInstallLayout(slug, { createParent = false } = {}) {
+  if (typeof slug !== "string" || cloudSlug(slug) !== slug) {
+    throw new Error(`invalid cloud install slug: ${String(slug || "")}`);
+  }
+  const dataRoot = userDataDir();
+  if (createParent) fs.mkdirSync(dataRoot, { recursive: true, mode: 0o700 });
+  else if (!fs.existsSync(dataRoot)) return null;
+  if (!fs.statSync(dataRoot).isDirectory()) throw new Error("cloud install user data root is unsafe");
+  const realDataRoot = fs.realpathSync.native(dataRoot);
+  const parent = path.join(dataRoot, "cloud-agent-installs");
+  if (createParent) fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+  else if (!fs.existsSync(parent)) return null;
+  const parentStat = fs.lstatSync(parent);
+  if (
+    !parentStat.isDirectory() || parentStat.isSymbolicLink() ||
+    fs.realpathSync.native(parent) !== path.join(realDataRoot, "cloud-agent-installs")
+  ) {
+    throw new Error("cloud install root is unsafe");
+  }
+  cloudApplyPrivateDirectoryMode(parent);
+  const destination = path.join(parent, slug);
+  return {
+    parent,
+    destination,
+    journalPath: path.join(parent, `.${slug}.install-journal.json`),
+  };
+}
+
+function cloudManagedDirectoryState(target, label, { allowMissing = true } = {}) {
+  let stat;
+  try { stat = fs.lstatSync(target); } catch (error) {
+    if (allowMissing && error && error.code === "ENOENT") return null;
+    throw error;
+  }
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error(`${label} is not a safe managed directory`);
+  }
+  return stat;
+}
+
+function cloudRemoveManagedDirectory(target, label) {
+  if (!cloudManagedDirectoryState(target, label)) return false;
+  fs.rmSync(target, { recursive: true, force: false });
+  return true;
+}
+
+function cloudRenameManagedDirectory(source, destination, label) {
+  cloudManagedDirectoryState(source, `${label} source`, { allowMissing: false });
+  if (cloudManagedDirectoryState(destination, `${label} destination`)) {
+    throw new Error(`${label} destination already exists`);
+  }
+  fs.renameSync(source, destination);
+}
+
+function cloudReadInstallJournal(journalPath) {
+  let fd;
+  try {
+    fd = fs.openSync(journalPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const listed = fs.lstatSync(journalPath);
+    const before = fs.fstatSync(fd);
+    if (
+      !listed.isFile() || listed.isSymbolicLink() || listed.nlink !== 1 ||
+      !before.isFile() || before.nlink !== 1 ||
+      listed.dev !== before.dev || listed.ino !== before.ino ||
+      before.size <= 0 || before.size > CLOUD_INSTALL_JOURNAL_MAX_BYTES
+    ) {
+      throw new Error("journal is not a bounded private file");
+    }
+    const raw = fs.readFileSync(fd, "utf8");
+    const after = fs.fstatSync(fd);
+    const current = fs.lstatSync(journalPath);
+    if (
+      Buffer.byteLength(raw, "utf8") !== before.size ||
+      after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size ||
+      after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs ||
+      current.dev !== before.dev || current.ino !== before.ino || current.nlink !== 1
+    ) {
+      throw new Error("journal changed while it was read");
+    }
+    return JSON.parse(raw);
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch { /* best effort */ }
+  }
+}
+
+function cloudUnlinkInstallJournal(journalPath) {
+  const stat = fs.lstatSync(journalPath);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+    throw new Error("cloud install recovery journal is unsafe");
+  }
+  fs.unlinkSync(journalPath);
+}
+
 function writeCloudInstallJournal(journalPath, value) {
-  fs.mkdirSync(path.dirname(journalPath), { recursive: true, mode: 0o700 });
+  const match = path.basename(journalPath).match(/^\.([a-z0-9][a-z0-9-]{0,63})\.install-journal\.json$/);
+  const layout = match ? cloudInstallLayout(match[1], { createParent: true }) : null;
+  if (!layout || path.resolve(journalPath) !== path.resolve(layout.journalPath)) {
+    throw new Error("cloud install recovery journal path is unsafe");
+  }
   const temp = `${journalPath}.tmp-${process.pid}-${crypto.randomBytes(4).toString("hex")}`;
-  const fd = fs.openSync(temp, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+  const fd = fs.openSync(temp, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0), 0o600);
   try {
     fs.writeFileSync(fd, JSON.stringify(value, null, 2) + "\n", "utf8");
     fs.fsyncSync(fd);
@@ -320,7 +455,10 @@ function writeCloudInstallJournal(journalPath, value) {
     fs.closeSync(fd);
   }
   fs.renameSync(temp, journalPath);
-  cloudApplyPortableFileMode(journalPath, 0o600);
+  const written = fs.lstatSync(journalPath);
+  if (!written.isFile() || written.isSymbolicLink() || written.nlink !== 1) {
+    throw new Error("cloud install recovery journal write was unsafe");
+  }
   cloudFsyncDirectory(path.dirname(journalPath));
 }
 
@@ -335,33 +473,47 @@ function cloudFsyncDirectory(directory) {
 }
 
 function rollbackCloudInstallSwap({ destination, staging, backup, movedExisting, installed }) {
-  if (installed && fs.existsSync(destination)) fs.rmSync(destination, { recursive: true, force: true });
-  if (movedExisting && fs.existsSync(backup) && !fs.existsSync(destination)) fs.renameSync(backup, destination);
-  if (fs.existsSync(staging)) fs.rmSync(staging, { recursive: true, force: true });
+  if (installed) cloudRemoveManagedDirectory(destination, "cloud install destination");
+  if (movedExisting && cloudManagedDirectoryState(backup, "cloud install backup")) {
+    cloudRenameManagedDirectory(backup, destination, "cloud install rollback");
+  }
+  cloudRemoveManagedDirectory(staging, "cloud install staging");
   cloudFsyncDirectory(path.dirname(destination));
 }
 
 function recoverCloudInstallJournal(db, slug) {
-  const destination = path.join(userDataDir(), "cloud-agent-installs", slug);
-  const parent = path.dirname(destination);
-  const journalPath = path.join(parent, `.${path.basename(destination)}.install-journal.json`);
+  const layout = cloudInstallLayout(slug);
+  if (!layout) return;
+  const { destination, parent, journalPath } = layout;
   if (!fs.existsSync(journalPath)) return;
   let journal;
-  try { journal = JSON.parse(fs.readFileSync(journalPath, "utf8")); } catch { throw new Error(`cloud install recovery journal is unreadable for ${slug}`); }
+  try { journal = cloudReadInstallJournal(journalPath); } catch { throw new Error(`cloud install recovery journal is unreadable for ${slug}`); }
   const safeSibling = (candidate, prefix) =>
-    typeof candidate === "string" && path.dirname(candidate) === parent && path.basename(candidate).startsWith(prefix);
+    typeof candidate === "string" && path.dirname(candidate) === parent &&
+    (path.basename(candidate).match(new RegExp(`^${prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:[0-9]+-[0-9]+-[a-f0-9]{8}|fixture|crash)$`)) !== null);
+  const expected = journal && journal.dbExpected;
+  const expectedEntries = expected && typeof expected === "object" && !Array.isArray(expected)
+    ? Object.entries(expected)
+    : [];
   if (
     journal.schemaVersion !== 1 || journal.slug !== slug || journal.destination !== destination ||
     !["prepared", "disk-swapped-db-pending", "db-committed"].includes(journal.phase) ||
     typeof journal.hadExisting !== "boolean" ||
     !safeSibling(journal.staging, `.${path.basename(destination)}.installing-`) ||
-    !safeSibling(journal.backup, `.${path.basename(destination)}.backup-`)
+    !safeSibling(journal.backup, `.${path.basename(destination)}.backup-`) ||
+    expectedEntries.length === 0 || expectedEntries.length > 32 ||
+    expectedEntries.some(([key, value]) =>
+      !CLOUD_INSTALL_DB_EXPECTED_KEYS.has(key) ||
+      (!["string", "number", "boolean"].includes(typeof value) && value !== null) ||
+      (typeof value === "string" && value.length > 256 * 1024)
+    )
   ) {
     throw new Error(`cloud install recovery journal is invalid for ${slug}`);
   }
+  cloudManagedDirectoryState(destination, "cloud install destination");
+  cloudManagedDirectoryState(journal.staging, "cloud install staging");
+  cloudManagedDirectoryState(journal.backup, "cloud install backup");
   const row = db.prepare("SELECT * FROM installed_agents WHERE slug=?").get(slug);
-  const expected = journal.dbExpected && typeof journal.dbExpected === "object" ? journal.dbExpected : {};
-  const expectedEntries = Object.entries(expected);
   const dbMatches = Boolean(row) && expectedEntries.length > 0 && expectedEntries.every(
     ([key, value]) => String(row[key] ?? "") === String(value ?? ""),
   );
@@ -370,27 +522,29 @@ function recoverCloudInstallJournal(db, slug) {
     // prepared journal always represents the pre-DB state. Cover both rename
     // crash windows: old→backup and staging→destination.
     if (journal.hadExisting) {
-      if (fs.existsSync(journal.backup)) {
-        if (fs.existsSync(destination)) fs.rmSync(destination, { recursive: true, force: true });
-        fs.renameSync(journal.backup, destination);
-      } else if (!fs.existsSync(destination)) {
+      if (cloudManagedDirectoryState(journal.backup, "cloud install backup")) {
+        cloudRemoveManagedDirectory(destination, "cloud install destination");
+        cloudRenameManagedDirectory(journal.backup, destination, "cloud install prepared rollback");
+      } else if (!cloudManagedDirectoryState(destination, "cloud install destination")) {
         throw new Error(`prepared cloud install lost both destination and backup for ${slug}`);
       }
     } else {
-      if (fs.existsSync(journal.backup)) {
+      if (cloudManagedDirectoryState(journal.backup, "cloud install backup")) {
         throw new Error(`prepared first cloud install has an unexpected backup for ${slug}`);
       }
-      if (fs.existsSync(destination)) fs.rmSync(destination, { recursive: true, force: true });
+      cloudRemoveManagedDirectory(destination, "cloud install destination");
     }
-    if (fs.existsSync(journal.staging)) fs.rmSync(journal.staging, { recursive: true, force: true });
-  } else if (journal.phase === "db-committed" || dbMatches) {
-    if (!fs.existsSync(destination) && fs.existsSync(journal.staging)) fs.renameSync(journal.staging, destination);
-    if (!fs.existsSync(destination)) throw new Error(`committed cloud install is missing for ${slug}`);
-    if (fs.existsSync(journal.backup)) fs.rmSync(journal.backup, { recursive: true, force: true });
-    if (fs.existsSync(journal.staging)) fs.rmSync(journal.staging, { recursive: true, force: true });
-  } else if (journal.phase === "disk-swapped-db-pending") {
-    if (!fs.existsSync(destination)) throw new Error(`pending cloud install destination is missing for ${slug}`);
-    if (journal.hadExisting !== fs.existsSync(journal.backup)) {
+    cloudRemoveManagedDirectory(journal.staging, "cloud install staging");
+  } else if (dbMatches) {
+    if (!cloudManagedDirectoryState(destination, "cloud install destination") && cloudManagedDirectoryState(journal.staging, "cloud install staging")) {
+      cloudRenameManagedDirectory(journal.staging, destination, "cloud install committed recovery");
+    }
+    if (!cloudManagedDirectoryState(destination, "cloud install destination")) throw new Error(`committed cloud install is missing for ${slug}`);
+    cloudRemoveManagedDirectory(journal.backup, "cloud install backup");
+    cloudRemoveManagedDirectory(journal.staging, "cloud install staging");
+  } else if (journal.phase === "disk-swapped-db-pending" || journal.phase === "db-committed") {
+    if (!cloudManagedDirectoryState(destination, "cloud install destination")) throw new Error(`pending cloud install destination is missing for ${slug}`);
+    if (journal.hadExisting !== Boolean(cloudManagedDirectoryState(journal.backup, "cloud install backup"))) {
       throw new Error(`pending cloud install backup state is invalid for ${slug}`);
     }
     rollbackCloudInstallSwap({
@@ -401,13 +555,14 @@ function recoverCloudInstallJournal(db, slug) {
       installed: true,
     });
   }
-  fs.unlinkSync(journalPath);
+  cloudUnlinkInstallJournal(journalPath);
   cloudFsyncDirectory(parent);
 }
 
 function recoverCloudInstallJournals(db) {
-  const parent = path.join(userDataDir(), "cloud-agent-installs");
-  if (!fs.existsSync(parent)) return 0;
+  const layout = cloudInstallLayout("recovery-sweep");
+  if (!layout) return 0;
+  const { parent } = layout;
   let recovered = 0;
   for (const entry of fs.readdirSync(parent, { withFileTypes: true })) {
     if (!entry.name.endsWith(".install-journal.json")) continue;
@@ -503,13 +658,11 @@ function materializeCloudListing(agentId, slug, listing, options = {}) {
   if (assetDescriptor && assetDescriptor.slug !== slug) throw new Error("restore asset descriptor slug mismatch");
   const pathConflict = cloudPortablePathConflict(pkg.files.map((file) => file && file.path));
   if (pathConflict) throw new Error(pathConflict.message);
-  const dir = path.join(userDataDir(), "cloud-agent-installs", slug);
-  const parent = path.dirname(dir);
-  fs.mkdirSync(parent, { recursive: true });
+  const layout = cloudInstallLayout(slug, { createParent: true });
+  const { destination: dir, parent, journalPath: journal } = layout;
   const nonce = `${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
   const staging = path.join(parent, `.${path.basename(dir)}.installing-${nonce}`);
   const backup = path.join(parent, `.${path.basename(dir)}.backup-${nonce}`);
-  const journal = path.join(parent, `.${path.basename(dir)}.install-journal.json`);
   const seen = new Set();
   const verifiedFiles = [];
   let verifiedTotalBytes = 0;
@@ -547,11 +700,20 @@ function materializeCloudListing(agentId, slug, listing, options = {}) {
       });
       verifiedTotalBytes += bytes.length;
       if (verifiedTotalBytes > CLOUD_MAX_TOTAL_BYTES) throw new Error("cloud package exceeds total byte limit");
-      fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
-      cloudApplyPrivateDirectoryMode(path.dirname(target));
+      cloudEnsurePrivateSubdirectory(staging, path.dirname(target));
       const mode = packageHashVersion === CLOUD_PACKAGE_HASH_V2 && file.executable ? 0o700 : 0o600;
-      fs.writeFileSync(target, bytes, { mode });
-      cloudApplyPortableFileMode(target, mode);
+      const fileFd = fs.openSync(
+        target,
+        fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0),
+        mode,
+      );
+      try {
+        fs.writeFileSync(fileFd, bytes);
+        if (process.platform !== "win32") fs.fchmodSync(fileFd, mode);
+        fs.fsyncSync(fileFd);
+      } finally {
+        fs.closeSync(fileFd);
+      }
     }
     const expectedPackageHash = String(pkg.packageHash || "").toLowerCase().replace(/^sha256:/, "");
     if (!/^[a-f0-9]{64}$/.test(expectedPackageHash)) {
@@ -569,9 +731,14 @@ function materializeCloudListing(agentId, slug, listing, options = {}) {
     }
     if (verifiedTotalBytes !== pkg.totalBytes) throw new Error("cloud package total byte count does not match its files");
     const restoredAt = new Date().toISOString();
-    fs.writeFileSync(
-      path.join(staging, ".agentlas-cloud-package.json"),
-      JSON.stringify({
+    const markerPath = path.join(staging, CLOUD_RESTORE_MARKER_PATH);
+    const markerFd = fs.openSync(
+      markerPath,
+      fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0),
+      0o600,
+    );
+    try {
+      fs.writeFileSync(markerFd, JSON.stringify({
         schemaVersion: 1,
         source: "agentlas-cloud",
         slug,
@@ -591,10 +758,12 @@ function materializeCloudListing(agentId, slug, listing, options = {}) {
           cloudAssets: { [assetDescriptor.scope]: assetDescriptor },
         } : {}),
         restoredAt,
-      }, null, 2) + "\n",
-      { encoding: "utf8", mode: 0o600 },
-    );
-    cloudApplyPortableFileMode(path.join(staging, CLOUD_RESTORE_MARKER_PATH), 0o600);
+      }, null, 2) + "\n", "utf8");
+      if (process.platform !== "win32") fs.fchmodSync(markerFd, 0o600);
+      fs.fsyncSync(markerFd);
+    } finally {
+      fs.closeSync(markerFd);
+    }
     cloudVerifyRestoredSnapshot(staging, verifiedFiles, {
       slug,
       packageHash: expectedPackageHash,
@@ -611,18 +780,18 @@ function materializeCloudListing(agentId, slug, listing, options = {}) {
         destination: dir,
         staging,
         backup,
-        hadExisting: fs.existsSync(dir),
+        hadExisting: Boolean(cloudManagedDirectoryState(dir, "cloud install destination")),
         dbExpected: options.dbExpected || {},
       });
     }
 
     // A Cloud agent is an immutable asset snapshot. Replace the managed install
     // as a whole so removed files and local mutations cannot leak across versions.
-    if (fs.existsSync(dir)) {
-      fs.renameSync(dir, backup);
+    if (cloudManagedDirectoryState(dir, "cloud install destination")) {
+      cloudRenameManagedDirectory(dir, backup, "cloud install snapshot swap");
       movedExisting = true;
     }
-    fs.renameSync(staging, dir);
+    cloudRenameManagedDirectory(staging, dir, "cloud install staging swap");
     cloudFsyncDirectory(parent);
     installed = true;
     if (options.deferCommit) {
@@ -639,11 +808,11 @@ function materializeCloudListing(agentId, slug, listing, options = {}) {
     }
   } catch (error) {
     rollbackCloudInstallSwap({ destination: dir, staging, backup, movedExisting, installed });
-    try { if (fs.existsSync(journal)) fs.unlinkSync(journal); } catch { /* best-effort */ }
+    try { if (fs.existsSync(journal)) cloudUnlinkInstallJournal(journal); } catch { /* best-effort */ }
     throw error;
   } finally {
-    try { if (fs.existsSync(staging)) fs.rmSync(staging, { recursive: true, force: true }); } catch { /* best-effort */ }
-    try { if (!options.deferCommit && installed && fs.existsSync(backup)) fs.rmSync(backup, { recursive: true, force: true }); } catch { /* best-effort */ }
+    try { cloudRemoveManagedDirectory(staging, "cloud install staging"); } catch { /* best-effort */ }
+    try { if (!options.deferCommit && installed) cloudRemoveManagedDirectory(backup, "cloud install backup"); } catch { /* best-effort */ }
   }
   if (!options.deferCommit) return dir;
   let settled = false;
@@ -661,15 +830,15 @@ function materializeCloudListing(agentId, slug, listing, options = {}) {
         hadExisting: movedExisting,
         dbExpected: options.dbExpected || {},
       });
-      if (fs.existsSync(backup)) fs.rmSync(backup, { recursive: true, force: true });
-      if (fs.existsSync(journal)) fs.unlinkSync(journal);
+      cloudRemoveManagedDirectory(backup, "cloud install backup");
+      if (fs.existsSync(journal)) cloudUnlinkInstallJournal(journal);
       cloudFsyncDirectory(parent);
       settled = true;
     },
     rollback() {
       if (settled) return;
       rollbackCloudInstallSwap({ destination: dir, staging, backup, movedExisting, installed });
-      if (fs.existsSync(journal)) fs.unlinkSync(journal);
+      if (fs.existsSync(journal)) cloudUnlinkInstallJournal(journal);
       cloudFsyncDirectory(parent);
       settled = true;
     },

@@ -171,7 +171,14 @@ function main() {
     const code = commands.SELF_HELP_COMMANDS.has(command)
       ? commands.dispatch(ctx, [command, "help"])
       : require("./commands/help.cjs").runForCommand(ctx, command);
-    process.exit(typeof code === "number" ? code : 0);
+    // Self-owned help may be an async native passthrough (Research is the first
+    // such command). Exiting on the unresolved Promise kills its child before
+    // the help text reaches stdout.
+    Promise.resolve(code).then(
+      (n) => process.exit(typeof n === "number" ? n : 0),
+      (error) => { ctx.fail(error); process.exit(1); },
+    );
+    return;
   }
   // 옵션 정규화: -h/--help/-V/--version 은 하위 명령으로 변환
   const normalized = argv.map((a) => {
@@ -199,7 +206,7 @@ function main() {
     const { startRepl } = require("./ui/repl.cjs");
     return startRepl(ctx).then(
       (replCode) => process.exit(replCode || 0),
-      (e) => { ctx.err(String((e && e.message) || e)); process.exit(1); },
+      (e) => { ctx.fail(e); process.exit(1); },
     );
   }
 
@@ -236,7 +243,7 @@ function main() {
 
   Promise.resolve(code).then(
     (n) => process.exit(typeof n === "number" ? n : 0),
-    (e) => { ctx.err(String((e && e.message) || e)); process.exit(1); },
+    (e) => { ctx.fail(e); process.exit(1); },
   );
 }
 

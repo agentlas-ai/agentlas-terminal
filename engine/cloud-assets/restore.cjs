@@ -30,15 +30,18 @@ async function listOwnedCloudAgents(limit = 100) {
   };
   if (!Array.isArray(result.results)) throw new Error("Agent Cloud list returned an invalid results contract.");
   if (result.results.length) {
-    const stateValue = state.readCloudAssetState();
-    for (const raw of result.results) {
-      const descriptor = normalizeCloudAssetDescriptor(raw, "Agent Cloud list result");
-      const key = state.cloudDescriptorKey(descriptor);
-      const previous = stateValue.assets[key];
-      const preserveRoots = previous && previous.descriptor.cloudId === descriptor.cloudId && previous.descriptor.revision === descriptor.revision;
-      stateValue.assets[key] = { descriptor, sourceRoots: preserveRoots ? previous.sourceRoots : [] };
-    }
-    state.writeCloudAssetState(stateValue);
+    const descriptors = result.results.map((raw) => normalizeCloudAssetDescriptor(raw, "Agent Cloud list result"));
+    state.updateCloudAssetState((stateValue) => {
+      for (const descriptor of descriptors) {
+        const key = state.cloudDescriptorKey(descriptor);
+        const previous = stateValue.assets[key];
+        // A list response may race a save that completed after the server made
+        // the list snapshot. Never regress a newer locally observed receipt.
+        if (previous && Date.parse(previous.descriptor.updatedAt) > Date.parse(descriptor.updatedAt)) continue;
+        const preserveRoots = previous && previous.descriptor.cloudId === descriptor.cloudId && previous.descriptor.revision === descriptor.revision;
+        stateValue.assets[key] = { descriptor, sourceRoots: preserveRoots ? previous.sourceRoots : [] };
+      }
+    });
   }
   return result;
 }

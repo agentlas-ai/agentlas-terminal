@@ -26,13 +26,42 @@ function toUrl(src) {
   return "file://" + path.resolve(src);                            // 로컬 파일
 }
 
+function documentArgumentError(message) {
+  const error = new Error(message);
+  error.code = "INVALID_ARGUMENT";
+  return error;
+}
+
+function parsePdfArgs(args, ko) {
+  let landscape = false;
+  let out = null;
+  let src = null;
+  for (let index = 0; index < args.length; index += 1) {
+    const token = String(args[index]);
+    if (token === "--landscape") {
+      if (landscape) throw documentArgumentError(usage(ko));
+      landscape = true;
+      continue;
+    }
+    if (token === "-o") {
+      if (out !== null) throw documentArgumentError(usage(ko));
+      const value = args[index + 1];
+      if (!value || String(value).startsWith("-")) throw documentArgumentError(usage(ko));
+      out = String(value);
+      index += 1;
+      continue;
+    }
+    if (token.startsWith("-")) throw documentArgumentError(usage(ko));
+    if (src !== null) throw documentArgumentError(usage(ko));
+    src = token;
+  }
+  if (!src) throw documentArgumentError(usage(ko));
+  return { landscape, out, src };
+}
+
 async function toPdf(ctx, args) {
   const ko = ctx.lang === "ko";
-  const flags = { landscape: args.includes("--landscape") };
-  const oi = args.indexOf("-o");
-  const out = oi >= 0 && args[oi + 1] ? args[oi + 1] : null;
-  const src = args.find((a, i) => a && !String(a).startsWith("-") && (oi < 0 || i !== oi + 1));
-  if (!src) { ctx.err(usage(ko)); return 1; }
+  const { landscape, out, src } = parsePdfArgs(args, ko);
 
   // 로컬 파일이면 존재 확인(없는 걸 조용히 빈 PDF 로 굽지 않는다).
   if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(src) && !fs.existsSync(path.resolve(src))) {
@@ -54,7 +83,7 @@ async function toPdf(ctx, args) {
     page = await cdp.attachPage({ selection: "new" });
     await page.navigate(url, { waitMs: 1800 });
     await page.waitFor("document.readyState === 'complete'", { timeoutMs: 8000 });
-    const r = await page.printPdf(outPath, { landscape: flags.landscape });
+    const r = await page.printPdf(outPath, { landscape });
     if (typeof ctx.ui.stopSpinner === "function") ctx.ui.stopSpinner();
     ctx.out(`${ctx.ui.green("✓")} ${ko ? "PDF 를 만들었습니다" : "wrote PDF"}: ${r.path} ${ctx.ui.dim(`(${Math.round(r.bytes / 1024)} KB)`)}`);
     return 0;
@@ -70,10 +99,9 @@ async function toPdf(ctx, args) {
 async function run(ctx, args) {
   const ko = ctx.lang === "ko";
   const sub = String(args[0] || "").toLowerCase();
-  if (!sub || sub === "help" || sub === "-h" || sub === "--help") { ctx.out(usage(ko)); return 0; }
+  if (!sub || (["help", "-h", "--help"].includes(sub) && args.length === 1)) { ctx.out(usage(ko)); return 0; }
   if (sub === "pdf") return toPdf(ctx, args.slice(1));
-  ctx.err(usage(ko));
-  return 1;
+  throw documentArgumentError(usage(ko));
 }
 
-module.exports = { run };
+module.exports = { run, parsePdfArgs };

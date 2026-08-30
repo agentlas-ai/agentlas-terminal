@@ -11,16 +11,16 @@
  *    기존 동의는 자동 무효가 된다. 손상된 동의 상태는 fail-closed(빈 목록).
  */
 const readline = require("node:readline");
-const fs = require("node:fs");
 const path = require("node:path");
+const { userDataDir: defaultUserDataDir } = require("../core/paths.cjs");
 const {
   MAX_APPROVED_MCP_PER_BUILD,
-  MAX_JSON_BYTES,
   ID_RE,
   assertExactKeys,
   assertId,
   assertIsoDateOrNull,
   safeCatalogId,
+  readJsonFile,
   writePrivateJsonAtomic,
   withPrivateStateLock,
   parseIdList,
@@ -35,6 +35,10 @@ const {
 
 const MCP_CONSENT_STATE_SCHEMA = "agentlas.terminal-mcp-consents.v1";
 const MCP_CONSENT_RECEIPT_SCHEMA = "agentlas.terminal-mcp-consent.v1";
+
+function resolvedMcpUserDataDir(value) {
+  return typeof value === "string" && value.trim() ? value : defaultUserDataDir();
+}
 
 /*
  * ── 통합 능력 승인(데스크탑 capability_grants)과의 합류 ───────────────────────
@@ -113,7 +117,7 @@ function rememberMcpCapabilityGrant(db, catalogId, decision = "allow") {
 }
 
 function mcpConsentStatePath(userDataDir) {
-  return path.join(userDataDir, "terminal", "mcp-consents-v1.json");
+  return path.join(resolvedMcpUserDataDir(userDataDir), "terminal", "mcp-consents-v1.json");
 }
 
 function emptyMcpConsentState() {
@@ -136,12 +140,13 @@ function validateMcpConsentReceipt(receipt, index) {
 
 function loadMcpConsentState(userDataDir) {
   const file = mcpConsentStatePath(userDataDir);
-  if (!fs.existsSync(file)) return emptyMcpConsentState();
-  const stat = fs.lstatSync(file);
-  if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0 || stat.size > MAX_JSON_BYTES) {
-    throw new Error("Terminal MCP consent state is unsafe or too large");
+  let state;
+  try {
+    ({ value: state } = readJsonFile(file, "Terminal MCP consent state"));
+  } catch (error) {
+    if (error && error.code === "ENOENT") return emptyMcpConsentState();
+    throw error;
   }
-  const state = JSON.parse(fs.readFileSync(file, "utf8"));
   assertExactKeys(state, new Set(["schemaVersion", "updatedAt", "receipts"]), ["schemaVersion", "updatedAt", "receipts"], "Terminal MCP consent state");
   if (state.schemaVersion !== MCP_CONSENT_STATE_SCHEMA || !Array.isArray(state.receipts) || state.receipts.length > 256) {
     throw new Error("Terminal MCP consent state schema is invalid");
@@ -159,9 +164,10 @@ function withMcpConsentStateLock(userDataDir, action) {
 }
 
 function persistMcpConsentReceipts(userDataDir, servers) {
-  if (!userDataDir || !(servers || []).length) return false;
-  withMcpConsentStateLock(userDataDir, () => {
-    const state = loadMcpConsentState(userDataDir);
+  if (!(servers || []).length) return false;
+  const resolvedUserDataDir = resolvedMcpUserDataDir(userDataDir);
+  withMcpConsentStateLock(resolvedUserDataDir, () => {
+    const state = loadMcpConsentState(resolvedUserDataDir);
     const now = new Date().toISOString();
     for (const server of servers) {
       if (!server || !ID_RE.test(String(server.id || "")) || !safeCatalogId(server.catalog_id) || !/^[0-9a-f]{64}$/.test(String(server.consentFingerprint || ""))) continue;
@@ -180,14 +186,15 @@ function persistMcpConsentReceipts(userDataDir, servers) {
     state.receipts.sort((a, b) => String(b.consentedAt).localeCompare(String(a.consentedAt)) || a.catalogId.localeCompare(b.catalogId));
     state.receipts = state.receipts.slice(0, 256);
     state.updatedAt = now;
-    writePrivateJsonAtomic(mcpConsentStatePath(userDataDir), state);
+    writePrivateJsonAtomic(mcpConsentStatePath(resolvedUserDataDir), state);
   });
   return true;
 }
 
 function readConsentedSystemMcpServers(db, options = {}) {
+  const resolvedUserDataDir = resolvedMcpUserDataDir(options.userDataDir);
   let state;
-  try { state = loadMcpConsentState(options.userDataDir); }
+  try { state = loadMcpConsentState(resolvedUserDataDir); }
   catch { return []; }
   // 영구 거부(deny)는 옛 동의 영수증을 이긴다 — 규칙이 영수증보다 위다.
   const partition = partitionMcpConsentByCapabilityGrants(
@@ -205,7 +212,7 @@ function readConsentedSystemMcpServers(db, options = {}) {
         "SELECT id, catalog_id, name, name_en, transport, command, args_json, env_keys_json, enabled FROM mcp_servers WHERE id=? LIMIT 1",
       ).get(receipt.registryServerId);
     } catch { continue; }
-    const server = materializeTrustedSystemMcpServer(row, options);
+    const server = materializeTrustedSystemMcpServer(row, { ...options, userDataDir: resolvedUserDataDir });
     if (
       !server || server.id !== receipt.registryServerId || server.catalog_id !== receipt.catalogId ||
       server.consentFingerprint !== receipt.consentFingerprint
@@ -280,6 +287,7 @@ function askMcpConsentOnce(plan, options = {}) {
 }
 
 async function resolveApprovedMcpRuntimeAllowlist(options) {
+  const resolvedUserDataDir = resolvedMcpUserDataDir(options.userDataDir);
   const approved = new Set(options.approvedIds || []);
   const selectedGroups = (options.plan?.entries || []).map((entry) => {
     if (entry.status !== "available") return null;
@@ -298,7 +306,7 @@ async function resolveApprovedMcpRuntimeAllowlist(options) {
   const probe = options.probeServer || ((server, probeOptions = {}) => probeSystemMcpServerConnection(server, {
     cwd: options.cwd,
     env: options.env,
-    userDataDir: options.userDataDir,
+    userDataDir: resolvedUserDataDir,
     timeoutMs: probeOptions.timeoutMs,
     signal: probeOptions.signal,
   }));
@@ -315,7 +323,7 @@ async function resolveApprovedMcpRuntimeAllowlist(options) {
 
   const probeCandidate = async (candidate) => {
     let server = null;
-    try { server = readApprovedSystemMcpServer(options.db, candidate, { userDataDir: options.userDataDir }); }
+    try { server = readApprovedSystemMcpServer(options.db, candidate, { userDataDir: resolvedUserDataDir }); }
     catch { /* one unsafe/unwritable runtime boundary excludes only this server */ }
     if (!server) return { candidate, server: null, status: { connected: false, reason: "registry_row_unavailable" } };
     const remainingMs = deadline - Date.now();
@@ -382,7 +390,7 @@ async function resolveApprovedMcpRuntimeAllowlist(options) {
   }
   let consentPersisted = servers.length === 0;
   if (servers.length) {
-    try { consentPersisted = persistMcpConsentReceipts(options.userDataDir, servers); }
+    try { consentPersisted = persistMcpConsentReceipts(resolvedUserDataDir, servers); }
     catch { consentPersisted = false; }
   }
   const receipt = {

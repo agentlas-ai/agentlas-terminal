@@ -34,7 +34,7 @@ function list(ctx) {
 async function probe(ctx, args) {
   const en = ctx.lang === "en";
   const ref = String(args[0] || "").trim();
-  if (!ref) {
+  if (!ref || args.length !== 1 || ref.startsWith("-")) {
     ctx.err(en ? "Usage: agentlas mcp probe <server-id|catalog-id>" : "사용법: agentlas mcp probe <server-id|catalog-id>");
     return 1;
   }
@@ -83,7 +83,13 @@ function run(ctx, args = []) {
   // 무인자 기본 동작이 목록인데 이름으로 부르면 거부되는 비대칭이 있었다
   // (2026-08-05 감사 결함 G): 다른 명령들(cloud list, plugin list)이 만든
   // "list를 붙이는" 습관이 여기서만 usage 오류가 됐다.
-  if (sub === "list" || sub === "ls") return list(ctx);
+  if (sub === "list" || sub === "ls") {
+    if (rest.length) {
+      ctx.err(ctx.lang === "en" ? "Usage: agentlas mcp list" : "사용법: agentlas mcp list");
+      return 1;
+    }
+    return list(ctx);
+  }
   if (sub === "probe") return probe(ctx, rest);
   const en = ctx.lang === "en";
   ctx.err(en

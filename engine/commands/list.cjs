@@ -7,6 +7,10 @@
 const { activeRuntimeRow, listAvailableCliRuntimes } = require("../runtimes/detect.cjs");
 const { resolvedModelRole } = require("../runtimes/roles.cjs");
 const { listAgents } = require("../agents/registry.cjs");
+const { render, single } = require("../cli-output.cjs");
+
+const LIST_OUTPUT_SCHEMA = Object.freeze({ idField: "slug", columns: [] });
+const LIST_OUTPUT_FLAGS = new Set(["--json", "--yaml", "--quiet", "-q", "--no-headers", "--no-color"]);
 
 function roleRuntimeLabel(selection, role, en) {
   if (!selection) return en ? "(not set)" : "(미설정)";
@@ -25,6 +29,12 @@ function roleRuntimeLabel(selection, role, en) {
 }
 
 function run(ctx, args = []) {
+  const invalidArgs = args.filter((arg) => !LIST_OUTPUT_FLAGS.has(arg));
+  if (invalidArgs.length) {
+    const error = new Error(`Usage: agentlas list [--json|--yaml|--quiet|--no-headers|--no-color]. Unknown argument: ${invalidArgs[0]}`);
+    error.code = "INVALID_ARGUMENT";
+    throw error;
+  }
   const db = ctx.db();
   // 프라이버시 정책(웹 전용/백그라운드 제외)은 registry가 소유한다 — 직접 SQL 금지.
   const agents = listAgents(db).map((a) => ({
@@ -33,18 +43,40 @@ function run(ctx, args = []) {
   const firms = ctx.tableExists(db, "firms")
     ? db.prepare("SELECT id, slug, name FROM firms ORDER BY name").all()
     : [];
+  const output = ctx.output || {};
+  let format = output.format || "table";
+  for (const arg of args) {
+    if (arg === "--json") format = "json";
+    if (arg === "--yaml") format = "yaml";
+  }
+  const quiet = Boolean(output.quiet) || args.includes("--quiet") || args.includes("-q");
+  const noHeaders = Boolean(output.noHeaders) || args.includes("--no-headers");
+  const noColor = Boolean(output.noColor) || args.includes("--no-color");
+  const payload = () => ({
+    agents,
+    firms,
+    modelRoles: {
+      orchestrator: resolvedModelRole(db, "orchestrator"),
+      worker: resolvedModelRole(db, "worker"),
+      multimodal: resolvedModelRole(db, "multimodal"),
+    },
+  });
 
-  // clig.dev: 스크립트 소비자는 사람용 표를 파싱하게 두지 말 것 — --json 은
-  // 사람용 출력과 같은 사실을 기계 계약으로 준다.
-  if (ctx.output?.format === "json" || args.includes("--json")) {
-    const orchestrator = resolvedModelRole(db, "orchestrator");
-    const worker = resolvedModelRole(db, "worker");
-    ctx.out(JSON.stringify({ agents, firms, modelRoles: { orchestrator, worker } }, null, 2));
+  // clig.dev: 스크립트 소비자는 사람용 표를 파싱하게 두지 말 것 — 공통 출력
+  // renderer가 quiet 우선과 JSON/YAML 형식을 한 곳에서 해석한다.
+  if (quiet) {
+    const ids = agents.map((agent) => agent.slug).concat(firms.map((firm) => firm.slug || firm.id));
+    if (ids.length) ctx.out(ids.join("\n"));
+    return 0;
+  }
+  if (format === "json" || format === "yaml") {
+    ctx.out(render(single(payload(), LIST_OUTPUT_SCHEMA), { ...output, format, quiet: false }));
     return 0;
   }
 
   const en = ctx.lang === "en";
-  ctx.out(ctx.ui.bold(en ? "Installed agents" : "설치된 에이전트"));
+  const paint = (name, value) => noColor ? String(value) : ctx.ui[name](value);
+  if (!noHeaders) ctx.out(paint("bold", en ? "Installed agents" : "설치된 에이전트"));
   if (!agents.length) {
     ctx.out("  " + (en ? "(none yet — try: agentlas search \"what you need\")" : "  (아직 없음 — agentlas search \"필요한 것\" 으로 찾아보세요)"));
   }
@@ -104,31 +136,39 @@ function run(ctx, args = []) {
     // 2 indent + slug + space + name + " — " + tagline must fit one line.
     const budget = Math.max(20, cols - (2 + slugWidth + 1 + displayWidth(name) + 3));
     const shown = tag ? clampTag(tag, budget) : "";
-    ctx.out(`  ${ctx.ui.accent(clampSlug(a.slug))} ${name}${shown ? ctx.ui.dim(" — " + shown) : ""}`);
+    ctx.out(`  ${paint("accent", clampSlug(a.slug))} ${name}${shown ? paint("dim", " — " + shown) : ""}`);
   }
   if (firms.length) {
-    ctx.out("");
-    ctx.out(ctx.ui.bold(en ? "Companies" : "회사"));
+    if (!noHeaders) {
+      ctx.out("");
+      ctx.out(paint("bold", en ? "Companies" : "회사"));
+    }
     for (const f of firms) {
       const callable = String(f.slug || f.id);
-      ctx.out(`  ${ctx.ui.accent(callable.padEnd(28))} ${f.name}`);
+      ctx.out(`  ${paint("accent", callable.padEnd(28))} ${f.name}`);
     }
-    ctx.out(ctx.ui.dim(en
+    ctx.out(paint("dim", en
       ? "  Run one with: agentlas firm <company-key> \"<task>\""
       : "  실행: agentlas firm <회사 키> \"<작업>\""));
   }
 
   const active = activeRuntimeRow(db);
   const clis = listAvailableCliRuntimes();
-  ctx.out("");
-  ctx.out(ctx.ui.bold(en ? "Model roles" : "모델 역할"));
+  if (!noHeaders) {
+    ctx.out("");
+    ctx.out(paint("bold", en ? "Model roles" : "모델 역할"));
+  }
   const orchestrator = resolvedModelRole(db, "orchestrator");
   const worker = resolvedModelRole(db, "worker");
+  const multimodal = resolvedModelRole(db, "multimodal");
   ctx.out(`  orchestrator: ${roleRuntimeLabel(orchestrator, "orchestrator", en)}`);
   ctx.out(`  worker:       ${roleRuntimeLabel(worker, "worker", en)}`);
+  ctx.out(`  multimodal:   ${roleRuntimeLabel(multimodal, "multimodal", en)}`);
 
-  ctx.out("");
-  ctx.out(ctx.ui.bold(en ? "Legacy runtime compatibility" : "레거시 런타임 호환"));
+  if (!noHeaders) {
+    ctx.out("");
+    ctx.out(paint("bold", en ? "Legacy runtime compatibility" : "레거시 런타임 호환"));
+  }
   if (active) {
     ctx.out(`  active: ${active.kind}${active.model ? ` (${active.model})` : ""}${active.backend ? ` via ${active.backend}` : ""}`);
   } else {

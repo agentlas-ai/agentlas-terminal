@@ -55,7 +55,9 @@ function patternMatches(pattern, detail) {
   if (pattern === null || pattern === undefined || pattern === "") return true;
   if (!detail) return false;
   const text = String(pattern);
-  if (text.endsWith("*")) return String(detail).startsWith(text.slice(0, -1).trimEnd());
+  // Keep the separator before `*`. Removing it turns `git push *` into the
+  // broader prefix `git push`, which also authorizes unrelated `git pushx`.
+  if (text.endsWith("*")) return String(detail).startsWith(text.slice(0, -1));
   return String(detail) === text;
 }
 
@@ -126,7 +128,10 @@ function recordCapabilityGrant(db, input) {
   if (!capabilityGrantsAvailable(db)) {
     return { ok: false, available: false, reason: UNAVAILABLE_REASON };
   }
-  const decision = input && input.decision === "deny" ? "deny" : "allow";
+  const decision = input && input.decision;
+  if (decision !== "allow" && decision !== "deny") {
+    return { ok: false, available: true, reason: "capability_grants decision must be allow or deny" };
+  }
   try {
     db.prepare(
       `INSERT INTO ${TABLE} (capability, pattern, decision, scope, source, created_at)

@@ -32,7 +32,8 @@ const path = require("node:path");
 const { userDataDir } = require("../core/paths.cjs");
 const hubClient = require("../cloud/hub-client.cjs");
 const detect = require("../runtimes/detect.cjs");
-const { roleMembers } = require("../runtimes/roles.cjs");
+const { canonicalRuntimeKind } = require("../runtimes/kinds.cjs");
+const { pickRoleFromPool } = require("../runtimes/roles.cjs");
 const capture = require("./capture.cjs");
 
 // ── 런타임 해석 (v1 resolveRuntime의 워크포스 어댑터) ─────────────────────
@@ -49,6 +50,8 @@ function runtimeFromSelection(selection) {
     efforts: [],
     source: selection.sourceLayer || selection.source || null,
     role: selection.role || null,
+    inherit: Boolean(selection.inherit),
+    skipped: Array.isArray(selection.skipped) ? selection.skipped : [],
   };
   if (capture.RUNTIME_BIN[selection.kind]) {
     return { mode: "cli", kind: selection.kind, ...common };
@@ -63,10 +66,10 @@ function runtimeFromSelection(selection) {
 }
 
 function legacyWorkforceRuntime(db, override) {
-  let selectedOverride = override;
+  let selectedOverride = canonicalRuntimeKind(override);
   if (!selectedOverride) {
     try {
-      const saved = require("../agentlas-config.cjs").loadPrefs(userDataDir()).runtime;
+      const saved = canonicalRuntimeKind(require("../agentlas-config.cjs").loadPrefs(userDataDir()).runtime);
       if (
         saved &&
         saved !== "auto" &&
@@ -81,7 +84,7 @@ function legacyWorkforceRuntime(db, override) {
   const active = ar
     ? runtimeFromSelection({
         role: "orchestrator",
-        kind: ar.kind,
+        kind: canonicalRuntimeKind(ar.kind),
         backend: ar.backend,
         source: ar.source,
         model: ar.model,
@@ -128,8 +131,17 @@ function resolveWorkforceRuntime(db, override) {
       },
     };
   }
-  const orchestrator = runtimeFromSelection(roleMembers(db, "orchestrator")[0] || null);
-  const worker = runtimeFromSelection(roleMembers(db, "worker")[0] || null);
+  const isAvailable = (selection) => {
+    const kind = canonicalRuntimeKind(selection && selection.kind);
+    if (capture.RUNTIME_BIN[kind]) return Boolean(capture.which(capture.RUNTIME_BIN[kind]));
+    return kind === "byok" && Boolean(selection.backend) || kind === "ollama";
+  };
+  const pickAvailableRole = (role) => {
+    const selected = pickRoleFromPool(db, role, isAvailable);
+    return selected && isAvailable(selected) ? runtimeFromSelection(selected) : null;
+  };
+  const orchestrator = pickAvailableRole("orchestrator");
+  const worker = pickAvailableRole("worker");
   if (!orchestrator || !worker) {
     const error = new Error("Dashboard orchestrator and worker priorities are required for Workforce execution.");
     error.code = "no_runtime_role_priority";

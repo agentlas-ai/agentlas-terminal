@@ -122,9 +122,16 @@ function findAgent(db, token) {
   const q = String(token || "").trim().toLowerCase();
   if (!q) return null;
   const agents = listRoutableAgents(db);
-  const exact = agents.find((a) => a.slug.toLowerCase() === q || a.id === token)
-    || agents.find((a) => (a.name || "").toLowerCase() === q || (a.nameEn || "").toLowerCase() === q);
-  if (exact) return exact;
+  const exactId = agents.find((agent) => agent.id === token);
+  if (exactId) return exactId; // primary key is authoritative
+  const exactSlug = agents.filter((agent) => agent.slug.toLowerCase() === q);
+  if (exactSlug.length === 1) return exactSlug[0];
+  if (exactSlug.length > 1) return null;
+  const exactName = agents.filter((agent) =>
+    (agent.name || "").toLowerCase() === q || (agent.nameEn || "").toLowerCase() === q,
+  );
+  if (exactName.length === 1) return exactName[0];
+  if (exactName.length > 1) return null;
   const partial = agents.filter((a) =>
     a.slug.toLowerCase().includes(q) || (a.name || "").toLowerCase().includes(q) || (a.nameEn || "").toLowerCase().includes(q));
   if (partial.length === 1) return partial[0];

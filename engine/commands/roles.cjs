@@ -1,6 +1,6 @@
 "use strict";
 /*
- * roles — 오케스트레이터/워커 모델 역할 조회·설정.
+ * roles — 오케스트레이터/워커/멀티모달 모델 역할 조회·설정.
  *
  * 배경(2026-08-05 감사, 결함 C): `list`와 `doctor`는 model_roles를 보여주는데
  * 터미널 어디에도 쓰기 경로가 없었다(전 코드베이스 SELECT만). 바꾸려면 데스크탑을
@@ -18,7 +18,7 @@
 const { RUNTIME_BIN, whichSync } = require("../runtimes/detect.cjs");
 const { runtimeAuthEvidence } = require("../runtimes/auth-evidence.cjs");
 const { canonicalRuntimeKind, storedRuntimeKind } = require("../runtimes/kinds.cjs");
-const { MODEL_ROLE_TABLE, VALID_ROLES, resolvedModelRole, roleMembers } = require("../runtimes/roles.cjs");
+const { MODEL_ROLE_TABLE, MODEL_ROLE_MEMBER_TABLE, VALID_ROLES, resolvedModelRole, roleMembers } = require("../runtimes/roles.cjs");
 const { runWriteTransaction } = require("../agentlas-sqlite-policy.cjs");
 const { EFFORTS } = require("../agentlas-workload-routing.cjs");
 
@@ -43,12 +43,17 @@ function show(ctx, args = []) {
     ctx.out(JSON.stringify({
       orchestrator: resolvedModelRole(db, "orchestrator"),
       worker: resolvedModelRole(db, "worker"),
-      pools: { orchestrator: roleMembers(db, "orchestrator"), worker: roleMembers(db, "worker") },
+      multimodal: resolvedModelRole(db, "multimodal"),
+      pools: {
+        orchestrator: roleMembers(db, "orchestrator"),
+        worker: roleMembers(db, "worker"),
+        multimodal: roleMembers(db, "multimodal"),
+      },
     }, null, 2));
     return 0;
   }
   ctx.out(ctx.ui.bold(en ? "Model roles" : "모델 역할"));
-  for (const role of ["orchestrator", "worker"]) {
+  for (const role of VALID_ROLES) {
     const resolved = resolvedModelRole(db, role);
     ctx.out(`  ${role.padEnd(13)} ${fmt(resolved, en)}`);
     const pool = roleMembers(db, role);
@@ -58,21 +63,35 @@ function show(ctx, args = []) {
   }
   ctx.out("");
   ctx.out(ctx.ui.dim(en
-    ? 'Change: agentlas roles set <orchestrator|worker> <runtime> [--model <id>] [--effort <level>]  ·  worker inherit: agentlas roles set worker --inherit'
-    : '변경: agentlas roles set <orchestrator|worker> <runtime> [--model <id>] [--effort <level>]  ·  워커 상속: agentlas roles set worker --inherit'));
+    ? 'Change: agentlas roles set <orchestrator|worker|multimodal> <runtime> [--model <id>] [--effort <level>]  ·  worker inherit: agentlas roles set worker --inherit'
+    : '변경: agentlas roles set <orchestrator|worker|multimodal> <runtime> [--model <id>] [--effort <level>]  ·  워커 상속: agentlas roles set worker --inherit'));
   return 0;
 }
 
 function parseSetFlags(args) {
   const rest = [];
   const flags = {};
+  const seen = new Set();
+  const take = (name, raw) => {
+    if (seen.has(name)) throw new Error(`duplicate option: --${name}`);
+    const value = String(raw ?? "").trim();
+    if (!value || value.startsWith("--")) throw new Error(`missing value: --${name}`);
+    seen.add(name);
+    return value;
+  };
   for (let i = 0; i < args.length; i += 1) {
-    const arg = args[i];
-    if (arg === "--model") { flags.model = String(args[++i] ?? "").trim(); continue; }
-    if (arg.startsWith("--model=")) { flags.model = arg.slice(8).trim(); continue; }
-    if (arg === "--effort") { flags.effort = String(args[++i] ?? "").trim().toLowerCase(); continue; }
-    if (arg.startsWith("--effort=")) { flags.effort = arg.slice(9).trim().toLowerCase(); continue; }
-    if (arg === "--inherit") { flags.inherit = true; continue; }
+    const arg = String(args[i] ?? "");
+    if (arg === "--model") { flags.model = take("model", args[++i]); continue; }
+    if (arg.startsWith("--model=")) { flags.model = take("model", arg.slice(8)); continue; }
+    if (arg === "--effort") { flags.effort = take("effort", args[++i]).toLowerCase(); continue; }
+    if (arg.startsWith("--effort=")) { flags.effort = take("effort", arg.slice(9)).toLowerCase(); continue; }
+    if (arg === "--inherit") {
+      if (seen.has("inherit")) throw new Error("duplicate option: --inherit");
+      seen.add("inherit");
+      flags.inherit = true;
+      continue;
+    }
+    if (arg.startsWith("-")) throw new Error(`unknown option: ${arg}`);
     rest.push(arg);
   }
   return { rest, flags };
@@ -81,17 +100,31 @@ function parseSetFlags(args) {
 function set(ctx, args) {
   const en = ctx.lang === "ko" ? false : true;
   const ko = !en;
-  const { rest, flags } = parseSetFlags(args);
+  let parsed;
+  try {
+    parsed = parseSetFlags(args);
+  } catch (error) {
+    ctx.err(error instanceof Error ? error.message : String(error));
+    return 1;
+  }
+  const { rest, flags } = parsed;
   const role = String(rest[0] || "").toLowerCase();
   const kindArg = rest[1] ? String(rest[1]).toLowerCase() : null;
 
   const usage = ko
-    ? "사용법: agentlas roles set <orchestrator|worker> <runtime> [--model <id>] [--effort <level>] | agentlas roles set worker --inherit"
-    : "Usage: agentlas roles set <orchestrator|worker> <runtime> [--model <id>] [--effort <level>] | agentlas roles set worker --inherit";
+    ? "사용법: agentlas roles set <orchestrator|worker|multimodal> <runtime> [--model <id>] [--effort <level>] | agentlas roles set worker --inherit"
+    : "Usage: agentlas roles set <orchestrator|worker|multimodal> <runtime> [--model <id>] [--effort <level>] | agentlas roles set worker --inherit";
 
   if (!VALID_ROLES.has(role)) { ctx.err(usage); return 1; }
+  if (rest.length > 2) { ctx.err(usage); return 1; }
   if (flags.inherit && role !== "worker") {
     ctx.err(ko ? "--inherit 는 worker 역할에만 씁니다 (스키마 계약)." : "--inherit applies to the worker role only (schema contract).");
+    return 1;
+  }
+  if (flags.inherit && (kindArg || flags.model !== undefined || flags.effort !== undefined)) {
+    ctx.err(ko
+      ? "--inherit 는 runtime, --model, --effort 와 함께 쓸 수 없습니다. 오케스트레이터 설정 전체를 따릅니다."
+      : "--inherit cannot be combined with a runtime, --model, or --effort. It follows the complete orchestrator selection.");
     return 1;
   }
   if (!flags.inherit && !kindArg) { ctx.err(usage); return 1; }
@@ -119,6 +152,7 @@ function set(ctx, args) {
   let kind = kindArg;
   let model = flags.model !== undefined ? (flags.model || null) : undefined;
   let inherit = 0;
+  let inheritedSelection = null;
   if (flags.inherit) {
     // 상속 = 워커가 오케스트레이터를 따른다. 스키마상 kind NOT NULL이라
     // 현재 오케스트레이터의 좌표를 복사해 두되 inherit=1로 표시한다(리더 부재 시 정직 정지).
@@ -129,32 +163,72 @@ function set(ctx, args) {
     }
     kind = orchestrator.kind;
     if (model === undefined) model = orchestrator.model;
+    inheritedSelection = orchestrator;
     inherit = 1;
   }
 
   const now = new Date().toISOString();
   runWriteTransaction(db, () => {
     const existing = db.prepare("SELECT * FROM model_roles WHERE role=?").get(role);
+    const sameKind = existing && canonicalRuntimeKind(existing.kind) === kind;
+    const storedKind = storedRuntimeKind(kind);
+    // kind가 바뀌면 이전 모델/백엔드/출처는 새 런타임의 좌표가 아니다
+    // (예: kimi에 opus, codex에 google backend). 명시하지 않은 값은 지운다.
+    const savedModel = model === undefined ? (sameKind ? existing.model : null) : model;
+    const savedEffort = flags.effort === undefined
+      ? (inheritedSelection ? inheritedSelection.effort : existing?.effort) || null
+      : (flags.effort === "none" ? null : flags.effort);
+    const savedBackend = inheritedSelection
+      ? inheritedSelection.backend || null
+      : sameKind ? existing.backend || null : null;
+    const savedSource = inheritedSelection
+      ? inheritedSelection.source || null
+      : sameKind ? existing.source || null : null;
+    const savedLongContext = inheritedSelection
+      ? (inheritedSelection.longContext ? 1 : 0)
+      : sameKind && existing.long_context ? 1 : 0;
     if (existing) {
-      // kind가 바뀌면 이전 모델 id는 새 런타임의 어휘가 아니다(예: kimi에 opus).
-      // --model 미지정 시 유지가 아니라 초기화 — 무의미한 좌표를 승계하지 않는다.
-      const keepModel = canonicalRuntimeKind(existing.kind) === kind ? existing.model : null;
       db.prepare(
-        "UPDATE model_roles SET kind=?, model=?, effort=?, inherit=?, updated_at=? WHERE role=?",
+        `UPDATE model_roles
+         SET kind=?, backend=?, source=?, model=?, effort=?, long_context=?, inherit=?, updated_at=?
+         WHERE role=?`,
       ).run(
         // 공유 DB 는 데스크탑 어휘로 적는다(runtimes/kinds.cjs) — 여기서 이 저장소의
         // 이름을 그대로 넣으면 데스크탑이 그 역할을 못 읽는다.
-        storedRuntimeKind(kind),
-        model === undefined ? keepModel : model,
-        flags.effort === undefined ? existing.effort : (flags.effort === "none" ? null : flags.effort),
+        storedKind,
+        savedBackend,
+        savedSource,
+        savedModel,
+        savedEffort,
+        savedLongContext,
         inherit,
         now,
         role,
       );
     } else {
       db.prepare(
-        "INSERT INTO model_roles (role, kind, model, effort, inherit, updated_at) VALUES (?,?,?,?,?,?)",
-      ).run(role, storedRuntimeKind(kind), model === undefined ? null : model, flags.effort === undefined || flags.effort === "none" ? null : flags.effort, inherit, now);
+        `INSERT INTO model_roles
+         (role, kind, backend, source, model, effort, long_context, inherit, updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?)`,
+      ).run(role, storedKind, savedBackend, savedSource, savedModel, savedEffort, savedLongContext, inherit, now);
+    }
+
+    // Desktop v80과 같은 단일 설정 계약: model_roles만 바꿔 실제 실행이
+    // 계속 옛 pool 1순위를 고르는 split-brain을 만들지 않는다.
+    if (ctx.tableExists(db, MODEL_ROLE_MEMBER_TABLE)) {
+      const hasMembers = Number(
+        db.prepare("SELECT COUNT(*) AS n FROM model_role_members WHERE role=?").get(role)?.n || 0,
+      ) > 0;
+      if (hasMembers && inherit) {
+        // 빈 worker 풀 자체가 orchestrator 풀 상속을 뜻한다.
+        db.prepare("DELETE FROM model_role_members WHERE role=?").run(role);
+      } else if (hasMembers) {
+        db.prepare(
+          `UPDATE model_role_members
+           SET kind=?, backend=?, source=?, model=?, effort=?, long_context=?, updated_at=?
+           WHERE role=? AND position=1`,
+        ).run(storedKind, savedBackend, savedSource, savedModel, savedEffort, savedLongContext, now, role);
+      }
     }
   });
 
@@ -188,18 +262,20 @@ function run(ctx, args = []) {
     // SELF_HELP_COMMANDS 계약: --help 는 스텁이 아니라 실제 안내여야 한다.
     ctx.out(en
       ? [
-        "agentlas roles — orchestrator/worker model roles (persisted, shared with Desktop)",
-        "  roles                                  show both roles and their pools",
+        "agentlas roles — orchestrator/worker/multimodal model roles (persisted, shared with Desktop)",
+        "  roles                                  show all three roles and their pools",
         "  roles set <orchestrator|worker> <runtime> [--model <id>] [--effort <level>]",
+        "  roles set multimodal <runtime> [--model <id>] [--effort <level>]",
         "  roles set worker --inherit             worker follows the orchestrator",
         "",
         `  runtimes: ${[...KNOWN_KINDS].join(" · ")}`,
         "  REPL /model and /runtime are session-scoped — this command is the persistent path.",
       ].join("\n")
       : [
-        "agentlas roles — 오케스트레이터/워커 모델 역할 (영구 저장, 데스크탑과 공유)",
-        "  roles                                  두 역할과 풀 조회",
+        "agentlas roles — 오케스트레이터/워커/멀티모달 모델 역할 (영구 저장, 데스크탑과 공유)",
+        "  roles                                  세 역할과 풀 조회",
         "  roles set <orchestrator|worker> <runtime> [--model <id>] [--effort <level>]",
+        "  roles set multimodal <runtime> [--model <id>] [--effort <level>]",
         "  roles set worker --inherit             워커가 오케스트레이터를 따름",
         "",
         `  런타임: ${[...KNOWN_KINDS].join(" · ")}`,

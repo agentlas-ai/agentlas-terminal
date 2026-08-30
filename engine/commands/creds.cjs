@@ -24,6 +24,9 @@ const {
   upsertLocalCredentialMapCli,
   projectScopedGlobalEnvKeyCli,
   safeCredentialDestRelCli,
+  credentialProjectRootCli,
+  resolveCredentialDestinationCli,
+  copyCredentialFileAtomicCli,
 } = require("../project/credentials.cjs");
 
 // 데스크탑과 공유하는 키체인 서비스/키 접두어 (v1 상수 그대로).
@@ -41,19 +44,27 @@ function readKeytar() {
   }
 }
 
-function parseCredFlags(args) {
+function parseCredFlags(args, schema) {
   const f = {};
+  const values = new Set(schema.values || []);
+  const booleans = new Set(schema.booleans || []);
   for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a && a.startsWith("--")) {
-      const next = args[i + 1];
-      if (next !== undefined && !String(next).startsWith("--")) {
-        f[a.slice(2)] = next;
-        i++;
-      } else {
-        f[a.slice(2)] = true;
-      }
+    const token = String(args[i]);
+    if (!token.startsWith("--") || token === "--") throw new Error(`unexpected argument: ${token}`);
+    const at = token.indexOf("=");
+    const key = token.slice(2, at >= 0 ? at : undefined);
+    if (!values.has(key) && !booleans.has(key)) throw new Error(`unknown option: --${key}`);
+    if (Object.prototype.hasOwnProperty.call(f, key)) throw new Error(`duplicate option: --${key}`);
+    if (booleans.has(key)) {
+      if (at >= 0) throw new Error(`--${key} does not take a value`);
+      f[key] = true;
+      continue;
     }
+    const next = at >= 0 ? token.slice(at + 1) : args[++i];
+    if (next === undefined || next === "" || (at < 0 && String(next).startsWith("--"))) {
+      throw new Error(`--${key} requires a value`);
+    }
+    f[key] = String(next);
   }
   return f;
 }
@@ -66,20 +77,35 @@ function resolveCredentialSourcePath(source, cwd) {
 
 async function cmdCredsFile(ctx, args) {
   const fail = (msg) => { ctx.err(msg); return 1; };
-  const f = parseCredFlags(args);
+  let f;
+  try {
+    f = parseCredFlags(args, {
+      values: ["source", "path", "provider", "env", "dest", "project", "id", "requiredFor", "staleCheck"],
+      booleans: ["force"],
+    });
+  } catch (error) { return fail(String((error && error.message) || error)); }
+  if (f.source !== undefined && f.path !== undefined) return fail("use only one of --source or --path");
   const source = typeof f.source === "string" ? f.source : typeof f.path === "string" ? f.path : "";
   if (!source) return fail("usage: agentlas creds file --source <path> [--provider <name>] [--env <ENV_NAME>] [--dest <relative-path>] [--project <path>] [--force]");
-  const project = typeof f.project === "string" && f.project ? f.project : activeProjectPath(ctx.db());
-  if (!project) return fail("creds file requires a project path");
+  const requestedProject = typeof f.project === "string" && f.project ? f.project : activeProjectPath(ctx.db());
+  if (!requestedProject) return fail("creds file requires a project path");
+  let project;
+  try { project = credentialProjectRootCli(requestedProject); }
+  catch (error) { return fail(`credential project is unsafe: ${String((error && error.message) || error)}`); }
   const provider = typeof f.provider === "string" && f.provider ? f.provider : "credential_file";
+  if (provider.length > 128 || /[\u0000-\u001f\u007f]/.test(provider)) return fail("credential provider name contains unsafe text");
   const envKey = typeof f.env === "string" && f.env ? f.env.trim() : "";
   if (envKey && !/^[A-Z][A-Z0-9_]*$/.test(envKey)) return fail("credential env name must look like ENV_NAME");
 
   const arch = loadArch();
   const cfg = localCredentialConfigCli(arch);
   const projectName = path.basename(project) || "Project";
-  ensureLocalCredentialStoreCli(project, projectName, arch);
-  ensureSoulCredentialIndexCli(project, projectName, arch);
+  try {
+    ensureLocalCredentialStoreCli(project, projectName, arch);
+    ensureSoulCredentialIndexCli(project, projectName, arch);
+  } catch (error) {
+    return fail(`credential store is unsafe: ${String((error && error.message) || error)}`);
+  }
 
   const sourceAbs = resolveCredentialSourcePath(source);
   let stat;
@@ -99,15 +125,13 @@ async function cmdCredsFile(ctx, args) {
   } catch (e) {
     return fail(String((e && e.message) || e));
   }
-  const destAbs = path.join(project, destRel);
-  if (!path.resolve(destAbs).startsWith(path.resolve(project) + path.sep)) {
-    return fail("credential destination must stay inside the project");
+  let destAbs;
+  try {
+    destAbs = resolveCredentialDestinationCli(project, destRel);
+    copyCredentialFileAtomicCli(sourceAbs, destAbs, { force: Boolean(f.force) });
+  } catch (error) {
+    return fail(`credential copy refused: ${String((error && error.message) || error)}`);
   }
-  if (fs.existsSync(destAbs) && !f.force) return fail(`credential destination already exists: ${destRel} (use --force to replace)`);
-
-  fs.mkdirSync(path.dirname(destAbs), { recursive: true });
-  fs.copyFileSync(sourceAbs, destAbs);
-  try { fs.chmodSync(destAbs, 0o600); } catch { /* best-effort */ }
 
   const targets = [destRel];
   if (envKey) {
@@ -185,11 +209,20 @@ async function run(ctx, args) {
   const fail = (msg) => { ctx.err(msg); return 1; };
   const sub = args[0];
   if (sub === "file") return cmdCredsFile(ctx, args.slice(1));
-  if (sub === "list" || sub === "ls") return cmdCredsList(ctx);
+  if (sub === "list" || sub === "ls") {
+    if (args.length !== 1) return fail(`unexpected argument: ${String(args[1])}`);
+    return cmdCredsList(ctx);
+  }
   if (sub !== "save") {
     return fail('usage: agentlas creds save --provider <name> --key <ENV_NAME> --value <value> [--project <path>] OR agentlas creds file --source <path> [--env <ENV_NAME>] OR agentlas creds list');
   }
-  const f = parseCredFlags(args.slice(1));
+  let f;
+  try {
+    f = parseCredFlags(args.slice(1), {
+      values: ["provider", "key", "value", "project"],
+      booleans: [],
+    });
+  } catch (error) { return fail(String((error && error.message) || error)); }
   const key = typeof f.key === "string" ? f.key.trim() : "";
   let value = f.value === undefined || f.value === true ? "" : String(f.value);
   /*
@@ -207,14 +240,26 @@ async function run(ctx, args) {
       : "Note: a secret passed via --value lands in shell history and `ps`. Prefer stdin next time: printf '%s' \"$SECRET\" | agentlas creds save --key X --value -");
   }
   if (!key || !value) return fail("creds save requires --key and --value (use `--value -` to read the secret from stdin)");
+  if (!/^[A-Z][A-Z0-9_]*$/.test(key)) return fail("credential env name must look like ENV_NAME");
+  if (/[\u0000\r\n]/.test(value)) return fail("credential env value must be a single line; use `agentlas creds file` for multiline credentials");
   const provider = typeof f.provider === "string" && f.provider ? f.provider : key;
-  const project = typeof f.project === "string" && f.project ? f.project : activeProjectPath(ctx.db());
+  if (provider.length > 128 || /[\u0000-\u001f\u007f]/.test(provider)) return fail("credential provider name contains unsafe text");
+  const requestedProject = typeof f.project === "string" && f.project ? f.project : activeProjectPath(ctx.db());
+  let project = null;
+  if (requestedProject) {
+    try { project = credentialProjectRootCli(requestedProject); }
+    catch (error) { return fail(`credential project is unsafe: ${String((error && error.message) || error)}`); }
+  }
   const targets = [];
   const arch = loadArch();
   const projectName = project ? path.basename(project) || "Project" : "Project";
   if (project) {
-    ensureLocalCredentialStoreCli(project, projectName, arch);
-    ensureSoulCredentialIndexCli(project, projectName, arch);
+    try {
+      ensureLocalCredentialStoreCli(project, projectName, arch);
+      ensureSoulCredentialIndexCli(project, projectName, arch);
+    } catch (error) {
+      return fail(`credential store is unsafe: ${String((error && error.message) || error)}`);
+    }
   }
 
   // 1) keychain vault — project-scoped when a project is active.
@@ -262,4 +307,4 @@ async function run(ctx, args) {
   return 0;
 }
 
-module.exports = { run, resolveCredentialSourcePath };
+module.exports = { run, resolveCredentialSourcePath, parseCredFlags };

@@ -182,6 +182,7 @@ async function runCareerGraphCli(args, opts) {
   const sub = normalizedArgs[0] || "status";
   const passivePaths = careerGraphPathsForCli(projectPath);
   if (sub === "status" || sub === "list") {
+    if (normalizedArgs.length > 1) throw new Error(`usage: career-graph ${sub}`);
     if (!initializedAgentlasProjectPathCli(projectPath)) {
       return [
         ko ? "커리어 그래프: 초기화되지 않음" : "Career Graph: not initialized",
@@ -192,7 +193,10 @@ async function runCareerGraphCli(args, opts) {
     }
     return formatCareerGraphStatusCli(passivePaths, opts.lang);
   }
-  if (sub === "help" || sub === "--help" || sub === "-h") return careerGraphUsageLinesCli(opts.lang);
+  if (sub === "help" || sub === "--help" || sub === "-h") {
+    if (normalizedArgs.length > 1) throw new Error("usage: career-graph help");
+    return careerGraphUsageLinesCli(opts.lang);
+  }
   if (["ingest", "query", "verify", "trace"].includes(String(sub))) {
     return [
       ko
@@ -207,6 +211,15 @@ async function runCareerGraphCli(args, opts) {
     const parsed = await parseOntologyNaturalArgsCli(normalizedArgs.join(" "), cwd);
     return runCareerGraphCli(parsed, opts);
   }
+  let directFlags = null;
+  if (sub === "open") {
+    if (normalizedArgs.length !== 1) throw new Error("usage: career-graph open");
+  } else if (sub === "add") {
+    directFlags = parseFlagsCli(normalizedArgs.slice(1));
+    if (directFlags._.length < 1 || directFlags._.length > 3) throw new Error("usage: career-graph add <path> [kind] [scope] [--kind <kind>] [--scope <scope>]");
+    if (directFlags.kind !== undefined && directFlags._[1] !== undefined) throw new Error("kind was provided twice; use either the positional value or --kind");
+    if (directFlags.scope !== undefined && directFlags._[2] !== undefined) throw new Error("scope was provided twice; use either the positional value or --scope");
+  }
   const paths = ensureCareerGraphCli(projectPath, opts.lang);
   if (sub === "open") {
     const opened = opts.noOpen ? true : openLocalPathCli(paths.inboxPath, opts.notify);
@@ -215,7 +228,7 @@ async function runCareerGraphCli(args, opts) {
       : (ko ? "커리어 그래프 수신함을 자동으로 열지 못했습니다. 직접 여세요" : "Could not open Career Graph inbox automatically; open it manually")}: ${paths.inboxPath}`];
   }
   if (sub === "add") {
-    const flags = parseFlagsCli(normalizedArgs.slice(1));
+    const flags = directFlags;
     const source = flags._[0];
     const kind = inferOntologyKindCli(flags.kind || flags._[1], normalizedArgs.join(" "));
     const scope = inferOntologyScopeCli(flags.scope || flags._[2], normalizedArgs.join(" "), kind);

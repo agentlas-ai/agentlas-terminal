@@ -4649,18 +4649,42 @@ const TRANSIENT_MODEL_ERROR_RE = /Connection closed mid-response|"terminal_reaso
   function parseArgs(args) {
     const task = [];
     const options = {};
+    const seen = new Set();
+    let passthrough = false;
     for (let index = 0; index < args.length; index += 1) {
       const token = String(args[index]);
-      if (token === "--benchmark") options.benchmark = true;
-      else if (token === "--json") options.json = true;
-      else if (token === "--parallel" || token === "-n") options.concurrency = Number(args[++index]);
-      else task.push(token);
+      if (passthrough) { task.push(token); continue; }
+      if (token === "--") { passthrough = true; continue; }
+      if (token === "--benchmark" || token === "--json") {
+        const key = token.slice(2);
+        if (seen.has(key)) throw new Error(`duplicate option: ${token}`);
+        seen.add(key);
+        options[key] = true;
+      } else if (token === "--parallel" || token === "-n" || token.startsWith("--parallel=")) {
+        if (seen.has("parallel")) throw new Error("duplicate option: --parallel");
+        seen.add("parallel");
+        const inline = token.startsWith("--parallel=");
+        const raw = inline ? token.slice(11) : args[++index];
+        const value = Number(raw);
+        if (raw === undefined || raw === "" || (!inline && String(raw).startsWith("--")) || !Number.isInteger(value) || value < 1 || value > 8) {
+          throw new Error("--parallel requires a positive integer (maximum 8)");
+        }
+        options.concurrency = value;
+      } else if (token.startsWith("-")) {
+        throw new Error(`unknown option: ${token} (use -- before a task token that starts with '-')`);
+      } else task.push(token);
     }
     return { task: task.join(" ").trim(), options };
   }
 
   async function cmdWorkforce(db, args, runtimeOverride, executionContext = {}) {
-    const parsed = parseArgs(args);
+    let parsed;
+    try { parsed = parseArgs(args); }
+    catch (error) {
+      const ui = executionContext.ui || newUi();
+      ui.error(String((error && error.message) || error), { reveal: true });
+      return { ok: false, error: "invalid-arguments" };
+    }
     if (!parsed.task) {
       const ui = executionContext.ui || newUi();
       ui.warn("usage: agentlas workforce <task> [--parallel N] [--benchmark] [--json]");

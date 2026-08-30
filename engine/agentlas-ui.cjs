@@ -116,10 +116,32 @@ function compactHomePath(value) {
   return home && value.startsWith(home + "/") ? "~/" + value.slice(home.length + 1) : value;
 }
 
+function maskSecretValue(value) {
+  const text = String(value || "");
+  const quote = text[0];
+  return (quote === "\"" || quote === "'") && text[text.length - 1] === quote
+    ? quote + "••••" + quote
+    : "••••";
+}
+
 function redactCommandSecrets(value) {
   return value
-    .replace(/\b([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD))=([^\s]+)/g, "$1=••••")
-    .replace(/\b(authorization\s*:\s*bearer)\s+[^\s]+/gi, "$1 ••••")
+    // URL userinfo is a credential even when it is not an assignment.
+    .replace(/\b(https?:\/\/)[^\s/:@]+:[^\s/@]+@/gi, "$1[redacted]@")
+    // Authorization schemes and common credential-bearing headers. Keep the
+    // header name/scheme visible so the action remains understandable.
+    .replace(/\b((?:proxy-)?authorization\s*[:=]\s*)((?:basic|bearer)\s+)?("[^"]*"|'[^']*'|[^\s"']+)/gi, (_m, prefix, scheme, secret) => prefix + (scheme || "") + maskSecretValue(secret))
+    .replace(/\b((?:x[-_]?api[-_]?key|api[-_]?key|x[-_]?(?:auth(?:entication)?|access|refresh)[-_]?token|x[-_]?(?:client[-_]?secret)|cookie|set[-_]?cookie)\s*:\s*)("[^"]*"|'[^']*'|[^\s"']+)/gi, (_m, prefix, secret) => prefix + maskSecretValue(secret))
+    // Environment assignments are case-insensitive in shells. Keep the
+    // suffix allowlist narrow so ordinary arguments remain readable, while
+    // also covering bare names such as token= and password=.
+    .replace(/(^|[^A-Za-z0-9_])((?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|[A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)*[_-](?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)))(\s*=\s*)("[^"]*"|'[^']*'|[^\s"']+)/gi, (_m, lead, name, equals, secret) => lead + name + equals + maskSecretValue(secret))
+    // Header and CLI bearer forms are common in curl/npm-style commands.
+    .replace(/(\b((?:proxy-)?authorization\s*(?::|=|\s)\s*bearer)\s+)("[^"]*"|'[^']*'|[^\s"']+)/gi, (_m, prefix, _header, secret) => prefix + maskSecretValue(secret))
+    .replace(/(--(?:api[-_]?key|auth(?:entication)?[-_]?token|access[-_]?token|refresh[-_]?token|client[-_]?secret|token|secret|password|passwd)(?:\s*=\s*|\s+))("[^"]*"|'[^']*'|[^\s"']+)/gi, (_m, prefix, secret) => prefix + maskSecretValue(secret))
+    // A standalone bearer value is only masked when it has token-like length;
+    // this avoids turning ordinary prose such as "bearer token" into noise.
+    .replace(/(\bbearer)\s+([A-Za-z0-9._~+/=-]{16,})\b/gi, "$1 ••••")
     // Some remote MCPs put a bearer-like credential in the URL path instead of a header.
     // Keep the provider/path useful while ensuring activity summaries never print the secret.
     .replace(/(https?:\/\/[^\s]+\/)(ocm_[A-Za-z0-9_-]{12,})\b/gi, "$1[redacted]")
@@ -145,7 +167,7 @@ function compactToolArg(name, value, max = 120) {
 }
 
 function compactResult(text, ok, toolName, maxCells = 120) {
-  const clean = stripAnsi(String(text || "")).replace(/\r/g, "").trim();
+  const clean = redactCommandSecrets(stripAnsi(String(text || ""))).replace(/\r/g, "").trim();
   const lines = clean.split("\n").map((line) => line.trim()).filter(Boolean);
   const count = lines.length;
   if (!ok) {
@@ -546,7 +568,7 @@ class Ui {
   toolResult(text, ok = true, options = {}) {
     if (!ok) this._turnFailures += 1;
     if (options.verbose) {
-      const body = truncate(stripAnsi(String(text || "")).trim(), options.maxChars || 4_000);
+      const body = truncate(redactCommandSecrets(stripAnsi(String(text || "")).trim()), options.maxChars || 4_000);
       const lines = body ? body.split("\n") : [ok ? "done" : "error"];
       const marker = ok ? this.c.green("  └ ") : this.c.paw("  └ ");
       for (let index = 0; index < lines.length; index++) {

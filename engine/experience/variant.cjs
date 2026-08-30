@@ -21,10 +21,51 @@ const {
   assertObject,
   assertExactKeys,
   assertId,
+  assertSafeText,
   validateMcpRequirement,
   readJsonFile,
-  parseSimpleFlags,
 } = require("./intents.cjs");
+
+const MAX_VARIANT_CANDIDATES = 512;
+
+function parseVariantFlags(args) {
+  const flags = { _: [] };
+  const seen = new Set();
+  const valueFlags = new Set(["base-release", "prefer", "candidates"]);
+  const booleanFlags = new Set(["json", "no-base-only"]);
+  let positionalOnly = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const token = String(args[index]);
+    if (positionalOnly) {
+      flags._.push(token);
+      continue;
+    }
+    if (token === "--") {
+      positionalOnly = true;
+      continue;
+    }
+    if (!token.startsWith("--")) {
+      flags._.push(token);
+      continue;
+    }
+    const at = token.indexOf("=");
+    const key = token.slice(2, at < 0 ? undefined : at);
+    if (!valueFlags.has(key) && !booleanFlags.has(key)) throw new Error(`unknown variant option: --${key}`);
+    if (seen.has(key)) throw new Error(`duplicate variant option: --${key}`);
+    seen.add(key);
+    if (booleanFlags.has(key)) {
+      if (at >= 0) throw new Error(`--${key} does not take a value`);
+      flags[key] = true;
+      continue;
+    }
+    const value = at >= 0 ? token.slice(at + 1) : String(args[++index] ?? "");
+    if (!value || (at < 0 && value.startsWith("--"))) throw new Error(`--${key} requires a value`);
+    flags[key] = value;
+  }
+  if (flags._.length > 1) throw new Error("variant resolve accepts at most one candidates.json path");
+  if (flags.candidates && flags._.length) throw new Error("choose either --candidates or a positional candidates.json path");
+  return flags;
+}
 
 function validateVariantCandidate(candidate, index) {
   const allowed = new Set(["variantId", "baseAgentReleaseId", "experiencePackReleaseId", "status", "compatibilityStatus", "score", "mcpRequirements"]);
@@ -39,15 +80,19 @@ function validateVariantCandidate(candidate, index) {
     variantId: candidate.variantId,
     baseAgentReleaseId: candidate.baseAgentReleaseId,
     experiencePackReleaseId: candidate.experiencePackReleaseId,
-    status: String(candidate.status || "draft"),
-    compatibilityStatus: String(candidate.compatibilityStatus || "unverified"),
+    status: assertSafeText(candidate.status || "draft", `candidate[${index}].status`, 64),
+    compatibilityStatus: assertSafeText(candidate.compatibilityStatus || "unverified", `candidate[${index}].compatibilityStatus`, 64),
     score,
     mcpRequirements: requirements,
   };
 }
 
 function resolveVariantCandidates(options) {
+  if (!options || !Array.isArray(options.candidates || [])) throw new Error("variant candidates must be an array");
+  if ((options.candidates || []).length > MAX_VARIANT_CANDIDATES) throw new Error("too many variant candidates");
   const candidates = (options.candidates || []).map(validateVariantCandidate);
+  const candidateIds = candidates.map((candidate) => candidate.variantId);
+  if (new Set(candidateIds).size !== candidateIds.length) throw new Error("variantId values must be unique");
   const inventoryById = indexInventory(options.inventory || []);
   if (!options.baseAgentReleaseId) {
     return {
@@ -67,6 +112,8 @@ function resolveVariantCandidates(options) {
       requiredMcpFailureScope: "variant-only",
     };
   }
+  assertId(options.baseAgentReleaseId, "baseAgentReleaseId");
+  if (options.preferredVariantId) assertId(options.preferredVariantId, "preferredVariantId");
   const excluded = [];
   const eligible = [];
   for (const candidate of candidates) {
@@ -202,7 +249,7 @@ function cmdVariant(options) {
     return null;
   }
   if (sub !== "resolve") throw new Error(`unknown variant subcommand: ${sub} (resolve|help)`);
-  const flags = parseSimpleFlags(args.slice(1));
+  const flags = parseVariantFlags(args.slice(1));
   let candidates = [];
   let baseAgentReleaseId = flags["base-release"] || null;
   const candidateFile = flags.candidates || flags._[0];
@@ -211,6 +258,12 @@ function cmdVariant(options) {
     if (Array.isArray(value)) candidates = value;
     else {
       assertObject(value, "variant candidate document");
+      assertExactKeys(
+        value,
+        new Set(["baseAgentReleaseId", "candidates"]),
+        ["candidates"],
+        "variant candidate document",
+      );
       if (!Array.isArray(value.candidates)) throw new Error("variant candidate document must contain candidates[]");
       candidates = value.candidates;
       if (!baseAgentReleaseId && value.baseAgentReleaseId) baseAgentReleaseId = value.baseAgentReleaseId;
@@ -236,5 +289,6 @@ module.exports = {
   resolveVariantCandidates,
   renderVariantResolution,
   variantUsage,
+  parseVariantFlags,
   cmdVariant,
 };

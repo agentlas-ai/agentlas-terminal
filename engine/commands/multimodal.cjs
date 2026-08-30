@@ -51,6 +51,18 @@ function saveSettings(db, patch) {
 
 function run(ctx, args) {
   const ko = ctx.lang === "ko";
+  const usage = ko
+    ? "사용법: agentlas multimodal [set <image|video|audio> <provider-id>]"
+    : "Usage: agentlas multimodal [set <image|video|audio> <provider-id>]";
+  if (args.length === 1 && ["help", "--help", "-h"].includes(args[0])) {
+    ctx.out(usage);
+    return 0;
+  }
+  if (args.length !== 0 && !(args.length === 3 && args[0] === "set")) {
+    const error = new Error(usage);
+    error.code = "INVALID_ARGUMENT";
+    throw error;
+  }
   const db = ctx.db();
 
   if (args[0] === "set") {

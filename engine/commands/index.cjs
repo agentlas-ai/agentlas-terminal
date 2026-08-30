@@ -181,7 +181,7 @@ function resolveCommandName(cmd) {
  * 인자로 읽는다(`agentlas run --help` 가 "help"라는 이름을 찾는 식). 추측하지 않는다.
  * `test/command-help-contract.cjs` 가 이 목록과 실제 분기를 대조한다.
  */
-const SELF_HELP_COMMANDS = new Set(["graph", "plugin", "billing", "roles", "native"]);
+const SELF_HELP_COMMANDS = new Set(["graph", "plugin", "billing", "roles", "native", "research"]);
 
 function dispatch(ctx, argv) {
   const [rawCmd, ...rest] = argv;

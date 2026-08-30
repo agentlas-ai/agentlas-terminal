@@ -206,6 +206,11 @@ function installPluginMcpRows(db, rows) {
 
 const PLUGIN_SKILL_SLUG_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/i;
 const PLUGIN_SKILL_FILE_MAX_BYTES = 512 * 1024;
+const PLUGIN_SKILL_MAX_COUNT = 64;
+const PLUGIN_SKILL_MAX_FILES_PER_SKILL = 256;
+const PLUGIN_SKILL_TOTAL_MAX_BYTES = 8 * 1024 * 1024;
+const PLUGIN_MARKER_MAX_BYTES = 128 * 1024;
+const PLUGIN_LOCAL_MAX_COUNT = 256;
 
 /** 세 채널이 공유하는 로컬 플러그인 저장소 루트. homeDir 주입은 테스트 격리용. */
 function agentlasPluginsDir({ homeDir } = {}) {
@@ -230,7 +235,12 @@ function planPluginSkillInstall(slug, manifest) {
   const skills = [];
   const declaredOnly = [];
   const refused = [];
-  for (const entry of entries) {
+  let plannedBytes = 0;
+  const seenNames = new Set();
+  if (entries.length > PLUGIN_SKILL_MAX_COUNT) {
+    refused.push({ name: "(manifest)", reason: `too many skills (maximum ${PLUGIN_SKILL_MAX_COUNT})` });
+  }
+  for (const entry of entries.slice(0, PLUGIN_SKILL_MAX_COUNT)) {
     const name = typeof entry?.name === "string" ? entry.name.trim() : "";
     if (!name) continue;
     const rawFiles = Array.isArray(entry?.files) ? entry.files : [];
@@ -242,23 +252,282 @@ function planPluginSkillInstall(slug, manifest) {
       refused.push({ name, reason: "invalid skill name" });
       continue;
     }
+    const nameKey = name.toLowerCase();
+    if (seenNames.has(nameKey)) {
+      refused.push({ name, reason: "duplicate skill name" });
+      continue;
+    }
+    seenNames.add(nameKey);
+    if (rawFiles.length > PLUGIN_SKILL_MAX_FILES_PER_SKILL) {
+      refused.push({ name, reason: `too many files (maximum ${PLUGIN_SKILL_MAX_FILES_PER_SKILL})` });
+      continue;
+    }
     const files = [];
+    const seenPaths = new Set();
+    let skillBytes = 0;
     let bad = null;
     for (const file of rawFiles) {
       const filePath = typeof file?.path === "string" ? file.path.trim() : "";
       const content = typeof file?.content === "string" ? file.content : "";
       if (!pluginSkillSafeRelativePath(filePath)) { bad = `unsafe file path "${filePath}"`; break; }
+      const pathKey = filePath.toLowerCase();
+      if (seenPaths.has(pathKey)) { bad = `duplicate file path "${filePath}"`; break; }
+      seenPaths.add(pathKey);
       if (!content.trim()) { bad = `empty content for ${filePath}`; break; }
-      if (Buffer.byteLength(content, "utf8") > PLUGIN_SKILL_FILE_MAX_BYTES) { bad = `${filePath} exceeds the file size cap`; break; }
+      const bytes = Buffer.byteLength(content, "utf8");
+      if (bytes > PLUGIN_SKILL_FILE_MAX_BYTES) { bad = `${filePath} exceeds the file size cap`; break; }
+      skillBytes += bytes;
       const sha256 = typeof file?.sha256 === "string" && /^[0-9a-f]{64}$/i.test(file.sha256)
         ? file.sha256.toLowerCase()
         : null;
       files.push({ path: filePath, content, sha256 });
     }
     if (bad) { refused.push({ name, reason: bad }); continue; }
+    if (plannedBytes + skillBytes > PLUGIN_SKILL_TOTAL_MAX_BYTES) {
+      refused.push({ name, reason: `skill payloads exceed the total size cap (${PLUGIN_SKILL_TOTAL_MAX_BYTES} bytes)` });
+      continue;
+    }
+    plannedBytes += skillBytes;
     skills.push({ name, description: typeof entry?.description === "string" ? entry.description : null, files });
   }
   return { skills, declaredOnly, refused };
+}
+
+function privateDirectory(dir) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const stat = fs.lstatSync(dir);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error(`refusing unsafe plugin directory: ${dir}`);
+  }
+  fs.chmodSync(dir, 0o700);
+  const verified = fs.lstatSync(dir);
+  if (!verified.isDirectory() || verified.isSymbolicLink() || !sameDirectoryIdentity(stat, verified)) {
+    throw new Error(`plugin directory changed during setup: ${dir}`);
+  }
+  return verified;
+}
+
+function sameDirectoryIdentity(left, right) {
+  return left
+    && right
+    && left.isDirectory()
+    && right.isDirectory()
+    && !left.isSymbolicLink()
+    && !right.isSymbolicLink()
+    && left.dev === right.dev
+    && left.ino === right.ino;
+}
+
+function privateDirectoryIdentity(dir) {
+  const stat = fs.lstatSync(dir);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error(`refusing unsafe plugin directory: ${dir}`);
+  }
+  return stat;
+}
+
+function assertPrivateDirectoryIdentity(dir, expected) {
+  const actual = privateDirectoryIdentity(dir);
+  if (!sameDirectoryIdentity(expected, actual)) {
+    throw new Error(`plugin directory changed during write: ${dir}`);
+  }
+  return actual;
+}
+
+function sameFileInode(left, right) {
+  return left
+    && right
+    && left.isFile()
+    && right.isFile()
+    && !left.isSymbolicLink()
+    && !right.isSymbolicLink()
+    && left.dev === right.dev
+    && left.ino === right.ino;
+}
+
+function existingPluginFile(target) {
+  let stat;
+  try {
+    stat = fs.lstatSync(target);
+  } catch (error) {
+    if (error && error.code === "ENOENT") return null;
+    throw error;
+  }
+  if (stat.isSymbolicLink()) throw new Error(`refusing symlink destination: ${target}`);
+  if (!stat.isFile()) throw new Error(`refusing non-file destination: ${target}`);
+  if (stat.nlink > 1) throw new Error(`refusing hard-linked destination: ${target}`);
+  return stat;
+}
+
+function writePluginFileAtomic(target, content) {
+  const parent = path.dirname(target);
+  const parentStat = privateDirectory(parent);
+  const expectedTarget = existingPluginFile(target);
+  assertPrivateDirectoryIdentity(parent, parentStat);
+  const temp = path.join(parent, `.${path.basename(target)}.agentlas-${crypto.randomUUID()}.tmp`);
+  const flags = fs.constants.O_WRONLY
+    | fs.constants.O_CREAT
+    | fs.constants.O_EXCL
+    | (fs.constants.O_NOFOLLOW || 0);
+  let fd = null;
+  let tempStat = null;
+  let tempPublished = false;
+  try {
+    assertPrivateDirectoryIdentity(parent, parentStat);
+    if (expectedTarget) {
+      // Node has no portable rename-no-replace primitive. For an existing file,
+      // update only the exact inode observed above, never a pathname successor.
+      fd = fs.openSync(target, fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0));
+      const opened = fs.fstatSync(fd);
+      if (!sameFileInode(expectedTarget, opened) || opened.nlink !== 1) {
+        throw new Error(`plugin destination changed before update: ${target}`);
+      }
+      fs.ftruncateSync(fd, 0);
+      fs.writeSync(fd, content, 0, "utf8");
+      fs.fsyncSync(fd);
+      const updated = fs.fstatSync(fd);
+      if (!sameFileInode(opened, updated) || updated.nlink !== 1) {
+        throw new Error(`plugin destination identity changed during update: ${target}`);
+      }
+      fs.closeSync(fd);
+      fd = null;
+      assertPrivateDirectoryIdentity(parent, parentStat);
+      const finalStat = fs.lstatSync(target);
+      if (!sameFileInode(updated, finalStat) || finalStat.nlink !== 1) {
+        throw new Error(`plugin destination changed after update: ${target}`);
+      }
+      return;
+    }
+
+    fd = fs.openSync(temp, flags, 0o600);
+    fs.writeFileSync(fd, content, { encoding: "utf8" });
+    fs.fsyncSync(fd);
+    tempStat = fs.fstatSync(fd);
+    if (!tempStat.isFile() || tempStat.nlink !== 1) throw new Error(`unsafe temporary plugin file: ${target}`);
+    fs.closeSync(fd);
+    fd = null;
+    assertPrivateDirectoryIdentity(parent, parentStat);
+    // link(2) is atomic and no-replace: unlike rename(2), a successor that
+    // appears after the preflight can never be silently clobbered.
+    if (existingPluginFile(target)) {
+      throw new Error(`plugin destination appeared during write: ${target}`);
+    }
+    fs.linkSync(temp, target);
+    tempPublished = true;
+    assertPrivateDirectoryIdentity(parent, parentStat);
+    fs.unlinkSync(temp);
+    tempPublished = false;
+    const finalStat = fs.lstatSync(target);
+    if (
+      !sameFileInode(tempStat, finalStat)
+      || finalStat.nlink !== 1
+    ) {
+      throw new Error(`plugin file identity changed after write: ${target}`);
+    }
+    assertPrivateDirectoryIdentity(parent, parentStat);
+  } catch (error) {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch { /* best effort */ }
+    }
+    try {
+      if (!tempPublished && sameDirectoryIdentity(parentStat, privateDirectoryIdentity(parent))) {
+        fs.unlinkSync(temp);
+      }
+    } catch (cleanupError) {
+      if (cleanupError && cleanupError.code !== "ENOENT") { /* best effort */ }
+    }
+    throw error;
+  }
+}
+
+function readPluginDirectory(dir) {
+  const stat = fs.lstatSync(dir);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error(`refusing unsafe plugin directory: ${dir}`);
+  }
+  return stat;
+}
+
+function sameFileIdentity(left, right) {
+  return left
+    && right
+    && left.dev === right.dev
+    && left.ino === right.ino
+    && left.size === right.size
+    && left.nlink === right.nlink;
+}
+
+function readPluginMarker(target) {
+  const before = fs.lstatSync(target);
+  if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1 || before.size > PLUGIN_MARKER_MAX_BYTES) {
+    throw new Error(`unsafe plugin marker: ${target}`);
+  }
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
+  let fd = null;
+  try {
+    fd = fs.openSync(target, flags);
+    const opened = fs.fstatSync(fd);
+    if (!sameFileIdentity(before, opened)) throw new Error(`plugin marker changed before read: ${target}`);
+    const buffer = Buffer.alloc(PLUGIN_MARKER_MAX_BYTES + 1);
+    let bytesRead = 0;
+    while (bytesRead < buffer.length) {
+      const count = fs.readSync(fd, buffer, bytesRead, buffer.length - bytesRead, null);
+      if (!count) break;
+      bytesRead += count;
+    }
+    if (bytesRead > PLUGIN_MARKER_MAX_BYTES) throw new Error(`plugin marker exceeds the ${PLUGIN_MARKER_MAX_BYTES}-byte cap`);
+    const after = fs.fstatSync(fd);
+    if (!sameFileIdentity(opened, after) || bytesRead !== after.size) {
+      throw new Error(`plugin marker changed during read: ${target}`);
+    }
+    const value = buffer.subarray(0, bytesRead).toString("utf8");
+    const pathnameAfter = fs.lstatSync(target);
+    if (!sameFileIdentity(before, pathnameAfter)) {
+      throw new Error(`plugin marker changed after read: ${target}`);
+    }
+    return value;
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
+  }
+}
+
+function validMarkerText(value, max) {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= max
+    && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
+}
+
+function validatePluginMarker(marker, directoryName) {
+  if (!marker || typeof marker !== "object" || Array.isArray(marker)) return null;
+  if (marker.schema !== "agentlas.local-plugin/v1") return null;
+  if (!validMarkerText(marker.slug, 64) || !PLUGIN_SKILL_SLUG_RE.test(marker.slug)) return null;
+  if (String(marker.slug).toLowerCase() !== String(directoryName).toLowerCase()) return null;
+  if (!validMarkerText(marker.name, 256)) return null;
+  if (!Array.isArray(marker.skills) || marker.skills.length > PLUGIN_SKILL_MAX_COUNT) return null;
+  const seenSkills = new Set();
+  for (const skill of marker.skills) {
+    if (!skill || typeof skill !== "object" || !validMarkerText(skill.name, 64) || !PLUGIN_SKILL_SLUG_RE.test(skill.name)) return null;
+    const skillKey = skill.name.toLowerCase();
+    if (seenSkills.has(skillKey)) return null;
+    seenSkills.add(skillKey);
+    if (!Array.isArray(skill.files) || skill.files.length > PLUGIN_SKILL_MAX_FILES_PER_SKILL) return null;
+    const seenFiles = new Set();
+    for (const file of skill.files) {
+      if (!file || typeof file !== "object" || !pluginSkillSafeRelativePath(file.path)) return null;
+      const fileKey = file.path.toLowerCase();
+      if (seenFiles.has(fileKey)) return null;
+      seenFiles.add(fileKey);
+      if (!/^[0-9a-f]{64}$/i.test(String(file.sha256 || "")) || typeof file.verified !== "boolean") return null;
+    }
+  }
+  return {
+    slug: marker.slug,
+    name: marker.name,
+    installedAt: validMarkerText(marker.installedAt, 128) ? marker.installedAt : null,
+    installedBy: validMarkerText(marker.installedBy, 128) ? marker.installedBy : null,
+    skills: marker.skills.map((skill) => String(skill.name)),
+  };
 }
 
 /**
@@ -272,35 +541,122 @@ function installPluginSkills(slug, plan, { homeDir, manifestUrl, meta } = {}) {
   if (!PLUGIN_SKILL_SLUG_RE.test(String(slug || ""))) {
     return { dir: "", installed: [], failed: [{ name: String(slug || ""), reason: "invalid plugin slug" }], verified: false };
   }
-  const pluginDir = path.join(agentlasPluginsDir({ homeDir }), slug);
+  const pluginsRoot = agentlasPluginsDir({ homeDir });
+  const pluginDir = path.join(pluginsRoot, slug);
   const installed = [];
   const failed = [];
   const markerSkills = [];
   let allDeclared = true;
-  for (const skill of plan.skills || []) {
+  let hadFailure = false;
+  try {
+    // Every directory owned by the installer is private and must be a real
+    // directory. In particular, do not follow a pre-created .agentlas/plugins
+    // or <slug>/skills symlink into an arbitrary location.
+    privateDirectory(path.dirname(pluginsRoot));
+    privateDirectory(pluginsRoot);
+    privateDirectory(pluginDir);
+  } catch (error) {
+    return {
+      dir: pluginDir,
+      installed,
+      failed: [{ name: "plugin", reason: String((error && error.message) || error).slice(0, 160) }],
+      verified: false,
+    };
+  }
+  const skills = Array.isArray(plan?.skills) ? plan.skills.slice(0, PLUGIN_SKILL_MAX_COUNT) : [];
+  if (Array.isArray(plan?.skills) && plan.skills.length > PLUGIN_SKILL_MAX_COUNT) {
+    failed.push({ name: "(manifest)", reason: `too many skills (maximum ${PLUGIN_SKILL_MAX_COUNT})` });
+    allDeclared = false;
+    hadFailure = true;
+  }
+  let installedBytes = 0;
+  const seenSkillNames = new Set();
+  for (const skill of skills) {
     const written = [];
     let mismatch = null;
+    let skillBytes = 0;
+    const seenPaths = new Set();
+    const skillName = typeof skill?.name === "string" ? skill.name : "";
+    if (!skill || typeof skill !== "object" || !PLUGIN_SKILL_SLUG_RE.test(skillName)) {
+      failed.push({ name: String(skill?.name || "skill"), reason: "invalid skill name" });
+      allDeclared = false;
+      hadFailure = true;
+      continue;
+    }
+    const skillNameKey = skillName.toLowerCase();
+    if (seenSkillNames.has(skillNameKey)) {
+      failed.push({ name: skillName, reason: "duplicate skill name" });
+      allDeclared = false;
+      hadFailure = true;
+      continue;
+    }
+    seenSkillNames.add(skillNameKey);
+    if (!Array.isArray(skill.files) || skill.files.length > PLUGIN_SKILL_MAX_FILES_PER_SKILL) {
+      failed.push({ name: skillName, reason: `too many files (maximum ${PLUGIN_SKILL_MAX_FILES_PER_SKILL})` });
+      allDeclared = false;
+      hadFailure = true;
+      continue;
+    }
     for (const file of skill.files) {
+      if (!file || typeof file !== "object" || !pluginSkillSafeRelativePath(file.path)) {
+        mismatch = `unsafe file path "${String(file?.path || "")}"`;
+        break;
+      }
+      const pathKey = file.path.toLowerCase();
+      if (seenPaths.has(pathKey)) {
+        mismatch = `duplicate file path "${file.path}"`;
+        break;
+      }
+      seenPaths.add(pathKey);
+      if (typeof file.content !== "string" || !file.content.trim()) {
+        mismatch = `empty content for ${file.path}`;
+        break;
+      }
+      const bytes = Buffer.byteLength(file.content, "utf8");
+      if (bytes > PLUGIN_SKILL_FILE_MAX_BYTES) {
+        mismatch = `${file.path} exceeds the file size cap`;
+        break;
+      }
+      skillBytes += bytes;
       const actual = crypto.createHash("sha256").update(file.content, "utf8").digest("hex");
       if (file.sha256 && file.sha256 !== actual) { mismatch = `sha256 mismatch for ${file.path}`; break; }
       if (!file.sha256) allDeclared = false;
       written.push({ path: file.path, sha256: actual, verified: Boolean(file.sha256) });
     }
-    if (mismatch) { failed.push({ name: skill.name, reason: mismatch }); continue; }
+    if (mismatch) {
+      failed.push({ name: skillName, reason: mismatch });
+      hadFailure = true;
+      continue;
+    }
+    if (installedBytes + skillBytes > PLUGIN_SKILL_TOTAL_MAX_BYTES) {
+      failed.push({ name: skillName, reason: `skill payloads exceed the total size cap (${PLUGIN_SKILL_TOTAL_MAX_BYTES} bytes)` });
+      allDeclared = false;
+      hadFailure = true;
+      continue;
+    }
     try {
-      const skillDir = path.join(pluginDir, "skills", skill.name);
+      const skillDir = path.join(pluginDir, "skills", skillName);
+      privateDirectory(path.join(pluginDir, "skills"));
+      privateDirectory(skillDir);
       for (const file of skill.files) {
-        const target = path.join(skillDir, file.path);
-        fs.mkdirSync(path.dirname(target), { recursive: true });
-        fs.writeFileSync(target, file.content, "utf8");
+        const parts = file.path.split("/");
+        let parent = skillDir;
+        for (const part of parts.slice(0, -1)) {
+          parent = path.join(parent, part);
+          privateDirectory(parent);
+        }
+        writePluginFileAtomic(path.join(parent, parts[parts.length - 1]), file.content);
       }
-      installed.push(skill.name);
-      markerSkills.push({ name: skill.name, files: written });
+      installedBytes += skillBytes;
+      installed.push(skillName);
+      markerSkills.push({ name: skillName, files: written });
     } catch (e) {
-      failed.push({ name: skill.name, reason: String((e && e.message) || e).slice(0, 160) });
+      failed.push({ name: skillName, reason: String((e && e.message) || e).slice(0, 160) });
+      hadFailure = true;
     }
   }
-  const verified = installed.length > 0 && allDeclared;
+  const contentVerified = installed.length > 0 && allDeclared && !hadFailure;
+  let markerWritten = false;
   if (installed.length > 0) {
     // 마커는 마지막에 쓴다 — 마커가 있으면 스킬 파일도 있다는 뜻이어야 한다.
     const marker = {
@@ -311,17 +667,18 @@ function installPluginSkills(slug, plan, { homeDir, manifestUrl, meta } = {}) {
       version: (meta && meta.version) || null,
       installedAt: new Date().toISOString(),
       installedBy: "agentlas-terminal",
-      source: { manifestUrl: manifestUrl || null, contentVerification: verified ? "manifest-sha256" : "none" },
+      source: { manifestUrl: manifestUrl || null, contentVerification: contentVerified ? "manifest-sha256" : "none" },
       skills: markerSkills,
     };
     try {
-      fs.mkdirSync(pluginDir, { recursive: true });
-      fs.writeFileSync(path.join(pluginDir, "plugin.json"), `${JSON.stringify(marker, null, 2)}\n`, "utf8");
+      writePluginFileAtomic(path.join(pluginDir, "plugin.json"), `${JSON.stringify(marker, null, 2)}\n`);
+      markerWritten = true;
     } catch (e) {
       failed.push({ name: "plugin.json", reason: String((e && e.message) || e).slice(0, 160) });
+      hadFailure = true;
     }
   }
-  return { dir: pluginDir, installed, failed, verified };
+  return { dir: pluginDir, installed, failed, verified: contentVerified && markerWritten && !hadFailure };
 }
 
 /** ~/.agentlas/plugins/<slug>/plugin.json 마커들을 읽는다 — list의 설치 여부 표시용. */
@@ -329,25 +686,30 @@ function listInstalledLocalPlugins({ homeDir } = {}) {
   const root = agentlasPluginsDir({ homeDir });
   let names;
   try {
-    names = fs.readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
+    const rootStat = readPluginDirectory(root);
+    names = fs.readdirSync(root, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && !d.isSymbolicLink())
+      .map((d) => d.name)
+      .filter((name) => !name.startsWith("."))
+      .slice(0, PLUGIN_LOCAL_MAX_COUNT);
+    const rootAfter = readPluginDirectory(root);
+    if (rootAfter.dev !== rootStat.dev || rootAfter.ino !== rootStat.ino) return [];
   } catch {
     return [];
   }
   const out = [];
   for (const name of names) {
-    if (name.startsWith(".")) continue;
     try {
-      const marker = JSON.parse(fs.readFileSync(path.join(root, name, "plugin.json"), "utf8"));
-      out.push({
-        slug: String(marker.slug || name),
-        name: String(marker.name || name),
-        installedAt: marker.installedAt || null,
-        installedBy: marker.installedBy || null,
-        skills: Array.isArray(marker.skills) ? marker.skills.map((s) => String(s?.name || "")).filter(Boolean) : [],
-        dir: path.join(root, name),
-      });
+      const pluginDir = path.join(root, name);
+      const pluginBefore = readPluginDirectory(pluginDir);
+      const marker = JSON.parse(readPluginMarker(path.join(pluginDir, "plugin.json")));
+      const pluginAfter = readPluginDirectory(pluginDir);
+      if (pluginAfter.dev !== pluginBefore.dev || pluginAfter.ino !== pluginBefore.ino) continue;
+      const valid = validatePluginMarker(marker, name);
+      if (!valid) continue;
+      out.push({ ...valid, dir: pluginDir });
     } catch {
-      // 마커 없는 디렉터리는 다른 도구의 산출물일 수 있다 — 조용히 건너뛴다.
+      // 마커 없는 디렉터리와 unsafe/corrupt markers는 설치 상태로 광고하지 않는다.
     }
   }
   return out;

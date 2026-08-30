@@ -2,7 +2,12 @@
 /* usage — 로컬 사용 현황 요약 (공유 DB 읽기 전용). 공급자 쿼터 대시보드는 데스크탑 소관. */
 const { listAgents } = require("../agents/registry.cjs");
 
-function run(ctx) {
+function run(ctx, args = []) {
+  if (args.length) {
+    const error = new Error("usage: agentlas usage");
+    error.code = "INVALID_ARGUMENT";
+    throw error;
+  }
   const ko = ctx.lang === "ko";
   const db = ctx.db();
   const day = new Date(Date.now() - 86400000).toISOString();

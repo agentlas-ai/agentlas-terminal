@@ -30,6 +30,7 @@ function probeSystemMcpServerConnection(server, options = {}) {
     let abortHandler = null;
     let forceKillTimer = null;
     let childClosed = false;
+    let writeMessage = () => false;
     const terminateChild = (signal) => {
       const pid = Number(child?.pid);
       // detached 자식은 프로세스 그룹(-pid)째로 종료해야 패키지 매니저가 띄운
@@ -63,12 +64,8 @@ function probeSystemMcpServerConnection(server, options = {}) {
       if (message.id === 1) {
         if (message.error || !message.result) return finish(false, "initialize_failed");
         initialized = true;
-        try {
-          child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} })}\n`);
-          child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} })}\n`);
-        } catch {
-          finish(false, "connection_failed");
-        }
+        if (!writeMessage({ jsonrpc: "2.0", method: "notifications/initialized", params: {} })) return;
+        writeMessage({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
       } else if (message.id === 2 && initialized) {
         finish(
           !message.error && Boolean(message.result),
@@ -100,8 +97,13 @@ function probeSystemMcpServerConnection(server, options = {}) {
       }
     };
     const timer = setTimeout(() => finish(false, "connection_timeout"), timeoutMs);
+    const runtimeArgs = parseRuntimeServerArgs(server.args_json);
+    if (!runtimeArgs) {
+      finish(false, "invalid_runtime_args");
+      return;
+    }
     try {
-      child = spawnImpl(server.command, parseRuntimeServerArgs(server.args_json) || [], {
+      child = spawnImpl(server.command, runtimeArgs, {
         cwd: options.cwd || process.cwd(),
         env: buildMcpChildEnv(options.env || process.env, server.credentialKeyNames || [], {
           runtimeHome: server.mcpRuntimeHome || mcpRuntimeHome(options.userDataDir, server.catalog_id || server.id || server.command),
@@ -110,6 +112,7 @@ function probeSystemMcpServerConnection(server, options = {}) {
         stdio: ["pipe", "pipe", "ignore"],
       });
       child.once("error", () => finish(false, "connection_failed"));
+      child.stdin.on?.("error", () => finish(false, "connection_failed"));
       child.once("close", () => {
         childClosed = true;
         if (forceKillTimer) clearTimeout(forceKillTimer);
@@ -122,7 +125,19 @@ function probeSystemMcpServerConnection(server, options = {}) {
         buffer = Buffer.concat([buffer, Buffer.from(chunk)]);
         drain();
       });
-      child.stdin.write(`${JSON.stringify({
+      writeMessage = (message) => {
+        if (settled) return false;
+        try {
+          child.stdin.write(`${JSON.stringify(message)}\n`, (error) => {
+            if (error) finish(false, "connection_failed");
+          });
+          return true;
+        } catch {
+          finish(false, "connection_failed");
+          return false;
+        }
+      };
+      writeMessage({
         jsonrpc: "2.0",
         id: 1,
         method: "initialize",
@@ -131,7 +146,7 @@ function probeSystemMcpServerConnection(server, options = {}) {
           capabilities: {},
           clientInfo: { name: "agentlas-terminal-build", version: "1" },
         },
-      })}\n`);
+      });
       if (options.signal) {
         abortHandler = () => finish(false, "connection_timeout");
         if (options.signal.aborted) abortHandler();

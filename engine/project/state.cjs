@@ -37,16 +37,27 @@ const projectBootstrapStates = new Map();
 
 function terminalProjectCandidateCli(projectPath) {
   try {
-    const root = path.resolve(projectPath || process.cwd());
+    const requested = path.resolve(projectPath || process.cwd());
+    const stat = fs.statSync(requested);
+    if (!stat.isDirectory()) return null;
+    // Resolve the directory before applying broad-root exclusions. Otherwise
+    // `/tmp/project -> ~/.agentlas` bypasses the lexical checks and lets an
+    // explicit init write private project state into Agentlas' own userData.
+    const root = fs.realpathSync.native(requested);
+    const realOrResolved = (candidate) => {
+      try { return fs.realpathSync.native(candidate); } catch { return path.resolve(candidate); }
+    };
+    const home = realOrResolved(os.homedir());
+    const data = realOrResolved(userDataDir());
+    const fallback = realOrResolved(runCwd());
     const unsafe = new Set([
-      path.resolve(os.homedir()),
+      home,
       path.parse(root).root,
-      path.resolve(userDataDir()),
-      path.resolve(runCwd()),
+      data,
+      fallback,
     ]);
     if (unsafe.has(root)) return null;
-    const stat = fs.statSync(root);
-    if (!stat.isDirectory()) return null;
+    if (root.startsWith(`${data}${path.sep}`) || root.startsWith(`${fallback}${path.sep}`)) return null;
     return root;
   } catch {
     return null;
@@ -67,6 +78,10 @@ function assertNoSymlinkInAgentlasStateCli(stateDir) {
     if (stat.isSymbolicLink()) throw new Error(".agentlas local state must not contain symbolic links");
     if (stat.isDirectory()) {
       for (const entry of fs.readdirSync(current)) pending.push(path.join(current, entry));
+    } else if (stat.isFile()) {
+      if (stat.nlink !== 1) throw new Error(".agentlas local state must not contain hard-linked files");
+    } else {
+      throw new Error(".agentlas local state must contain only directories and regular files");
     }
   }
   if (pending.length) throw new Error(".agentlas local state exceeds the safe bootstrap inspection limit");
@@ -78,7 +93,9 @@ function readRegularUtf8FileNoFollowCli(filePath, maxBytes = AGENTLAS_GITIGNORE_
     if (error && error.code === "ENOENT") return { exists: false, content: "", mode: 0o644, stat: null };
     throw error;
   }
-  if (before.isSymbolicLink() || !before.isFile()) throw new Error(".gitignore must be a regular non-symbolic-link file");
+  if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1) {
+    throw new Error(".gitignore must be a single-link regular non-symbolic-link file");
+  }
   if (before.size > maxBytes) throw new Error(`.gitignore exceeds the ${maxBytes}-byte safe bootstrap limit`);
 
   const noFollow = fs.constants.O_NOFOLLOW || 0;
@@ -91,7 +108,7 @@ function readRegularUtf8FileNoFollowCli(filePath, maxBytes = AGENTLAS_GITIGNORE_
   }
   try {
     const opened = fs.fstatSync(fd);
-    if (!opened.isFile()) throw new Error(".gitignore changed type during bootstrap");
+    if (!opened.isFile() || opened.nlink !== 1) throw new Error(".gitignore changed type during bootstrap");
     if (opened.size > maxBytes) throw new Error(`.gitignore exceeds the ${maxBytes}-byte safe bootstrap limit`);
     if (
       Number.isFinite(before.dev) && Number.isFinite(before.ino) &&
@@ -110,7 +127,9 @@ function readRegularUtf8FileNoFollowCli(filePath, maxBytes = AGENTLAS_GITIGNORE_
     }
     if (total > maxBytes) throw new Error(`.gitignore exceeds the ${maxBytes}-byte safe bootstrap limit`);
     const after = fs.fstatSync(fd);
-    if (after.size !== opened.size || after.mtimeMs !== opened.mtimeMs) throw new Error(".gitignore changed while it was being read");
+    if (after.nlink !== 1 || after.size !== opened.size || after.mtimeMs !== opened.mtimeMs) {
+      throw new Error(".gitignore changed while it was being read");
+    }
     let content;
     try { content = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks, total)); } catch {
       throw new Error(".gitignore must contain valid UTF-8 text");
@@ -132,7 +151,7 @@ function assertFileSnapshotUnchangedCli(filePath, snapshot) {
     }
   }
   const current = fs.lstatSync(filePath);
-  if (current.isSymbolicLink() || !current.isFile()) throw new Error(".gitignore changed type during bootstrap");
+  if (current.isSymbolicLink() || !current.isFile() || current.nlink !== 1) throw new Error(".gitignore changed type during bootstrap");
   const original = snapshot.stat;
   if (
     !original || current.dev !== original.dev || current.ino !== original.ino ||
@@ -227,14 +246,20 @@ function hardenAgentlasProjectStateCli(projectPath) {
     visited += 1;
     try {
       const stat = fs.lstatSync(current);
-      if (stat.isSymbolicLink()) continue;
+      if (stat.isSymbolicLink()) throw new Error(".agentlas local state must not contain symbolic links");
       if (stat.isDirectory()) {
         try { fs.chmodSync(current, 0o700); } catch { /* Windows/best effort */ }
         for (const entry of fs.readdirSync(current)) pending.push(path.join(current, entry));
       } else if (stat.isFile()) {
+        if (stat.nlink !== 1) throw new Error(".agentlas local state must not contain hard-linked files");
         try { fs.chmodSync(current, 0o600); } catch { /* Windows/best effort */ }
+      } else {
+        throw new Error(".agentlas local state must contain only directories and regular files");
       }
-    } catch { /* disappearing files and ACL-only hosts are best effort */ }
+    } catch (error) {
+      if (error && error.code === "ENOENT") continue;
+      throw error;
+    }
   }
 }
 
@@ -314,10 +339,10 @@ function recordCliFolderVisit(db, projectPath, options = {}) {
   const activate = options.activate === true;
   try {
     if (!activate) {
-      const row = tableExists(db, "folder_activity")
-        ? db.prepare("SELECT activated_at FROM folder_activity WHERE path=?").get(root)
-        : null;
-      return { activated: Boolean(row && row.activated_at) || fs.existsSync(path.join(root, ".agentlas")) };
+      // A historical DB row or an arbitrary `.agentlas` entry is not proof
+      // that today's private-state boundary is intact. Revalidate the marker,
+      // soul file, entry types, and link identities on every passive use.
+      return { activated: Boolean(initializedAgentlasProjectPathCli(root)) };
     }
 
     ensureCoreProjectCli(root, { reason: options.reason || "terminal-first-contact", coreRoot: options.coreRoot });

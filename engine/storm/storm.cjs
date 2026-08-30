@@ -208,10 +208,33 @@ function create(deps) {
       cwd: executionContext.cwd || (typeof D.projectCwd === "function" ? D.projectCwd() : D.runCwd()),
       runtimeOverride,
     };
+    const seen = new Set();
+    let passthrough = false;
     for (let i = 0; i < args.length; i++) {
-      if (args[i] === "--research" || args[i] === "--research-evidence") ctx.research = true;
-      else if (args[i] === "--background") ctx.background = true;
-      else rest.push(args[i]);
+      const token = String(args[i]);
+      if (passthrough) { rest.push(token); continue; }
+      if (token === "--") { passthrough = true; continue; }
+      if (token === "--research" || token === "--research-evidence") {
+        if (seen.has("research")) {
+          const ui = executionContext.ui || newUi();
+          ui.error("duplicate option: --research", { reveal: true });
+          return { ok: false, error: "duplicate-option" };
+        }
+        seen.add("research");
+        ctx.research = true;
+      } else if (token === "--background") {
+        if (seen.has("background")) {
+          const ui = executionContext.ui || newUi();
+          ui.error("duplicate option: --background", { reveal: true });
+          return { ok: false, error: "duplicate-option" };
+        }
+        seen.add("background");
+        ctx.background = true;
+      } else if (token.startsWith("-")) {
+        const ui = executionContext.ui || newUi();
+        ui.error(`unknown option ${token} — storm accepts: --research | --background | --runtime <kind>`, { reveal: true });
+        return { ok: false, error: "unknown-option" };
+      } else rest.push(token);
     }
     const r = await stormRun(db, rest.join(" "), ctx);
     if (!r.ok) process.exitCode = 1;

@@ -22,6 +22,7 @@ function normalizeSite(input) {
   if (!raw) return "";
   let u;
   try { u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `https://${raw}`); } catch { return ""; }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return "";
   if (u.username || u.password) return ""; // 자격증명은 사이트 키에 절대 들이지 않는다
   const host = u.host.toLowerCase().replace(/^www\./, "");
   return host && !/\s/.test(host) ? host : "";

@@ -238,7 +238,9 @@ async function parallelCap(items, cap, fn) {
 }
 
 function isVerificationDivision(node) {
-  const label = `${node && node.role || ""} ${node && node.name || ""} ${node && node.key || ""}`
+  // key에는 `<firm-slug>:` 접두사가 들어간다. 회사 이름이 `firm-test`/`qa-studio`인
+  // 것만으로 모든 본부를 검증 본부로 오분류하면 구현 슬롯이 하나도 실행되지 않는다.
+  const label = `${node && node.role || ""} ${node && node.name || ""}`
     .toLowerCase()
     .replace(/[_-]+/g, " ");
   return /\b(?:eval|qa|quality|test|verification|verifier)\b|policy\s+gate/.test(label);
@@ -278,9 +280,9 @@ function verificationResultOk(text, sessionOk) {
   if (!sessionOk) return false;
   const source = String(text || "").trim();
   const explicit = source.match(/<verification_verdict>\s*(PASS|FAIL)\s*<\/verification_verdict>/i);
-  if (explicit) return explicit[1].toUpperCase() === "PASS";
-  const opening = source.slice(0, 900);
-  return !/(?:\bverdict\s*:\s*fail\b|\brelease[- ]blocking\b|\bnot complete\b|\bcannot truthfully\b|\bno[- ]go\b|\bblocking defect\b)/i.test(opening);
+  // 검증 프롬프트가 요구한 machine-readable verdict가 유일한 성공 근거다.
+  // 본문 어조로 성공을 추측하면 태그를 빠뜨린 응답이나 명시적 FAIL까지 통과할 수 있다.
+  return Boolean(explicit && explicit[1].toUpperCase() === "PASS");
 }
 
 function latestResultsAllOk(results) {
@@ -400,9 +402,10 @@ async function runFirmTurn(p) {
             ? `${m.brief || task}\n\n[Release-blocking repair stage]\nIndependent verification found the following failures in the current integrated product. Inspect the evidence and current files, repair the actual shipped experience, and rerun the relevant checks before returning. Do not merely describe the fix.\n${stageContext}`
             : (m.brief || task);
       const res = await session.send(prompt);
-      text = cleanFenceText(turnText(res));
+      const rawText = turnText(res);
+      text = cleanFenceText(rawText);
       ok = stageKind === "verification"
-        ? verificationResultOk(text, session.status === "done")
+        ? verificationResultOk(rawText, session.status === "done")
         : session.status === "done";
       if (!ok && !text) text = session.lastError || "no response";
     } catch (e) {

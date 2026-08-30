@@ -18,6 +18,7 @@ const MAX_JSON_BYTES = 2 * 1024 * 1024;
 const MAX_APPROVED_MCP_PER_BUILD = 8;
 const STATE_LOCK_STALE_MS = 30_000;
 const STATE_LOCK_WAIT_MS = 2_000;
+const STATE_LOCK_OWNER_MAX_BYTES = 512;
 
 // Public contract text must be compact, value-free, and instruction-safe.
 const UNSAFE_TEXT_PATTERNS = [
@@ -92,14 +93,109 @@ function safeDisplayName(value, fallback) {
   return text;
 }
 
+function fileIdentityEqual(left, right) {
+  return Boolean(left && right) && left.dev === right.dev && left.ino === right.ino && left.nlink === right.nlink && left.mode === right.mode;
+}
+
+function fileTimesEqual(left, right) {
+  return Boolean(left && right) && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
+}
+
+function assertRegularJsonFile(stat, label) {
+  if (!stat || !stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+    throw new Error(`${label} must be a regular file (symlinks are not accepted)`);
+  }
+}
+
+function assertJsonFileSize(stat, label) {
+  if (stat.size <= 0 || stat.size > MAX_JSON_BYTES) throw new Error(`${label} has an invalid size`);
+}
+
+function openReadOnlyNoFollow(filePath) {
+  const noFollow = fs.constants.O_NOFOLLOW || 0;
+  try {
+    return fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
+  } catch (error) {
+    // Node does not expose a no-follow open flag on every Windows filesystem.
+    // Keep the lstat/fstat/path identity checks below as the fallback there;
+    // never silently drop O_NOFOLLOW on POSIX.
+    if (process.platform === "win32" && noFollow && ["EINVAL", "ENOTSUP"].includes(error && error.code)) {
+      return fs.openSync(filePath, fs.constants.O_RDONLY);
+    }
+    throw error;
+  }
+}
+
+function readBoundedDescriptor(fd, maxBytes) {
+  const chunks = [];
+  let total = 0;
+  while (total <= maxBytes) {
+    const capacity = Math.min(64 * 1024, maxBytes + 1 - total);
+    if (capacity <= 0) break;
+    const chunk = Buffer.allocUnsafe(capacity);
+    const result = fs.readSync(fd, chunk, 0, capacity, null);
+    const bytesRead = typeof result === "number" ? result : result.bytesRead;
+    if (!Number.isInteger(bytesRead) || bytesRead < 0) throw new Error("descriptor read returned an invalid byte count");
+    if (bytesRead === 0) break;
+    chunks.push(chunk.subarray(0, bytesRead));
+    total += bytesRead;
+  }
+  return { bytes: Buffer.concat(chunks, total), byteLength: total };
+}
+
 function readJsonFile(filePath, label) {
   const absolute = path.resolve(filePath);
-  const stat = fs.lstatSync(absolute);
-  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`${label} must be a regular file (symlinks are not accepted)`);
-  if (stat.size <= 0 || stat.size > MAX_JSON_BYTES) throw new Error(`${label} has an invalid size`);
-  let value;
-  try { value = JSON.parse(fs.readFileSync(absolute, "utf8")); } catch (error) { throw new Error(`${label} is not valid JSON: ${error.message}`); }
-  return { absolute, value };
+  let fd;
+  let listed;
+  try {
+    listed = fs.lstatSync(absolute);
+    assertRegularJsonFile(listed, label);
+    assertJsonFileSize(listed, label);
+    fd = openReadOnlyNoFollow(absolute);
+  } catch (error) {
+    if (error && error.code === "ELOOP") {
+      throw new Error(`${label} must be a regular file (symlinks are not accepted)`);
+    }
+    throw error;
+  }
+  try {
+    const before = fs.fstatSync(fd);
+    assertRegularJsonFile(before, label);
+    assertJsonFileSize(before, label);
+    if (!fileIdentityEqual(listed, before) || !fileTimesEqual(listed, before) || listed.size !== before.size) {
+      throw new Error(`${label} changed while it was being read`);
+    }
+
+    let captured;
+    try {
+      captured = readBoundedDescriptor(fd, MAX_JSON_BYTES);
+    } catch (error) {
+      throw new Error(`${label} is not valid JSON: ${error.message}`);
+    }
+    const after = fs.fstatSync(fd);
+    let current;
+    try { current = fs.lstatSync(absolute); }
+    catch { throw new Error(`${label} changed while it was being read`); }
+    if (!current.isFile() || current.isSymbolicLink() || current.nlink !== 1) {
+      throw new Error(`${label} changed while it was being read`);
+    }
+    if (captured.byteLength <= 0 || captured.byteLength > MAX_JSON_BYTES || after.size <= 0 || after.size > MAX_JSON_BYTES) {
+      throw new Error(`${label} has an invalid size`);
+    }
+    if (
+      !fileIdentityEqual(before, after) || !fileTimesEqual(before, after) || after.size !== before.size ||
+      captured.byteLength !== after.size || !fileIdentityEqual(before, current) ||
+      !fileTimesEqual(before, current) || current.size !== after.size
+    ) {
+      throw new Error(`${label} changed while it was being read`);
+    }
+    let value;
+    try { value = JSON.parse(captured.bytes.toString("utf8")); }
+    catch (error) { throw new Error(`${label} is not valid JSON: ${error.message}`); }
+    return { absolute, value };
+  } finally {
+    try { fs.closeSync(fd); } catch { /* best effort */ }
+  }
 }
 
 function writePrivateJsonAtomic(filePath, value) {
@@ -122,43 +218,152 @@ function waitSync(milliseconds) {
   Atomics.wait(signal, 0, 0, milliseconds);
 }
 
+function processIsAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error && error.code === "ESRCH") return false;
+    // EPERM and unknown failures mean the process may still be alive. Never
+    // reclaim a stale-looking lock when liveness cannot be disproved.
+    return true;
+  }
+}
+
+function readLockOwner(lockPath, labels) {
+  const ownerPath = path.join(lockPath, "owner.json");
+  let fd;
+  try {
+    const listed = fs.lstatSync(ownerPath);
+    if (!listed.isFile() || listed.isSymbolicLink() || listed.nlink !== 1) throw new Error(labels.unsafe);
+    fd = openReadOnlyNoFollow(ownerPath);
+    const before = fs.fstatSync(fd);
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size <= 0 || before.size > STATE_LOCK_OWNER_MAX_BYTES) {
+      throw new Error(labels.unsafe);
+    }
+    // 정상 release/다음 owner 획득과 겹친 교체는 unsafe 파일이 아니라 재시도 신호다.
+    if (!fileIdentityEqual(listed, before) || !fileTimesEqual(listed, before)) return null;
+    const captured = readBoundedDescriptor(fd, STATE_LOCK_OWNER_MAX_BYTES);
+    const after = fs.fstatSync(fd);
+    let current;
+    try { current = fs.lstatSync(ownerPath); }
+    catch (error) {
+      if (error && error.code === "ENOENT") return null;
+      throw new Error(labels.unsafe);
+    }
+    if (
+      captured.byteLength !== before.size || !fileIdentityEqual(before, after) || !fileTimesEqual(before, after) ||
+      after.size !== before.size || !fileIdentityEqual(before, current) || !fileTimesEqual(before, current) ||
+      current.size !== after.size
+    ) return null;
+    let owner;
+    try { owner = JSON.parse(captured.bytes.toString("utf8")); }
+    catch { throw new Error(labels.unsafe); }
+    if (
+      !owner || !Number.isSafeInteger(owner.pid) || owner.pid <= 0 ||
+      typeof owner.nonce !== "string" || !/^[a-f0-9]{32}$/.test(owner.nonce)
+    ) throw new Error(labels.unsafe);
+    return owner;
+  } catch (error) {
+    if (error && error.code === "ENOENT") return null;
+    if (error && error.code === "ELOOP") throw new Error(labels.unsafe);
+    throw error;
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch { /* best effort */ }
+  }
+}
+
 /**
- * <stateFile>.lock 파일 기반 상호배제. 크래시 잔류 락은 STALE_MS 이후 회수한다.
- * busyMessage/unsafeMessage를 호출자가 주어 사용자 문구를 상태별로 유지한다.
+ * <stateFile>.lock directory 기반 상호배제. 크래시 잔류 락은 owner PID가
+ * 실제로 죽었다고 확인될 때만 고유 quarantine 경로로 회수한다. 디렉터리
+ * rename이 소유권 hand-off 경계이므로 이전 소유자의 cleanup이 successor를
+ * unlink할 수 없다.
  */
 function withPrivateStateLock(stateFile, labels, action) {
   const dir = path.dirname(stateFile);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   try { fs.chmodSync(dir, 0o700); } catch { /* best effort */ }
-  const lockFile = `${stateFile}.lock`;
+  const lockPath = `${stateFile}.lock`;
   const deadline = Date.now() + STATE_LOCK_WAIT_MS;
-  let descriptor = null;
-  while (descriptor == null) {
+  let acquiredOwner = null;
+  let acquired = false;
+  while (!acquired) {
     try {
-      descriptor = fs.openSync(lockFile, "wx", 0o600);
-      fs.writeFileSync(descriptor, `${process.pid}\n${new Date().toISOString()}\n`, "utf8");
+      fs.mkdirSync(lockPath, { mode: 0o700 });
     } catch (error) {
-      if (!error || error.code !== "EEXIST") throw error;
-      try {
-        const stat = fs.lstatSync(lockFile);
-        if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(labels.unsafe);
-        if (Date.now() - stat.mtimeMs > STATE_LOCK_STALE_MS) {
-          fs.unlinkSync(lockFile);
-          continue;
-        }
-      } catch (statError) {
+      if (!error || (error.code !== "EEXIST" && error.code !== "ENOENT")) throw error;
+      if (error.code === "ENOENT") continue;
+      let stat;
+      try { stat = fs.lstatSync(lockPath); }
+      catch (statError) {
         if (statError && statError.code === "ENOENT") continue;
         throw statError;
       }
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(labels.unsafe);
+      let owner;
+      try { owner = readLockOwner(lockPath, labels); }
+      catch (ownerError) { throw ownerError; }
+      if (Date.now() - stat.mtimeMs > STATE_LOCK_STALE_MS) {
+        // Missing or malformed owner identity is not evidence of a dead PID.
+        // Stay fail-closed rather than stealing a possibly live lock.
+        if (!owner || processIsAlive(owner.pid)) {
+          if (Date.now() >= deadline) throw new Error(labels.busy);
+          waitSync(25);
+          continue;
+        }
+        const quarantine = `${lockPath}.stale-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
+        try {
+          fs.renameSync(lockPath, quarantine);
+          fs.rmSync(quarantine, { recursive: true, force: true });
+          continue;
+        } catch (reclaimError) {
+          if (reclaimError && reclaimError.code === "ENOENT") continue;
+          throw reclaimError;
+        }
+      }
       if (Date.now() >= deadline) throw new Error(labels.busy);
       waitSync(25);
+      // 기존 소유자가 정상적으로 보유 중이다. 같은 디렉터리의 owner.json에
+      // 쓰기를 시도하면 EEXIST 처리 중 활성 잠금을 abandoned로 오인해 지울 수 있다.
+      continue;
+    }
+    try {
+      acquiredOwner = {
+        pid: process.pid,
+        nonce: crypto.randomBytes(16).toString("hex"),
+        createdAt: new Date().toISOString(),
+      };
+      // owner.json 자체도 원자적으로 공개한다. mkdir 직후의 부분 쓰기를 다른
+      // contender가 size=0/malformed unsafe lock으로 관측하면 정상 경합이 실패한다.
+      writePrivateJsonAtomic(path.join(lockPath, "owner.json"), acquiredOwner);
+      acquired = true;
+    } catch (error) {
+      const abandoned = `${lockPath}.abandoned-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
+      try {
+        fs.renameSync(lockPath, abandoned);
+        fs.rmSync(abandoned, { recursive: true, force: true });
+      } catch { /* original owner-write error remains authoritative */ }
+      throw error;
     }
   }
   try {
     return action();
   } finally {
-    try { fs.closeSync(descriptor); } catch { /* noop */ }
-    try { fs.unlinkSync(lockFile); } catch { /* crash recovery handles leftovers */ }
+    let ownsLock = false;
+    try {
+      const owner = readLockOwner(lockPath, labels);
+      ownsLock = Boolean(owner && acquiredOwner && owner.pid === acquiredOwner.pid && owner.nonce === acquiredOwner.nonce);
+    } catch { /* do not remove an unverified lock */ }
+    if (ownsLock) {
+      const cleanup = `${lockPath}.done-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
+      try {
+        fs.renameSync(lockPath, cleanup);
+        fs.rmSync(cleanup, { recursive: true, force: true });
+      } catch (error) {
+        if (!error || error.code !== "ENOENT") throw error;
+      }
+    }
   }
 }
 

@@ -38,9 +38,47 @@ function configureSqliteConnection(db) {
   return db;
 }
 
+let fallbackSavepointCounter = 0;
+
 function runWriteTransaction(db, fn, ...args) {
-  if (!db || typeof db.transaction !== "function") return fn(...args);
-  const transaction = db.transaction(fn);
+  if (!db || typeof fn !== "function") throw new TypeError("SQLite connection and transaction callback are required");
+  const invoke = (...invokeArgs) => {
+    const result = fn(...invokeArgs);
+    if (result && typeof result.then === "function") {
+      throw new TypeError("SQLite write transactions must be synchronous");
+    }
+    return result;
+  };
+  if (typeof db.transaction !== "function") {
+    if (typeof db.exec !== "function") throw new TypeError("SQLite connection must expose transaction() or exec()");
+    // node:sqlite DatabaseSync has no transaction() helper. Execute the same
+    // atomic contract explicitly; nested callers use a SAVEPOINT so an outer
+    // transaction keeps ownership, while top-level writers acquire authority
+    // up front with BEGIN IMMEDIATE.
+    if (db.isTransaction === true) {
+      const savepoint = `agentlas_write_${process.pid}_${++fallbackSavepointCounter}`;
+      db.exec(`SAVEPOINT ${savepoint}`);
+      try {
+        const result = invoke(...args);
+        db.exec(`RELEASE SAVEPOINT ${savepoint}`);
+        return result;
+      } catch (error) {
+        try { db.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`); } catch { /* preserve original error */ }
+        try { db.exec(`RELEASE SAVEPOINT ${savepoint}`); } catch { /* outer transaction may already be gone */ }
+        throw error;
+      }
+    }
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = invoke(...args);
+      db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      try { db.exec("ROLLBACK"); } catch { /* preserve original error */ }
+      throw error;
+    }
+  }
+  const transaction = db.transaction(invoke);
   if (typeof transaction.immediate === "function") {
     return transaction.immediate(...args);
   }

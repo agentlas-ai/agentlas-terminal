@@ -74,12 +74,18 @@ async function streamAnthropic({ apiKey, model, system, messages, permission, ui
   if (toolDefs.length) body.tools = toolDefs;
 
   const idle = idleAbort(signal, IDLE_MS);
-  const resp = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
-    signal: idle.signal,
-    body: JSON.stringify(body),
-  });
+  let resp;
+  try {
+    resp = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+      signal: idle.signal,
+      body: JSON.stringify(body),
+    });
+  } catch (error) {
+    idle.clear();
+    throw error;
+  }
   if (!resp.ok) {
     idle.clear();
     throw new Error(`Anthropic ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 300)}`);
@@ -88,45 +94,49 @@ async function streamAnthropic({ apiKey, model, system, messages, permission, ui
   const blocks = {}; // index → {type, text, name, id, inputJson}
   let stopReason = null;
   let usage = null;
-  for await (const line of iterSse(resp, idle)) {
-    const data = sseData(line);
-    if (!data || data === "[DONE]") continue;
-    let ev;
-    try {
-      ev = JSON.parse(data);
-    } catch {
-      continue;
-    }
-    if (ev.type === "content_block_start") {
-      const cb = ev.content_block || {};
-      blocks[ev.index] = { type: cb.type, text: "", name: cb.name, id: cb.id, inputJson: "" };
-      if (cb.type === "tool_use") ui.tool(cb.name, "");
-      else ui.streamStart();
-    } else if (ev.type === "content_block_delta") {
-      const b = blocks[ev.index] || (blocks[ev.index] = { type: "text", text: "", inputJson: "" });
-      if (ev.delta.type === "text_delta") {
-        b.text += ev.delta.text;
-        ui.streamDelta(ev.delta.text);
-      } else if (ev.delta.type === "input_json_delta") {
-        b.inputJson += ev.delta.partial_json || "";
+  try {
+    for await (const line of iterSse(resp, idle)) {
+      const data = sseData(line);
+      if (!data || data === "[DONE]") continue;
+      let ev;
+      try {
+        ev = JSON.parse(data);
+      } catch {
+        continue;
       }
-    } else if (ev.type === "content_block_stop") {
-      const b = blocks[ev.index];
-      if (b && b.type === "tool_use") {
-        const arg = safeArg(b.inputJson);
-        if (arg) ui.info(ui.c.dim("  " + arg));
+      if (ev.type === "content_block_start") {
+        const cb = ev.content_block || {};
+        blocks[ev.index] = { type: cb.type, text: "", name: cb.name, id: cb.id, inputJson: "" };
+        if (cb.type === "tool_use") ui.tool(cb.name, "");
+        else ui.streamStart();
+      } else if (ev.type === "content_block_delta") {
+        const b = blocks[ev.index] || (blocks[ev.index] = { type: "text", text: "", inputJson: "" });
+        if (ev.delta.type === "text_delta") {
+          b.text += ev.delta.text;
+          ui.streamDelta(ev.delta.text);
+        } else if (ev.delta.type === "input_json_delta") {
+          b.inputJson += ev.delta.partial_json || "";
+        }
+      } else if (ev.type === "content_block_stop") {
+        const b = blocks[ev.index];
+        if (b && b.type === "tool_use") {
+          const arg = safeArg(b.inputJson);
+          if (arg) ui.info(ui.c.dim("  " + arg));
+        }
+        // 텍스트 블록 stop에서는 streamEnd를 호출하지 않는다 — 메모리 가드 중간 flush 방지(턴 끝에서만 flush).
+      } else if (ev.type === "message_start") {
+        const u = ev.message && ev.message.usage;
+        if (u) usage = { input_tokens: u.input_tokens || 0, output_tokens: u.output_tokens || 0 };
+      } else if (ev.type === "message_delta") {
+        if (ev.delta && ev.delta.stop_reason) stopReason = ev.delta.stop_reason;
+        if (ev.usage) usage = { input_tokens: (usage && usage.input_tokens) || 0, output_tokens: ev.usage.output_tokens };
       }
-      // 텍스트 블록 stop에서는 streamEnd를 호출하지 않는다 — 메모리 가드 중간 flush 방지(턴 끝에서만 flush).
-    } else if (ev.type === "message_start") {
-      const u = ev.message && ev.message.usage;
-      if (u) usage = { input_tokens: u.input_tokens || 0, output_tokens: u.output_tokens || 0 };
-    } else if (ev.type === "message_delta") {
-      if (ev.delta && ev.delta.stop_reason) stopReason = ev.delta.stop_reason;
-      if (ev.usage) usage = { input_tokens: (usage && usage.input_tokens) || 0, output_tokens: ev.usage.output_tokens };
     }
+  } finally {
+    // 본문 스트림이 중간에 끊겨도 Renderer의 열린 스트림 상태와 취소 리스너를 남기지 않는다.
+    ui.streamEnd();
+    idle.clear();
   }
-  ui.streamEnd();
-  idle.clear();
 
   // 어셈블
   const ordered = Object.keys(blocks)
@@ -192,12 +202,18 @@ async function streamOpenAI({ apiKey, model, messages, permission, ui, signal, b
   if (toolDefs.length) body.tools = toolDefs;
 
   const idle = idleAbort(signal, IDLE_MS);
-  const resp = await fetch(`${baseUrl || "https://api.openai.com/v1"}/chat/completions`, {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
-    signal: idle.signal,
-    body: JSON.stringify(body),
-  });
+  let resp;
+  try {
+    resp = await fetch(`${baseUrl || "https://api.openai.com/v1"}/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+      signal: idle.signal,
+      body: JSON.stringify(body),
+    });
+  } catch (error) {
+    idle.clear();
+    throw error;
+  }
   if (!resp.ok) {
     idle.clear();
     throw new Error(`OpenAI ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 300)}`);
@@ -208,43 +224,46 @@ async function streamOpenAI({ apiKey, model, messages, permission, ui, signal, b
   const toolCalls = {}; // index → {id, name, args}
   let finish = null;
   let usage = null;
-  for await (const line of iterSse(resp, idle)) {
-    const data = sseData(line);
-    if (!data || data === "[DONE]") continue;
-    let ev;
-    try {
-      ev = JSON.parse(data);
-    } catch {
-      continue;
-    }
-    if (ev.usage) usage = { input_tokens: ev.usage.prompt_tokens || 0, output_tokens: ev.usage.completion_tokens || 0 };
-    const choice = ev.choices && ev.choices[0];
-    if (!choice) continue;
-    const delta = choice.delta || {};
-    if (delta.content) {
-      if (!started) {
-        ui.streamStart();
-        started = true;
+  try {
+    for await (const line of iterSse(resp, idle)) {
+      const data = sseData(line);
+      if (!data || data === "[DONE]") continue;
+      let ev;
+      try {
+        ev = JSON.parse(data);
+      } catch {
+        continue;
       }
-      text += delta.content;
-      ui.streamDelta(delta.content);
-    }
-    if (Array.isArray(delta.tool_calls)) {
-      for (const tc of delta.tool_calls) {
-        const idx = tc.index ?? 0;
-        const cur = toolCalls[idx] || (toolCalls[idx] = { id: "", name: "", args: "" });
-        if (tc.id) cur.id = tc.id;
-        if (tc.function && tc.function.name) {
-          if (!cur.name) ui.tool(tc.function.name, "");
-          cur.name = tc.function.name;
+      if (ev.usage) usage = { input_tokens: ev.usage.prompt_tokens || 0, output_tokens: ev.usage.completion_tokens || 0 };
+      const choice = ev.choices && ev.choices[0];
+      if (!choice) continue;
+      const delta = choice.delta || {};
+      if (delta.content) {
+        if (!started) {
+          ui.streamStart();
+          started = true;
         }
-        if (tc.function && tc.function.arguments) cur.args += tc.function.arguments;
+        text += delta.content;
+        ui.streamDelta(delta.content);
       }
+      if (Array.isArray(delta.tool_calls)) {
+        for (const tc of delta.tool_calls) {
+          const idx = tc.index ?? 0;
+          const cur = toolCalls[idx] || (toolCalls[idx] = { id: "", name: "", args: "" });
+          if (tc.id) cur.id = tc.id;
+          if (tc.function && tc.function.name) {
+            if (!cur.name) ui.tool(tc.function.name, "");
+            cur.name = tc.function.name;
+          }
+          if (tc.function && tc.function.arguments) cur.args += tc.function.arguments;
+        }
+      }
+      if (choice.finish_reason) finish = choice.finish_reason;
     }
-    if (choice.finish_reason) finish = choice.finish_reason;
+  } finally {
+    if (started) ui.streamEnd();
+    idle.clear();
   }
-  if (started) ui.streamEnd();
-  idle.clear();
 
   const calls = Object.keys(toolCalls)
     .sort((a, b) => a - b)
@@ -327,26 +346,29 @@ async function runOllamaLoop(req) {
     let text = "";
     let started = false;
     let toolCalls = [];
-    for await (const line of iterSse(resp, idle)) {
-      let ev;
-      try {
-        ev = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      const msg = ev.message || {};
-      if (msg.content) {
-        if (!started) {
-          ui.streamStart();
-          started = true;
+    try {
+      for await (const line of iterSse(resp, idle)) {
+        let ev;
+        try {
+          ev = JSON.parse(line);
+        } catch {
+          continue;
         }
-        text += msg.content;
-        ui.streamDelta(msg.content);
+        const msg = ev.message || {};
+        if (msg.content) {
+          if (!started) {
+            ui.streamStart();
+            started = true;
+          }
+          text += msg.content;
+          ui.streamDelta(msg.content);
+        }
+        if (Array.isArray(msg.tool_calls)) toolCalls = toolCalls.concat(msg.tool_calls);
       }
-      if (Array.isArray(msg.tool_calls)) toolCalls = toolCalls.concat(msg.tool_calls);
+    } finally {
+      if (started) ui.streamEnd();
+      idle.clear();
     }
-    if (started) ui.streamEnd();
-    idle.clear();
     finalText = text || finalText;
     if (!toolCalls.length) break;
     messages.push({ role: "assistant", content: text, tool_calls: toolCalls });
@@ -373,39 +395,48 @@ async function runGoogleChat(req) {
   }
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${req.model}:streamGenerateContent?alt=sse&key=${encodeURIComponent(req.apiKey)}`;
   const idle = idleAbort(req.signal, IDLE_MS);
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    signal: idle.signal,
-    body: JSON.stringify({ systemInstruction: { parts: [{ text: req.system }] }, contents }),
-  });
+  let resp;
+  try {
+    resp = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      signal: idle.signal,
+      body: JSON.stringify({ systemInstruction: { parts: [{ text: req.system }] }, contents }),
+    });
+  } catch (error) {
+    idle.clear();
+    throw error;
+  }
   if (!resp.ok) {
     idle.clear();
     throw new Error(`Google ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 300)}`);
   }
   let text = "";
   let started = false;
-  for await (const line of iterSse(resp, idle)) {
-    const data = sseData(line);
-    if (!data || data === "[DONE]") continue;
-    let ev;
-    try {
-      ev = JSON.parse(data);
-    } catch {
-      continue;
-    }
-    const t = ev.candidates && ev.candidates[0] && ev.candidates[0].content && ev.candidates[0].content.parts && ev.candidates[0].content.parts[0] && ev.candidates[0].content.parts[0].text;
-    if (t) {
-      if (!started) {
-        ui.streamStart();
-        started = true;
+  try {
+    for await (const line of iterSse(resp, idle)) {
+      const data = sseData(line);
+      if (!data || data === "[DONE]") continue;
+      let ev;
+      try {
+        ev = JSON.parse(data);
+      } catch {
+        continue;
       }
-      text += t;
-      ui.streamDelta(t);
+      const t = ev.candidates && ev.candidates[0] && ev.candidates[0].content && ev.candidates[0].content.parts && ev.candidates[0].content.parts[0] && ev.candidates[0].content.parts[0].text;
+      if (t) {
+        if (!started) {
+          ui.streamStart();
+          started = true;
+        }
+        text += t;
+        ui.streamDelta(t);
+      }
     }
+  } finally {
+    if (started) ui.streamEnd();
+    idle.clear();
   }
-  if (started) ui.streamEnd();
-  idle.clear();
   return { text };
 }
 

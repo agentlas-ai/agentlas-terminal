@@ -15,12 +15,44 @@ const nativeHost = require("../agentlas-native-host.cjs");
 const permissions = require("../agentlas-permissions.cjs");
 const { RUNTIME_BIN, whichSync } = require("../runtimes/detect.cjs");
 const { CLI_EXECUTABLE_KINDS } = require("../runtimes/resolve.cjs");
+const ACP_RUNTIME_KINDS = new Set(require("../runtimes/kinds.cjs").ACP_CLI_KINDS);
 const { roleMembers } = require("../runtimes/roles.cjs");
 const { EventSink } = require("./sink.cjs");
 const store = require("./store.cjs");
 const memoryTurn = require("./memory-turn.cjs");
 
 const RING_LIMIT = 2000;
+const RING_BYTE_LIMIT = 8 * 1024 * 1024;
+
+function eventBytes(event) {
+  try { return Buffer.byteLength(JSON.stringify(event), "utf8"); }
+  catch { return 1024; }
+}
+
+/**
+ * Provider resume ids belong to the model that created them. Effort and other
+ * per-turn controls can safely change on the same thread, but a model switch
+ * must start a fresh provider session and let Agentlas history preserve the
+ * visible conversation. Otherwise the CLI receives `--model new` together
+ * with `--resume old-session` and the dashboard selection is not authoritative.
+ */
+function runtimeSessionFingerprint(runtime, agent, permission) {
+  const digest = crypto.createHash("sha256")
+    .update("agentlas-terminal-runtime-session.v2\0")
+    .update(String((runtime && runtime.kind) || ""))
+    .update("\0model\0")
+    .update(String((runtime && runtime.model) || ""))
+    .update("\0agent\0")
+    .update(String((agent && agent.id) || ""))
+    .update("\0prompt\0")
+    .update(String((agent && agent.systemPrompt) || ""));
+  // ACP chooses its session mode at session/new. Unlike native Codex/Claude
+  // flags, a later turn cannot safely retrofit that mode onto an old id.
+  if (ACP_RUNTIME_KINDS.has(runtime && runtime.kind)) {
+    digest.update("\0permission\0").update(permissions.normalize(permission));
+  }
+  return digest.digest("hex");
+}
 
 class Session extends EventEmitter {
   /**
@@ -48,6 +80,7 @@ class Session extends EventEmitter {
     this.queue = [];
     this._child = null;
     this._events = [];
+    this._eventBytes = 0;
     this._turnPromise = null;
     // 계약 테스트용 spawn 주입(runNativeTurn의 req.spawn). 프로덕션 경로에선 null.
     this._spawnImpl = opts.spawnImpl || null;
@@ -73,9 +106,7 @@ class Session extends EventEmitter {
       } catch { /* kind 열이 없는 구형 DB — user 취급(레거시 NULL=user 계약) */ }
     }
 
-    this.fingerprint = crypto.createHash("sha256")
-      .update(`${this.runtime.kind}\n${this.agent.id}\n${this.agent.systemPrompt || ""}`)
-      .digest("hex");
+    this.fingerprint = runtimeSessionFingerprint(this.runtime, this.agent, this.permission);
     this.runtimeSession = store.loadRuntimeSession(this.db, this.chatId, this.runtime.kind, this.fingerprint, this.agent.id);
 
     this._sink = new EventSink({
@@ -91,7 +122,11 @@ class Session extends EventEmitter {
 
   _record(ev) {
     this._events.push(ev);
-    if (this._events.length > RING_LIMIT) this._events.splice(0, this._events.length - RING_LIMIT);
+    this._eventBytes += eventBytes(ev);
+    while (this._events.length > RING_LIMIT || this._eventBytes > RING_BYTE_LIMIT) {
+      const removed = this._events.shift();
+      this._eventBytes = Math.max(0, this._eventBytes - eventBytes(removed));
+    }
     if (ev.type === "stream-delta") {
       const tail = (this.lastLine + ev.text).split(/\r?\n/).filter((l) => l.trim());
       this.lastLine = tail.length ? tail[tail.length - 1].slice(0, 200) : this.lastLine;
@@ -154,6 +189,10 @@ class Session extends EventEmitter {
   }
 
   _nextRecoveryRuntime() {
+    // Per-automation exact pins are authoritative. A provider/model failure is
+    // surfaced to the run receipt; it must never jump into a Dashboard role
+    // pool and make the unattended run use a different provider.
+    if (this.runtime.pinAuthoritative) return null;
     const role = this.runtime.role === "worker" ? "worker" : "orchestrator";
     const members = roleMembers(this.db, role);
     const current = members.findIndex((member) =>
@@ -178,6 +217,10 @@ class Session extends EventEmitter {
   }
 
   async _runTurn(prompt) {
+    const runtimeSessionAtTurnStart = {
+      kind: this.runtime.kind,
+      id: this.runtimeSession && this.runtimeSession.id ? String(this.runtimeSession.id) : "",
+    };
     this.status = "running";
     this.startedAt = Date.now();
     this.lastError = null;
@@ -304,6 +347,7 @@ class Session extends EventEmitter {
       if (turnAbort) req.signal = turnAbort.signal;
       if (this._spawnImpl) req.spawn = this._spawnImpl;
       if (this._timeoutConfig) req.timeoutConfig = this._timeoutConfig;
+      let recoveryAbort = null;
       try {
         res = await nativeHost.runNativeTurn(req);
         /*
@@ -312,16 +356,21 @@ class Session extends EventEmitter {
          * 그래서 `!res.text`가 영원히 거짓이 되어, 예비 런타임이 등록돼 있는데도
          * 복구가 한 번도 발화하지 않았다. 실패는 error가 말하고, text는 표시용이다.
          */
-        if (res && res.error) {
+        // A user kill is terminal. The killed child normally unwinds with an
+        // error marker; treating that marker as provider failure would launch
+        // the next priority model after the user explicitly pressed stop.
+        if (res && res.error && this.status !== "killed") {
           const nextRuntime = this._nextRecoveryRuntime();
           if (nextRuntime) {
             const privateEvidence = [...this._privateRecoveryEvidence, String(res.error)]
               .filter(Boolean).join("\n").slice(0, 12000);
             this.runtime = nextRuntime;
             this.runtimeSession = {};
-            this.fingerprint = crypto.createHash("sha256")
-              .update(`${nextRuntime.kind}\n${this.agent.id}\n${this.agent.systemPrompt || ""}`)
-              .digest("hex");
+            this.fingerprint = runtimeSessionFingerprint(nextRuntime, this.agent, this.permission);
+            if (ACP_RUNTIME_KINDS.has(nextRuntime.kind)) {
+              recoveryAbort = new AbortController();
+              this._apiAbort = recoveryAbort;
+            }
             res = await nativeHost.runNativeTurn({
               ...req,
               kind: nextRuntime.kind,
@@ -329,6 +378,8 @@ class Session extends EventEmitter {
               model: nextRuntime.model,
               effort: nextRuntime.effort,
               session: {},
+              sessionFingerprintSeed: this.fingerprint,
+              ...(recoveryAbort ? { signal: recoveryAbort.signal } : {}),
               prompt: [
                 prompt,
                 "",
@@ -342,6 +393,7 @@ class Session extends EventEmitter {
       } catch (e) {
         res = { text: "", session: req.session, error: (e && e.message) || String(e) };
       } finally {
+        if (recoveryAbort && this._apiAbort === recoveryAbort) this._apiAbort = null;
         if (turnAbort && this._apiAbort === turnAbort) this._apiAbort = null;
       }
     }
@@ -396,7 +448,15 @@ class Session extends EventEmitter {
     if (persistText) store.appendMessage(this.db, this.chatId, "assistant", persistText);
     if (res && res.session && res.session.id) {
       this.runtimeSession = { id: res.session.id };
-      store.saveRuntimeSession(this.db, this.chatId, this.runtime.kind, this.runtimeSession, this.fingerprint, this.agent.id);
+      store.saveRuntimeSession(
+        this.db,
+        this.chatId,
+        this.runtime.kind,
+        this.runtimeSession,
+        this.fingerprint,
+        this.agent.id,
+        runtimeSessionAtTurnStart.kind === this.runtime.kind ? runtimeSessionAtTurnStart.id : "",
+      );
     }
     if (res && res.usage) this.usage = res.usage;
 
@@ -495,4 +555,4 @@ class Session extends EventEmitter {
   }
 }
 
-module.exports = { Session };
+module.exports = { Session, runtimeSessionFingerprint };

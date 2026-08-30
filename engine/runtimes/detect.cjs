@@ -6,21 +6,41 @@
  * 여기서는 "실행 파일이 있는가"만 결정론적으로 본다. 모델 응답 여부는 판정하지 않는다
  * (없으면 no_runtime 정직 정지 — 폴백 금지는 상위 계층의 계약).
  */
-const { spawnSync } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
 // kind 목록/실행 파일 이름의 정본은 runtimes/kinds.cjs 하나다 — 여기서 다시 적지 않는다.
 const { RUNTIME_BIN, CLI_KINDS } = require("./kinds.cjs");
 
 const CLI_RUNTIMES = CLI_KINDS;
 
 function whichSync(bin) {
-  const cmd = process.platform === "win32" ? "where" : "which";
-  try {
-    const res = spawnSync(cmd, [bin], { encoding: "utf8", timeout: 4000 });
-    if (res.status === 0) {
-      const line = String(res.stdout || "").split(/\r?\n/).find((l) => l.trim());
-      return line ? line.trim() : null;
+  const name = typeof bin === "string" ? bin.trim() : "";
+  if (!name || name.includes("\0") || path.basename(name) !== name) return null;
+  const pathValue = String(process.env.PATH || "");
+  if (!pathValue) return null;
+  const windows = process.platform === "win32";
+  const configuredExts = windows
+    ? String(process.env.PATHEXT || ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean)
+    : [""];
+  const hasWindowsExt = windows && configuredExts.some((ext) => name.toLowerCase().endsWith(ext.toLowerCase()));
+  const extensions = hasWindowsExt ? [""] : configuredExts;
+  for (const rawDir of pathValue.split(path.delimiter)) {
+    const unquoted = rawDir.length >= 2 && rawDir.startsWith('"') && rawDir.endsWith('"')
+      ? rawDir.slice(1, -1)
+      : rawDir;
+    const directory = path.resolve(unquoted || ".");
+    for (const ext of extensions) {
+      const candidate = path.join(directory, name + ext);
+      try {
+        const stat = fs.statSync(candidate);
+        if (!stat.isFile()) continue;
+        fs.accessSync(candidate, windows ? fs.constants.F_OK : fs.constants.X_OK);
+        return candidate;
+      } catch {
+        // Continue to the next PATH entry just like a shell command lookup.
+      }
     }
-  } catch { /* not found */ }
+  }
   return null;
 }
 

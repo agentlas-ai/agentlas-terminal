@@ -72,11 +72,11 @@ function ensureJudgeRunner(db, runtime) {
         const fetchImpl = typeof baseFetch === "function" && signal
           ? (url, init) => baseFetch(url, { ...(init || {}), signal })
           : baseFetch;
-        try {
-          return await capture.runApi(backend, resolved.model || null, system, prompt, { fetch: fetchImpl });
-        } catch {
-          return "";
-        }
+        // CLI 판정과 같은 정직한 실패 계약을 쓴다. 여기서 API 오류를 빈 문자열로
+        // 바꾸면 judgment 서비스가 인증·한도·연결 사유를 보존할 기회를 잃고
+        // "유효한 판단 없음"으로 오진한다. judgeLabels가 예외 문구를 bounded reason으로
+        // 정규화하므로 원래 오류를 그대로 올린다.
+        return capture.runApi(backend, resolved.model || null, system, prompt, { fetch: fetchImpl });
       });
       return judgment;
     }
@@ -158,9 +158,9 @@ async function resolveAutoRoute(db, task, opts = {}) {
 
   if (verdict.source !== "llm" || !verdict.labels.length) {
     return finish(unresolvedChoice(lang,
-      lang === "ko"
+      verdict.reason || (lang === "ko"
         ? "연결된 모델이 유효한 판단을 반환하지 않았습니다"
-        : "The connected model did not return a valid judgment",
+        : "The connected model did not return a valid judgment"),
       "model_unavailable"));
   }
   const picked = verdict.labels[0];

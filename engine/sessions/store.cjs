@@ -84,24 +84,46 @@ function loadRuntimeSession(db, chatId, kind, fingerprint, agentId) {
   return {};
 }
 
-function saveRuntimeSession(db, chatId, kind, session, fingerprint, agentId) {
+function saveRuntimeSession(db, chatId, kind, session, fingerprint, agentId, expectedSessionId = null) {
   const sessionId = session && session.id ? String(session.id) : "";
   if (!sessionId) return false;
   const agent = normalizeRuntimeAgentId(agentId);
+  const expected = typeof expectedSessionId === "string" ? expectedSessionId : "";
   try {
-    runWriteTransaction(db, () => {
-      db.prepare(
-        "INSERT OR REPLACE INTO chat_runtime_sessions (chat_id, kind, agent_id, session_id, fingerprint, updated_at) VALUES (?,?,?,?,?,?)",
-      ).run(chatId, kind, agent, sessionId, fingerprint, nowIso());
+    const saved = runWriteTransaction(db, () => {
+      const current = db.prepare(
+        "SELECT session_id, fingerprint FROM chat_runtime_sessions WHERE chat_id=? AND kind=? AND agent_id=?",
+      ).get(chatId, kind, agent);
+      let changed = 0;
+      if (!current) {
+        const inserted = db.prepare(
+          "INSERT OR IGNORE INTO chat_runtime_sessions (chat_id, kind, agent_id, session_id, fingerprint, updated_at) VALUES (?,?,?,?,?,?)",
+        ).run(chatId, kind, agent, sessionId, fingerprint, nowIso());
+        changed = inserted.changes ?? inserted.rowsAffected ?? 0;
+      } else if (
+        (expected && current.session_id === expected && current.fingerprint === fingerprint) ||
+        (!expected && current.fingerprint !== fingerprint)
+      ) {
+        // Compare-and-swap: two sessions that began from the same provider id
+        // cannot finish out of order and overwrite the newer continuation.
+        const updated = db.prepare(
+          "UPDATE chat_runtime_sessions SET session_id=?, fingerprint=?, updated_at=? WHERE chat_id=? AND kind=? AND agent_id=? AND session_id=? AND fingerprint=?",
+        ).run(sessionId, fingerprint, nowIso(), chatId, kind, agent, current.session_id, current.fingerprint);
+        changed = updated.changes ?? updated.rowsAffected ?? 0;
+      } else if (current.session_id === sessionId && current.fingerprint === fingerprint) {
+        changed = 1; // idempotent retry of the already-persisted continuation
+      }
+      if (!changed) return false;
       // 레거시 행을 승계했다면 이제 새 키가 정본이다 — 같은 세션을 가리키는 '' 행을
       // 정리해 다음 점유자가 이 봇의 세션을 승계 후보로 오인하지 않게 한다.
       if (agent !== "") {
         db.prepare(
           "DELETE FROM chat_runtime_sessions WHERE chat_id=? AND kind=? AND agent_id='' AND session_id=?",
-        ).run(chatId, kind, sessionId);
+        ).run(chatId, kind, expected || sessionId);
       }
+      return true;
     });
-    return true;
+    return saved === true;
   } catch (error) {
     // 턴 자체는 유효하므로 던지지 않는다. 다만 조용히 지나가지도 않는다 — 이 자리의
     // 침묵이 resume 유실을 여러 판 동안 숨겼다.

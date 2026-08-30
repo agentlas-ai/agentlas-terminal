@@ -166,30 +166,80 @@ function writePurposeRepairCopy(root, projection) {
   return tempRoot;
 }
 
-function parseCloudFlags(args) {
+const CLOUD_VALUE_FLAGS = ["limit", "name", "purpose", "scope", "slug", "visibility"];
+const CLOUD_BOOLEAN_FLAGS = ["dry-run", "json", "llm-review", "overwrite", "strict"];
+
+function cloudArgumentError(message) {
+  const error = new Error(message);
+  error.code = "INVALID_ARGUMENT";
+  return error;
+}
+
+function parseCloudFlags(args, spec = {}) {
+  const values = new Set(spec.values || CLOUD_VALUE_FLAGS);
+  const booleans = new Set(spec.booleans || CLOUD_BOOLEAN_FLAGS);
   const flags = { _: [] };
+  const seen = new Set();
+  let positionalOnly = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a && a.startsWith("--")) {
-      const key = a.slice(2);
-      const next = args[i + 1];
-      if (next !== undefined && !String(next).startsWith("--")) {
-        flags[key] = next;
-        i++;
-      } else {
-        flags[key] = true;
-      }
-    } else {
+    if (positionalOnly) {
       flags._.push(a);
+      continue;
     }
+    if (a === "--") {
+      positionalOnly = true;
+      continue;
+    }
+    if (!String(a).startsWith("-")) {
+      flags._.push(a);
+      continue;
+    }
+    if (!String(a).startsWith("--")) throw cloudArgumentError(`unknown option: ${a}`);
+    const equal = String(a).indexOf("=");
+    const key = String(a).slice(2, equal === -1 ? undefined : equal);
+    if (!key || (!values.has(key) && !booleans.has(key))) throw cloudArgumentError(`unknown option: --${key || ""}`);
+    if (seen.has(key)) throw cloudArgumentError(`duplicate option: --${key}`);
+    seen.add(key);
+    if (booleans.has(key)) {
+      if (equal !== -1) throw cloudArgumentError(`--${key} does not take a value`);
+      flags[key] = true;
+      continue;
+    }
+    let value;
+    if (equal !== -1) {
+      value = String(a).slice(equal + 1);
+    } else {
+      const next = args[i + 1];
+      if (next === undefined || String(next).startsWith("--")) throw cloudArgumentError(`--${key} requires a value`);
+      value = String(next);
+      i++;
+    }
+    if (!value) throw cloudArgumentError(`--${key} requires a non-empty value`);
+    flags[key] = value;
   }
   return flags;
+}
+
+function requireCloudPositionals(flags, min, max, usage) {
+  if (flags._.length < min || flags._.length > max) throw cloudArgumentError(usage);
+  return flags;
+}
+
+function positiveIntegerFlag(value, fallback, name, max) {
+  if (value == null) return fallback;
+  if (!/^\d+$/.test(String(value))) throw cloudArgumentError(`--${name} must be a positive integer`);
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > max) {
+    throw cloudArgumentError(`--${name} must be between 1 and ${max}`);
+  }
+  return parsed;
 }
 
 function cloudVisibilityFlag(value) {
   if (value == null) return null;
   if (value === "private-link" || value === "marketplace") return value;
-  throw new Error("--visibility must be private-link or marketplace");
+  throw cloudArgumentError("--visibility must be private-link or marketplace");
 }
 
 function cloudVisibilityForAction(sub, flags) {
@@ -213,7 +263,10 @@ function cloudVisibilityForAction(sub, flags) {
 
 /** 최상위 `upload`의 실제 동작 결정: 기본 save, 명시적 marketplace만 publish. */
 function cloudActionForTopLevelUpload(args) {
-  const flags = parseCloudFlags(args);
+  const flags = requireCloudPositionals(parseCloudFlags(args, {
+    values: ["purpose", "slug", "visibility"],
+    booleans: ["dry-run", "json", "llm-review", "overwrite"],
+  }), 1, 1, "usage: agentlas upload <path> [--visibility marketplace]");
   return cloudVisibilityFlag(flags.visibility) === "marketplace" ? "publish" : "save";
 }
 
@@ -269,17 +322,20 @@ const CLOUD_HELP = [
 async function runCloud(ctx, args) {
   const sub = args[0] || "help";
   if (sub === "help" || sub === "--help" || sub === "-h") {
+    requireCloudPositionals(parseCloudFlags(args.slice(1), { values: [], booleans: ["json"] }), 0, 0, "usage: agentlas cloud help");
     ctx.out(CLOUD_HELP);
     return 0;
   }
   if (sub === "search") {
-    const flags = parseCloudFlags(args.slice(1));
+    const flags = requireCloudPositionals(parseCloudFlags(args.slice(1), {
+      values: ["limit"], booleans: ["json"],
+    }), 1, Number.MAX_SAFE_INTEGER, 'usage: agentlas cloud search "<what you need>" [--limit 10]');
     const query = flags._.join(" ").trim();
     if (!query) {
       ctx.err('usage: agentlas cloud search "<what you need>" [--limit 10]');
       return 1;
     }
-    const limit = Math.max(1, Math.min(30, Number(flags.limit) || 10));
+    const limit = positiveIntegerFlag(flags.limit, 10, "limit", 30);
     let result;
     try {
       result = await callHubTool("marketplace.search_agents", { q: query, limit });
@@ -287,6 +343,7 @@ async function runCloud(ctx, args) {
       ctx.err(e instanceof HubError ? e.message : `Marketplace connection failed: ${(e && e.message) || e}`);
       return 1;
     }
+    if (flags.json) { ctx.out(JSON.stringify(result, null, 2)); return 0; }
     const items = (result && (result.results || result.agents || result.items)) || [];
     if (!Array.isArray(items) || !items.length) {
       ctx.out(`No results for "${query}"`);
@@ -298,8 +355,10 @@ async function runCloud(ctx, args) {
     return 0;
   }
   if (sub === "list") {
-    const flags = parseCloudFlags(args.slice(1));
-    const result = await listOwnedCloudAgents(Number(flags.limit || 100));
+    const flags = requireCloudPositionals(parseCloudFlags(args.slice(1), {
+      values: ["limit"], booleans: ["json"],
+    }), 0, 0, "usage: agentlas cloud list [--limit 100] [--json]");
+    const result = await listOwnedCloudAgents(positiveIntegerFlag(flags.limit, 100, "limit", 1000));
     if (flags.json) { ctx.out(JSON.stringify(result, null, 2)); return 0; }
     const agents = Array.isArray(result.results) ? result.results : [];
     if (!agents.length) { ctx.out("No agents are stored in Private Agent Cloud."); return 0; }
@@ -332,7 +391,9 @@ async function runCloud(ctx, args) {
     return 0;
   }
   if (sub === "restore") {
-    const flags = parseCloudFlags(args.slice(1));
+    const flags = requireCloudPositionals(parseCloudFlags(args.slice(1), {
+      values: [], booleans: ["json"],
+    }), 1, 1, "usage: agentlas cloud restore <slug> [--json]");
     const slug = flags._[0];
     if (!slug) { ctx.err("usage: agentlas cloud restore <slug> [--json]"); return 1; }
     const result = await restoreOwnedCloudAgent(ctx.db(), slug);
@@ -344,7 +405,9 @@ async function runCloud(ctx, args) {
     return 0;
   }
   if (sub === "delete" || sub === "unpublish") {
-    const flags = parseCloudFlags(args.slice(1));
+    const flags = requireCloudPositionals(parseCloudFlags(args.slice(1), {
+      values: ["scope"], booleans: ["json"],
+    }), 1, 1, `usage: agentlas cloud ${sub} <slug> [--scope owner-private|hub-public] [--json]`);
     const slug = flags._[0];
     if (!slug) { ctx.err(`usage: agentlas cloud ${sub} <slug> [--json]`); return 1; }
     const result = await deleteCloudAgent(slug, { scope: flags.scope });
@@ -356,7 +419,9 @@ async function runCloud(ctx, args) {
   }
   // ── agentlas-cloud-runtime 소비 지점 (스캔/매니페스트/lazy-read/필드테스트) ──
   if (sub === "wizard") {
-    const flags = parseCloudFlags(args.slice(1));
+    const flags = requireCloudPositionals(parseCloudFlags(args.slice(1), {
+      values: ["name"], booleans: ["json"],
+    }), 1, 1, "usage: agentlas cloud wizard <path> [--name name] [--json]");
     const root = flags._[0];
     if (!root) { ctx.err("usage: agentlas cloud wizard <path> [--name name]"); return 1; }
     const result = cloudRuntime.runWizard(root, { name: typeof flags.name === "string" ? flags.name : undefined });
@@ -365,7 +430,9 @@ async function runCloud(ctx, args) {
   }
   if (sub === "security") {
     if (args[1] !== "scan") { ctx.err("usage: agentlas cloud security scan <path> [--strict]"); return 1; }
-    const flags = parseCloudFlags(args.slice(2));
+    const flags = requireCloudPositionals(parseCloudFlags(args.slice(2), {
+      values: [], booleans: ["json", "strict"],
+    }), 1, 1, "usage: agentlas cloud security scan <path> [--strict]");
     const root = flags._[0];
     if (!root) { ctx.err("usage: agentlas cloud security scan <path> [--strict]"); return 1; }
     const report = cloudRuntime.scanFolder(root);
@@ -375,15 +442,18 @@ async function runCloud(ctx, args) {
   if (sub === "runtime") {
     const action = args[1];
     if (action === "bundle") {
-      const root = args[2];
-      if (!root) { ctx.err("usage: agentlas cloud runtime bundle <path>"); return 1; }
+      const flags = requireCloudPositionals(parseCloudFlags(args.slice(2), {
+        values: [], booleans: ["json"],
+      }), 1, 1, "usage: agentlas cloud runtime bundle <path> [--json]");
+      const root = flags._[0];
       ctx.out(JSON.stringify(cloudRuntime.compileBundle(root), null, 2));
       return 0;
     }
     if (action === "read-agent-file") {
-      const root = args[2];
-      const targetPath = args[3];
-      if (!root || !targetPath) { ctx.err("usage: agentlas cloud runtime read-agent-file <path> <file>"); return 1; }
+      const flags = requireCloudPositionals(parseCloudFlags(args.slice(2), {
+        values: [], booleans: ["json"],
+      }), 2, 2, "usage: agentlas cloud runtime read-agent-file <path> <file> [--json]");
+      const [root, targetPath] = flags._;
       ctx.out(JSON.stringify(cloudRuntime.readAgentFile(root, targetPath), null, 2));
       return 0;
     }
@@ -391,15 +461,20 @@ async function runCloud(ctx, args) {
     return 1;
   }
   if (sub === "field-test") {
-    const flags = parseCloudFlags(args.slice(1));
+    const flags = requireCloudPositionals(parseCloudFlags(args.slice(1), {
+      values: [], booleans: ["json"],
+    }), 0, 0, "usage: agentlas cloud field-test [--json]");
     const result = cloudRuntime.runFieldTest();
     ctx.out(flags.json ? JSON.stringify(result, null, 2) : `${result.suite}: ${result.status}`);
     return result.status === "PASS" ? 0 : 1;
   }
   if (sub === "install") {
-    const slug = args[1];
-    if (!slug) { ctx.err("usage: agentlas cloud install <slug>"); return 1; }
+    const flags = requireCloudPositionals(parseCloudFlags(args.slice(1), {
+      values: [], booleans: ["json"],
+    }), 1, 1, "usage: agentlas cloud install <slug> [--json]");
+    const slug = flags._[0];
     const agent = await installHubAgent(ctx.db(), slug);
+    if (flags.json) { ctx.out(JSON.stringify(agent, null, 2)); return 0; }
     ctx.out(`${ctx.ui.green("✓")} Hub installed ${agent.slug} — ${agent.name}`);
     if (agent.localPath) ctx.out(`  files: ${agent.localPath}`);
     return 0;
@@ -408,7 +483,10 @@ async function runCloud(ctx, args) {
     ctx.err("usage: agentlas cloud <save|publish|package|list|restore|install|delete|field-test> ...");
     return 1;
   }
-  const flags = parseCloudFlags(args.slice(1));
+  const flags = requireCloudPositionals(parseCloudFlags(args.slice(1), {
+    values: ["purpose", "slug", "visibility"],
+    booleans: ["dry-run", "json", "llm-review", "overwrite"],
+  }), 1, 1, `usage: agentlas cloud ${sub} <path>`);
   const root = flags._[0];
   if (!root) { ctx.err(`usage: agentlas cloud ${sub} <path>`); return 1; }
   const visibility = cloudVisibilityForAction(sub, flags);

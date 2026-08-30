@@ -36,9 +36,14 @@ function usage(ko) {
 
 async function run(ctx, args) {
   const ko = ctx.lang === "ko";
-  if (args.some((a) => a === "--help" || a === "-h" || a === "help")) {
+  if (args.length === 1 && ["--help", "-h", "help"].includes(args[0])) {
     ctx.out(usage(ko));
     return 0;
+  }
+  if (args.length) {
+    const error = new Error(usage(ko).split("\n")[0]);
+    error.code = "INVALID_ARGUMENT";
+    throw error;
   }
 
   const cookie = await cloudSessionCookie();

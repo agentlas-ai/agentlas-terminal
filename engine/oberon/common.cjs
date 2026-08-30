@@ -21,22 +21,47 @@ function fail(msg, code) {
   throw new OberonFail(String(msg ?? ""), code);
 }
 
-// v1 oberonParseFlags 그대로: `--key value` / `--key`(불리언) / 나머지는 위치 인자.
-// 다음 토큰이 `--`로 시작하면 값이 아니라 다른 플래그로 본다.
-function parseFlags(args) {
+// 타입 스키마가 있으면 알 수 없는/중복/값 누락 플래그를 fail-closed 한다.
+// `--key=value`와 위치 인자용 `--` sentinel도 지원한다.
+function parseFlags(args, schema = null) {
   const flags = {};
   const rest = [];
   for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a.startsWith("--")) {
-      const key = a.slice(2);
+    const a = String(args[i]);
+    if (a === "--") {
+      rest.push(...args.slice(i + 1).map(String));
+      break;
+    }
+    if (!a.startsWith("--")) { rest.push(a); continue; }
+    const equals = a.indexOf("=");
+    const key = a.slice(2, equals >= 0 ? equals : undefined);
+    const inlineValue = equals >= 0 ? a.slice(equals + 1) : null;
+    if (!key) fail("Oberon option name is empty");
+    if (Object.prototype.hasOwnProperty.call(flags, key)) fail(`Duplicate Oberon option: --${key}`);
+    const type = schema && schema[key];
+    if (schema && !type) fail(`Unknown Oberon option: --${key}`);
+    if (!schema) {
       const next = args[i + 1];
-      if (next === undefined || next.startsWith("--")) flags[key] = true;
-      else {
-        flags[key] = next;
-        i++;
-      }
-    } else rest.push(a);
+      if (inlineValue != null) flags[key] = inlineValue;
+      else if (next === undefined || String(next).startsWith("--")) flags[key] = true;
+      else { flags[key] = String(next); i += 1; }
+      continue;
+    }
+    if (type === "boolean") {
+      if (inlineValue != null) fail(`Boolean Oberon option does not take a value: --${key}`);
+      flags[key] = true;
+      continue;
+    }
+    if (type !== "value") fail(`Invalid Oberon option schema: --${key}`);
+    if (inlineValue != null) {
+      if (!inlineValue) fail(`Oberon option requires a value: --${key}`);
+      flags[key] = inlineValue;
+      continue;
+    }
+    const next = args[i + 1];
+    if (next === undefined || String(next).startsWith("--")) fail(`Oberon option requires a value: --${key}`);
+    flags[key] = String(next);
+    i += 1;
   }
   return { flags, rest };
 }

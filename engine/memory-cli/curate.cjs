@@ -19,6 +19,11 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { tableExists, columnExists } = require("../core/db.cjs");
 
+const MAX_MEMORY_EVENTS = 32;
+const MAX_MEMORY_CONTENT_CHARS = 900;
+const MAX_MEMORY_LOG_BYTES = 16 * 1024 * 1024;
+const MAX_MEMORY_LOG_RECORD_BYTES = 16 * 1024;
+
 // 앱과 동일한 컴파일된 manifest — 빌트인 에이전트 + 메모리 아키텍처 상수.
 let _arch = null;
 function loadArch() {
@@ -45,13 +50,43 @@ const SECRET_RE = [/\b(?:sk|pk|rk)-[A-Za-z0-9]{16,}/, /AKIA[0-9A-Z]{16}/, /ghp_[
  * 이 모듈이 위장하지 않는다.
  */
 function logCli(projectPath, rec) {
-  if (!projectPath) return;
+  if (!projectPath) return false;
+  let fd = null;
   try {
     const arch = loadArch();
-    const dir = path.join(projectPath, arch.memoryDir);
-    fs.mkdirSync(dir, { recursive: true });
-    fs.appendFileSync(path.join(dir, arch.logFile), JSON.stringify(rec) + "\n", "utf8");
-  } catch { /* ignore */ }
+    // Memory curation is not project initialization. Only an existing private
+    // .agentlas directory may receive the best-effort decision log.
+    const root = fs.realpathSync(path.resolve(projectPath));
+    const dir = path.join(root, arch.memoryDir || ".agentlas");
+    const dirStat = fs.lstatSync(dir);
+    if (!dirStat.isDirectory() || dirStat.isSymbolicLink()) return false;
+    if (process.platform !== "win32" && (dirStat.mode & 0o077) !== 0) return false;
+
+    const line = Buffer.from(JSON.stringify(rec) + "\n", "utf8");
+    if (line.length <= 1 || line.length > MAX_MEMORY_LOG_RECORD_BYTES) return false;
+    const file = path.join(dir, arch.logFile || "memory-log.jsonl");
+    const noFollow = fs.constants.O_NOFOLLOW || 0;
+    fd = fs.openSync(
+      file,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | noFollow,
+      0o600,
+    );
+    const opened = fs.fstatSync(fd);
+    const listed = fs.lstatSync(file);
+    if (
+      !opened.isFile() || opened.nlink !== 1 ||
+      !listed.isFile() || listed.isSymbolicLink() || listed.nlink !== 1 ||
+      opened.dev !== listed.dev || opened.ino !== listed.ino ||
+      opened.size + line.length > MAX_MEMORY_LOG_BYTES
+    ) return false;
+    const written = fs.writeSync(fd, line, 0, line.length, null);
+    if (written !== line.length) return false;
+    fs.fsyncSync(fd);
+    fs.fchmodSync(fd, 0o600);
+    const after = fs.fstatSync(fd);
+    return after.isFile() && after.nlink === 1 && after.dev === opened.dev && after.ino === opened.ino;
+  } catch { return false; }
+  finally { if (fd != null) try { fs.closeSync(fd); } catch { /* best effort */ } }
 }
 
 function coerceText(v, max) {
@@ -128,9 +163,9 @@ function curateCliReply(db, text, ctx) {
     if (!ctx || !Array.isArray(ctx.curatedMemories) || !memory) return;
     if (!ctx.curatedMemories.some((item) => item.id === memory.id)) ctx.curatedMemories.push(memory);
   };
-  for (const ev of events) {
+  for (const ev of events.slice(0, MAX_MEMORY_EVENTS)) {
     const content = ev && typeof ev.content === "string" ? ev.content.trim() : "";
-    if (!content) continue;
+    if (!content || content.length > MAX_MEMORY_CONTENT_CHARS) continue;
     if (ev.sensitivity === "secret" || SECRET_RE.some((re) => re.test(content))) continue;
     const kind = arch.kinds.includes(ev.memory_kind) ? ev.memory_kind : "fact";
     let scope = ev.suggested_scope === "agent_team"
@@ -146,17 +181,37 @@ function curateCliReply(db, text, ctx) {
     const scopedAgentId = scope === "agent_repo" ? (ctx.agentId || null) : null;
     const requestContext = normalizeRequestContext(ev, ctx, ppath);
     try {
-      const dup = db.prepare("SELECT id,scope,kind,content,confidence,sensitivity,context_json FROM memory_entries WHERE scope=? AND kind=? AND lower(trim(content))=? AND superseded_at IS NULL AND (project_path IS ? OR project_path=?) AND (agent_id IS ? OR agent_id=?) LIMIT 1").get(scope, kind, content.toLowerCase(), ppath, ppath, scopedAgentId, scopedAgentId);
-      if (dup) {
-        rememberCurated({ ...dup, requestContext });
+      const memoryId = randomUUID();
+      const confidence = ["low", "medium", "high"].includes(ev.confidence) ? ev.confidence : "medium";
+      const sensitivity = ["public", "internal", "private"].includes(ev.sensitivity) ? ev.sensitivity : "internal";
+      const evidence = Array.isArray(ev.evidence_refs)
+        ? ev.evidence_refs.filter((item) => typeof item === "string").slice(0, 16).map((item) => item.slice(0, 240))
+        : [];
+      // One statement owns both the duplicate observation and insertion. A
+      // SELECT followed by INSERT allowed two Terminal processes to observe
+      // absence and persist the same memory under different UUIDs.
+      const inserted = db.prepare(`
+        INSERT INTO memory_entries
+          (id,scope,kind,content,project_id,project_path,agent_id,chat_id,confidence,sensitivity,evidence_json,context_json,superseded_at,created_at)
+        SELECT ?,?,?,?,?,?,?,?,?,?,?,?,NULL,?
+        WHERE NOT EXISTS (
+          SELECT 1 FROM memory_entries
+          WHERE scope=? AND kind=? AND lower(trim(content))=? AND superseded_at IS NULL
+            AND (project_path IS ? OR project_path=?)
+            AND (agent_id IS ? OR agent_id=?)
+        )
+      `).run(
+        memoryId, scope, kind, content, ctx.projectId || null, ppath, scopedAgentId, null,
+        confidence, sensitivity, JSON.stringify(evidence), JSON.stringify(requestContext), now,
+        scope, kind, content.toLowerCase(), ppath, ppath, scopedAgentId, scopedAgentId,
+      );
+      if ((inserted.changes ?? inserted.rowsAffected ?? 0) > 0) {
+        rememberCurated({ id: memoryId, scope, kind, content, confidence, sensitivity, requestContext });
+        logCli(ctx.projectPath, { action: "written", scope, kind, content, request_context: requestContext, at: now });
         continue;
       }
-      const memoryId = randomUUID();
-      const confidence = ev.confidence || "medium";
-      const sensitivity = ev.sensitivity || "internal";
-      db.prepare("INSERT INTO memory_entries (id,scope,kind,content,project_id,project_path,agent_id,chat_id,confidence,sensitivity,evidence_json,context_json,superseded_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)").run(memoryId, scope, kind, content, ctx.projectId || null, ppath, scopedAgentId, null, confidence, sensitivity, JSON.stringify(Array.isArray(ev.evidence_refs) ? ev.evidence_refs : []), JSON.stringify(requestContext), now);
-      rememberCurated({ id: memoryId, scope, kind, content, confidence, sensitivity, requestContext });
-      logCli(ctx.projectPath, { action: "written", scope, kind, content, request_context: requestContext, at: now });
+      const dup = db.prepare("SELECT id,scope,kind,content,confidence,sensitivity,context_json FROM memory_entries WHERE scope=? AND kind=? AND lower(trim(content))=? AND superseded_at IS NULL AND (project_path IS ? OR project_path=?) AND (agent_id IS ? OR agent_id=?) LIMIT 1").get(scope, kind, content.toLowerCase(), ppath, ppath, scopedAgentId, scopedAgentId);
+      if (dup) rememberCurated({ ...dup, requestContext });
     } catch { /* ignore */ }
   }
   return style.sanitizeAssistantText(cleaned);
@@ -170,4 +225,7 @@ module.exports = {
   normalizeRequestContext,
   parseMemoryEventsCli,
   curateCliReply,
+  MAX_MEMORY_EVENTS,
+  MAX_MEMORY_CONTENT_CHARS,
+  MAX_MEMORY_LOG_BYTES,
 };

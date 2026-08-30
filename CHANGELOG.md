@@ -1,5 +1,83 @@
 # Changelog
 
+## 1.0.66 — 2026-08-30
+
+- API 스트리밍 요청이 연결·본문 읽기 중 실패하거나 취소돼도 부모 취소 리스너와 idle 타이머를 즉시 정리해, 오래 실행한 Terminal 세션에 실패한 요청의 리스너가 누적되지 않게 했습니다.
+- MCP 정책·동의·Experience 상태 JSON은 이제 no-follow 파일 디스크립터와 읽기 전후 identity 검증을 사용하며, private-state 잠금은 살아 있는 소유자를 시간만으로 탈취하거나 이전 소유자가 후속 잠금을 지울 수 없게 했습니다.
+- `read` 권한의 Memory Event는 One 영구 원장에 기록되지 않으며, 쓰기 권한에서도 큐레이션을 통과한 제한된 후보만 안전한 원장 경로와 소유자 검증 잠금 안에서 중복 없이 전달됩니다.
+- CLI 환경설정도 같은 bounded no-follow JSON 및 live-owner 잠금을 사용해, 오래 실행 중인 설정 저장을 시간만으로 탈취하거나 링크 경로에서 설정을 읽지 않습니다.
+- Graph 인터뷰는 명시 또는 역할 기본값으로 선택한 Ollama를 이제 로컬 API 루프로 실제 실행하며, `bin`이 없다는 이유로 선택을 버리거나 다른 CLI로 바꾸지 않습니다.
+- ACP client 연결이 닫히면 진행 중 child뿐 아니라 대화 유지를 위해 남아 있던 idle Session과 Orchestrator도 모두 종료해 편집기 재연결 뒤 좀비 런타임이 쌓이지 않게 했습니다.
+- Workforce·Storm이 쓰는 Core JSON 캡처는 stdout을 16MiB로 제한하고 기본 120초 안에 끝나지 않는 Python 호출을 종료해, 손상된 Core 응답이 Terminal 메모리나 실행을 무기한 점유하지 않습니다.
+- 자동화 on/off/run/remove의 ID 접두사는 `%`·`_`를 와일드카드로 해석하지 않고, 여러 자동화와 겹치면 임의 행을 조작하는 대신 전체 ID를 요구합니다.
+- 직접 생성한 Operational RunReceipt도 반환된 실제 생성 시각을 fallback run identity에 사용해, `createdAt`을 생략한 호출이 모두 같은 `undefined` 기반 ID로 합쳐지지 않습니다.
+- Desktop이 저장한 자동화의 `antigravity`/backend/source/model/effort 핀을 Terminal도 같은 실행 정체성으로 해석하고, 정확 핀 실패 시 Dashboard 역할 풀의 다른 공급자로 넘어가지 않습니다.
+- Memory Event 큐레이션은 후보 수·본문·증거를 제한하고 단일 원자 SQL로 중복을 막으며, 기존 private 프로젝트 디렉터리의 regular 단일-link JSONL에만 bounded append합니다.
+- Experience 적립은 누락·잘못된 권한을 read로 막고, 부분적으로만 전달된 exact agent binding을 설치본이나 로컬 해시 정체성으로 조용히 대체하지 않습니다.
+- Provider resume ID 저장은 시작 시 읽은 ID를 compare-and-swap 조건으로 사용해, 같은 채팅의 늦게 끝난 이전 턴이 더 최신 세션 연속성을 덮어쓰지 않습니다.
+- Hub 응답은 stream-readable 본문만 16MiB 안에서 읽고, CLI 세션 파일도 bounded no-follow identity 검증을 통과한 private JSON만 인증 증거로 사용합니다.
+- Project 초기 시드는 실제 private `.agentlas` 디렉터리와 single-link regular 파일만 만들거나 재사용해, 미리 놓인 symlink/hardlink를 따라 외부 파일을 쓰지 않습니다.
+- Project 팀 연결은 Desktop의 현재 agent/team 정본과 레거시 행을 명시적으로 구분하고, 정확 릴리스가 로컬에 증명된 컨트롤러만 최대 64개 bounded 팀에서 실행합니다.
+- Cloud 설치·복구는 private 실제 설치 루트와 bounded single-link 저널만 신뢰하고, 심링크·하드링크·특수 엔트리로 바뀐 destination/staging/backup을 재귀 삭제하거나 교체하지 않습니다.
+- Project 활성화는 canonical 루트와 현재 private-state 무결성을 매번 확인하고, Desktop의 `antigravity` 선택을 일반 Terminal 실행에서도 `agy`로 보존하며, 능력 승인 프리픽스는 토큰 경계를 넘어 비슷한 명령을 허용하지 않습니다.
+- Workforce는 누락·손상 권한을 read로 막고 `--parallel`의 실제 8개 상한을 지키며, Dashboard 역할 풀에서 첫 가용 런타임을 우선순위대로 선택하고 빈 Worker 풀은 Orchestrator 풀을 상속합니다.
+- 설치 에이전트 라우팅은 BYOK·Ollama 판정의 인증·한도·연결 오류를 빈 응답으로 지우지 않고, CLI 런타임과 같이 실제 실패 사유를 보존합니다.
+- 명시값·환경설정의 Desktop `antigravity` 런타임도 Terminal `agy`로 일관되게 실행하며, 정상 답변의 기술 용어 `rate-limit`을 한도 거절로 오인하지 않습니다.
+- Native 모델 stdout을 16MiB로 제한하고, 생성·재사용하는 MCP 설정은 실제 private 디렉터리와 bounded single-link 파일만 허용해 비정상 스트림·링크 경로를 따라가지 않습니다.
+- node:sqlite fallback도 실제 `BEGIN IMMEDIATE`/rollback과 중첩 savepoint를 사용해, 예외가 난 다중 쓰기를 부분 커밋하지 않습니다.
+- Runtime capability 변환은 Desktop `antigravity`를 `agy`로 보존하고 ACP CLI를 API backend로 오분류하거나 알 수 없는 runtime spec을 제조하지 않습니다.
+- Local Core Workforce 어댑터는 search→validate→prepare의 WorkOrder·Selection을 정확히 묶고, 과도하게 깊거나 큰 응답 및 prototype key를 경계에서 거절합니다.
+- 로컬 모델의 파일 도구는 8MiB를 넘는 텍스트를 전체 메모리에 읽거나 쓰지 않으며, Terminal 설정 화면은 이미 제공되는 멀티모달 설정 명령을 Desktop 전용으로 잘못 안내하지 않습니다.
+- 희소 cron 탐색은 긴 분 단위 루프 대신 로컬 달력의 불일치 날짜를 건너뛰며 8년 범위를 확인해, 비윤년 직후 등록한 2월 29일 일정도 다음 윤년 실행 시각을 잃지 않습니다.
+- 저장 권한이 없을 때의 제품 기본값과 손상된 권한 값을 구분해 후자는 read로 막고, CLI 런타임 탐지는 PATH의 `which` 프로그램을 실행하지 않고 실제 실행 파일을 직접 확인합니다.
+- Hephaestus 캡처는 시간·출력 상한이나 사용자 중단 뒤 응답 없는 child를 강제 종료하고 부분 JSON을 결과처럼 렌더링하지 않으며, bounded no-follow CLI history와 그 잠금은 살아 있는 소유자를 시간만으로 탈취하거나 이전 소유자가 후속 잠금을 지우지 않습니다.
+- Graph 패키지는 중첩 비밀값까지 재귀 치환하고 그래프·매니페스트 지문을 모두 검증하며, 같은 MCP 서버를 쓰는 모든 노드를 의존성에 보존합니다.
+- 모델 카탈로그와 라우팅 영수증은 bounded no-follow 단일-link 파일로만 읽고 쓰며, `route`·`call`·`hep` 요청 안의 일반 단어 `help`를 명령 도움말로 가로채지 않습니다.
+- Desktop Core 캐시는 live-owner 버전 잠금과 streaming 크기·해시 검증을 사용하고, 경로 이탈·링크·특수 엔트리가 든 archive를 풀기 전에 거절합니다.
+
+- CLI output and argument contracts now fail closed across list, run, build,
+  One, roles, variants, graphs, firms, search, automations, credentials, MCP,
+  Experience, Ontology, Storm, Swarm, Workforce, Cloud/upload, doctor,
+  install/update/import/uninstall, login/logout/setup, project/billing,
+  ACP/multimodal/memory, browser/document/plugin, environment/account, and
+  connection commands instead
+  of silently accepting unknown or contradictory input. Invalid commands stop
+  before model, network, project, or credential mutations. JSON, YAML, quiet,
+  no-header, and no-color modes now match their documented behavior.
+- Help now rejects undocumented flags and trailing arguments, and the compact
+  startup banner stays within the actual terminal width on narrow screens.
+- Research now exposes the complete Agentlas OS 1.2.37 diagnostic, proof,
+  browser-hardpoint, module, loadout, planning, read, search, and gather command
+  set instead of rejecting every subcommand outside the legacy five.
+- Async native help now waits for its child output, and the Local Core MCP
+  transport bounds unterminated stdout responses instead of growing memory
+  without limit.
+- MCP connection probes now refuse malformed runtime arguments and handle
+  asynchronous child-stdin failures as a failed preflight instead of risking
+  an unhandled stream error.
+- REPL shell commands now participate in shutdown tracking, stop on Ctrl-C or
+  quit, escalate stubborn process groups to SIGKILL, and cannot survive the
+  parent process as detached zombies.
+- Persistent model-role changes now cover multimodal, keep Dashboard pools and
+  the resolved selection in sync, and bind resumed provider sessions to the
+  selected model (plus ACP permission identity where the protocol requires it).
+  An explicit stop no longer launches the next fallback model, while a genuine
+  ACP recovery receives its own current fingerprint and cancellation signal.
+- Project credential/env files, Telegram token files, MCP consent/inventory,
+  child-process shutdown, session event sinks, and generated output paths now
+  enforce bounded, no-follow, project-scoped storage and cleanup contracts.
+  Native context preparation also refuses broad, missing, or symbolic-link
+  agent source folders instead of recreating or writing through them.
+- Cloud packaging, agent evolution, route persistence, Storm/Swarm fan-out, and
+  Oberon rendering now reject ambiguous or stale state rather than reporting a
+  partial operation as complete.
+- Concurrent Cloud list/save/delete/bind and source-marker updates now preserve
+  every observed revision under private locks, reject corrupted tombstones, and
+  compare receipt times chronologically instead of as text.
+- Terminal palettes no longer advertise the retired `career-graph` command. Its
+  project data remains preserved, while users are directed to `ontology` for
+  sources and the Agentlas OS runtime for derived indexing.
+
 ## 1.0.65 — 2026-08-29
 
 - Browser, document, and Telegram CDP flows now create and track an Agentlas-owned

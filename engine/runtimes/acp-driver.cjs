@@ -14,6 +14,48 @@ const permissions = require("../agentlas-permissions.cjs");
 
 // 정본(runtimes/kinds.cjs)의 ACP 3종에서 파생 — resolve.cjs의 ACP_CLI_KINDS와 같은 원소.
 const ACP_KINDS = new Set(require("./kinds.cjs").ACP_CLI_KINDS);
+const ACP_HISTORY_MAX_ENTRIES = 40;
+const ACP_HISTORY_MAX_BYTES = 512 * 1024;
+const ACP_HISTORY_MAX_ENTRY_BYTES = 64 * 1024;
+
+function boundedHistoryText(value, maxBytes) {
+  const text = String(value || "");
+  const encoded = Buffer.from(text, "utf8");
+  if (encoded.length <= maxBytes) return text;
+  let bounded = encoded.subarray(0, maxBytes).toString("utf8");
+  // A byte cut in the middle of a multibyte code point can decode to U+FFFD,
+  // whose three bytes would otherwise make the decoded value exceed maxBytes.
+  while (Buffer.byteLength(bounded, "utf8") > maxBytes) bounded = bounded.slice(0, -1);
+  return bounded;
+}
+
+/*
+ * Provider history is supplied by the local chat store, where old rows may be
+ * larger than the ACP request budget. Keep the newest messages, retain their
+ * original order, and cap both message count and UTF-8 text bytes before the
+ * request is serialized by the provider runner.
+ */
+function boundedAcpHistory(history) {
+  if (!Array.isArray(history)) return [];
+  const bounded = [];
+  let totalBytes = 0;
+  for (let index = history.length - 1;
+    index >= 0 && bounded.length < ACP_HISTORY_MAX_ENTRIES && totalBytes < ACP_HISTORY_MAX_BYTES;
+    index -= 1) {
+    const entry = history[index];
+    const remainingBytes = ACP_HISTORY_MAX_BYTES - totalBytes;
+    const text = boundedHistoryText(
+      entry && (entry.text ?? entry.content),
+      Math.min(ACP_HISTORY_MAX_ENTRY_BYTES, remainingBytes),
+    );
+    bounded.unshift({
+      role: entry && entry.role === "assistant" ? "assistant" : "user",
+      text,
+    });
+    totalBytes += Buffer.byteLength(text, "utf8");
+  }
+  return bounded;
+}
 
 /** 이 머신에서 ACP 드라이버를 쓸 수 있는가. { ok, reason?, module? } */
 function acpDriverAvailability() {
@@ -48,13 +90,14 @@ async function runAcpTurn(req) {
     return { text: "", session: req.session || {}, error: `runtime '${kind}' is not an ACP agent in this core`, errorKind: "unsupported", errorSource: "marker" };
   }
   const runner = mod.createAcpRunner(spec);
+  const permission = permissions.normalize(req.permission);
   let mcpConfigPath;
   try {
     // ACP runner consumes the same Claude-compatible MCP config shape as Desktop.
     // Reuse native-host's content-addressed, credential-isolating materializer so
     // Cursor/Grok/Kimi receive exactly the already-consented Terminal allowlist.
     const nativeHost = require("../agentlas-native-host.cjs");
-    const allowedMcpServers = permissions.normalize(req.permission) === "full"
+    const allowedMcpServers = permission === "full"
       ? (req.mcpServers || [])
       : [];
     mcpConfigPath = nativeHost.cliMcpConfigPath(allowedMcpServers, {
@@ -92,16 +135,11 @@ async function runAcpTurn(req) {
   try {
     const result = await runner({
       systemPrompt: req.systemPrompt || "",
-      history: Array.isArray(req.history)
-        ? req.history.map((entry) => ({
-          role: entry && entry.role === "assistant" ? "assistant" : "user",
-          text: String((entry && (entry.text ?? entry.content)) || ""),
-        }))
-        : [],
+      history: boundedAcpHistory(req.history),
       userPrompt: req.prompt || "",
       backendLabel: spec.label,
       locale,
-      permission: req.permission,
+      permission,
       runtimeSource: bin,
       cwd: req.cwd,
       env: req.env || process.env,
@@ -132,4 +170,13 @@ async function runAcpTurn(req) {
   }
 }
 
-module.exports = { ACP_KINDS, acpDriverAvailability, acpSpecFor, runAcpTurn };
+module.exports = {
+  ACP_KINDS,
+  ACP_HISTORY_MAX_ENTRIES,
+  ACP_HISTORY_MAX_BYTES,
+  ACP_HISTORY_MAX_ENTRY_BYTES,
+  boundedAcpHistory,
+  acpDriverAvailability,
+  acpSpecFor,
+  runAcpTurn,
+};

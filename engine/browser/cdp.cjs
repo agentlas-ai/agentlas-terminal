@@ -17,24 +17,83 @@
  * 안전: Agentlas 전용 프로필 Chrome 에만 붙는다(개인 크롬 아님). 되돌릴 수 없는
  * 행동은 호출자가 판단한다 — 이 모듈은 조종 primitive 만 제공한다.
  */
+const crypto = require("node:crypto");
+const fs = require("node:fs");
 const http = require("node:http");
+const path = require("node:path");
 
 const DEFAULT_PORT = Number(process.env.AGENTLAS_CDP_PORT || 9222);
 const DEFAULT_WS_OPEN_TIMEOUT_MS = 5_000;
+const CDP_HTTP_TIMEOUT_MS = 3_000;
+const CDP_HTTP_MAX_BYTES = 8 * 1024 * 1024;
+const CDP_PDF_MAX_BYTES = 64 * 1024 * 1024;
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 
-function httpJson(port, path, { timeout = 3000, method = "GET" } = {}) {
+function httpJson(port, requestPath, { timeout = CDP_HTTP_TIMEOUT_MS, method = "GET" } = {}) {
+  const limit = Number.isFinite(Number(timeout)) && Number(timeout) > 0
+    ? Number(timeout)
+    : CDP_HTTP_TIMEOUT_MS;
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: "127.0.0.1", port, path, timeout, method }, (res) => {
-      let body = "";
-      res.on("data", (d) => { body += d; });
-      res.on("end", () => {
-        try { resolve(JSON.parse(body)); } catch (e) { reject(e); }
+    let req = null;
+    let response = null;
+    let timer = null;
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (error) {
+        try { response?.destroy(); } catch { /* already closed */ }
+        try { req?.destroy(); } catch { /* already closed */ }
+        reject(error);
+      } else {
+        resolve(value);
+      }
+    };
+    const timeoutError = () => {
+      const error = new Error(`CDP ${requestPath} timed out`);
+      error.code = "CDP_HTTP_TIMEOUT";
+      return error;
+    };
+    try {
+      req = http.request({ host: "127.0.0.1", port, path: requestPath, timeout: limit, method }, (res) => {
+        response = res;
+        const chunks = [];
+        let bodyBytes = 0;
+        res.on("data", (chunk) => {
+          if (settled) return;
+          const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          bodyBytes += bytes.length;
+          if (bodyBytes > CDP_HTTP_MAX_BYTES) {
+            const error = new Error(`CDP ${requestPath} response exceeded ${CDP_HTTP_MAX_BYTES} bytes`);
+            error.code = "CDP_HTTP_BODY_LIMIT";
+            finish(error);
+            return;
+          }
+          chunks.push(bytes);
+        });
+        res.on("aborted", () => finish(new Error(`CDP ${requestPath} response aborted`)));
+        res.on("error", (error) => finish(error));
+        res.on("end", () => {
+          if (settled) return;
+          try {
+            finish(null, JSON.parse(Buffer.concat(chunks, bodyBytes).toString("utf8")));
+          } catch (error) {
+            finish(error);
+          }
+        });
       });
-    });
-    req.on("error", reject);
-    req.on("timeout", () => { req.destroy(); reject(new Error(`CDP ${path} timed out`)); });
-    req.end();
+      req.on("error", (error) => finish(error));
+      // Keep the inactivity timeout as a fast-path, but also enforce the
+      // absolute deadline below so a peer cannot keep this request alive by
+      // dripping one byte before every inactivity interval.
+      req.on("timeout", () => finish(timeoutError()));
+      timer = setTimeout(() => finish(timeoutError()), limit);
+      timer.unref?.();
+      req.end();
+    } catch (error) {
+      finish(error);
+    }
   });
 }
 
@@ -96,19 +155,113 @@ async function pickPageTarget(port = DEFAULT_PORT, options = {}) {
 
 function closePageTarget(port, targetId) {
   return new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve();
+    };
     const req = http.request({
       host: "127.0.0.1",
       port,
       path: `/json/close/${encodeURIComponent(String(targetId))}`,
-      timeout: 3_000,
+      timeout: CDP_HTTP_TIMEOUT_MS,
     }, (res) => {
       res.resume();
-      res.once("end", resolve);
+      res.once("end", finish);
+      res.once("aborted", finish);
+      res.once("error", finish);
     });
-    req.once("error", resolve);
-    req.once("timeout", () => { req.destroy(); resolve(); });
+    req.once("error", finish);
+    req.once("timeout", () => { req.destroy(); finish(); });
+    timer = setTimeout(() => { req.destroy(); finish(); }, CDP_HTTP_TIMEOUT_MS);
+    timer.unref?.();
     req.end();
   });
+}
+
+function sameFileIdentity(left, right) {
+  return left && right && String(left.dev) === String(right.dev) && String(left.ino) === String(right.ino);
+}
+
+function writeAtomicRegularFile(outPath, data) {
+  const target = path.resolve(String(outPath));
+  let original = null;
+  try {
+    original = fs.lstatSync(target);
+    if (!original.isFile() || original.nlink !== 1) {
+      const error = new Error(`CDP output path must be a regular file with one link: ${target}`);
+      error.code = "CDP_UNSAFE_OUTPUT_PATH";
+      throw error;
+    }
+  } catch (error) {
+    if (error && error.code !== "ENOENT") throw error;
+  }
+
+  const dir = path.dirname(target);
+  const base = path.basename(target);
+  const flags = fs.constants.O_WRONLY
+    | fs.constants.O_CREAT
+    | fs.constants.O_EXCL
+    | (fs.constants.O_NOFOLLOW || 0);
+  let temp = null;
+  let fd = null;
+  try {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      temp = path.join(dir, `.${base}.${process.pid}.${crypto.randomUUID()}.tmp`);
+      try {
+        fd = fs.openSync(temp, flags, 0o600);
+        break;
+      } catch (error) {
+        temp = null;
+        if (!error || error.code !== "EEXIST" || attempt === 2) throw error;
+      }
+    }
+    if (fd == null || !temp) throw new Error("could not create a temporary CDP output file");
+    let offset = 0;
+    while (offset < data.length) {
+      const written = fs.writeSync(fd, data, offset, data.length - offset);
+      if (!written) throw new Error("could not write the CDP output file");
+      offset += written;
+    }
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+
+    // Refuse a path that changed identity while the temporary file was being
+    // written. The final rename itself never follows a symlink or hardlink.
+    let current = null;
+    try { current = fs.lstatSync(target); } catch (error) {
+      if (!error || error.code !== "ENOENT") throw error;
+    }
+    if (original) {
+      if (!current || !current.isFile() || current.nlink !== 1 || !sameFileIdentity(original, current)) {
+        const error = new Error(`CDP output path changed while writing: ${target}`);
+        error.code = "CDP_OUTPUT_IDENTITY_CHANGED";
+        throw error;
+      }
+    } else if (current) {
+      // The caller observed an absent path. A file appearing before commit is
+      // a competing writer, even when it is otherwise a safe regular file.
+      // Never overwrite a file whose identity this operation did not capture.
+      const error = new Error(`CDP output path appeared while writing: ${target}`);
+      error.code = current.isFile() && current.nlink === 1
+        ? "CDP_OUTPUT_IDENTITY_CHANGED"
+        : "CDP_UNSAFE_OUTPUT_PATH";
+      throw error;
+    }
+    fs.renameSync(temp, target);
+    temp = null;
+  } finally {
+    if (fd != null) {
+      try { fs.closeSync(fd); } catch { /* already closed */ }
+    }
+    if (temp) {
+      try { fs.unlinkSync(temp); } catch { /* best-effort cleanup */ }
+    }
+  }
 }
 
 function waitForWebSocketOpen(ws, timeoutMs) {
@@ -280,9 +433,19 @@ async function attachPage({ port = DEFAULT_PORT, wsUrl, selection = "new", targe
   async function printPdf(outPath, { landscape = false, printBackground = true, scale = 1 } = {}) {
     const res = await send("Page.printToPDF", { landscape, printBackground, scale, transferMode: "ReturnAsBase64" }, { timeout: 60000 });
     const b64 = res && res.data;
-    if (!b64) throw new Error("Page.printToPDF returned no data");
+    if (typeof b64 !== "string" || !b64) throw new Error("Page.printToPDF returned no data");
+    if (b64.length > Math.ceil(CDP_PDF_MAX_BYTES / 3) * 4) {
+      const error = new Error(`Page.printToPDF response exceeded ${CDP_PDF_MAX_BYTES} bytes`);
+      error.code = "CDP_PDF_BODY_LIMIT";
+      throw error;
+    }
     const buf = Buffer.from(b64, "base64");
-    require("node:fs").writeFileSync(outPath, buf);
+    if (buf.length > CDP_PDF_MAX_BYTES) {
+      const error = new Error(`Page.printToPDF response exceeded ${CDP_PDF_MAX_BYTES} bytes`);
+      error.code = "CDP_PDF_BODY_LIMIT";
+      throw error;
+    }
+    writeAtomicRegularFile(outPath, buf);
     return { path: outPath, bytes: buf.length };
   }
 
@@ -301,4 +464,14 @@ async function attachPage({ port = DEFAULT_PORT, wsUrl, selection = "new", targe
   };
 }
 
-module.exports = { cdpReady, pickPageTarget, attachPage, DEFAULT_PORT, DEFAULT_WS_OPEN_TIMEOUT_MS };
+module.exports = {
+  cdpReady,
+  pickPageTarget,
+  attachPage,
+  DEFAULT_PORT,
+  DEFAULT_WS_OPEN_TIMEOUT_MS,
+  CDP_HTTP_TIMEOUT_MS,
+  CDP_HTTP_MAX_BYTES,
+  CDP_PDF_MAX_BYTES,
+  writeAtomicRegularFile,
+};

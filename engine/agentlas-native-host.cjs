@@ -32,6 +32,8 @@ const NATIVE_TIMEOUT_DEFAULTS = Object.freeze({
   totalMs: 4 * 60 * 60_000,
   killGraceMs: 3_000,
 });
+const NATIVE_STDOUT_MAX_BYTES = 16 * 1024 * 1024;
+const MANAGED_MCP_CONFIG_MAX_BYTES = 2 * 1024 * 1024;
 
 function finiteTimeoutMs(value, fallback, min, max) {
   const parsed = Number(value);
@@ -85,22 +87,244 @@ function geminiMcpIsolationArgs() {
   return ["--allowed-mcp-server-names", `__agentlas_no_mcp_${crypto.randomUUID()}__`];
 }
 
-function writeManagedFile(file, content) {
-  const temp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
-  try {
-    fs.writeFileSync(temp, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
-    try {
-      fs.renameSync(temp, file);
-    } catch (error) {
-      // Windows cannot always replace an existing destination atomically.
-      if (!error || !["EEXIST", "EPERM"].includes(error.code)) throw error;
-      fs.rmSync(file, { force: true });
-      fs.renameSync(temp, file);
-    }
-  } finally {
-    try { fs.rmSync(temp, { force: true }); } catch { /* best-effort cleanup */ }
+function assertManagedDirectory(dir) {
+  const requestedPath = path.resolve(dir);
+  fs.mkdirSync(requestedPath, { recursive: true, mode: 0o700 });
+  const stat = fs.lstatSync(requestedPath);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error(`managed runtime directory must be a real directory: ${requestedPath}`);
   }
-  try { fs.chmodSync(file, 0o600); } catch { /* Windows/best-effort */ }
+  const realPath = fs.realpathSync.native(requestedPath);
+  try { fs.chmodSync(requestedPath, 0o700); } catch { /* Windows/best-effort */ }
+  return { requestedPath, realPath, dev: stat.dev, ino: stat.ino };
+}
+
+function recheckManagedDirectory(identity) {
+  let stat;
+  try {
+    stat = fs.lstatSync(identity.requestedPath);
+  } catch {
+    throw new Error(`managed runtime directory changed while publishing: ${identity.requestedPath}`);
+  }
+  let realPath;
+  try {
+    realPath = fs.realpathSync.native(identity.requestedPath);
+  } catch {
+    throw new Error(`managed runtime directory changed while publishing: ${identity.requestedPath}`);
+  }
+  if (
+    !stat.isDirectory() || stat.isSymbolicLink() ||
+    stat.dev !== identity.dev || stat.ino !== identity.ino || realPath !== identity.realPath
+  ) {
+    throw new Error(`managed runtime directory changed while publishing: ${identity.requestedPath}`);
+  }
+  return stat;
+}
+
+function managedFileLocation(file, directory = null) {
+  const requestedFile = path.resolve(file);
+  const requestedDirectory = path.dirname(requestedFile);
+  const identity = directory || assertManagedDirectory(requestedDirectory);
+  if (identity.requestedPath !== requestedDirectory) {
+    throw new Error(`managed runtime file directory mismatch: ${requestedFile}`);
+  }
+  recheckManagedDirectory(identity);
+  return {
+    requestedFile,
+    file: path.join(identity.realPath, path.basename(requestedFile)),
+    directory: identity,
+  };
+}
+
+function existingManagedFileStat(file) {
+  try {
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+      throw new Error(`managed runtime file must be a single-link regular file: ${file}`);
+    }
+    return stat;
+  } catch (error) {
+    if (error && error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function readManagedFileDetails(file, maxBytes = MANAGED_MCP_CONFIG_MAX_BYTES) {
+  const listed = existingManagedFileStat(file);
+  if (!listed) return null;
+  if (listed.size > maxBytes) throw new Error(`managed runtime file exceeds ${maxBytes} bytes: ${file}`);
+  let fd = null;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const opened = fs.fstatSync(fd);
+    if (
+      !opened.isFile() || opened.nlink !== 1 ||
+      opened.dev !== listed.dev || opened.ino !== listed.ino || opened.size !== listed.size
+    ) throw new Error(`managed runtime file changed while opening: ${file}`);
+    const chunks = [];
+    let total = 0;
+    while (total <= maxBytes) {
+      const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes + 1 - total));
+      const count = fs.readSync(fd, buffer, 0, buffer.length, null);
+      if (!count) break;
+      chunks.push(buffer.subarray(0, count));
+      total += count;
+    }
+    const after = fs.fstatSync(fd);
+    if (
+      total > maxBytes || !after.isFile() || after.nlink !== 1 ||
+      after.dev !== opened.dev || after.ino !== opened.ino || after.size !== opened.size ||
+      after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs || total !== after.size
+    ) throw new Error(`managed runtime file changed while reading: ${file}`);
+    let content;
+    try { content = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks, total)); }
+    catch { throw new Error(`managed runtime file must contain valid UTF-8: ${file}`); }
+    return {
+      content,
+      stat: after,
+    };
+  } finally {
+    if (fd != null) fs.closeSync(fd);
+  }
+}
+
+function readManagedFile(file, maxBytes = MANAGED_MCP_CONFIG_MAX_BYTES) {
+  const result = readManagedFileDetails(file, maxBytes);
+  return result && result.content;
+}
+
+function sameManagedFileIdentity(stat, expected) {
+  return stat && stat.isFile() && !stat.isSymbolicLink() && stat.dev === expected.dev && stat.ino === expected.ino;
+}
+
+function sameManagedFileSnapshot(stat, expected) {
+  return sameManagedFileIdentity(stat, expected) && stat.nlink === expected.nlink &&
+    stat.size === expected.size && stat.mtimeMs === expected.mtimeMs && stat.ctimeMs === expected.ctimeMs;
+}
+
+function assertManagedFileStable(file, expected, expectedContent, directory) {
+  recheckManagedDirectory(directory);
+  const listed = existingManagedFileStat(file);
+  if (!sameManagedFileSnapshot(listed, expected)) {
+    throw new Error(`managed runtime file changed after reading: ${file}`);
+  }
+  const reread = readManagedFileDetails(file);
+  if (!reread || reread.content !== expectedContent || !sameManagedFileSnapshot(reread.stat, expected)) {
+    throw new Error(`managed runtime file content changed after reading: ${file}`);
+  }
+  recheckManagedDirectory(directory);
+  const final = existingManagedFileStat(file);
+  if (!sameManagedFileSnapshot(final, expected)) {
+    throw new Error(`managed runtime file changed before returning: ${file}`);
+  }
+}
+
+function removeOwnedManagedTemp(temp, expected, directory = null) {
+  const candidates = [temp];
+  if (directory) {
+    try {
+      const parent = path.dirname(directory.requestedPath);
+      for (const entry of fs.readdirSync(parent, { withFileTypes: true })) {
+        if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+        const candidateDirectory = path.join(parent, entry.name);
+        const candidateStat = fs.lstatSync(candidateDirectory);
+        if (candidateStat.dev === directory.dev && candidateStat.ino === directory.ino) {
+          candidates.push(path.join(candidateDirectory, path.basename(temp)));
+        }
+      }
+    } catch { /* leave an unknown successor untouched */ }
+  }
+  for (const candidate of candidates) {
+    try {
+      const stat = fs.lstatSync(candidate);
+      if (sameManagedFileIdentity(stat, expected)) fs.unlinkSync(candidate);
+    } catch { /* leave an unknown successor untouched */ }
+  }
+}
+
+function writeManagedFile(file, content, location = null) {
+  const managed = location || managedFileLocation(file);
+  const value = String(content);
+  const bytes = Buffer.from(value, "utf8");
+  if (bytes.length > MANAGED_MCP_CONFIG_MAX_BYTES) {
+    throw new Error(`managed runtime file exceeds ${MANAGED_MCP_CONFIG_MAX_BYTES} bytes: ${managed.file}`);
+  }
+  recheckManagedDirectory(managed.directory);
+  const currentRead = readManagedFileDetails(managed.file);
+  const current = currentRead && currentRead.content;
+  if (current !== null) {
+    if (current !== value) {
+      assertManagedFileStable(managed.file, currentRead.stat, current, managed.directory);
+      throw new Error(`managed runtime file already exists with different content: ${managed.file}`);
+    }
+    // The first check binds the pathname to the inode that was read. Repeat
+    // it immediately before returning so an intervening successor cannot be
+    // mistaken for the idempotent managed file.
+    assertManagedFileStable(managed.file, currentRead.stat, current, managed.directory);
+    assertManagedFileStable(managed.file, currentRead.stat, current, managed.directory);
+    return managed.file;
+  }
+  recheckManagedDirectory(managed.directory);
+
+  const temp = `${managed.file}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  let tempIdentity = null;
+  let fd = null;
+  try {
+    fd = fs.openSync(
+      temp,
+      fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0),
+      0o600,
+    );
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.nlink !== 1) throw new Error(`managed runtime temp file is unsafe: ${managed.file}`);
+    tempIdentity = { dev: opened.dev, ino: opened.ino };
+    let offset = 0;
+    while (offset < bytes.length) {
+      const written = fs.writeSync(fd, bytes, offset, bytes.length - offset, null);
+      if (!Number.isInteger(written) || written <= 0) throw new Error(`managed runtime file write stalled: ${managed.file}`);
+      offset += written;
+    }
+    try { fs.fchmodSync(fd, 0o600); } catch { /* Windows/ACL-only host */ }
+    fs.fsyncSync(fd);
+    const finished = fs.fstatSync(fd);
+    if (
+      !sameManagedFileIdentity(finished, tempIdentity) || finished.nlink !== 1 ||
+      finished.size !== bytes.length
+    ) throw new Error(`managed runtime temp file changed while writing: ${managed.file}`);
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
+  }
+
+  try {
+    const listedTemp = fs.lstatSync(temp);
+    if (!sameManagedFileIdentity(listedTemp, tempIdentity) || listedTemp.nlink !== 1 || listedTemp.size !== bytes.length) {
+      throw new Error(`managed runtime temp file changed before publication: ${managed.file}`);
+    }
+    recheckManagedDirectory(managed.directory);
+    // link(2) is an atomic create-if-absent publication on POSIX and never
+    // replaces a destination. Windows has no safe overwrite fallback here:
+    // linkSync failure is deliberately surfaced and the successor is kept.
+    fs.linkSync(temp, managed.file);
+    const linked = fs.lstatSync(managed.file);
+    if (!sameManagedFileIdentity(linked, tempIdentity) || linked.nlink < 2 || linked.size !== bytes.length) {
+      throw new Error(`managed runtime file publication produced an unsafe target: ${managed.file}`);
+    }
+    removeOwnedManagedTemp(temp, tempIdentity, managed.directory);
+    const published = existingManagedFileStat(managed.file);
+    if (!published || !sameManagedFileIdentity(published, tempIdentity) || published.size !== bytes.length) {
+      throw new Error(`managed runtime file publication changed while finishing: ${managed.file}`);
+    }
+    recheckManagedDirectory(managed.directory);
+    return managed.file;
+  } catch (error) {
+    // If the directory moved to a symlink during publication, the canonical
+    // path can temporarily resolve outside the managed tree. Remove only our
+    // inode; a successor at the same path remains untouched.
+    removeOwnedManagedTemp(managed.file, tempIdentity, managed.directory);
+    throw error;
+  } finally {
+    removeOwnedManagedTemp(temp, tempIdentity, managed.directory);
+  }
 }
 
 function prepareCodexRuntimeEnv(env = process.env) {
@@ -110,10 +334,9 @@ function prepareCodexRuntimeEnv(env = process.env) {
   const explicitTarget = Boolean(base.AGENTLAS_CODEX_HOME);
   const targetHome = path.resolve(base.AGENTLAS_CODEX_HOME || path.join(dataHome, "runtime-homes", "codex"));
   fs.mkdirSync(dataHome, { recursive: true, mode: 0o700 });
-  fs.mkdirSync(targetHome, { recursive: true, mode: 0o700 });
-  try { fs.chmodSync(targetHome, 0o700); } catch { /* Windows/best-effort */ }
+  const targetDirectory = assertManagedDirectory(targetHome);
   const realDataHome = fs.realpathSync(dataHome);
-  const realTargetHome = fs.realpathSync(targetHome);
+  const realTargetHome = targetDirectory.realPath;
   let realSourceHome = sourceHome;
   try { realSourceHome = fs.realpathSync(sourceHome); } catch (error) { if (!error || error.code !== "ENOENT") throw error; }
   const targetRelative = path.relative(realDataHome, realTargetHome);
@@ -127,9 +350,11 @@ function prepareCodexRuntimeEnv(env = process.env) {
   // CODEX_HOME has no replace-config CLI flag: profiles and `mcp_servers={}`
   // merge with the user's global config. A dedicated home is the only reliable
   // way to exclude global/project/plugin MCP while keeping Agentlas sessions.
+  const configLocation = managedFileLocation(path.join(targetHome, "config.toml"), targetDirectory);
   writeManagedFile(
-    path.join(targetHome, "config.toml"),
+    configLocation.file,
     "# Managed by Agentlas Terminal. MCP is supplied only for explicit full-access turns.\n",
+    configLocation,
   );
 
   if (sourceHome !== targetHome) {
@@ -191,26 +416,16 @@ function wrappedMcpServerMap(servers, options = {}) {
 // stdio servers. Empty means empty; there is no legacy or provider seed.
 function cliMcpConfigPath(servers, options = {}) {
   const dir = path.join(userDataDir(options.env || process.env), "mcp");
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  try { fs.chmodSync(dir, 0o700); } catch { /* Windows/best-effort */ }
+  const directory = assertManagedDirectory(dir);
   const mcpServers = wrappedMcpServerMap(servers, options);
   const body = JSON.stringify({ mcpServers }, null, 2);
   // 서로 다른 동시 실행이 하나의 agentlas-cli-mcp.json을 덮어쓰지 않도록 내용 주소 파일을 쓴다.
   const digest = crypto.createHash("sha256").update(body).digest("hex").slice(0, 20);
-  const file = path.join(dir, `agentlas-cli-mcp-${digest}.json`);
-  let current = null;
-  try { current = fs.readFileSync(file, "utf8"); } catch { /* first write */ }
-  if (current !== body) {
-    const temp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
-    try {
-      fs.writeFileSync(temp, body, { encoding: "utf8", mode: 0o600, flag: "wx" });
-      fs.renameSync(temp, file);
-    } finally {
-      try { fs.rmSync(temp, { force: true }); } catch { /* noop */ }
-    }
-  }
-  try { fs.chmodSync(file, 0o600); } catch { /* Windows/best-effort */ }
-  return { file, names: Object.keys(mcpServers) };
+  const location = managedFileLocation(path.join(dir, `agentlas-cli-mcp-${digest}.json`), directory);
+  // Always delegate the idempotent case to the identity-checked writer; a
+  // caller-side read followed by an early return would reopen a TOCTOU gap.
+  writeManagedFile(location.file, body, location);
+  return { file: location.file, names: Object.keys(mcpServers) };
 }
 // Full-access turns only: codex -c mcp_servers.* with the same exact Build
 // allowlist semantics as Claude.
@@ -246,11 +461,24 @@ function summarizeToolInput(name, input) {
 }
 
 // child.stdout → 줄 단위 콜백. 종료 시 잔여 버퍼 flush. cleanup 반환.
-function lineReader(stream, onLine, onActivity) {
+function lineReader(stream, onLine, onActivity, options = {}) {
   let buf = "";
+  let totalBytes = 0;
+  let limited = false;
+  const maxBytes = Number.isFinite(Number(options.maxBytes))
+    ? Math.max(1, Math.trunc(Number(options.maxBytes)))
+    : NATIVE_STDOUT_MAX_BYTES;
   stream.setEncoding("utf8");
   const onData = (chunk) => {
+    if (limited) return;
     if (onActivity) onActivity();
+    totalBytes += Buffer.byteLength(chunk, "utf8");
+    if (totalBytes > maxBytes) {
+      limited = true;
+      buf = "";
+      if (typeof options.onLimit === "function") options.onLimit(maxBytes);
+      return;
+    }
     buf += chunk;
     let nl;
     while ((nl = buf.indexOf("\n")) >= 0) {
@@ -260,7 +488,7 @@ function lineReader(stream, onLine, onActivity) {
     }
   };
   const onEnd = () => {
-    if (buf.trim()) onLine(buf);
+    if (!limited && buf.trim()) onLine(buf);
   };
   stream.on("data", onData);
   stream.on("end", onEnd);
@@ -661,16 +889,15 @@ function prepareGeminiRuntimeEnv(env = process.env, options = {}) {
     throw error;
   }
   const dir = path.join(userDataDir(base), "mcp");
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  try { fs.chmodSync(dir, 0o700); } catch { /* Windows/best-effort */ }
+  const directory = assertManagedDirectory(dir);
   const names = Object.keys(mcpServers);
   const body = JSON.stringify({ mcpServers, mcp: { allowed: names } }, null, 2);
   const digest = crypto.createHash("sha256").update(body).digest("hex").slice(0, 20);
-  const file = path.join(dir, `agentlas-gemini-mcp-${digest}.json`);
-  let current = null;
-  try { current = fs.readFileSync(file, "utf8"); } catch { /* first write */ }
-  if (current !== body) writeManagedFile(file, body);
-  base.GEMINI_CLI_SYSTEM_SETTINGS_PATH = file;
+  const location = managedFileLocation(path.join(dir, `agentlas-gemini-mcp-${digest}.json`), directory);
+  // Keep the idempotent read and return inside writeManagedFile's identity
+  // checks; do not leave a caller-side read/early-return race here.
+  writeManagedFile(location.file, body, location);
+  base.GEMINI_CLI_SYSTEM_SETTINGS_PATH = location.file;
   return base;
 }
 
@@ -1042,7 +1269,7 @@ function runNativeTurn(req) {
         session: st.session,
         usage: st.usage,
         error: termination ? termination.message : "native runtime stopped",
-        errorKind: "timeout",
+        errorKind: termination?.reason === "output" ? "output_limit" : "timeout",
         errorSource: "marker",
         terminationVerified: Boolean(termination?.verified),
       });
@@ -1065,7 +1292,11 @@ function runNativeTurn(req) {
     };
     const requestStop = (reason) => {
       if (termination || settled) return;
-      const message = reason === "abort" ? "aborted" : nativeTimeoutMessage(reason, reason === "idle" ? timeout.idleMs : timeout.totalMs);
+      const message = reason === "abort"
+        ? "aborted"
+        : reason === "output"
+          ? `native runtime stdout exceeded ${NATIVE_STDOUT_MAX_BYTES} bytes`
+          : nativeTimeoutMessage(reason, reason === "idle" ? timeout.idleMs : timeout.totalMs);
       termination = { reason, message };
       st.error = message;
       st.errorShown = true;
@@ -1105,9 +1336,12 @@ function runNativeTurn(req) {
         }
         ui.streamDelta(l + "\n");
         st.text += l + "\n";
-      }, markActivity);
+      }, markActivity, { maxBytes: NATIVE_STDOUT_MAX_BYTES, onLimit: () => requestStop("output") });
     } else {
-      removeLineReader = lineReader(child.stdout, lineHandler, markActivity);
+      removeLineReader = lineReader(child.stdout, lineHandler, markActivity, {
+        maxBytes: NATIVE_STDOUT_MAX_BYTES,
+        onLimit: () => requestStop("output"),
+      });
     }
 
     child.stderr.setEncoding("utf8");
@@ -1345,4 +1579,5 @@ module.exports = {
   activeNativeProcessIds,
   forceStopNativeProcessTree,
   terminateNativeChild,
+  NATIVE_STDOUT_MAX_BYTES,
 };

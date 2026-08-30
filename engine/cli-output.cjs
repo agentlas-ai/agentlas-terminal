@@ -67,12 +67,23 @@ function textOf(value) {
   return JSON.stringify(value);
 }
 
+function terminalTextOf(value, maxLength = Number.POSITIVE_INFINITY) {
+  const text = textOf(value);
+  if (typeof text !== "string") return "";
+  return text
+    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, "")
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\u001b[@-_]/g, "")
+    .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ")
+    .slice(0, maxLength);
+}
+
 /**
  * 표시 폭 — ANSI 를 벗기고, CJK 전각을 2칸으로 센다.
  * 한글 표가 어긋나던 이유가 이것이다(폭을 문자 수로 세면 열이 밀린다).
  */
 function displayWidth(value) {
-  const plain = String(value).replace(/\[[0-9;]*m/g, "");
+  const plain = terminalTextOf(value);
   let width = 0;
   for (const char of plain) {
     const code = char.codePointAt(0) ?? 0;
@@ -102,7 +113,7 @@ function padTo(value, width, align) {
 function renderQuiet(result) {
   const idField = result.schema.idField;
   return rowsOf(result)
-    .map((item) => textOf(readField(item, idField)))
+    .map((item) => terminalTextOf(readField(item, idField)))
     .filter((line) => line.length > 0)
     .join("\n");
 }
@@ -122,31 +133,65 @@ function renderYaml(result) {
     if (value === null || value === undefined) return "null";
     if (typeof value === "number" || typeof value === "boolean") return String(value);
     const text = textOf(value);
-    return /^[\w./:@-]+$/.test(text) ? text : JSON.stringify(text);
+    // YAML implicitly retypes unquoted strings such as yes/null/001/dates.
+    // Machine output must round-trip the command result without changing a
+    // string into a boolean, null, number, or timestamp. Conservatively leave
+    // only unambiguous word/path-like strings plain; JSON quoting is valid YAML.
+    const ambiguousWord = /^(?:~|null|true|false|yes|no|on|off|[-+]?\.?(?:inf|nan))$/i.test(text);
+    return /^[A-Za-z_./][\w./:@-]*$/.test(text) && !ambiguousWord ? text : JSON.stringify(text);
+  };
+  const isObject = (value) => value && typeof value === "object" && !Array.isArray(value) && !(value instanceof Date);
+  const assertBoundedTree = (root) => {
+    let nodes = 0;
+    const visit = (value, ancestors, depth) => {
+      if ((!isObject(value) && !Array.isArray(value)) || value instanceof Date) return;
+      if (depth > 64) throw new TypeError("YAML output exceeds the maximum nesting depth");
+      if (ancestors.has(value)) throw new TypeError("YAML output contains a circular reference");
+      nodes += 1;
+      if (nodes > 100_000) throw new TypeError("YAML output contains too many nodes");
+      const next = new Set(ancestors);
+      next.add(value);
+      for (const child of Array.isArray(value) ? value : Object.values(value)) visit(child, next, depth + 1);
+    };
+    visit(root, new Set(), 0);
   };
   const objectLines = (object, indent) => {
     const pad = " ".repeat(indent);
-    return Object.entries(object).map(([key, value]) => {
-      if (value && typeof value === "object" && !Array.isArray(value) && !(value instanceof Date)) {
-        return `${pad}${key}:\n${objectLines(value, indent + 2).join("\n")}`;
+    const entries = Object.entries(object);
+    if (!entries.length) return [`${pad}{}`];
+    return entries.flatMap(([key, value]) => {
+      const renderedKey = scalar(key);
+      if (isObject(value) || Array.isArray(value)) {
+        const nested = value.length === 0 ? [`${pad}  ${Array.isArray(value) ? "[]" : "{}"}`] : valueLines(value, indent + 2);
+        if (nested.length === 1 && /^(?:\{\}|\[\])$/.test(nested[0].trim())) return [`${pad}${renderedKey}: ${nested[0].trim()}`];
+        return [`${pad}${renderedKey}:`, ...nested];
       }
-      if (Array.isArray(value)) {
-        if (value.length === 0) return `${pad}${key}: []`;
-        return `${pad}${key}:\n${value.map((entry) => `${pad}  - ${scalar(entry)}`).join("\n")}`;
-      }
-      return `${pad}${key}: ${scalar(value)}`;
+      return [`${pad}${renderedKey}: ${scalar(value)}`];
     });
   };
-  if (result.type === "list") {
-    if (result.data.length === 0) return "[]";
-    return result.data
-      .map((item) => {
-        const lines = objectLines(project(item), 2);
-        return `- ${lines.join("\n").trimStart()}`;
-      })
-      .join("\n");
-  }
-  return objectLines(project(result.data), 0).join("\n");
+  const valueLines = (value, indent) => {
+    const pad = " ".repeat(indent);
+    if (Array.isArray(value)) {
+      if (!value.length) return [`${pad}[]`];
+      return value.flatMap((entry) => {
+        if (isObject(entry)) {
+          const nested = objectLines(entry, indent + 2);
+          return [`${pad}- ${nested[0].trimStart()}`, ...nested.slice(1)];
+        }
+        if (Array.isArray(entry)) {
+          const nested = valueLines(entry, indent + 2);
+          return [`${pad}-`, ...nested];
+        }
+        return [`${pad}- ${scalar(entry)}`];
+      });
+    }
+    if (isObject(value)) return objectLines(value, indent);
+    return [`${pad}${scalar(value)}`];
+  };
+  const payload = result.type === "list" ? result.data.map(project) : project(result.data);
+  assertBoundedTree(payload);
+  if (result.type === "list" && result.data.length === 0) return "[]";
+  return valueLines(payload, 0).join("\n");
 }
 
 function renderTable(result, options) {
@@ -154,11 +199,11 @@ function renderTable(result, options) {
   const rows = rowsOf(result);
   if (rows.length === 0) return "";
   const cells = rows.map((item) =>
-    columns.map((column) => textOf(readField(item, column.field))),
+    columns.map((column) => terminalTextOf(readField(item, column.field))),
   );
   const widths = columns.map((column, index) =>
     Math.max(
-      options.noHeaders ? 0 : displayWidth(column.header),
+      options.noHeaders ? 0 : displayWidth(terminalTextOf(column.header)),
       ...cells.map((row) => displayWidth(row[index] ?? "")),
     ),
   );
@@ -166,7 +211,7 @@ function renderTable(result, options) {
   if (!options.noHeaders) {
     lines.push(
       columns
-        .map((column, index) => padTo(column.header.toUpperCase(), widths[index], column.align))
+        .map((column, index) => padTo(terminalTextOf(column.header).toUpperCase(), widths[index], column.align))
         .join("  ")
         .trimEnd(),
     );
@@ -212,12 +257,13 @@ function renderError(error, options = {}) {
   const commandError = toCommandError(error);
   if (opts.format === "json") return JSON.stringify({ error: commandError }, null, 2);
   if (opts.format === "yaml") {
-    return ["error:", `  code: ${commandError.code}`, `  message: ${JSON.stringify(commandError.message)}`].join("\n");
+    return ["error:", `  code: ${JSON.stringify(commandError.code)}`, `  message: ${JSON.stringify(commandError.message)}`].join("\n");
   }
   const prefix = opts.noColor ? "Error: " : "[31mError: [0m";
+  const safeMessage = terminalTextOf(commandError.message, 8192);
   return commandError.details && typeof commandError.details === "string" && opts.format === "table"
-    ? `${prefix}${commandError.message}`
-    : `${prefix}${commandError.message}`;
+    ? `${prefix}${safeMessage}`
+    : `${prefix}${safeMessage}`;
 }
 
 /**
@@ -230,7 +276,12 @@ function renderError(error, options = {}) {
 function parseOutputFlags(argv, env = process.env, isTty = Boolean(process.stdout.isTTY)) {
   const rest = [];
   const options = { ...DEFAULT_OPTIONS };
-  for (const token of argv) {
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (token === "--") {
+      rest.push(...argv.slice(index + 1));
+      break;
+    }
     if (token === "--json") options.format = "json";
     else if (token === "--yaml") options.format = "yaml";
     else if (token === "--quiet" || token === "-q") options.quiet = true;
@@ -259,4 +310,5 @@ module.exports = {
   parseOutputFlags,
   isRichUi,
   displayWidth,
+  terminalTextOf,
 };

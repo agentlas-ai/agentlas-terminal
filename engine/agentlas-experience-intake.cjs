@@ -75,9 +75,9 @@ function createRunReceipt(input) {
   if (!input.exactBase || !ID_RE.test(String(input.exactBase.agentReleaseId || ""))) {
     throw new Error("RunReceipt requires an exact agent definition release.");
   }
-  const runId = cleanId(input.runId, opaqueId("run", input.exactBase.agentReleaseId, taskSignature, input.createdAt));
-  const idempotencyKey = cleanId(input.idempotencyKey, opaqueId("run-key", runId));
   const createdAt = input.createdAt || new Date().toISOString();
+  const runId = cleanId(input.runId, opaqueId("run", input.exactBase.agentReleaseId, taskSignature, createdAt));
+  const idempotencyKey = cleanId(input.idempotencyKey, opaqueId("run-key", runId));
   const provider = cleanId(input.model?.provider, "terminal-runtime");
   const modelId = cleanId(input.model?.modelId, provider);
   const outcome = ["succeeded", "partial", "failed", "cancelled"].includes(input.outcome?.status)

@@ -8,8 +8,11 @@
  */
 const fs = require("node:fs");
 const path = require("node:path");
-const LOCK_WAIT_MS = 2_000;
-const LOCK_STALE_MS = 30_000;
+const {
+  readJsonFile,
+  writePrivateJsonAtomic,
+  withPrivateStateLock,
+} = require("./mcp/contract.cjs");
 
 function prefsPath(userDataDir) {
   return path.join(userDataDir, "cli-prefs.json");
@@ -19,7 +22,7 @@ function backupPath(userDataDir) {
 }
 function readPrefsFile(file) {
   try {
-    const value = JSON.parse(fs.readFileSync(file, "utf8"));
+    const { value } = readJsonFile(file, "CLI preferences");
     return value && typeof value === "object" && !Array.isArray(value) ? value : null;
   } catch {
     return null;
@@ -29,60 +32,15 @@ function loadPrefs(userDataDir) {
   return readPrefsFile(prefsPath(userDataDir)) || readPrefsFile(backupPath(userDataDir)) || {};
 }
 
-function sleepSync(ms) {
-  try {
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-  } catch {
-    const until = Date.now() + ms;
-    while (Date.now() < until) { /* old Node fallback */ }
-  }
-}
-
 function withPrefsLock(userDataDir, callback) {
-  const lock = prefsPath(userDataDir) + ".lock";
-  const deadline = Date.now() + LOCK_WAIT_MS;
-  while (true) {
-    try {
-      fs.mkdirSync(lock, { mode: 0o700 });
-      break;
-    } catch (error) {
-      if (!error || error.code !== "EEXIST") throw error;
-      try {
-        if (Date.now() - fs.statSync(lock).mtimeMs > LOCK_STALE_MS) {
-          fs.rmdirSync(lock);
-          continue;
-        }
-      } catch {
-        continue;
-      }
-      if (Date.now() >= deadline) throw new Error("preferences lock timeout");
-      sleepSync(10);
-    }
-  }
-  try {
-    return callback();
-  } finally {
-    try { fs.rmdirSync(lock); } catch { /* stale lock recovery handles interrupted writers */ }
-  }
+  return withPrivateStateLock(prefsPath(userDataDir), {
+    unsafe: "preferences lock is unsafe",
+    busy: "preferences lock timeout",
+  }, callback);
 }
 
 function atomicWrite(file, value) {
-  const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
-  let fd;
-  try {
-    fd = fs.openSync(tmp, "wx", 0o600);
-    fs.writeFileSync(fd, JSON.stringify(value, null, 2), "utf8");
-    fs.fsyncSync(fd);
-    fs.closeSync(fd);
-    fd = null;
-    fs.renameSync(tmp, file);
-    try { fs.chmodSync(file, 0o600); } catch { /* win32 */ }
-  } finally {
-    if (fd != null) {
-      try { fs.closeSync(fd); } catch { /* ignore */ }
-    }
-    try { fs.unlinkSync(tmp); } catch { /* already renamed or never created */ }
-  }
+  writePrivateJsonAtomic(file, value);
 }
 
 function mergePrefs(base, patch) {
@@ -111,9 +69,16 @@ function updatePrefs(userDataDir, patch) {
   fs.mkdirSync(userDataDir, { recursive: true });
   return withPrefsLock(userDataDir, () => {
     const file = prefsPath(userDataDir);
+    let currentStat = null;
+    try { currentStat = fs.lstatSync(file); } catch (error) {
+      if (!error || error.code !== "ENOENT") throw error;
+    }
+    if (currentStat && (!currentStat.isFile() || currentStat.isSymbolicLink() || currentStat.nlink !== 1)) {
+      throw new Error("CLI preferences path is unsafe");
+    }
     const currentWasValid = Boolean(readPrefsFile(file));
     const current = loadPrefs(userDataDir);
-    if (fs.existsSync(file) && !currentWasValid) {
+    if (currentStat && !currentWasValid) {
       try { fs.renameSync(file, `${file}.corrupt-${Date.now()}-${process.pid}`); } catch { /* recover from backup */ }
     }
     const next = mergePrefs(current, patch);

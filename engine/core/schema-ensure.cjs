@@ -23,23 +23,33 @@ const applied = new WeakMap();
 
 /**
  * `key` 작업을 이 커넥션에서 아직 안 했으면 실행한다.
- * 실패는 삼키되 **기억하지 않는다** — 다음 호출이 다시 시도할 수 있어야 한다.
- * (일시적 락 경합으로 실패한 것을 "완료"로 기억하면 스키마가 영구히 안 맞는다.)
+ * 실패하거나 콜백이 `false`를 반환하면 **기억하지 않는다** — 다음 호출이 다시 시도할
+ * 수 있어야 한다. (일시적 락 경합이나 아직 없는 테이블을 "완료"로 기억하면 스키마가
+ * 영구히 안 맞는다.)
+ *
+ * `inFlight`는 동기 콜백이 같은 커넥션/키를 재진입 호출하는 경우를 막는다. 재진입
+ * 호출은 아직 완료를 증명할 수 없으므로 `false`를 돌려주고, 바깥 호출만 완료를
+ * 기록한다. 기존 호출부는 예외가 없으면 `undefined`를 반환하므로, 호환성을 위해
+ * `false`만 명시적인 미완료 신호로 취급한다.
  */
 function ensureOnce(db, key, fn) {
-  if (!db) return false;
-  let done = applied.get(db);
-  if (!done) {
-    done = new Set();
-    applied.set(db, done);
+  if (!db || (typeof db !== "object" && typeof db !== "function") || typeof fn !== "function") return false;
+  let state = applied.get(db);
+  if (!state) {
+    state = { done: new Set(), inFlight: new Set() };
+    applied.set(db, state);
   }
-  if (done.has(key)) return true;
+  if (state.done.has(key)) return true;
+  if (state.inFlight.has(key)) return false;
+  state.inFlight.add(key);
   try {
-    fn(db);
-    done.add(key);
+    if (fn(db) === false) return false;
+    state.done.add(key);
     return true;
   } catch {
     return false;
+  } finally {
+    state.inFlight.delete(key);
   }
 }
 
@@ -66,9 +76,11 @@ function columnExists(db, table, column) {
  */
 function ensureMemoryContextColumn(db) {
   return ensureOnce(db, "memory_entries.context_json", (conn) => {
-    if (tableExists(conn, "memory_entries") && !columnExists(conn, "memory_entries", "context_json")) {
+    if (!tableExists(conn, "memory_entries")) return false;
+    if (!columnExists(conn, "memory_entries", "context_json")) {
       conn.exec("ALTER TABLE memory_entries ADD COLUMN context_json TEXT NOT NULL DEFAULT '{}'");
     }
+    return columnExists(conn, "memory_entries", "context_json");
   });
 }
 

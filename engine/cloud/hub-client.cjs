@@ -8,9 +8,9 @@
  *  - 업스트림 AbortSignal 전파
  * 세션 쿠키 해석 순서: AGENTLAS_SESSION env → auth/cli-session.v1.json → (레거시) keytar.
  */
-const fs = require("node:fs");
 const path = require("node:path");
 const { userDataDir } = require("../core/paths.cjs");
+const { readJsonFile } = require("../mcp/contract.cjs");
 
 const HUB_RESPONSE_MAX_BYTES = 16 * 1024 * 1024;
 const HUB_TIMEOUT_DEFAULTS = Object.freeze({ connectMs: 15_000, idleMs: 30_000, totalMs: 180_000 });
@@ -69,6 +69,7 @@ async function fetchHub(url, init = {}, options = {}) {
   let idleTimer = null;
   let totalTimer = null;
   let reader = null;
+  let iterator = null;
   let terminalError = null;
   let rejectTerminal;
   const terminal = new Promise((_, reject) => { rejectTerminal = reject; });
@@ -106,27 +107,46 @@ async function fetchHub(url, init = {}, options = {}) {
     const chunks = [];
     let bytes = 0;
     armIdle();
+    const acceptChunk = (value) => {
+      armIdle();
+      const chunk = Buffer.from(value || []);
+      bytes += chunk.length;
+      if (bytes > HUB_RESPONSE_MAX_BYTES) {
+        const error = new Error(`Hub 응답이 허용 크기(${HUB_RESPONSE_MAX_BYTES} bytes)를 초과했습니다.`);
+        error.code = "AGENTLAS_HUB_RESPONSE_TOO_LARGE";
+        stop(error);
+        throw error;
+      }
+      chunks.push(chunk);
+    };
     if (response.body && typeof response.body.getReader === "function") {
       reader = response.body.getReader();
       while (true) {
         const part = await Promise.race([reader.read(), terminal]);
         if (part.done) break;
-        armIdle();
-        const chunk = Buffer.from(part.value || []);
-        bytes += chunk.length;
-        if (bytes > HUB_RESPONSE_MAX_BYTES) {
-          const error = new Error(`Hub 응답이 허용 크기(${HUB_RESPONSE_MAX_BYTES} bytes)를 초과했습니다.`);
-          error.code = "AGENTLAS_HUB_RESPONSE_TOO_LARGE";
-          stop(error);
-          throw error;
-        }
-        chunks.push(chunk);
+        acceptChunk(part.value);
       }
+    } else if (response.body && typeof response.body[Symbol.asyncIterator] === "function") {
+      iterator = response.body[Symbol.asyncIterator]();
+      while (true) {
+        // Node streams and test adapters can expose only an async iterator. A
+        // plain `for await` leaves us stuck inside next() after idle/total expiry,
+        // even though the request's AbortController has already fired.
+        const part = await Promise.race([
+          Promise.resolve().then(() => iterator.next()),
+          terminal,
+        ]);
+        if (part.done) break;
+        acceptChunk(part.value);
+      }
+    } else if (response.body == null) {
+      // Standards-compliant empty/HEAD/204 response. There is no body to read.
     } else {
-      const raw = Buffer.from(await Promise.race([response.arrayBuffer(), terminal]));
-      bytes = raw.length;
-      if (bytes > HUB_RESPONSE_MAX_BYTES) throw new Error(`Hub response exceeds the allowed size (${HUB_RESPONSE_MAX_BYTES} bytes).`);
-      chunks.push(raw);
+      // arrayBuffer()/text() allocates the complete attacker-controlled body
+      // before a size check can run, defeating the 16 MiB contract.
+      const error = new Error("Hub response body is not stream-readable; refusing an unbounded buffered read.");
+      error.code = "AGENTLAS_HUB_RESPONSE_NOT_STREAMABLE";
+      throw error;
     }
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = null;
@@ -142,6 +162,11 @@ async function fetchHub(url, init = {}, options = {}) {
     if (upstreamSignal) upstreamSignal.removeEventListener?.("abort", onUpstreamAbort);
     if (reader && terminalError) {
       try { await reader.cancel(terminalError); } catch { /* ignore */ }
+    }
+    if (iterator && terminalError && typeof iterator.return === "function") {
+      // Do not await an untrusted iterator's cleanup hook: the timeout must
+      // remain a hard upper bound even when return() itself never settles.
+      Promise.resolve().then(() => iterator.return()).catch(() => {});
     }
   }
 }
@@ -161,7 +186,7 @@ function cliSessionPath() {
 
 function readCliSessionValue() {
   try {
-    const j = JSON.parse(fs.readFileSync(cliSessionPath(), "utf8"));
+    const { value: j } = readJsonFile(cliSessionPath(), "Agentlas CLI session");
     return (j && typeof j.value === "string" && j.value) || null;
   } catch {
     return null;

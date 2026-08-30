@@ -130,12 +130,35 @@ function buildScaffoldManifest({ title, aspect, shotCount, provider, model, reso
 
 // `oberon scaffold [out.json] [--title T] [--aspect 16:9] [--shots N] [--titles] [--overwrite]`
 function scaffold(io, args) {
-  const { flags, rest } = parseFlags(args);
+  const { flags, rest } = parseFlags(args, {
+    title: "value",
+    aspect: "value",
+    shots: "value",
+    provider: "value",
+    model: "value",
+    resolution: "value",
+    titles: "boolean",
+    overwrite: "boolean",
+  });
+  if (rest.length > 1) fail("Oberon scaffold accepts at most one output path");
   const outPath = path.resolve(rest[0] || "oberon-manifest.json");
   const title = flags.title || "My Oberon Film";
   const aspect = flags.aspect || "16:9";
+  for (const [label, value, max] of [
+    ["title", title, 300],
+    ["aspect", aspect, 32],
+    ["provider", flags.provider || "google-gemini-veo", 128],
+    ["model", flags.model || "veo-3.1-lite-generate-001", 128],
+    ["resolution", flags.resolution || "720p", 32],
+  ]) {
+    if (typeof value !== "string" || !value.trim() || value.length > max || /[\u0000\r\n]/.test(value)) {
+      fail(`Oberon ${label} is invalid`);
+    }
+  }
   // v1 계약: 샷 수는 1..12로 클램프, 기본 2 (Veo 폴링 비용 상한).
-  const shotCount = Math.max(1, Math.min(Number(flags.shots) || 2, 12));
+  const requestedShots = flags.shots === undefined ? 2 : Number(flags.shots);
+  if (!Number.isInteger(requestedShots)) fail("Oberon --shots must be an integer");
+  const shotCount = Math.max(1, Math.min(requestedShots, 12));
   const manifest = buildScaffoldManifest({
     title,
     aspect,

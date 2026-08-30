@@ -30,6 +30,132 @@ const {
 } = require("../hub/install.cjs");
 
 const CLOUD_ASSET_STATE_FILE = "cloud-asset-state.v1.json";
+const CLOUD_ASSET_STATE_MAX_BYTES = 1024 * 1024;
+const CLOUD_ASSET_LOCK_STALE_MS = 30_000;
+const CLOUD_ASSET_LOCK_WAIT_MS = 10_000;
+
+function waitSync(milliseconds) {
+  const signal = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(signal, 0, 0, milliseconds);
+}
+
+function processIsAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error && error.code === "ESRCH") return false;
+    // EPERM means the process exists but belongs to another user. Unknown
+    // failures also stay fail-safe: never steal a lock from a possibly live owner.
+    return true;
+  }
+}
+
+function readLockOwner(lockPath) {
+  const ownerPath = path.join(lockPath, "owner.json");
+  let fd;
+  try {
+    fd = fs.openSync(ownerPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const before = fs.fstatSync(fd);
+    if (!before.isFile() || before.nlink !== 1 || before.size <= 0 || before.size > 512) {
+      throw new Error("lock owner is not a bounded private file");
+    }
+    const raw = fs.readFileSync(fd, "utf8");
+    const after = fs.fstatSync(fd);
+    if (
+      Buffer.byteLength(raw, "utf8") !== before.size || after.dev !== before.dev || after.ino !== before.ino ||
+      after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs
+    ) {
+      throw new Error("lock owner changed while it was read");
+    }
+    const parsed = JSON.parse(raw);
+    if (!Number.isSafeInteger(parsed.pid) || parsed.pid <= 0 || typeof parsed.nonce !== "string" || !/^[a-f0-9]{32}$/.test(parsed.nonce)) {
+      throw new Error("lock owner identity is invalid");
+    }
+    return parsed;
+  } catch (error) {
+    if (error && error.code === "ENOENT") return null;
+    throw error;
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch { /* best effort */ }
+  }
+}
+
+/**
+ * Directory rename is the lock hand-off boundary. A stale lock is moved to a
+ * unique quarantine path before cleanup, so a new owner's lock can never be
+ * removed by the old cleanup path.
+ */
+function withCloudAssetLock(targetPath, label, action) {
+  const lockPath = `${targetPath}.lock`;
+  const lockParent = path.dirname(lockPath);
+  fs.mkdirSync(lockParent, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(lockParent, 0o700); } catch { /* best effort */ }
+  const deadline = Date.now() + CLOUD_ASSET_LOCK_WAIT_MS;
+  let acquired = false;
+  while (!acquired) {
+    try {
+      fs.mkdirSync(lockPath, { mode: 0o700 });
+    } catch (error) {
+      if (!error || (error.code !== "EEXIST" && error.code !== "ENOENT")) throw error;
+      if (error.code === "ENOENT") continue;
+      let stat;
+      try { stat = fs.lstatSync(lockPath); } catch (statError) {
+        if (statError && statError.code === "ENOENT") continue;
+        throw statError;
+      }
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`${label} lock is unsafe`);
+      let owner = null;
+      try { owner = readLockOwner(lockPath); } catch { owner = null; }
+      if (Date.now() - stat.mtimeMs > CLOUD_ASSET_LOCK_STALE_MS && (!owner || !processIsAlive(owner.pid))) {
+        const quarantine = `${lockPath}.stale-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
+        try {
+          fs.renameSync(lockPath, quarantine);
+          fs.rmSync(quarantine, { recursive: true, force: true });
+          continue;
+        } catch (reclaimError) {
+          if (reclaimError && reclaimError.code === "ENOENT") continue;
+          throw reclaimError;
+        }
+      }
+      if (Date.now() >= deadline) throw new Error(`${label} is busy; retry after the active operation finishes`);
+      waitSync(25);
+      continue;
+    }
+    try {
+      const owner = {
+        pid: process.pid,
+        nonce: crypto.randomBytes(16).toString("hex"),
+        createdAt: new Date().toISOString(),
+      };
+      fs.writeFileSync(path.join(lockPath, "owner.json"), JSON.stringify(owner) + "\n", {
+        encoding: "utf8",
+        mode: 0o600,
+        flag: "wx",
+      });
+      acquired = true;
+    } catch (error) {
+      const abandoned = `${lockPath}.abandoned-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
+      try {
+        fs.renameSync(lockPath, abandoned);
+        fs.rmSync(abandoned, { recursive: true, force: true });
+      } catch { /* original owner-write error remains authoritative */ }
+      throw error;
+    }
+  }
+  try {
+    return action();
+  } finally {
+    const cleanup = `${lockPath}.done-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
+    try {
+      fs.renameSync(lockPath, cleanup);
+      fs.rmSync(cleanup, { recursive: true, force: true });
+    } catch (error) {
+      if (!error || error.code !== "ENOENT") throw error;
+    }
+  }
+}
 
 function normalizeCloudScopeFlag(value) {
   if (value === "owner-private" || value === "private" || value === "private-link") return "owner-private";
@@ -45,45 +171,68 @@ function cloudAssetStatePath() {
   return path.join(userDataDir(), CLOUD_ASSET_STATE_FILE);
 }
 
+function normalizeCloudAssetState(parsed) {
+  if (!parsed || parsed.schemaVersion !== 1 || !parsed.assets || typeof parsed.assets !== "object" || Array.isArray(parsed.assets)) {
+    throw new Error("state schema is invalid");
+  }
+  const assets = {};
+  for (const [key, raw] of Object.entries(parsed.assets)) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`state entry ${key} is invalid`);
+    const descriptor = normalizeCloudAssetDescriptor(raw.descriptor, `state entry ${key}`);
+    if (key !== cloudDescriptorKey(descriptor)) throw new Error(`state entry ${key} key is invalid`);
+    if (!Array.isArray(raw.sourceRoots)) throw new Error(`state entry ${key} sourceRoots is invalid`);
+    for (const item of raw.sourceRoots) {
+      if (typeof item !== "string" || !path.isAbsolute(item)) throw new Error(`state entry ${key} sourceRoots is invalid`);
+    }
+    const sourceRoots = [...new Set(raw.sourceRoots.map((item) => path.resolve(item)))].slice(0, 32);
+    assets[key] = { descriptor, sourceRoots };
+  }
+  if (!Array.isArray(parsed.deletedBases)) throw new Error("state deletedBases is invalid");
+  const deletedBases = parsed.deletedBases.map((item, index) => {
+    if (
+      !item || typeof item !== "object" || Array.isArray(item) ||
+      typeof item.rootPath !== "string" || !path.isAbsolute(item.rootPath) ||
+      typeof item.slug !== "string" || cloudSlug(item.slug) !== item.slug ||
+      !CLOUD_ASSET_SCOPES.has(item.scope) || !/^[A-Za-z0-9_-]{8,128}$/.test(String(item.cloudId || "")) ||
+      typeof item.revision !== "string" || !item.revision || item.revision.length > 512 || /["\\\u0000-\u001f\u007f]/.test(item.revision)
+    ) {
+      throw new Error(`state deletedBases[${index}] is invalid`);
+    }
+    return {
+      rootPath: path.resolve(item.rootPath),
+      slug: item.slug,
+      scope: item.scope,
+      cloudId: item.cloudId,
+      revision: item.revision,
+    };
+  }).slice(-256);
+  return { schemaVersion: 1, assets, deletedBases };
+}
+
 function readCloudAssetState() {
   const statePath = cloudAssetStatePath();
-  if (!fs.existsSync(statePath)) return { schemaVersion: 1, assets: {}, deletedBases: [] };
   let fd;
   try {
     // O_NOFOLLOW: 상태 파일이 심링크로 바꿔치기되면 읽지 않는다 (로컬 상태 위조 방어).
-    fd = fs.openSync(statePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-    const stat = fs.fstatSync(fd);
-    if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error("state file is not a bounded regular file");
-    const parsed = JSON.parse(fs.readFileSync(fd, "utf8"));
-    if (!parsed || parsed.schemaVersion !== 1 || !parsed.assets || typeof parsed.assets !== "object" || Array.isArray(parsed.assets)) {
-      throw new Error("state schema is invalid");
+    try {
+      fd = fs.openSync(statePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    } catch (error) {
+      if (error && error.code === "ENOENT") return { schemaVersion: 1, assets: {}, deletedBases: [] };
+      throw error;
     }
-    const assets = {};
-    for (const [key, raw] of Object.entries(parsed.assets)) {
-      if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`state entry ${key} is invalid`);
-      const descriptor = normalizeCloudAssetDescriptor(raw.descriptor, `state entry ${key}`);
-      if (key !== cloudDescriptorKey(descriptor)) throw new Error(`state entry ${key} key is invalid`);
-      const sourceRoots = Array.isArray(raw.sourceRoots)
-        ? [...new Set(raw.sourceRoots.filter((item) => typeof item === "string" && path.isAbsolute(item)).map((item) => path.resolve(item)))].slice(0, 32)
-        : [];
-      assets[key] = { descriptor, sourceRoots };
+    const before = fs.fstatSync(fd);
+    if (!before.isFile() || before.nlink !== 1 || before.size <= 0 || before.size > CLOUD_ASSET_STATE_MAX_BYTES) {
+      throw new Error("state file is not a bounded private file");
     }
-    const deletedBases = Array.isArray(parsed.deletedBases)
-      ? parsed.deletedBases.filter((item) =>
-          item && typeof item === "object" && !Array.isArray(item) &&
-          typeof item.rootPath === "string" && path.isAbsolute(item.rootPath) &&
-          typeof item.slug === "string" && cloudSlug(item.slug) === item.slug &&
-          CLOUD_ASSET_SCOPES.has(item.scope) && typeof item.cloudId === "string" &&
-          typeof item.revision === "string"
-        ).map((item) => ({
-          rootPath: path.resolve(item.rootPath),
-          slug: item.slug,
-          scope: item.scope,
-          cloudId: item.cloudId,
-          revision: item.revision,
-        })).slice(-256)
-      : [];
-    return { schemaVersion: 1, assets, deletedBases };
+    const raw = fs.readFileSync(fd, "utf8");
+    const after = fs.fstatSync(fd);
+    if (
+      Buffer.byteLength(raw, "utf8") !== before.size || after.dev !== before.dev || after.ino !== before.ino ||
+      after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs
+    ) {
+      throw new Error("state file changed while it was read");
+    }
+    return normalizeCloudAssetState(JSON.parse(raw));
   } catch (error) {
     // 깨진 상태 파일을 빈 상태로 위장하면 stale 베이스로 원격 리비전을 덮어쓸 수 있다.
     throw new Error(`Agent Cloud local revision state is unreadable: ${error.message || error}`);
@@ -92,40 +241,62 @@ function readCloudAssetState() {
   }
 }
 
-function writeCloudAssetState(state) {
+function writeCloudAssetStateUnlocked(state) {
   const statePath = cloudAssetStatePath();
-  fs.mkdirSync(path.dirname(statePath), { recursive: true });
+  const normalized = normalizeCloudAssetState(state);
+  fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(path.dirname(statePath), 0o700); } catch { /* best effort */ }
   const temp = `${statePath}.tmp-${process.pid}-${crypto.randomBytes(4).toString("hex")}`;
-  const fd = fs.openSync(temp, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+  let fd;
   try {
-    fs.writeFileSync(fd, JSON.stringify(state, null, 2) + "\n", "utf8");
-    fs.fsyncSync(fd);
+    try {
+      fd = fs.openSync(temp, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+      fs.writeFileSync(fd, JSON.stringify(normalized, null, 2) + "\n", "utf8");
+      fs.fsyncSync(fd);
+    } finally {
+      if (fd !== undefined) try { fs.closeSync(fd); } catch { /* best effort */ }
+    }
+    fs.renameSync(temp, statePath);
+    cloudApplyPortableFileMode(statePath, 0o600);
+    cloudFsyncDirectory(path.dirname(statePath));
   } finally {
-    fs.closeSync(fd);
+    try { fs.rmSync(temp, { force: true }); } catch { /* best effort */ }
   }
-  fs.renameSync(temp, statePath);
-  cloudApplyPortableFileMode(statePath, 0o600);
-  cloudFsyncDirectory(path.dirname(statePath));
+  return normalized;
+}
+
+function writeCloudAssetState(state) {
+  return withCloudAssetLock(cloudAssetStatePath(), "Agent Cloud local revision state", () => writeCloudAssetStateUnlocked(state));
+}
+
+function updateCloudAssetState(mutator) {
+  if (typeof mutator !== "function") throw new TypeError("Cloud asset state mutator must be a function");
+  return withCloudAssetLock(cloudAssetStatePath(), "Agent Cloud local revision state", () => {
+    const state = readCloudAssetState();
+    const result = mutator(state);
+    writeCloudAssetStateUnlocked(state);
+    return result;
+  });
 }
 
 /** 서버가 준 리비전 영수증을 관측 상태로 승격. sourceRoot가 있으면 톰스톤도 해제한다. */
 function rememberCloudAssetDescriptor(value, options = {}) {
   const descriptor = normalizeCloudAssetDescriptor(value);
-  const state = readCloudAssetState();
-  const key = cloudDescriptorKey(descriptor);
-  const previous = state.assets[key];
-  const sameRevision = previous && previous.descriptor.cloudId === descriptor.cloudId && previous.descriptor.revision === descriptor.revision;
-  const roots = sameRevision ? [...previous.sourceRoots] : [];
-  if (options.sourceRoot) {
-    const sourceRoot = path.resolve(options.sourceRoot);
-    roots.push(sourceRoot);
-    state.deletedBases = state.deletedBases.filter(
-      (item) => !(item.rootPath === sourceRoot && item.slug === descriptor.slug && item.scope === descriptor.scope),
-    );
-  }
-  state.assets[key] = { descriptor, sourceRoots: [...new Set(roots)].slice(0, 32) };
-  writeCloudAssetState(state);
-  return descriptor;
+  return updateCloudAssetState((state) => {
+    const key = cloudDescriptorKey(descriptor);
+    const previous = state.assets[key];
+    const sameRevision = previous && previous.descriptor.cloudId === descriptor.cloudId && previous.descriptor.revision === descriptor.revision;
+    const roots = sameRevision ? [...previous.sourceRoots] : [];
+    if (options.sourceRoot) {
+      const sourceRoot = path.resolve(options.sourceRoot);
+      roots.push(sourceRoot);
+      state.deletedBases = state.deletedBases.filter(
+        (item) => !(item.rootPath === sourceRoot && item.slug === descriptor.slug && item.scope === descriptor.scope),
+      );
+    }
+    state.assets[key] = { descriptor, sourceRoots: [...new Set(roots)].slice(0, 32) };
+    return descriptor;
+  });
 }
 
 function findCloudAssetDescriptor(slug, scope) {
@@ -193,18 +364,18 @@ function cloudUnboundDescriptorForSource(rootPath, slug, scope) {
 
 /** 이 소스 루트를 이미 관측된 클라우드 자산에 명시적으로 연결한다. */
 function bindCloudAssetSourceRoot(rootPath, slug, scope) {
-  const state = readCloudAssetState();
-  const key = `${scope}:${slug}`;
-  const entry = state.assets[key];
-  if (!entry) throw new Error(`No observed Cloud revision for ${key} to bind.`);
-  const normalizedRoot = path.resolve(rootPath);
-  const roots = [...new Set([...entry.sourceRoots, normalizedRoot])].slice(0, 32);
-  state.assets[key] = { descriptor: entry.descriptor, sourceRoots: roots };
-  state.deletedBases = state.deletedBases.filter(
-    (item) => !(item.rootPath === normalizedRoot && item.slug === slug && item.scope === scope),
-  );
-  writeCloudAssetState(state);
-  return entry.descriptor;
+  return updateCloudAssetState((state) => {
+    const key = `${scope}:${slug}`;
+    const entry = state.assets[key];
+    if (!entry) throw new Error(`No observed Cloud revision for ${key} to bind.`);
+    const normalizedRoot = path.resolve(rootPath);
+    const roots = [...new Set([...entry.sourceRoots, normalizedRoot])].slice(0, 32);
+    state.assets[key] = { descriptor: entry.descriptor, sourceRoots: roots };
+    state.deletedBases = state.deletedBases.filter(
+      (item) => !(item.rootPath === normalizedRoot && item.slug === slug && item.scope === scope),
+    );
+    return entry.descriptor;
+  });
 }
 
 function cloudBaseDescriptorForSource(marker, rootPath, slug, scope) {
@@ -221,64 +392,87 @@ function cloudBaseDescriptorForSource(marker, rootPath, slug, scope) {
   const stateDescriptor = entry && entry.sourceRoots.includes(normalizedRoot) ? entry.descriptor : null;
   if (!markerDescriptor) return stateDescriptor;
   if (!stateDescriptor) return markerDescriptor;
-  return stateDescriptor.cloudId === markerDescriptor.cloudId && stateDescriptor.updatedAt >= markerDescriptor.updatedAt
+  return stateDescriptor.cloudId === markerDescriptor.cloudId && Date.parse(stateDescriptor.updatedAt) >= Date.parse(markerDescriptor.updatedAt)
     ? stateDescriptor
     : markerDescriptor;
 }
 
 function writeCloudSourceMarker(rootPath, scan, descriptor, options = {}) {
   const markerPath = path.join(rootPath, CLOUD_RESTORE_MARKER_PATH);
-  if (fs.existsSync(markerPath)) {
-    const stat = fs.lstatSync(markerPath);
-    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Agent Cloud revision marker is not a regular file");
-  }
-  const descriptors = cloudMarkerDescriptors(options.previousMarker);
-  if (descriptor) descriptors[descriptor.scope] = descriptor;
-  if (options.removeDescriptor) {
-    const current = descriptors[options.removeDescriptor.scope];
-    if (current && current.cloudId === options.removeDescriptor.cloudId && current.revision === options.removeDescriptor.revision) {
-      delete descriptors[options.removeDescriptor.scope];
+  const lockTarget = path.join(
+    userDataDir(),
+    "cloud-source-marker-locks",
+    crypto.createHash("sha256").update(path.resolve(rootPath)).digest("hex"),
+  );
+  return withCloudAssetLock(lockTarget, "Agent Cloud source marker", () => {
+    const previousMarker = readCloudSourceMarker(rootPath);
+    const descriptors = cloudMarkerDescriptors(previousMarker);
+    if (descriptor) descriptors[descriptor.scope] = descriptor;
+    if (options.removeDescriptor) {
+      const current = descriptors[options.removeDescriptor.scope];
+      if (current && current.cloudId === options.removeDescriptor.cloudId && current.revision === options.removeDescriptor.revision) {
+        delete descriptors[options.removeDescriptor.scope];
+      }
     }
-  }
-  const latest = descriptor || Object.values(descriptors)[0] || null;
-  const marker = {
-    schemaVersion: 1,
-    source: "agentlas-cloud",
-    slug: latest?.slug || options.removeDescriptor?.slug || cloudSlug(path.basename(rootPath)),
-    packageHash: descriptor?.packageHash || options.packageHash || options.previousMarker?.packageHash || "",
-    packageHashVersion: descriptor?.packageHashVersion || options.packageHashVersion || options.previousMarker?.packageHashVersion || CLOUD_PACKAGE_HASH_V1,
-    fileCount: Number.isSafeInteger(options.fileCount) ? options.fileCount : (options.previousMarker?.fileCount || 0),
-    totalBytes: Number.isSafeInteger(options.totalBytes) ? options.totalBytes : (options.previousMarker?.totalBytes || 0),
-    executablePaths: Array.isArray(options.executablePaths) ? options.executablePaths : options.previousMarker?.executablePaths,
-    cloudAssets: descriptors,
-    ...(latest ? latest : {}),
-    restoredAt: options.previousMarker?.restoredAt,
-    savedAt: new Date().toISOString(),
-  };
-  for (const key of Object.keys(marker)) if (marker[key] === undefined) delete marker[key];
-  const temp = path.join(rootPath, `.${CLOUD_RESTORE_MARKER_PATH}.tmp-${process.pid}-${crypto.randomBytes(4).toString("hex")}`);
-  const fd = fs.openSync(temp, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
-  try {
-    fs.writeFileSync(fd, JSON.stringify(marker, null, 2) + "\n", "utf8");
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
-  fs.renameSync(temp, markerPath);
-  cloudApplyPortableFileMode(markerPath, 0o600);
-  cloudFsyncDirectory(rootPath);
-  return marker;
+    const latest = descriptor || Object.values(descriptors)[0] || null;
+    const marker = {
+      schemaVersion: 1,
+      source: "agentlas-cloud",
+      slug: latest?.slug || options.removeDescriptor?.slug || cloudSlug(path.basename(rootPath)),
+      packageHash: descriptor?.packageHash || options.packageHash || previousMarker?.packageHash || "",
+      packageHashVersion: descriptor?.packageHashVersion || options.packageHashVersion || previousMarker?.packageHashVersion || CLOUD_PACKAGE_HASH_V1,
+      fileCount: Number.isSafeInteger(options.fileCount) ? options.fileCount : (previousMarker?.fileCount || 0),
+      totalBytes: Number.isSafeInteger(options.totalBytes) ? options.totalBytes : (previousMarker?.totalBytes || 0),
+      executablePaths: Array.isArray(options.executablePaths) ? options.executablePaths : previousMarker?.executablePaths,
+      cloudAssets: descriptors,
+      ...(latest ? latest : {}),
+      restoredAt: previousMarker?.restoredAt,
+      savedAt: new Date().toISOString(),
+    };
+    for (const key of Object.keys(marker)) if (marker[key] === undefined) delete marker[key];
+    const temp = path.join(rootPath, `.${CLOUD_RESTORE_MARKER_PATH}.tmp-${process.pid}-${crypto.randomBytes(4).toString("hex")}`);
+    let fd;
+    try {
+      try {
+        fd = fs.openSync(temp, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+        fs.writeFileSync(fd, JSON.stringify(marker, null, 2) + "\n", "utf8");
+        fs.fsyncSync(fd);
+      } finally {
+        if (fd !== undefined) try { fs.closeSync(fd); } catch { /* best effort */ }
+      }
+      fs.renameSync(temp, markerPath);
+      cloudApplyPortableFileMode(markerPath, 0o600);
+      cloudFsyncDirectory(rootPath);
+    } finally {
+      try { fs.rmSync(temp, { force: true }); } catch { /* best effort */ }
+    }
+    return marker;
+  });
 }
 
 function readCloudSourceMarker(rootPath) {
   const markerPath = path.join(rootPath, CLOUD_RESTORE_MARKER_PATH);
-  if (!fs.existsSync(markerPath)) return null;
   let fd;
   try {
-    fd = fs.openSync(markerPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-    const stat = fs.fstatSync(fd);
-    if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error("marker is not a bounded regular file");
-    return JSON.parse(fs.readFileSync(fd, "utf8"));
+    try {
+      fd = fs.openSync(markerPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    } catch (error) {
+      if (error && error.code === "ENOENT") return null;
+      throw error;
+    }
+    const before = fs.fstatSync(fd);
+    if (!before.isFile() || before.nlink !== 1 || before.size <= 0 || before.size > CLOUD_ASSET_STATE_MAX_BYTES) {
+      throw new Error("marker is not a bounded private file");
+    }
+    const raw = fs.readFileSync(fd, "utf8");
+    const after = fs.fstatSync(fd);
+    if (
+      Buffer.byteLength(raw, "utf8") !== before.size || after.dev !== before.dev || after.ino !== before.ino ||
+      after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs
+    ) {
+      throw new Error("marker changed while it was read");
+    }
+    return JSON.parse(raw);
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
   }
@@ -291,6 +485,7 @@ module.exports = {
   cloudAssetStatePath,
   readCloudAssetState,
   writeCloudAssetState,
+  updateCloudAssetState,
   rememberCloudAssetDescriptor,
   findCloudAssetDescriptor,
   cloudMarkerDescriptors,

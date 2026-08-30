@@ -37,10 +37,19 @@ async function runOnboard({ ui, rl, helpers, persist }) {
   };
   const pendingLines = [];
   let lineWaiter = null;
+  let lineRejecter = null;
+  let inputClosed = Boolean(rl.closed);
+  const inputClosedError = () => Object.assign(new Error(
+    ui.lang === "ko"
+      ? "입력이 닫혀 설정을 완료하지 못했습니다. setup을 다시 실행하세요."
+      : "Setup input closed before all choices were entered. Run setup again.",
+  ), { code: "SETUP_INPUT_CLOSED", reason: "eof", honestStop: true });
   const onLine = (line) => {
+    if (inputClosed) return;
     if (lineWaiter) {
       const resolve = lineWaiter;
       lineWaiter = null;
+      lineRejecter = null;
       resolve((line || "").trim());
     } else {
       // A pasted multi-line setup response can arrive in one terminal data
@@ -48,11 +57,22 @@ async function runOnboard({ ui, rl, helpers, persist }) {
       pendingLines.push((line || "").trim());
     }
   };
+  const onClose = () => {
+    inputClosed = true;
+    if (!lineRejecter) return;
+    const reject = lineRejecter;
+    lineWaiter = null;
+    lineRejecter = null;
+    reject(inputClosedError());
+  };
   rl.on("line", onLine);
+  rl.on("close", onClose);
   const ask = (q) => {
     if (pendingLines.length) return Promise.resolve(pendingLines.shift());
-    return new Promise((resolve) => {
+    if (inputClosed) return Promise.reject(inputClosedError());
+    return new Promise((resolve, reject) => {
       lineWaiter = resolve;
+      lineRejecter = reject;
       rl.setPrompt(q);
       rl.prompt();
     });
@@ -198,8 +218,10 @@ async function runOnboard({ ui, rl, helpers, persist }) {
     return { onboarded: true, saved: !saveError, saveError, lang, runtime, permission };
   } finally {
     rl.removeListener("line", onLine);
+    rl.removeListener("close", onClose);
     if (ownsSigint) rl.removeListener("SIGINT", onSigint);
     lineWaiter = null;
+    lineRejecter = null;
   }
 }
 

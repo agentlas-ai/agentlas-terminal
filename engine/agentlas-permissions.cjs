@@ -57,7 +57,11 @@ function normalize(value, fallback = "read") {
 }
 
 function persistent(value, fallback = "write") {
-  const level = normalize(value, fallback);
+  const raw = String(value ?? "").trim();
+  // Missing is a product default; malformed is damaged state. Treating both as
+  // `fallback` let a corrupt persisted value become write-capable whenever the
+  // caller's normal first-run default was write.
+  const level = raw ? normalize(raw, "read") : normalize(fallback, "read");
   if (level !== "full") return level;
   const safeFallback = normalize(fallback, "write");
   return safeFallback === "full" ? "write" : safeFallback;

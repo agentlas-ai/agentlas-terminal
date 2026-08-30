@@ -35,12 +35,53 @@ const PERSONAL_PATH_RE = /(\/Users\/[^/\s"']+|\/home\/[^/\s"']+|C:\\Users\\[^\\\
 
 
 
-function vaultKeyFor(nodeId, key) {
-  return `${String(key).replace(/[^A-Za-z0-9]+/g, "_").toUpperCase()}`;
+function vaultKeyFor(fieldPath) {
+  return String(fieldPath).replace(/[^A-Za-z0-9]+/g, "_").toUpperCase();
 }
 
 function looksSecretValue(value) {
   return typeof value === "string" && SECRET_VALUE_PATTERNS.some((re) => re.test(value));
+}
+
+function scrubNestedConfigValue(nodeId, fieldPath, value, state) {
+  if (Array.isArray(value)) {
+    return value.map((item, index) => scrubNestedConfigValue(nodeId, `${fieldPath}[${index}]`, item, state));
+  }
+  if (!value || typeof value !== "object") return value;
+
+  const out = {};
+  for (const [key, child] of Object.entries(value)) {
+    const childPath = fieldPath ? `${fieldPath}.${key}` : key;
+    if (SECRET_KEY_RE.test(key)) {
+      const vaultKey = vaultKeyFor(childPath);
+      out[key] = `\${vault.${vaultKey}}`;
+      state.vaultTemplate.push({ key: vaultKey, kind: "secret", requiredBy: [nodeId], sourceField: childPath });
+      state.findings.push({ rule: "secret-field", nodeId, field: childPath, action: `templated:${vaultKey}` });
+      continue;
+    }
+    if (looksSecretValue(child)) {
+      state.blockers.push({
+        nodeId,
+        field: childPath,
+        reason: `"${childPath}" 값이 자격증명처럼 보입니다. 어떤 키인지 알 수 없어 자동으로 빈칸 처리할 수 없습니다.`,
+        nextAction: `이 값을 금고 변수로 바꾼 뒤(예: \${vault.MY_TOKEN}) 다시 내보내세요.`,
+      });
+      out[key] = child;
+      continue;
+    }
+    if (typeof child === "string") {
+      PERSONAL_PATH_RE.lastIndex = 0;
+      if (PERSONAL_PATH_RE.test(child)) {
+        PERSONAL_PATH_RE.lastIndex = 0;
+        out[key] = child.replace(PERSONAL_PATH_RE, "<사용자 폴더>");
+        PERSONAL_PATH_RE.lastIndex = 0;
+        state.findings.push({ rule: "personal-path", nodeId, field: childPath, action: "removed" });
+        continue;
+      }
+    }
+    out[key] = scrubNestedConfigValue(nodeId, childPath, child, state);
+  }
+  return out;
 }
 
 /**
@@ -55,7 +96,7 @@ function scrubNodeConfig(nodeId, config) {
   for (const [key, value] of Object.entries(config || {})) {
     // 1) 비밀로 선언된 칸 — 값 유무와 무관하게 금고 변수로 바꾼다.
     if (SECRET_KEY_RE.test(key)) {
-      const vaultKey = vaultKeyFor(nodeId, key);
+      const vaultKey = vaultKeyFor(key);
       out[key] = `$\{vault.${vaultKey}}`;
       vaultTemplate.push({ key: vaultKey, kind: "secret", requiredBy: [nodeId], sourceField: key });
       findings.push({ rule: "secret-field", nodeId, field: key, action: `templated:${vaultKey}` });
@@ -86,7 +127,7 @@ function scrubNodeConfig(nodeId, config) {
       PERSONAL_PATH_RE.lastIndex = 0;
       continue;
     }
-    out[key] = value;
+    out[key] = scrubNestedConfigValue(nodeId, key, value, { findings, vaultTemplate, blockers });
   }
   return { config: out, findings, vaultTemplate, blockers };
 }
@@ -134,8 +175,13 @@ function buildPackage(input) {
       }
     }
     const server = node.config?.mcpServer;
-    if (typeof server === "string" && server && !dependencies.mcp.some((m) => m.serverSlug === server)) {
-      dependencies.mcp.push({ serverSlug: server, requiredBy: [node.id] });
+    if (typeof server === "string" && server) {
+      const existingMcp = dependencies.mcp.find((item) => item.serverSlug === server);
+      if (existingMcp) {
+        if (!existingMcp.requiredBy.includes(node.id)) existingMcp.requiredBy.push(node.id);
+      } else {
+        dependencies.mcp.push({ serverSlug: server, requiredBy: [node.id] });
+      }
     }
   }
 
@@ -210,10 +256,19 @@ function verifyPackage(pkg) {
   if (!graph || !Array.isArray(graph.nodes) || graph.nodes.length === 0) {
     problems.push("그래프에 단계가 없습니다.");
   }
-  if (manifest?.integrity?.graphDigest && graph) {
-    if (digestOf(graph) !== manifest.integrity.graphDigest) {
+  const integrity = manifest?.integrity;
+  if (integrity && typeof integrity.graphDigest === "string" && graph) {
+    if (digestOf(graph) !== integrity.graphDigest) {
       problems.push("그래프 내용이 매니페스트 지문과 다릅니다(전송 중 변형되었을 수 있습니다).");
     }
+  }
+  if (!integrity || typeof integrity.graphDigest !== "string" || typeof integrity.manifestDigest !== "string") {
+    problems.push("매니페스트 무결성 지문이 없습니다.");
+  } else if (digestOf({
+    ...manifest,
+    integrity: { graphDigest: integrity.graphDigest, manifestDigest: null },
+  }) !== integrity.manifestDigest) {
+    problems.push("매니페스트 내용이 자체 지문과 다릅니다(전송 중 변형되었을 수 있습니다).");
   }
   return problems;
 }

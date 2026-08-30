@@ -118,7 +118,7 @@ const CATALOG = [
   { name: "telegram", group: "advanced", tier: "more", surfaces: BOTH, args: "[sub]", ko: "텔레그램 연결", en: "Telegram bindings" },
   { name: "connect", group: "advanced", tier: "more", surfaces: BOTH, aliases: ["hep-connect"], args: "<target>", argsKo: "<대상>", ko: "에이전트·팀 연결", en: "Connect an agent or team" },
   { name: "browser", group: "advanced", tier: "more", surfaces: BOTH, aliases: ["hep-browser"], args: "<url|status|sites|login>", ko: "브라우저 하드포인트", en: "Browser hardpoint" },
-  { name: "research", group: "advanced", tier: "more", surfaces: BOTH, args: "<sub>", ko: "리서치", en: "Research" },
+  { name: "research", group: "advanced", tier: "more", surfaces: BOTH, args: "<subcommand> [args]", argsKo: "<하위-명령> [인자]", ko: "Research Engine (전체 목록: research --help)", en: "Research Engine (full list: research --help)" },
   { name: "document", group: "advanced", tier: "more", surfaces: BOTH, args: "pdf <html|url>", ko: "문서 PDF 내보내기", en: "Export a document to PDF" },
   { name: "oberon", group: "advanced", tier: "more", surfaces: BOTH, aliases: ["film"], args: "<scaffold|render|list|open>", ko: "AI 필름 렌더", en: "AI film render" },
   { name: "variant", group: "advanced", tier: "more", surfaces: BOTH, args: "resolve --base-release", ko: "로컬 변형 선택", en: "Local variant selection" },

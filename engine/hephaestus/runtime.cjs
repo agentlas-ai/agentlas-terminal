@@ -10,10 +10,8 @@
  *
  * v2 이식 규칙:
  *   - D.out → ctx.out, D.prefsLang() → ctx.lang.
- *   - D.runCwd — v1 검증 결과: AGENTLAS_RUN_CWD 같은 env는 v1에 존재하지 않았다.
- *     v1 runCwd()의 실제 동작 = userDataDir()/agent-cwd 샌드박스(mkdir, 실패 시
- *     homedir 폴백). 그 동작을 그대로 보존해 여기 로컬로 이식했다. (프로젝트
- *     실행 위치가 필요한 곳은 v1과 동일하게 projectCwd()를 쓴다.)
+ *   - D.runCwd — Terminal 정본(project/paths.cjs)의 private agent-cwd 경계를 쓴다.
+ *     생성 실패 시 홈 폴더로 권한을 넓히지 않는다.
  *   - 런타임 발견은 engine/agentlas-core-harness.cjs(복원본)를 소비만 한다.
  *   - 런타임 부재 = 정직 정지(exit 1) + v1 설치 안내 문구 그대로. 폴백 금지.
  *
@@ -30,8 +28,10 @@ const { Ui } = require("../agentlas-ui.cjs");
 const { truncateWidth, visWidth, wrapWidth } = require("../ui/width.cjs");
 const coreHarness = require("../agentlas-core-harness.cjs");
 const { userDataDir } = require("../core/paths.cjs");
+const { runCwd, projectCwd } = require("../project/paths.cjs");
 
 const { CONTEXT_MAP_MIN_CORE_VERSION, resolveContextMapCoreRoot } = coreHarness;
+const CAPTURE_KILL_GRACE_MS = 250;
 
 // ── 명령 usage 문자열 (v1 TOP_LEVEL_COMMAND_USAGE에서 hephaestus 클러스터만 발췌) ──
 const USAGE = Object.freeze({
@@ -47,7 +47,7 @@ const USAGE = Object.freeze({
   hephaestus: "usage: agentlas hephaestus <subcommand> [args]",
   journal: "usage: agentlas journal <status|verify|repair|gate> --run-id <id> | --journal <path>",
   netadmin: "usage: agentlas netadmin <init|status|reindex|bench|add-source> [args]",
-  research: "usage: agentlas research <status|gather|search|read|plan> [args]",
+  research: "usage: agentlas research <subcommand> [args] (full list: agentlas research --help)",
   route: 'usage: agentlas route "<request>" [--json]',
 });
 
@@ -64,6 +64,13 @@ function usageFor(cmd, lang) {
 
 function isHelpToken(value) {
   return value === "help" || value === "--help" || value === "-h";
+}
+
+function isHelpRequest(args) {
+  if (!Array.isArray(args) || !args.length) return false;
+  if (args.length === 1) return isHelpToken(args[0]);
+  if (args.length === 2 && args[1] === "help") return true;
+  return args.some((value) => value === "--help" || value === "-h");
 }
 
 // ── 라우팅/리서치 미리보기 모델 (v1 module-level 순수 함수, 그대로) ──
@@ -204,31 +211,6 @@ function create(ctx, deps = {}) {
     return new Ui({ lang: uiLang || lang() });
   }
 
-  // v1 agentlas.cjs runCwd() 그대로: 에이전트 전용 안전 샌드박스 폴더.
-  // (검증: v1에 AGENTLAS_RUN_CWD env는 없었다 — process.cwd() 매핑이 아니라
-  //  이 샌드박스가 원래 동작이므로 그대로 보존한다.)
-  function runCwd() {
-    const dir = path.join(userDataDir(), "agent-cwd");
-    try {
-      fs.mkdirSync(dir, { recursive: true });
-      return dir;
-    } catch {
-      return os.homedir();
-    }
-  }
-
-  // v1: 에이전트가 실제로 실행될 작업 폴더 = 사용자가 명령을 친 현재 디렉터리.
-  // 단, home/userData/agent-cwd 같은 "프로젝트 아님" 위치면 샌드박스로 폴백.
-  function projectCwd() {
-    try {
-      const cwd = process.cwd();
-      if (!cwd || cwd === os.homedir() || cwd === userDataDir() || cwd === runCwd()) return runCwd();
-      return cwd;
-    } catch {
-      return runCwd();
-    }
-  }
-
   // ── Hephaestus 런타임 해석 (설치 런처 우선, 앱 번들 폴백) ──
   // v1 후보 순서 그대로: HEPHAESTUS_BIN → ~/.agentlas/runtime/current/bin/hephaestus
   // → Core python 모듈(resolveCoreRuntimeRoot). win32는 bin 후보를 건너뛴다(v1 동일).
@@ -300,29 +282,44 @@ function create(ctx, deps = {}) {
       let overflow = false;
       let timedOut = false;
       let settled = false;
+      let forceKillTimer = null;
+      const terminate = () => {
+        if (settled) return;
+        try { child.kill("SIGTERM"); } catch { /* already gone */ }
+        if (forceKillTimer) return;
+        forceKillTimer = setTimeout(() => {
+          forceKillTimer = null;
+          if (!settled) {
+            try { child.kill("SIGKILL"); } catch { /* already gone */ }
+          }
+        }, CAPTURE_KILL_GRACE_MS);
+        if (forceKillTimer.unref) forceKillTimer.unref();
+      };
       const append = (target, chunk) => {
         if (overflow) return;
         bytes += chunk.length;
         if (bytes > maxBytes) {
           overflow = true;
-          child.kill("SIGTERM");
+          terminate();
           return;
         }
         target.push(chunk);
       };
       child.stdout.on("data", (chunk) => append(stdout, Buffer.from(chunk)));
       child.stderr.on("data", (chunk) => append(stderr, Buffer.from(chunk)));
-      const onInterrupt = () => child.kill("SIGINT");
+      const onInterrupt = () => terminate();
       process.once("SIGINT", onInterrupt);
       const timer = setTimeout(() => {
         timedOut = true;
-        child.kill("SIGTERM");
+        terminate();
       }, timeoutMs);
       if (timer.unref) timer.unref();
       const done = (code, error) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        if (forceKillTimer) clearTimeout(forceKillTimer);
+        forceKillTimer = null;
         process.removeListener("SIGINT", onInterrupt);
         resolve({
           code: overflow || timedOut || error ? 1 : (code ?? 0),
@@ -426,14 +423,15 @@ function create(ctx, deps = {}) {
         ui.line("  " + (index === 0 ? ui.c.paw("✗ ") : "  ") + ui.c.text(line));
       });
     };
-    if (json) renderRoutePreview(json, ui);
+    if (result.overflow || result.timedOut) {
+      if (result.overflow) renderError(ui.lang === "ko" ? "라우팅 출력이 2MB 제한을 넘었습니다." : "Route output exceeded the 2 MB limit.");
+      if (result.timedOut) renderError(ui.lang === "ko" ? "라우팅이 30초 제한을 넘었습니다." : "Route timed out after 30 seconds.");
+    } else if (json) renderRoutePreview(json, ui);
     else {
       const detail = (result.stderr || result.stdout || "").trim();
       const message = detail || (ui.lang === "ko" ? "라우팅 결과를 읽지 못했습니다." : "Could not read the route result.");
       renderError(message);
     }
-    if (result.overflow) renderError(ui.lang === "ko" ? "라우팅 출력이 2MB 제한을 넘었습니다." : "Route output exceeded the 2 MB limit.");
-    if (result.timedOut) renderError(ui.lang === "ko" ? "라우팅이 30초 제한을 넘었습니다." : "Route timed out after 30 seconds.");
     return result.code;
   }
 
@@ -551,7 +549,7 @@ function create(ctx, deps = {}) {
   }
 
   async function runHephaestusResearch(args, opts = {}) {
-    if (args.some((arg) => arg === "--help" || arg === "-h" || arg === "help")) {
+    if (isHelpRequest(args)) {
       return runHephaestusInteractive(args, { ...opts, human: false });
     }
     const raw = args.includes("--json");
@@ -573,8 +571,13 @@ function create(ctx, deps = {}) {
     const preview = json ? researchPreviewModel(json) : null;
     const code = result.code !== 0 || preview?.totalEvidenceFailure ? 1 : 0;
     if (raw) {
-      if (result.stdout) process.stdout.write(result.stdout);
-      if (result.stderr) process.stderr.write(result.stderr);
+      if (!result.overflow && !result.timedOut) {
+        if (result.stdout) process.stdout.write(result.stdout);
+        if (result.stderr) process.stderr.write(result.stderr);
+      } else {
+        if (result.overflow) process.stderr.write("Research output exceeded the 2 MB limit.\n");
+        if (result.timedOut) process.stderr.write("Research timed out after 60 seconds.\n");
+      }
       return code;
     }
     const renderError = (message) => {
@@ -583,15 +586,16 @@ function create(ctx, deps = {}) {
         ui.line("  " + (index === 0 ? ui.c.paw("✗ ") : "  ") + ui.c.text(line));
       });
     };
-    if (json) {
+    if (result.overflow || result.timedOut) {
+      if (result.overflow) renderError(ui.lang === "ko" ? "리서치 출력이 2MB 제한을 넘었습니다." : "Research output exceeded the 2 MB limit.");
+      if (result.timedOut) renderError(ui.lang === "ko" ? "리서치가 60초 제한을 넘었습니다." : "Research timed out after 60 seconds.");
+    } else if (json) {
       renderResearchPreview(json, ui);
     } else {
       const message = (result.stderr || result.stdout || "").trim()
         || (ui.lang === "ko" ? "리서치 결과를 읽지 못했습니다." : "Could not read the research result.");
       renderError(message);
     }
-    if (result.overflow) renderError(ui.lang === "ko" ? "리서치 출력이 2MB 제한을 넘었습니다." : "Research output exceeded the 2 MB limit.");
-    if (result.timedOut) renderError(ui.lang === "ko" ? "리서치가 60초 제한을 넘었습니다." : "Research timed out after 60 seconds.");
     return code;
   }
 
@@ -638,7 +642,7 @@ function create(ctx, deps = {}) {
       }
       return Promise.resolve(1);
     }
-    const helpOnly = args.some((arg) => arg === "--help" || arg === "-h" || arg === "help");
+    const helpOnly = isHelpRequest(args);
     const cwd = opts.cwd || (helpOnly ? process.cwd() : runCwd());
     const moduleName = found.kind === "python" && isCareerGraph ? "career_graph" : "agentlas_cloud";
     const moduleArgs = moduleName === "career_graph" ? args.slice(1) : args;
@@ -744,5 +748,6 @@ module.exports = {
   USAGE,
   usageFor,
   isHelpToken,
+  isHelpRequest,
   CONTEXT_MAP_MIN_CORE_VERSION,
 };

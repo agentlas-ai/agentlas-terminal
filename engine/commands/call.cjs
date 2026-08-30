@@ -10,7 +10,7 @@
 const { create, usageFor, isHelpToken } = require("../hephaestus/runtime.cjs");
 
 async function run(ctx, args) {
-  if (args.some(isHelpToken)) {
+  if (args.length === 1 && isHelpToken(args[0])) {
     ctx.out(usageFor("call", ctx.lang));
     return 0;
   }

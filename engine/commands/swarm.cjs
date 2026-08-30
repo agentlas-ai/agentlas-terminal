@@ -38,24 +38,62 @@ function resolvePermission(ctx) {
 function splitRuntimeOverride(args) {
   const rest = [];
   let runtimeOverride = null;
+  let seen = false;
+  let passthrough = false;
   for (let i = 0; i < args.length; i += 1) {
-    if (args[i] === "--runtime" && args[i + 1]) {
-      runtimeOverride = String(args[++i]);
+    const token = String(args[i]);
+    if (passthrough) { rest.push(token); continue; }
+    if (token === "--") { passthrough = true; rest.push(token); continue; }
+    if (token === "--runtime" || token.startsWith("--runtime=")) {
+      if (seen) throw new Error("duplicate option: --runtime");
+      seen = true;
+      const inline = token.startsWith("--runtime=");
+      const value = inline ? token.slice(10) : args[++i];
+      if (value === undefined || value === "" || (!inline && String(value).startsWith("--"))) {
+        throw new Error("--runtime requires a value");
+      }
+      runtimeOverride = String(value);
       continue;
     }
-    rest.push(args[i]);
+    rest.push(token);
   }
   return { rest, runtimeOverride };
 }
 
+function validateSwarmArgs(args) {
+  let seenParallel = false;
+  let passthrough = false;
+  let hasGoal = false;
+  for (let i = 0; i < args.length; i += 1) {
+    const token = String(args[i]);
+    if (passthrough) { hasGoal = true; continue; }
+    if (token === "--") { passthrough = true; continue; }
+    if (token === "--parallel" || token === "-n" || token.startsWith("--parallel=")) {
+      if (seenParallel) return { error: "duplicate option: --parallel", hasGoal };
+      seenParallel = true;
+      const inline = token.startsWith("--parallel=");
+      const raw = inline ? token.slice(11) : args[++i];
+      const value = Number(raw);
+      if (raw === undefined || raw === "" || (!inline && String(raw).startsWith("--")) || !Number.isInteger(value) || value < 1) {
+        return { error: "--parallel requires a positive integer (maximum 8)", hasGoal };
+      }
+    } else if (token.startsWith("-")) {
+      return { error: `unknown option: ${token} (use -- before a goal token that starts with '-')`, hasGoal };
+    } else hasGoal = true;
+  }
+  return { error: null, hasGoal };
+}
+
 async function run(ctx, args) {
-  const { rest, runtimeOverride } = splitRuntimeOverride(args);
+  let parsed;
+  try { parsed = splitRuntimeOverride(args); }
+  catch (error) { ctx.err(String((error && error.message) || error)); return 1; }
+  const { rest, runtimeOverride } = parsed;
+  const validation = validateSwarmArgs(rest);
+  if (validation.error) { ctx.err(validation.error); return 1; }
   // usage 경로(목표 텍스트 없음)는 SQLite를 열 이유가 없다 — cmdSwarm 의 플래그
   // (--parallel/-n <N>)만 있는 호출은 빈 목표다.
-  const hasGoal = rest.some((token, i) =>
-    !["--parallel", "-n"].includes(String(token))
-    && !(i > 0 && ["--parallel", "-n"].includes(String(rest[i - 1]))));
-  if (!hasGoal) {
+  if (!validation.hasGoal) {
     ctx.err("usage: agentlas swarm <goal>  [--parallel N] [--runtime <kind>]");
     return 1;
   }
@@ -72,4 +110,4 @@ async function run(ctx, args) {
   return r && r.ok ? 0 : 1;
 }
 
-module.exports = { run, splitRuntimeOverride };
+module.exports = { run, splitRuntimeOverride, validateSwarmArgs };

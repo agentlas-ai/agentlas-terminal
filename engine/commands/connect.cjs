@@ -43,10 +43,21 @@ function resolveTarget(db, token) {
 /** 봇 토큰을 stdin 에서 읽는다(비밀은 argv 금지). 파이프면 첫 줄, TTY면 숨김 안내. */
 async function readTokenFromStdin(ctx, ko) {
   if (!process.stdin.isTTY) {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       let buf = "";
-      process.stdin.on("data", (d) => { buf += d; });
-      process.stdin.on("end", () => resolve(buf.split(/\r?\n/)[0].trim()));
+      let tooLarge = false;
+      process.stdin.on("data", (d) => {
+        if (tooLarge) return;
+        buf += d;
+        if (Buffer.byteLength(buf, "utf8") > 2048) tooLarge = true;
+      });
+      process.stdin.on("end", () => {
+        if (tooLarge) return reject(new Error("Telegram bot token input is too large"));
+        const value = buf.replace(/\r?\n$/, "");
+        if (/[\r\n]/.test(value)) return reject(new Error("Telegram bot token input must contain exactly one line"));
+        resolve(value.trim());
+      });
+      process.stdin.on("error", reject);
     });
   }
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -95,7 +106,11 @@ async function connectTelegram(ctx, targetToken, { auto = false } = {}) {
     }
     ctx.out(ctx.ui.dim(ko ? "토큰을 읽었습니다." : "Captured the token."));
   } else {
-    token = await readTokenFromStdin(ctx, ko);
+    try { token = await readTokenFromStdin(ctx, ko); }
+    catch (error) {
+      ctx.err(`${ctx.ui.red("✖")} ${String((error && error.message) || error)}`);
+      return 1;
+    }
     if (!token) { ctx.err(ko ? "토큰이 필요합니다." : "a bot token is required."); return 1; }
   }
 
@@ -145,16 +160,21 @@ async function run(ctx, args) {
   const sub = String(args[0] || "").toLowerCase();
 
   if (!sub || sub === "help" || sub === "--help" || sub === "-h") { ctx.out(usage(ko)); return 0; }
-  if (sub === "status") return renderTelegram(ctx);
+  if (sub === "status") {
+    if (args.length !== 1) { ctx.err(usage(ko)); return 1; }
+    return renderTelegram(ctx);
+  }
   if (sub === "telegram") {
     const rest = args.slice(1);
+    const unknownOptions = rest.filter((item) => String(item).startsWith("-") && item !== "--auto");
+    const positionals = rest.filter((item) => item && !String(item).startsWith("-"));
+    if (unknownOptions.length || positionals.length !== 1) { ctx.err(usage(ko)); return 1; }
     const auto = rest.includes("--auto");
-    const targetToken = rest.find((a) => a && !String(a).startsWith("-"));
-    if (!targetToken) { ctx.err(usage(ko)); return 1; }
+    const targetToken = positionals[0];
     return connectTelegram(ctx, targetToken, { auto });
   }
   if (sub === "pair") {
-    if (!args[1]) { ctx.err(ko ? "사용법: agentlas connect pair <id>" : "Usage: agentlas connect pair <id>"); return 1; }
+    if (!args[1] || args.length !== 2) { ctx.err(ko ? "사용법: agentlas connect pair <id>" : "Usage: agentlas connect pair <id>"); return 1; }
     const row = tg.getBinding(ctx.db(), args[1]);
     if (!row) { ctx.err(ko ? "연결을 찾을 수 없습니다." : "connection not found."); return 1; }
     if (row.telegram_chat_id) {
@@ -181,7 +201,7 @@ async function run(ctx, args) {
     }
   }
   if (sub === "test") {
-    if (!args[1]) { ctx.err(ko ? "사용법: agentlas connect test <id>" : "Usage: agentlas connect test <id>"); return 1; }
+    if (!args[1] || args.length !== 2) { ctx.err(ko ? "사용법: agentlas connect test <id>" : "Usage: agentlas connect test <id>"); return 1; }
     try {
       await tg.sendTest(ctx.db(), args[1], ko ? "Agentlas 테스트 메시지" : "Agentlas test message");
       ctx.out(`${ctx.ui.green("✓")} ${ko ? "메시지를 보냈습니다." : "message sent."}`);
@@ -189,10 +209,15 @@ async function run(ctx, args) {
     } catch (e) { ctx.err(`${ctx.ui.red("✖")} ${String((e && e.message) || e)}`); return 1; }
   }
   if (sub === "remove") {
-    if (!args[1]) { ctx.err(ko ? "사용법: agentlas connect remove <id>" : "Usage: agentlas connect remove <id>"); return 1; }
-    tg.removeBinding(ctx.db(), args[1]);
-    ctx.out(`${ctx.ui.green("✓")} ${ko ? "연결을 제거했습니다." : "connection removed."}`);
-    return 0;
+    if (!args[1] || args.length !== 2) { ctx.err(ko ? "사용법: agentlas connect remove <id>" : "Usage: agentlas connect remove <id>"); return 1; }
+    try {
+      tg.removeBinding(ctx.db(), args[1]);
+      ctx.out(`${ctx.ui.green("✓")} ${ko ? "연결을 제거했습니다." : "connection removed."}`);
+      return 0;
+    } catch (error) {
+      ctx.err(`${ctx.ui.red("✖")} ${String((error && error.message) || error)}`);
+      return 1;
+    }
   }
   ctx.err(usage(ko));
   return 1;

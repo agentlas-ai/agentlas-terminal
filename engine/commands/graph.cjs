@@ -15,7 +15,11 @@ const fs = require("node:fs");
 const path = require("node:path");
 const pkgLib = require("../graph/package.cjs");
 const desktopCore = require("../core/desktop-core.cjs");
+const { terminalTextOf } = require("../cli-output.cjs");
 
+function inlineText(value, maxLength = 500) {
+  return terminalTextOf(value, maxLength).replace(/\s+/g, " ").trim();
+}
 
 
 function graphRows(ctx, db) {
@@ -116,7 +120,7 @@ function describe(ctx, row, graph, en) {
   const kindLabel = kind === "cron"
     ? (en ? "schedule" : "예약")
     : (en ? "input" : "입력");
-  return `${ctx.ui.bold(row.name)}  ${ctx.ui.dim(`${kindLabel} · ${nodeCount} ${en ? "steps" : "단계"} · ${state} · ${when}`)}`;
+  return `${ctx.ui.bold(inlineText(row.name))}  ${ctx.ui.dim(`${kindLabel} · ${nodeCount} ${en ? "steps" : "단계"} · ${state} · ${inlineText(when)}`)}`;
 }
 
 function findGraph(rows, needle) {
@@ -135,9 +139,9 @@ function findGraph(rows, needle) {
 /** 이름이 여러 개 걸렸을 때, 고르지 말고 후보를 보여준다. */
 function reportAmbiguous(ctx, needle, matches, en) {
   ctx.err(en
-    ? `"${needle}" matches ${matches.length} automations. Say which one:`
-    : `"${needle}"에 자동화 ${matches.length}개가 걸립니다. 어느 것인지 정확히 적어 주세요:`);
-  for (const row of matches) ctx.err(`  · ${row.name}`);
+    ? `"${inlineText(needle)}" matches ${matches.length} automations. Say which one:`
+    : `"${inlineText(needle)}"에 자동화 ${matches.length}개가 걸립니다. 어느 것인지 정확히 적어 주세요:`);
+  for (const row of matches) ctx.err(`  · ${inlineText(row.name)}`);
 }
 
 function listGraphs(ctx) {
@@ -240,8 +244,8 @@ async function reconcileGraph(ctx, needle, flags, en) {
   const view = reconciliation.get(row.id);
   if (!view) {
     ctx.out(en
-      ? `"${row.name}" has nothing waiting to be reconciled.`
-      : `"${row.name}"에는 재조정을 기다리는 것이 없습니다.`);
+      ? `"${inlineText(row.name)}" has nothing waiting to be reconciled.`
+      : `"${inlineText(row.name)}"에는 재조정을 기다리는 것이 없습니다.`);
     return 0;
   }
 
@@ -255,34 +259,34 @@ async function reconcileGraph(ctx, needle, flags, en) {
 
   if (done.size === 0 && notDone.size === 0) {
     ctx.out(en
-      ? `"${row.name}" stopped with steps whose effect cannot be told from the record.`
-      : `"${row.name}"은(는) 기록만으로는 일어났는지 알 수 없는 단계가 있어 멈춰 있습니다.`);
+      ? `"${inlineText(row.name)}" stopped with steps whose effect cannot be told from the record.`
+      : `"${inlineText(row.name)}"은(는) 기록만으로는 일어났는지 알 수 없는 단계가 있어 멈춰 있습니다.`);
     ctx.out("");
     for (const node of view.nodes) {
       const needs = node.outputRequired
         ? (en ? `  (needs --output ${node.nodeId}=<value> when done)` : `  (일어났다면 --output ${node.nodeId}=<값> 필요)`)
         : "";
-      ctx.out(`  ${node.nodeId}  ${node.label}${needs}`);
+      ctx.out(`  ${inlineText(node.nodeId)}  ${inlineText(node.label)}${inlineText(needs)}`);
     }
     ctx.out("");
     ctx.out(ctx.ui.dim(en
-      ? `Decide each one: agentlas graph reconcile "${row.name}" --done <node> --not-done <node>`
-      : `각각 정하세요: agentlas graph reconcile "${row.name}" --done <노드> --not-done <노드>`));
+      ? `Decide each one: agentlas graph reconcile "${inlineText(row.name)}" --done <node> --not-done <node>`
+      : `각각 정하세요: agentlas graph reconcile "${inlineText(row.name)}" --done <노드> --not-done <노드>`));
     return 0;
   }
 
   const undecided = view.nodes.filter((n) => !done.has(n.nodeId) && !notDone.has(n.nodeId));
   if (undecided.length > 0) {
     ctx.err(en
-      ? `Still undecided: ${undecided.map((n) => n.nodeId).join(", ")}. Every step needs one answer.`
-      : `아직 안 정한 단계가 있습니다: ${undecided.map((n) => n.nodeId).join(", ")}. 모든 단계에 답이 필요합니다.`);
+      ? `Still undecided: ${undecided.map((n) => inlineText(n.nodeId)).join(", ")}. Every step needs one answer.`
+      : `아직 안 정한 단계가 있습니다: ${undecided.map((n) => inlineText(n.nodeId)).join(", ")}. 모든 단계에 답이 필요합니다.`);
     return 1;
   }
   const missingOutput = view.nodes.filter((n) => done.has(n.nodeId) && n.outputRequired && !outputs.has(n.nodeId));
   if (missingOutput.length > 0) {
     ctx.err(en
-      ? `These steps populate a value, so completing them needs it: ${missingOutput.map((n) => `--output ${n.nodeId}=<value>`).join(" ")}`
-      : `값을 만드는 단계라 "일어났다"로 두려면 값이 필요합니다: ${missingOutput.map((n) => `--output ${n.nodeId}=<값>`).join(" ")}`);
+      ? `These steps populate a value, so completing them needs it: ${missingOutput.map((n) => `--output ${inlineText(n.nodeId)}=<value>`).join(" ")}`
+      : `값을 만드는 단계라 "일어났다"로 두려면 값이 필요합니다: ${missingOutput.map((n) => `--output ${inlineText(n.nodeId)}=<값>`).join(" ")}`);
     return 1;
   }
 
@@ -304,8 +308,8 @@ async function reconcileGraph(ctx, needle, flags, en) {
       ? `Reconciled. ${result.completedNodeIds.length} step(s) marked as done, ${result.retryNodeIds.length} to redo.`
       : `재조정했습니다. ${result.completedNodeIds.length}개는 일어난 것으로, ${result.retryNodeIds.length}개는 다시 하는 것으로 두었습니다.`);
     ctx.out(ctx.ui.dim(en
-      ? `Now run it: agentlas graph run "${row.name}"`
-      : `이제 실행하세요: agentlas graph run "${row.name}"`));
+      ? `Now run it: agentlas graph run "${inlineText(row.name)}"`
+      : `이제 실행하세요: agentlas graph run "${inlineText(row.name)}"`));
     return 0;
   } catch (error) {
     ctx.err(en
@@ -342,8 +346,8 @@ function showGraph(ctx, needle) {
   const requirement = graphInputRequirement(graph, en);
   if (requirement) {
     ctx.out("  " + ctx.ui.dim(en
-      ? `Starts from a value you provide — ${requirement.label}`
-      : `시작할 때 값을 받습니다 — ${requirement.label}`));
+      ? `Starts from a value you provide — ${inlineText(requirement.label)}`
+      : `시작할 때 값을 받습니다 — ${inlineText(requirement.label)}`));
   }
   ctx.out("");
   renderGraphTree(ctx, graph, en);
@@ -354,8 +358,8 @@ function showGraph(ctx, needle) {
       ? `This graph will stop when it runs (${problems.length}):`
       : `이대로 실행하면 도중에 멈춥니다 (${problems.length}건):`));
     for (const p of problems) {
-      ctx.out(`  ⚠ ${p.what}`);
-      ctx.out(`    ${ctx.ui.dim(p.fix)}`);
+      ctx.out(`  ⚠ ${inlineText(p.what, 1000)}`);
+      ctx.out(`    ${ctx.ui.dim(inlineText(p.fix, 1000))}`);
     }
   }
   // 그대로 복사해 쓸 수 있는 명령. 예전에는 값이 필요한 그래프인지 화면에서만 알려주고
@@ -363,8 +367,8 @@ function showGraph(ctx, needle) {
   ctx.out("");
   ctx.out(ctx.ui.dim(en ? "Run it with:" : "실행하려면:"));
   ctx.out(requirement
-    ? `  agentlas graph run "${row.name}" --input "<${requirement.label}>"`
-    : `  agentlas graph run "${row.name}"`);
+    ? `  agentlas graph run "${inlineText(row.name)}" --input "<${inlineText(requirement.label)}>"`
+    : `  agentlas graph run "${inlineText(row.name)}"`);
   return 0;
 }
 
@@ -469,17 +473,17 @@ function nodeLine(ctx, node, en) {
     const rule = conditionRule(node, en);
     if (rule) marks.unshift(rule);
   }
-  return `${ctx.ui.accent(kindWord(node.type, en))}  ${node.label || node.id}`
-    + (marks.length ? ctx.ui.dim(`  — ${marks.join(", ")}`) : "");
+  return `${ctx.ui.accent(inlineText(kindWord(node.type, en)))}  ${inlineText(node.label || node.id)}`
+    + (marks.length ? ctx.ui.dim(`  — ${marks.map((mark) => inlineText(mark)).join(", ")}`) : "");
 }
 
 /** 갈림길이 실제로 무엇을 보는지 한 줄로. 모르는 연산은 지어내지 않고 그대로 보여준다. */
 function conditionRule(node, en) {
   const cfg = node.config || {};
-  const v = cfg.var;
+  const v = inlineText(cfg.var);
   if (typeof v !== "string" || !v.trim()) return null;
   const value = cfg.value;
-  const shown = typeof value === "string" ? `"${value}"` : String(value ?? "");
+  const shown = typeof value === "string" ? `"${inlineText(value)}"` : inlineText(value);
   switch (cfg.op) {
     case "contains": return en ? `yes when {{${v}}} contains ${shown}` : `{{${v}}}에 ${shown}이(가) 들어 있으면 예`;
     case "truthy": return en ? `yes when {{${v}}} has a value` : `{{${v}}}에 값이 있으면 예`;
@@ -488,7 +492,7 @@ function conditionRule(node, en) {
     case "neq": return en ? `yes when {{${v}}} differs from ${shown}` : `{{${v}}}이(가) ${shown}과 다르면 예`;
     case "gt": return en ? `yes when {{${v}}} > ${shown}` : `{{${v}}}이(가) ${shown}보다 크면 예`;
     case "lt": return en ? `yes when {{${v}}} < ${shown}` : `{{${v}}}이(가) ${shown}보다 작으면 예`;
-    default: return en ? `checks {{${v}}} with "${cfg.op ?? "?"}"` : `{{${v}}}을(를) "${cfg.op ?? "?"}"(으)로 검사`;
+    default: return en ? `checks {{${v}}} with "${inlineText(cfg.op ?? "?")}"` : `{{${v}}}을(를) "${inlineText(cfg.op ?? "?")}"(으)로 검사`;
   }
 }
 
@@ -525,7 +529,7 @@ function kindWord(type, en) {
   const read = vocabulary.readEnum(type, vocabulary.GRAPH_NODE_KINDS);
   if ("unknown" in read) {
     // 이 버전이 모르는 종류 — 지어내지 않고 그렇다고 말한다(원문 보존).
-    return vocabulary.degradedLabel(read, en ? "en" : "ko");
+    return vocabulary.degradedLabel({ unknown: inlineText(read.unknown) }, en ? "en" : "ko");
   }
   return (en ? enWords[read.known] : ko[read.known]) || read.known;
 }
@@ -557,8 +561,8 @@ function renderGraphTree(ctx, graph, en) {
         ? (en ? " — no repeat limit set, so it will refuse to run" : " — 반복 횟수가 정해져 있지 않아 실행이 거절됩니다")
         : (en ? ` — up to ${cap} more time(s)` : ` — 최대 ${cap}바퀴까지`);
       ctx.out(`${indent}${prefix}↩ ${ctx.ui.dim(en
-        ? `back to "${node.label || node.id}"${capText}`
-        : `"${node.label || node.id}"(으)로 되돌아감${capText}`)}`);
+        ? `back to "${inlineText(node.label || node.id)}"${capText}`
+        : `"${inlineText(node.label || node.id)}"(으)로 되돌아감${capText}`)}`);
       return;
     }
     seen.add(nodeId);
@@ -568,7 +572,7 @@ function renderGraphTree(ctx, graph, en) {
       for (const item of items) {
         if (!item || typeof item.text !== "string" || !item.text.trim()) continue;
         const mark = item.kind === "mustNot" ? (en ? "must not" : "하면 안 됨") : (en ? "must" : "있어야 함");
-        ctx.out(`${indent}  ${ctx.ui.dim(`· [${mark}] ${item.text.trim()}`)}`);
+        ctx.out(`${indent}  ${ctx.ui.dim(`· [${mark}] ${inlineText(item.text, 1000)}`)}`);
       }
     }
     const edges = outgoing.get(nodeId) ?? [];

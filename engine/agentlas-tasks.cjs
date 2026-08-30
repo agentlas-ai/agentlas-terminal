@@ -96,6 +96,13 @@ function applyTaskResult(current, name, payload, toolId) {
   const id = String(record.id || record.taskId || payload.taskId || "");
   if (!id) return current;
   const next = Array.isArray(current) ? current.map((task) => ({ ...task })) : [];
+  // Claude emits the successful tool result after the TaskUpdate input.  A
+  // delete result must remain a delete: otherwise the input removes the row,
+  // then this result-only path recreates it as a pending placeholder.
+  const resultStatus = record.status ?? payload.status;
+  if (tool === "taskupdate" && String(resultStatus || "").trim().toLowerCase() === "deleted") {
+    return next.filter((task) => task.id !== id);
+  }
   const provisional = next.findIndex((task) => task.id === String(toolId || ""));
   const existing = next.findIndex((task) => task.id === id);
   const index = existing >= 0 ? existing : provisional;

@@ -14,6 +14,7 @@
  * 정직하게 거절한다(승급은 여전히 데스크탑의 일이다).
  */
 const fs = require("node:fs");
+const { pathToFileURL } = require("node:url");
 const { configureSqliteConnection } = require("../agentlas-sqlite-policy.cjs");
 const { parseSemVer, compareSemVer } = require("../semver.cjs");
 const { dbPath } = require("./paths.cjs");
@@ -38,13 +39,16 @@ function loadNodeSqliteQuietly() {
 function openRaw(file) {
   try {
     const Database = require("better-sqlite3");
-    const db = new Database(file);
+    const db = new Database(file, { fileMustExist: true });
     configureSqliteConnection(db);
     db.__driver = "better-sqlite3";
     return db;
   } catch { /* optional dep 미설치/ABI 불일치 → node:sqlite */ }
   const { DatabaseSync } = loadNodeSqliteQuietly();
-  const db = new DatabaseSync(file);
+  // DatabaseSync does not expose better-sqlite3's `fileMustExist` option. A
+  // SQLite URI with mode=rw opens an existing file read/write but refuses to
+  // create it when an existsSync check races with deletion.
+  const db = new DatabaseSync(`${pathToFileURL(file).href}?mode=rw`);
   configureSqliteConnection(db);
   db.__driver = "node:sqlite";
   return db;
@@ -125,9 +129,13 @@ function columnExists(db, table, col) {
 }
 
 function runWriteTransaction(db, fn) {
+  if (!db || typeof fn !== "function") throw new TypeError("SQLite connection and transaction callback are required");
   db.exec("BEGIN IMMEDIATE");
   try {
     const result = fn();
+    if (result && typeof result.then === "function") {
+      throw new TypeError("SQLite write transactions must be synchronous");
+    }
     db.exec("COMMIT");
     return result;
   } catch (e) {

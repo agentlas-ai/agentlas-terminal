@@ -49,6 +49,11 @@ async function checkNpmLatest({ fetch: fetchImpl, timeoutMs = 8_000 } = {}) {
 }
 
 async function run(ctx, args, deps = {}) {
+  if (args.some((arg) => arg !== "--json") || args.filter((arg) => arg === "--json").length > 1) {
+    const error = new Error("usage: agentlas update [--json]");
+    error.code = "INVALID_ARGUMENT";
+    throw error;
+  }
   const json = ctx.output?.format === "json" || args.includes("--json");
   const status = await checkNpmLatest(deps);
   if (json) {

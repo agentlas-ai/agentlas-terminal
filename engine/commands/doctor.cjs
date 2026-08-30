@@ -14,6 +14,14 @@ const { runtimeAuthEvidence } = require("../runtimes/auth-evidence.cjs");
 const { sharedRuntimeKind } = require("../runtimes/resolve.cjs");
 const { resolvedModelRole } = require("../runtimes/roles.cjs");
 
+function hasCloudSessionCredential() {
+  try {
+    return Boolean(require("../cloud/auth.cjs").cloudSessionCookie());
+  } catch {
+    return false;
+  }
+}
+
 function roleDetail(selection, role, en) {
   if (!selection) return en ? "not set" : "미설정";
   const provider = selection.kind === "byok" ? selection.backend || "byok" : selection.kind;
@@ -28,6 +36,12 @@ function roleDetail(selection, role, en) {
 
 async function run(ctx, args = []) {
   const en = ctx.lang === "en";
+  const unknown = args.filter((arg) => arg !== "--json");
+  if (unknown.length || args.filter((arg) => arg === "--json").length > 1) {
+    const error = new Error("usage: agentlas doctor [--json]");
+    error.code = "INVALID_ARGUMENT";
+    throw error;
+  }
   // clig.dev: 스크립트 소비자를 위한 기계 계약. 사람용 줄과 같은 사실만 담는다.
   if (ctx.output?.format === "json" || args.includes("--json")) {
     const db = ctx.db();
@@ -43,7 +57,9 @@ async function run(ctx, args = []) {
           orchestrator: resolvedModelRole(db, "orchestrator"),
           worker: resolvedModelRole(db, "worker"),
         },
-        cloudSession: Boolean(process.env.AGENTLAS_SESSION) || fs.existsSync(path.join(userDataDir(), "auth", "cli-session.v1.json")),
+        // JSON is intentionally offline, but it must use the same validated
+        // credential interpretation as the human path rather than file existence.
+        cloudSession: hasCloudSessionCredential(),
       }, null, 2));
       return 0;
     })();

@@ -22,6 +22,8 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 
+const MAX_CORE_STDOUT_LINE_BYTES = 16 * 1024 * 1024;
+
 function localCoreBin() {
   const candidates = [
     process.env.HEPHAESTUS_BIN,
@@ -66,7 +68,7 @@ function createLocalCoreClient({ cwd, timeoutMs = 60_000 } = {}) {
   // 세션에서 `hephaestus mcp serve` 17개 누적. exit 훅으로 반드시 걷는다.
   const reap = () => { try { child.kill(); } catch { /* already gone */ } };
   process.once("exit", reap);
-  let buffer = "";
+  let buffer = Buffer.alloc(0);
   let nextId = 0;
   let initialized = null;
   const pending = new Map();
@@ -93,10 +95,21 @@ function createLocalCoreClient({ cwd, timeoutMs = 60_000 } = {}) {
     failPending("local_core_transport_error", `the local core input stream failed: ${(error && error.message) || error}`);
   });
   child.stdout.on("data", (chunk) => {
-    buffer += chunk;
+    if (exited) return;
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    if (buffer.length + bytes.length > MAX_CORE_STDOUT_LINE_BYTES) {
+      failPending(
+        "local_core_response_too_large",
+        `the local core emitted a response line larger than ${MAX_CORE_STDOUT_LINE_BYTES} bytes`,
+      );
+      buffer = Buffer.alloc(0);
+      try { child.kill(); } catch { /* already gone */ }
+      return;
+    }
+    buffer = buffer.length ? Buffer.concat([buffer, bytes]) : bytes;
     let index;
-    while ((index = buffer.indexOf("\n")) >= 0) {
-      const line = buffer.slice(0, index);
+    while ((index = buffer.indexOf(0x0a)) >= 0) {
+      const line = buffer.subarray(0, index).toString("utf8");
       buffer = buffer.slice(index + 1);
       if (!line.trim()) continue;
       let message;
@@ -191,4 +204,4 @@ function createLocalCoreClient({ cwd, timeoutMs = 60_000 } = {}) {
   return { call, close };
 }
 
-module.exports = { createLocalCoreClient, localCoreBin };
+module.exports = { createLocalCoreClient, localCoreBin, MAX_CORE_STDOUT_LINE_BYTES };

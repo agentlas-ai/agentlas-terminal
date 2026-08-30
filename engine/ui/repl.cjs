@@ -267,6 +267,7 @@ async function startRepl(ctx, opts = {}) {
     });
     // 진행 중인 비동기 슬래시 명령 — 종료가 이걸 잘라먹지 않도록 close 핸들러가 기다린다.
     const pendingCommands = new Set();
+    const pendingShells = new Set();
     const trackCommand = (promise) => {
       pendingCommands.add(promise);
       promise.then(() => pendingCommands.delete(promise), () => pendingCommands.delete(promise));
@@ -394,6 +395,15 @@ async function startRepl(ctx, opts = {}) {
         prompt();
         return;
       }
+      if (pendingShells.size) {
+        const controller = [...pendingShells].at(-1);
+        controller.abort();
+        ui.ensureNl();
+        ui.line(ui.c.dim(en ? "(shell command interrupted)" : "(셸 명령 중단됨)"));
+        sigints = 0;
+        prompt();
+        return;
+      }
       sigints += 1;
       if (sigints >= 2) { rl.close(); return; }
       ui.line(ui.c.dim(en ? "(ctrl-c again to quit)" : "(한 번 더 ctrl-c 하면 종료)"));
@@ -487,7 +497,12 @@ async function startRepl(ctx, opts = {}) {
       }
 
       if (input.startsWith("!")) {
-        runShell(ctx, input.slice(1).trim(), permission).then(prompt, (e) => { recoverPresentation("shell action", e); prompt(); });
+        const controller = new AbortController();
+        pendingShells.add(controller);
+        const command = runShell(ctx, input.slice(1).trim(), permission, { signal: controller.signal })
+          .then(prompt, (e) => { recoverPresentation("shell action", e); prompt(); })
+          .finally(() => pendingShells.delete(controller));
+        trackCommand(command);
         return;
       }
 
@@ -519,6 +534,7 @@ async function startRepl(ctx, opts = {}) {
       process.stdin.removeListener("keypress", onShortcutKey);
       slashPalette.detach();
       renderer.detach();
+      for (const controller of pendingShells) controller.abort();
       /*
        * 슬래시 명령은 비동기다. 예전에는 close 가 곧바로 resolve 해서 프로세스가 끝나 버렸고,
        * `/search …` 직후 `/quit` 을 치면 그 명령이 출력 한 줄 없이 사라졌다(실측: 같은 입력을
@@ -554,7 +570,7 @@ async function startRepl(ctx, opts = {}) {
  *    env 객체는 절대 변형하지 않는다 (credential-env-regression 계약).
  *  - 출력 8MB 캡, 표시 전 시크릿 마스킹, 프로세스 그룹 종료.
  */
-async function runShell(ctx, cmd, permission) {
+async function runShell(ctx, cmd, permission, options = {}) {
   const ui = ctx.uiInstance;
   const en = ctx.lang === "en";
   if (!cmd) return;
@@ -588,13 +604,49 @@ async function runShell(ctx, cmd, permission) {
     });
     let bytes = 0;
     let capped = false;
+    let settled = false;
+    let forceKillTimer = null;
+    const terminate = (signal) => {
+      const pid = Number(child.pid);
+      if (grouped && Number.isInteger(pid) && pid > 1) {
+        try { process.kill(-pid, signal); return; } catch { /* fall through */ }
+      }
+      try { child.kill(signal); } catch { /* already gone */ }
+    };
+    const forceKillSoon = () => {
+      if (forceKillTimer) return;
+      forceKillTimer = setTimeout(() => terminate("SIGKILL"), 250);
+      forceKillTimer.unref?.();
+    };
+    const reapOnExit = () => terminate("SIGKILL");
+    process.once("exit", reapOnExit);
+    const abortHandler = () => {
+      terminate("SIGTERM");
+      forceKillSoon();
+    };
+    if (options.signal) {
+      if (options.signal.aborted) abortHandler();
+      else options.signal.addEventListener?.("abort", abortHandler, { once: true });
+    }
+    const finish = (code, failed = false) => {
+      if (settled) return;
+      settled = true;
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      process.removeListener("exit", reapOnExit);
+      if (options.signal) options.signal.removeEventListener?.("abort", abortHandler);
+      ui.streamEnd();
+      if (failed) ui.error();
+      else if (code !== 0 && !capped && !options.signal?.aborted) ui.line(ui.c.dim(`exit ${code}`));
+      resolve();
+    };
     const onData = (d) => {
       bytes += d.length;
       if (bytes > maxBytes) {
         if (!capped) {
           capped = true;
           ui.warn(en ? "(output capped at 8MB — command stopped)" : "(출력 8MB 초과 — 명령 중단)");
-          try { grouped ? process.kill(-child.pid, "SIGTERM") : child.kill("SIGTERM"); } catch { /* dead */ }
+          terminate("SIGTERM");
+          forceKillSoon();
         }
         return;
       }
@@ -603,12 +655,8 @@ async function runShell(ctx, cmd, permission) {
     ui.streamStart(true);
     child.stdout.on("data", onData);
     child.stderr.on("data", onData);
-    child.on("error", () => { ui.streamEnd(); ui.error(); resolve(); });
-    child.on("close", (code) => {
-      ui.streamEnd();
-      if (code !== 0 && !capped) ui.line(ui.c.dim(`exit ${code}`));
-      resolve();
-    });
+    child.on("error", () => finish(1, true));
+    child.on("close", (code) => finish(code));
   });
 }
 

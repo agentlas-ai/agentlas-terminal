@@ -133,7 +133,11 @@ async function cmdBuild(options) {
   if (!parsed.noMcp) {
     if (parsed.approveAll) approvedIds = [...plan.availableCatalogIds];
     else if (parsed.approvedIds.length) approvedIds = mcp.normalizeConsentAnswer(parsed.approvedIds.join(","), plan.availableCatalogIds);
-    else approvedIds = await mcp.askMcpConsentOnce(plan, { input: options.input, output: options.promptOutput });
+    else approvedIds = await mcp.askMcpConsentOnce(plan, {
+      db: options.db,
+      input: options.input,
+      output: options.promptOutput,
+    });
   }
   approvedIds = mcp.fitApprovedMcpIds(plan, approvedIds);
   const runtimeAllowlist = await mcp.resolveApprovedMcpRuntimeAllowlist({

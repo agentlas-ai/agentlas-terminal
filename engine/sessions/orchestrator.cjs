@@ -84,7 +84,17 @@ class Orchestrator extends EventEmitter {
 
   runningCount() {
     let n = 0;
-    for (const s of this.sessions.values()) if (s.isBusy()) n += 1;
+    for (const s of this.sessions.values()) {
+      if (s.isBusy()) {
+        n += 1;
+        continue;
+      }
+      // kill() fences the session immediately, but native/API cancellation is
+      // asynchronous. Keep the slot occupied until Session has released its
+      // child or abort controller; otherwise a replacement turn can start
+      // while the killed provider is still consuming a process/slot.
+      if (s.status === "killed" && (s._child || s._apiAbort)) n += 1;
+    }
     return n;
   }
 

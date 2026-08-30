@@ -5,10 +5,12 @@
  * v1 모놀리스 890–1112 구간의 충실 이식 — 규칙 변경 금지(데스크탑과 판정 동형이어야 함).
  */
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { tableExists, columnExists } = require("../core/db.cjs");
 const { routesMap, saveRoutes } = require("./routes.cjs");
+const { userDataDir } = require("../core/paths.cjs");
 
 function exists(p) { try { fs.accessSync(p); return true; } catch { return false; } }
 function isDir(p) { try { return fs.statSync(p).isDirectory(); } catch { return false; } }
@@ -159,8 +161,14 @@ function upsertLocalTeamFirm(db, dir, ceoAgentId, agentSlug, name, tagline) {
 }
 
 function importLocalFolder(db, absPath) {
-  const dir = path.resolve(absPath);
-  if (!isDir(dir)) throw new Error(`Not a directory: ${absPath}`);
+  const requested = path.resolve(absPath);
+  const unsafe = new Set([path.parse(requested).root, path.resolve(os.homedir()), path.resolve(userDataDir())]);
+  if (unsafe.has(requested)) throw new Error(`Refusing to import a broad user/system directory: ${absPath}`);
+  let stat;
+  try { stat = fs.lstatSync(requested); } catch { throw new Error(`Not a directory: ${absPath}`); }
+  if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`Imported agent path must be a real non-symbolic-link directory: ${absPath}`);
+  const dir = fs.realpathSync(requested);
+  if (unsafe.has(dir)) throw new Error(`Refusing to import a broad user/system directory: ${absPath}`);
   const labels = detectRuntimeLabels(dir);
   const runtime = labels[0];
   const kind = detectKind(dir);

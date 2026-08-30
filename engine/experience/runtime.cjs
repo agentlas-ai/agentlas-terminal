@@ -23,6 +23,7 @@ const { tableExists } = require("../core/db.cjs");
 const { agentFolder } = require("../agents/files.cjs");
 const { routesMap } = require("../agents/routes.cjs");
 const terminalExperienceExchange = require("../agentlas-experience-exchange.cjs");
+const permissions = require("../agentlas-permissions.cjs");
 const terminalExperienceIntake = require("../agentlas-experience-intake.cjs");
 const desktopOntologyLoadout = require("../agentlas-desktop-loadout.cjs");
 
@@ -103,9 +104,14 @@ function exactAgentBaseForExecution(db, agent, runtimeExperience = null) {
   const packageHash = /^[a-f0-9]{64}$/.test(rawHash) ? `sha256:${rawHash}` : null;
   const explicitDefinition = String(runtimeExperience?.agentDefinitionId || "");
   const explicitRelease = String(runtimeExperience?.baseAgentReleaseId || "");
+  const hasExplicitBinding = !!runtimeExperience && (
+    Object.prototype.hasOwnProperty.call(runtimeExperience, "agentDefinitionId") ||
+    Object.prototype.hasOwnProperty.call(runtimeExperience, "baseAgentReleaseId")
+  );
   if (portableId.test(explicitDefinition) && portableId.test(explicitRelease)) {
     return { agentDefinitionId: explicitDefinition, agentReleaseId: explicitRelease, packageHash, authority: "explicit-runtime-binding" };
   }
+  if (hasExplicitBinding) return null;
   if (binding && portableId.test(String(binding.agent_definition_id)) && portableId.test(String(binding.agent_release_id))) {
     return { agentDefinitionId: binding.agent_definition_id, agentReleaseId: binding.agent_release_id, packageHash, authority: "installed-hub-binding" };
   }
@@ -185,7 +191,7 @@ function resolveRuntimeExperienceCli(agent, prompt, requested, cwd, overrides = 
  * null — 적립이 실행 성공/실패 판정을 바꾸지 않는다.
  */
 function finalizeExperienceExecutionCli(db, input) {
-  if (input.permission === "read") return null;
+  if (permissions.normalize(input.permission) === "read") return null;
   if (!input.agentId) return null;
   let agent;
   try { agent = db.prepare("SELECT * FROM installed_agents WHERE id=?").get(input.agentId); }

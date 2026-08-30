@@ -12,6 +12,7 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
+const { TextDecoder } = require("node:util");
 
 const BUNDLE_SCHEMA = "agentlas.experience-bundle.v1";
 const RECEIPT_SCHEMA = "agentlas.experience-upload-receipt.v1";
@@ -604,13 +605,94 @@ function validateExperienceBundle(payload) {
   return { bundle: value, canonicalJson: canonicalJson(value), canonicalBytes, expectedPackHash, expectedBundleHash, expectedBundleId: experienceBundleId(value) };
 }
 
+function isBoundedSingleLinkRegular(stat, maxBytes, minBytes = 0) {
+  return Boolean(
+    stat && stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1 &&
+    Number.isSafeInteger(stat.size) && stat.size >= minBytes && stat.size <= maxBytes,
+  );
+}
+
+function sameBoundedFileSnapshot(left, right) {
+  return Boolean(
+    left && right && left.dev === right.dev && left.ino === right.ino && left.nlink === right.nlink &&
+    left.size === right.size && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs,
+  );
+}
+
+function readBoundedTextFile(filePath, maxBytes, options = {}) {
+  const {
+    label = "private file",
+    minBytes = 0,
+    allowMissing = false,
+    unsafeMessage = `${label} is unsafe`,
+    sizeMessage = `${label} exceeds ${maxBytes} bytes`,
+    symlinkMessage = unsafeMessage,
+  } = options;
+  let before;
+  try {
+    before = fs.lstatSync(filePath);
+  } catch (error) {
+    if (allowMissing && error?.code === "ENOENT") return null;
+    throw error;
+  }
+  if (before.isSymbolicLink()) throw new Error(symlinkMessage);
+  if (!before.isFile() || before.nlink !== 1) throw new Error(unsafeMessage);
+  if (!Number.isSafeInteger(before.size) || before.size < minBytes || before.size > maxBytes) throw new Error(sizeMessage);
+
+  const noFollow = fs.constants.O_NOFOLLOW;
+  if (!Number.isInteger(noFollow)) throw new Error(`${label} cannot enforce symlink-safe open`);
+  const nonBlock = Number.isInteger(fs.constants.O_NONBLOCK) ? fs.constants.O_NONBLOCK : 0;
+  const descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow | nonBlock);
+  try {
+    const opened = fs.fstatSync(descriptor);
+    if (!isBoundedSingleLinkRegular(opened, maxBytes, minBytes) || !sameBoundedFileSnapshot(before, opened)) {
+      throw new Error(`${label} changed while opening`);
+    }
+
+    const chunks = [];
+    let total = 0;
+    while (total <= maxBytes) {
+      const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes + 1 - total));
+      const count = fs.readSync(descriptor, buffer, 0, buffer.length, null);
+      if (count === 0) break;
+      chunks.push(buffer.subarray(0, count));
+      total += count;
+    }
+    if (total > maxBytes) throw new Error(sizeMessage);
+
+    const after = fs.fstatSync(descriptor);
+    const pathAfter = fs.lstatSync(filePath);
+    if (
+      !isBoundedSingleLinkRegular(after, maxBytes, minBytes) ||
+      !isBoundedSingleLinkRegular(pathAfter, maxBytes, minBytes) ||
+      !sameBoundedFileSnapshot(opened, after) ||
+      !sameBoundedFileSnapshot(before, pathAfter) ||
+      !sameBoundedFileSnapshot(opened, pathAfter) ||
+      total !== after.size
+    ) {
+      throw new Error(`${label} changed while reading`);
+    }
+
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks, total));
+    } catch (error) {
+      throw new Error(`${label} is invalid UTF-8: ${error.message}`);
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
 function readBundleFile(filePath, cwd = process.cwd()) {
   const absolute = path.resolve(cwd, filePath);
-  const stat = fs.lstatSync(absolute);
-  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Experience bundle must be a regular file; symlinks are forbidden");
-  if (stat.size < 1 || stat.size > MAX_BUNDLE_FILE_BYTES) throw new Error(`Experience bundle file must be 1..${MAX_BUNDLE_FILE_BYTES} bytes`);
+  const text = readBoundedTextFile(absolute, MAX_BUNDLE_FILE_BYTES, {
+    label: "Experience bundle",
+    minBytes: 1,
+    unsafeMessage: "Experience bundle must be a regular file; symlinks are forbidden",
+    sizeMessage: `Experience bundle file must be 1..${MAX_BUNDLE_FILE_BYTES} bytes`,
+  });
   let payload;
-  try { payload = JSON.parse(fs.readFileSync(absolute, "utf8")); } catch (error) { throw new Error(`Experience bundle is invalid JSON: ${error.message}`); }
+  try { payload = JSON.parse(text); } catch (error) { throw new Error(`Experience bundle is invalid JSON: ${error.message}`); }
   return { absolute, ...validateExperienceBundle(payload) };
 }
 
@@ -776,10 +858,14 @@ function withExchangeStateLock(userDataDir, action) {
 function loadExchangeState(userDataDir) {
   const file = exchangeStatePath(userDataDir);
   recoverPrivateAtomicTarget(file);
-  if (!fs.existsSync(file)) return emptyState();
-  const stat = fs.lstatSync(file);
-  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_STATE_BYTES) throw new Error("Terminal Experience exchange state is unsafe or too large");
-  const state = JSON.parse(fs.readFileSync(file, "utf8"));
+  const text = readBoundedTextFile(file, MAX_STATE_BYTES, {
+    label: "Terminal Experience exchange state",
+    allowMissing: true,
+    unsafeMessage: "Terminal Experience exchange state is unsafe or too large",
+    sizeMessage: "Terminal Experience exchange state is unsafe or too large",
+  });
+  if (text === null) return emptyState();
+  const state = JSON.parse(text);
   const allowed = new Set(["schemaVersion", "updatedAt", "bundles"]);
   const issues = [];
   strictObject(state, allowed, allowed, "exchange state", issues);
@@ -896,19 +982,50 @@ function resolveBundleInput(userDataDir, sourceOrRef, cwd) {
   return readBundleFile(sourceOrRef, cwd);
 }
 
-function parseFlags(args) {
+function parseFlags(args, schema = {}) {
   const flags = { _: [] };
+  const values = new Set(schema.values || []);
+  const booleans = new Set(schema.booleans || []);
+  let passthrough = false;
   for (let index = 0; index < args.length; index += 1) {
     const token = String(args[index]);
+    if (passthrough) { flags._.push(token); continue; }
+    if (token === "--") { passthrough = true; continue; }
     if (!token.startsWith("--")) { flags._.push(token); continue; }
     const equal = token.indexOf("=");
-    if (equal > 2) { flags[token.slice(2, equal)] = token.slice(equal + 1); continue; }
-    const key = token.slice(2);
-    if (index + 1 < args.length && !String(args[index + 1]).startsWith("--")) flags[key] = String(args[++index]);
-    else flags[key] = true;
+    const key = token.slice(2, equal > 2 ? equal : undefined);
+    if (!values.has(key) && !booleans.has(key)) throw new Error(`unknown option: --${key}`);
+    if (Object.prototype.hasOwnProperty.call(flags, key)) throw new Error(`duplicate option: --${key}`);
+    if (booleans.has(key)) {
+      if (equal > 2) throw new Error(`--${key} does not take a value`);
+      flags[key] = true;
+      continue;
+    }
+    const value = equal > 2 ? token.slice(equal + 1) : args[++index];
+    if (value === undefined || value === "" || (equal <= 2 && String(value).startsWith("--"))) {
+      throw new Error(`--${key} requires a value`);
+    }
+    flags[key] = String(value);
   }
   return flags;
 }
+
+const EXPERIENCE_COMMAND_FLAG_SCHEMA = Object.freeze({
+  list: { booleans: ["json"] },
+  inspect: { booleans: ["json"] },
+  validate: { booleans: ["json"] },
+  save: {
+    booleans: ["json", "dry-run", "local-only"],
+    values: ["idempotency-key", "base-slug", "base-cloud-id", "base-package-hash", "base-package-hash-version"],
+  },
+  publish: {
+    booleans: ["json", "dry-run"],
+    values: ["visibility", "idempotency-key", "base-slug", "base-cloud-id", "base-package-hash", "base-package-hash-version"],
+  },
+  status: { booleans: ["json"] },
+  export: { booleans: ["json", "overwrite"], values: ["out"] },
+  unpublish: { booleans: ["json", "dry-run"] },
+});
 
 function idempotencyKeyForBundle(bundle, explicit, operation = "save") {
   const defaultDigest = crypto.createHash("sha256")
@@ -1935,7 +2052,6 @@ function baseDescriptorFromFlags(flags) {
 async function cmdExperienceExchange(options = {}) {
   const args = options.args || [];
   const sub = args[0] || "list";
-  const flags = parseFlags(args.slice(1));
   const emit = options.out || console.log;
   if (!options.userDataDir) throw new Error("Terminal userData path is required");
 
@@ -1963,6 +2079,15 @@ async function cmdExperienceExchange(options = {}) {
     const mapped = sub.slice("legacy-".length);
     return options.legacyCommand({ ...options, args: [mapped, ...args.slice(1)] });
   }
+  const canonicalSub = sub === "ls" ? "list"
+    : sub === "show" ? "inspect"
+      : sub === "withdraw" ? "unpublish"
+        : sub;
+  const schema = EXPERIENCE_COMMAND_FLAG_SCHEMA[canonicalSub];
+  if (!schema) {
+    throw new Error("unknown experience subcommand (list|inspect|validate|save|publish|status|export|unpublish|withdraw; legacy: legacy-list|legacy-inspect|legacy-publish|legacy-unpublish)");
+  }
+  const flags = parseFlags(args.slice(1), schema);
   if (sub === "list" || sub === "ls") {
     if (flags._.length) throw new Error("usage: agentlas experience list [--json]");
     const bundles = listStoredExperienceBundles(options.userDataDir, options.cwd);
@@ -1998,12 +2123,14 @@ async function cmdExperienceExchange(options = {}) {
     return result;
   }
   if (sub === "validate") {
+    if (flags._.length !== 1) throw new Error("usage: agentlas experience validate <bundle.agentlas-experience.json> [--json]");
     const validation = readBundleFile(flags._[0], options.cwd);
     const result = { valid: true, bundleId: validation.bundle.bundleId, bundleHash: validation.bundle.bundleHash, packContentHash: validation.bundle.pack.contentHash, items: validation.bundle.items.length, canonicalBytes: validation.canonicalBytes, networkUsed: false, authority: "local-validation" };
     emit(flags.json ? JSON.stringify(result, null, 2) : renderValidation(validation));
     return result;
   }
   if (sub === "save") {
+    if (flags._.length !== 1) throw new Error("usage: agentlas experience save <bundle> [options]");
     const validation = readBundleFile(flags._[0], options.cwd);
     if (flags["local-only"] === true) {
       if (flags["dry-run"] === true) {
@@ -2027,6 +2154,7 @@ async function cmdExperienceExchange(options = {}) {
     return result;
   }
   if (sub === "publish") {
+    if (flags._.length !== 1) throw new Error("usage: agentlas experience publish <bundle> [options]");
     const source = flags._[0];
     const validation = resolveBundleInput(options.userDataDir, source, options.cwd);
     const result = await publishBundle(validation, {
@@ -2041,11 +2169,13 @@ async function cmdExperienceExchange(options = {}) {
     return result;
   }
   if (sub === "status") {
+    if (flags._.length !== 1) throw new Error("usage: agentlas experience status <bundle-id|upload-id> [--json]");
     const result = await fetchUploadStatus(flags._[0], options);
     emit(flags.json ? JSON.stringify(publicCommandExchangeResult(result), null, 2) : `Server-authoritative status: ${result.receipt.status} · ${result.receipt.uploadId}\nrequested visibility: ${result.receipt.requestedVisibility} · Terminal did not assert public activation/evaluator reputation`);
     return result;
   }
   if (sub === "export") {
+    if (flags._.length !== 1) throw new Error("usage: agentlas experience export <bundle-id|upload-id> [--out file] [--overwrite] [--json]");
     const result = await fetchUploadExport(flags._[0], {
       ...options,
       outputPath: typeof flags.out === "string" ? flags.out : null,
@@ -2111,6 +2241,7 @@ module.exports = {
   previewWithdrawUpload,
   publicUploadReceipt,
   publicCommandExchangeResult,
+  parseFlags,
   projectScopeHash,
   idempotencyKeyForBundle,
   idempotencyKeyHash,

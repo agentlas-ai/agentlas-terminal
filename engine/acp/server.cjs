@@ -131,6 +131,21 @@ function productionTurnRunner(options = {}) {
       const s = sessions.get(acpSessionId);
       if (s) { try { s.kill(); } catch { /* best effort */ } }
     },
+    closeSession(spec) {
+      if (!spec) return;
+      const session = spec.session;
+      if (session) {
+        try { session.kill(); } catch { /* best effort */ }
+      }
+      if (spec.acpSessionId && sessions.get(spec.acpSessionId) === session) {
+        sessions.delete(spec.acpSessionId);
+      }
+      if (spec.orch && typeof spec.orch.shutdown === "function") {
+        try { spec.orch.shutdown(); } catch { /* best effort */ }
+      }
+      spec.session = null;
+      spec.orch = null;
+    },
   };
 }
 
@@ -168,7 +183,18 @@ class AcpAgentServer {
       if (!msg || typeof msg !== "object" || !msg.method) return;
       void this.handle(msg);
     });
-    rl.on("close", () => { this.closed = true; });
+    rl.on("close", () => {
+      this.closed = true;
+      // stdin을 닫은 ACP client는 이 서버의 모든 session 소유권을 내려놓았다.
+      // idle conversation의 Orchestrator도, 진행 중 native child도 남기지 않는다.
+      for (const spec of this.sessions.values()) {
+        try {
+          if (typeof this.runner.closeSession === "function") this.runner.closeSession(spec);
+          else this.runner.cancel(spec.acpSessionId);
+        } catch { /* connection close must still settle */ }
+      }
+      this.sessions.clear();
+    });
     return new Promise((resolve) => rl.on("close", resolve));
   }
 

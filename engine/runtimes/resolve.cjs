@@ -63,7 +63,7 @@ function sharedRuntimeKind(row) {
   // never discard `agy` and silently fall through to Gemini or another CLI.
   const selectedBin = path.posix.basename(path.win32.basename(String(row.source || ""))).toLowerCase();
   if (row.kind === "gemini" && /^agy(?:\.exe|\.cmd)?$/i.test(selectedBin)) return "agy";
-  return row.kind;
+  return KINDS.canonicalRuntimeKind(row.kind);
 }
 
 class NoRuntimeError extends Error {
@@ -79,21 +79,22 @@ class NoRuntimeError extends Error {
  */
 function resolveRuntime({ db, prefs, explicit }) {
   if (explicit) {
-    const api = apiRuntime(explicit, null, "explicit");
+    const explicitKind = KINDS.canonicalRuntimeKind(explicit);
+    const api = apiRuntime(explicitKind, null, "explicit");
     if (api) return api;
-    const bin = RUNTIME_BIN[explicit];
+    const bin = RUNTIME_BIN[explicitKind];
     if (!bin) throw new NoRuntimeError(`unknown runtime: ${explicit}`);
-    if (!CLI_EXECUTABLE_KINDS.has(explicit)) {
-      const acpHint = ACP_CLI_KINDS.has(explicit)
+    if (!CLI_EXECUTABLE_KINDS.has(explicitKind)) {
+      const acpHint = ACP_CLI_KINDS.has(explicitKind)
         ? ` — its ACP driver needs the desktop core with electron/runtime/acp.js (npm run vendor:core / agentlas doctor)`
         : "";
       throw new NoRuntimeError(`runtime '${explicit}' has no v2 streaming driver yet (available: ${[...EXECUTABLE_KINDS].join(", ")})${acpHint}`);
     }
     const p = whichSync(bin);
     if (!p) throw new NoRuntimeError(`runtime '${explicit}' requested but '${bin}' is not on PATH`);
-    return { kind: explicit, bin: p, source: "explicit" };
+    return { kind: explicitKind, bin: p, source: "explicit" };
   }
-  const pref = prefs && prefs.runtime;
+  const pref = KINDS.canonicalRuntimeKind(prefs && prefs.runtime);
   if (pref && API_EXECUTABLE_KINDS.has(pref)) {
     return apiRuntime(pref, null, "prefs");
   }

@@ -10,9 +10,19 @@
 const catalog = require("../ui/commands-catalog.cjs");
 
 function run(ctx, args = []) {
+  if (!Array.isArray(args) || args.length > 1) {
+    const error = new Error("usage: agentlas help [all|<command>]");
+    error.code = "INVALID_ARGUMENT";
+    throw error;
+  }
   const first = String((args && args[0]) || "").trim();
+  if (first.startsWith("-")) {
+    const error = new Error("usage: agentlas help [all|<command>]");
+    error.code = "INVALID_ARGUMENT";
+    throw error;
+  }
   const all = first.toLowerCase() === "all";
-  const name = !all && first && !first.startsWith("-") ? first : null;
+  const name = !all && first ? first : null;
   if (name) return runForCommand(ctx, name);
   ctx.out(catalog.renderHelp({ lang: ctx.lang, surface: "cli", all }));
   return 0;

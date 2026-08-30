@@ -15,9 +15,30 @@ function isInternalAgentSlug(slug) {
 async function run(ctx, args) {
   let limit = 10;
   const rest = [];
+  let seenLimit = false;
+  let passthrough = false;
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--limit") limit = Math.max(1, Math.min(30, Number(args[++i]) || 10));
-    else rest.push(args[i]);
+    const token = String(args[i]);
+    if (passthrough) { rest.push(token); continue; }
+    if (token === "--") { passthrough = true; continue; }
+    if (token === "--limit" || token.startsWith("--limit=")) {
+      if (seenLimit) { ctx.err("duplicate option: --limit"); return 1; }
+      seenLimit = true;
+      const inline = token.startsWith("--limit=");
+      const raw = inline ? token.slice(8) : args[++i];
+      const parsed = Number(raw);
+      if (raw === undefined || raw === "" || !Number.isInteger(parsed) || parsed < 1 || parsed > 30) {
+        ctx.err("--limit requires an integer from 1 to 30");
+        return 1;
+      }
+      limit = parsed;
+      continue;
+    }
+    if (token.startsWith("-")) {
+      ctx.err(`unknown option: ${token} (use -- before a query that starts with '-')`);
+      return 1;
+    }
+    rest.push(token);
   }
   const query = rest.join(" ").trim();
   if (!query) {

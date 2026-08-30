@@ -5,6 +5,7 @@
  * Persistence is owned by Desktop migration v79. Terminal reads defensively:
  *   orchestrator row -> legacy active_runtime -> null
  *   worker direct row -> orchestrator row/legacy active_runtime
+ *   multimodal direct row -> null (never inherits a conversational runtime)
  *
  * The worker may inherit upward for quality; the orchestrator never falls
  * downward to the worker row.
@@ -13,7 +14,7 @@ const { canonicalRuntimeKind } = require("./kinds.cjs");
 const { tableExists, columnExists } = require("../core/db.cjs");
 
 const MODEL_ROLE_TABLE = "model_roles";
-const VALID_ROLES = new Set(["orchestrator", "worker"]);
+const VALID_ROLES = new Set(["orchestrator", "worker", "multimodal"]);
 
 function cleanText(value) {
   const trimmed = typeof value === "string" ? value.trim() : "";
@@ -136,17 +137,18 @@ function resolvedModelRole(db, role = "orchestrator") {
   if (role === "orchestrator") {
     return normalizedRow(roleRow(db, "orchestrator"), role) || legacyOrchestrator(db);
   }
-  const worker = normalizedRow(roleRow(db, "worker"), "worker");
-  if (worker && !worker.inherit) return worker;
+  const direct = normalizedRow(roleRow(db, role), role);
+  if (role === "multimodal") return direct;
+  if (direct && !direct.inherit) return direct;
   const orchestrator = resolvedModelRole(db, "orchestrator");
   if (!orchestrator) return null;
   return {
     ...orchestrator,
     role: "worker",
     inherit: true,
-    updatedAt: worker?.updatedAt || orchestrator.updatedAt,
+    updatedAt: direct?.updatedAt || orchestrator.updatedAt,
     sourceLayer:
-      worker?.sourceLayer === "model-role"
+      direct?.sourceLayer === "model-role"
         ? "model-role-inherit"
         : "active-runtime-inherit",
   };

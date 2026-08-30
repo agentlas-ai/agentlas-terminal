@@ -56,10 +56,21 @@ function run(ctx, args) {
   const action = String(args[0] || "status").toLowerCase();
   const cwd = projectCwd();
   const ko = ctx.lang === "ko";
+  const invalid = () => {
+    const error = new Error(ko
+      ? "사용법: agentlas project [status | init | use <에이전트> | team <에이전트>...]"
+      : "Usage: agentlas project [status | init | use <agent> | team <agent>...]");
+    error.code = "INVALID_ARGUMENT";
+    throw error;
+  };
 
-  if (action === "status") return showStatus(ctx, cwd, ko);
+  if (action === "status") {
+    if (args.length > 1) return invalid();
+    return showStatus(ctx, cwd, ko);
+  }
 
   if (action === "init") {
+    if (args.length !== 1) return invalid();
     ctx.out(ko
       ? "비공개 Agentlas 프로젝트 상태를 초기화합니다. .agentlas/ 생성, .gitignore 갱신, 로컬 자격증명·서명 템플릿 추가가 포함될 수 있습니다."
       : "Initializing private Agentlas project state. This may create .agentlas/, update .gitignore, and add local credential/signing templates.");
@@ -79,13 +90,8 @@ function run(ctx, args) {
    * 둘 다 데스크탑 없이 동작한다.
    */
   if (action === "use" || action === "team") {
-    const tokens = args.slice(1).filter((t) => t && !String(t).startsWith("-"));
-    if (!tokens.length) {
-      ctx.err(ko
-        ? `사용법: agentlas project ${action} <에이전트> ${action === "team" ? "[<에이전트>...]" : ""}  ·  에이전트 목록: agentlas list`
-        : `Usage: agentlas project ${action} <agent> ${action === "team" ? "[<agent>...]" : ""}  ·  list agents: agentlas list`);
-      return 1;
-    }
+    const tokens = args.slice(1);
+    if (!tokens.length || tokens.some((token) => !token || String(token).startsWith("-")) || (action === "use" && tokens.length !== 1)) return invalid();
     try {
       const result = connectProjectTeam(ctx.db(), cwd, tokens, {});
       reportTeam(ctx, result, ko);
@@ -101,10 +107,7 @@ function run(ctx, args) {
     }
   }
 
-  ctx.err(ko
-    ? "사용법: agentlas project [status | init | use <에이전트> | team <에이전트>...]"
-    : "Usage: agentlas project [status | init | use <agent> | team <agent>...]");
-  return 1;
+  return invalid();
 }
 
 module.exports = { run };

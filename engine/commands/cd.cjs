@@ -5,7 +5,7 @@ const { agentFolder } = require("../agents/files.cjs");
 
 function run(ctx, args) {
   const ko = ctx.lang === "ko";
-  if (!args[0]) {
+  if (!args[0] || args.length !== 1) {
     ctx.err(ko ? "사용법: agentlas cd <agent>" : "Usage: agentlas cd <agent>");
     return 1;
   }

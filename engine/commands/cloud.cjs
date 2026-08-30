@@ -12,7 +12,8 @@ async function run(ctx, args) {
       : args;
     return await runCloud(ctx, commandArgs);
   } catch (e) {
-    ctx.err(String((e && e.message) || e));
+    if (typeof ctx.fail === "function") ctx.fail(e);
+    else ctx.err(String((e && e.message) || e));
     return 1;
   }
 }

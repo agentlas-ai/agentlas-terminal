@@ -280,8 +280,14 @@ function triggerQuestion() {
  */
 function autofillOutputChecks(bp) {
   if (!bp || !Array.isArray(bp.steps)) return bp;
+  // 잘못된 모델 출력을 빈 목록으로 고쳐 쓰지 않는다. validateBlueprint가 retry 사유로
+  // 돌려줘야 모델이 자기 형식을 바로잡을 수 있다.
+  if (bp.checks != null && !Array.isArray(bp.checks)) return bp;
   const checks = Array.isArray(bp.checks) ? [...bp.checks] : [];
-  const checked = new Set(checks.map((c) => (c.subject || "").trim()).filter(Boolean));
+  const checked = new Set(checks
+    .filter((check) => check && typeof check === "object")
+    .map((check) => String(check.subject || "").trim())
+    .filter(Boolean));
   bp.steps.forEach((step, index) => {
     if (step.effect !== "mutation") return;
     for (const value of Array.isArray(step.consumes) ? step.consumes : []) {
@@ -310,10 +316,14 @@ function validateBlueprint(bp, ctx = {}) {
   const problems = [];
   const push = (reason, ask = null) => problems.push({ reason, ask });
   if (!bp || typeof bp !== "object") { push("만들 내용을 읽지 못했습니다."); return problems; }
-  if (!String(bp.name || "").trim()) {
+  if (typeof bp.name !== "string") {
+    push("이름(name)의 형식이 올바르지 않습니다.");
+  } else if (!bp.name.trim()) {
     push("이름이 없습니다.", { id: "name", question: "이 자동화를 뭐라고 부를까요?", why: "목록에서 이 이름으로 찾게 됩니다." });
   }
-  if (!String(bp.goal || "").trim()) {
+  if (typeof bp.goal !== "string") {
+    push("목표(goal)의 형식이 올바르지 않습니다.");
+  } else if (!bp.goal.trim()) {
     push("무엇을 위한 자동화인지가 없습니다.", {
       id: "goal", question: "이 자동화로 무엇을 얻고 싶으신가요? 한 문장이면 됩니다.",
       why: "나중에 목록에서 보고 무엇이었는지 알아보려면 필요합니다.",
@@ -323,7 +333,9 @@ function validateBlueprint(bp, ctx = {}) {
   if (!trigger || typeof trigger !== "object") {
     push("언제 시작하는지가 없습니다.", triggerQuestion());
   } else if (trigger.kind === "cron") {
-    if (!String(trigger.schedule || "").trim()) {
+    if (typeof trigger.schedule !== "string") {
+      push("실행 시각(schedule)의 형식이 올바르지 않습니다.");
+    } else if (!trigger.schedule.trim()) {
       push("실행 시각이 없습니다.", {
         id: "schedule", question: "몇 시에 돌릴까요?",
         why: "시각을 대신 정하면, 보지 않는 시간에 조용히 돌게 됩니다.",
@@ -331,18 +343,22 @@ function validateBlueprint(bp, ctx = {}) {
       });
     }
   } else if (trigger.kind === "input") {
-    if (!String(trigger.label || "").trim()) {
+    if (typeof trigger.label !== "string") {
+      push("입력 안내(label)의 형식이 올바르지 않습니다.");
+    } else if (!trigger.label.trim()) {
       push("무엇을 입력받는지가 없습니다.", {
         id: "input-label", question: "시작할 때 무엇을 입력받을까요? (예: 만들 프로젝트의 주제)",
         why: "입력창에 이 문구가 그대로 보입니다.",
       });
     }
-    if (!VAR_RE.test(String(trigger.varName || ""))) push("입력값의 이름이 올바르지 않습니다.");
+    if (typeof trigger.varName !== "string" || !VAR_RE.test(trigger.varName)) push("입력값의 이름이 올바르지 않습니다.");
   } else {
     push("언제 시작하는지를 알 수 없습니다.", triggerQuestion());
   }
 
   const steps = Array.isArray(bp.steps) ? bp.steps : [];
+  const checks = Array.isArray(bp.checks) ? bp.checks : [];
+  const branches = Array.isArray(bp.branches) ? bp.branches : [];
   if (steps.length === 0) {
     push("할 일이 하나도 없습니다.", {
       id: "steps", question: "무슨 일을 해야 하나요? 순서대로 적어 주세요.",
@@ -350,14 +366,19 @@ function validateBlueprint(bp, ctx = {}) {
     });
   }
   if (steps.length > MAX_STEPS) push(`단계가 ${steps.length}개입니다. 한 번에 만들 수 있는 것은 ${MAX_STEPS}개까지입니다.`);
+  if (bp.checks != null && !Array.isArray(bp.checks)) push("검증 목록(checks)의 형식이 올바르지 않습니다.");
+  if (bp.branches != null && !Array.isArray(bp.branches)) push("갈림길 목록(branches)의 형식이 올바르지 않습니다.");
 
   const produced = new Set();
   if (trigger && trigger.kind === "input" && trigger.varName) produced.add(trigger.varName);
   steps.forEach((step, index) => {
     const at = `${index + 1}번째 단계`;
     if (!step || typeof step !== "object") { push(`${at}를 읽지 못했습니다.`); return; }
-    if (!String(step.title || "").trim()) push(`${at}에 이름이 없습니다.`);
-    if (!String(step.instruction || "").trim()) {
+    if (typeof step.title !== "string") push(`${at}의 이름(title) 형식이 올바르지 않습니다.`);
+    else if (!step.title.trim()) push(`${at}에 이름이 없습니다.`);
+    if (typeof step.instruction !== "string") {
+      push(`${at}의 지시(instruction) 형식이 올바르지 않습니다.`);
+    } else if (!step.instruction.trim()) {
       push(`${at}가 무엇을 할지 적혀 있지 않습니다.`, {
         id: `step-${index}-instruction`,
         question: `"${step.title || at}" 단계에서 정확히 무엇을 해야 하나요?`,
@@ -372,11 +393,14 @@ function validateBlueprint(bp, ctx = {}) {
         choices: ["아니요, 만들기만 합니다", "네, 바깥으로 나갑니다"],
       });
     }
+    if (step.kind != null && !["agent", "code", "runGraph"].includes(step.kind)) {
+      push(`${at}의 실행 종류(kind) 형식이 올바르지 않습니다.`);
+    }
     // ★부를 자동화는 실재해야 한다(데스크탑 shared/graph-blueprint.ts와 같은 규칙). 이름이
     //   아니라 id로 가리키는 이유도 같다 — 이름은 바뀌고 지어낸 id는 실행에서 죽는다.
     //   목록을 모르는 호출부에서는 형식만 본다(ctx.knownGraphs 없으면 건너뜀).
     if (step.kind === "runGraph") {
-      const ref = String(step.graphRef || "").trim();
+      const ref = typeof step.graphRef === "string" ? step.graphRef.trim() : "";
       if (!ref) {
         push(`${at}가 어느 자동화를 부를지 정하지 않았습니다.`);
       } else if (ctx.selfId && ref === ctx.selfId) {
@@ -388,7 +412,9 @@ function validateBlueprint(bp, ctx = {}) {
     // ★코드 스텝은 스크립트가 있어야 한다. 없으면 "코드로 하겠다"고 해 놓고 빈 채로 저장돼
     //   실행에서 CODE_NODE_EMPTY로 죽는다(데스크탑과 같은 규칙, 저작 시점에 막는다).
     if (step.kind === "code") {
-      if (!String(step.code || "").trim()) {
+      if (typeof step.code !== "string") {
+        push(`${at}의 코드(code) 형식이 올바르지 않습니다.`);
+      } else if (!step.code.trim()) {
         push(`${at}는 코드로 실행한다고 했는데 스크립트가 비어 있습니다.`, {
           id: `step-${index}-code`,
           question: `"${step.title || at}" 단계에서 무엇을 계산·가공하나요? (AI가 스크립트를 채웁니다)`,
@@ -398,8 +424,19 @@ function validateBlueprint(bp, ctx = {}) {
       if (step.codeLang && step.codeLang !== "python" && step.codeLang !== "js") {
         push(`${at}의 코드 언어 "${step.codeLang}"을(를) 이 제품이 모릅니다(python 또는 js).`);
       }
+      if (step.packages != null && !Array.isArray(step.packages)) {
+        push(`${at}의 코드 패키지 목록(packages) 형식이 올바르지 않습니다.`);
+      } else if (Array.isArray(step.packages) && step.packages.some((value) => typeof value !== "string" || !value.trim())) {
+        push(`${at}의 코드 패키지 이름 하나가 올바르지 않습니다.`);
+      }
     }
-    for (const name of step.consumes || []) {
+    const consumes = Array.isArray(step.consumes) ? step.consumes : [];
+    if (step.consumes != null && !Array.isArray(step.consumes)) push(`${at}의 입력값 목록(consumes) 형식이 올바르지 않습니다.`);
+    for (const name of consumes) {
+      if (typeof name !== "string" || !VAR_RE.test(name)) {
+        push(`${at}의 입력값 이름 하나가 올바르지 않습니다.`);
+        continue;
+      }
       if (!produced.has(name)) {
         push(`${at}가 쓰는 "${name}" 값을 아무도 만들지 않습니다.`, {
           id: `step-${index}-consumes-${name}`,
@@ -409,7 +446,9 @@ function validateBlueprint(bp, ctx = {}) {
       }
     }
 
-    for (const use of step.uses || []) {
+    const uses = Array.isArray(step.uses) ? step.uses : [];
+    if (step.uses != null && !Array.isArray(step.uses)) push(`${at}의 도구 목록(uses) 형식이 올바르지 않습니다.`);
+    for (const use of uses) {
       if (!use || typeof use !== "object") { push(`${at}의 도구 선언을 읽지 못했습니다.`); continue; }
       if (!CAPABILITIES.includes(use.capability)) {
         push(`${at}가 이 제품이 모르는 도구("${use.capability}")를 쓰려고 합니다.`, {
@@ -430,15 +469,20 @@ function validateBlueprint(bp, ctx = {}) {
       }
     }
     if (step.produces) {
-      if (!VAR_RE.test(step.produces)) push(`${at}의 결과 이름 "${step.produces}"은(는) 쓸 수 없습니다.`);
+      if (typeof step.produces !== "string" || !VAR_RE.test(step.produces)) push(`${at}의 결과 이름 "${step.produces}"은(는) 쓸 수 없습니다.`);
       else produced.add(step.produces);
+    } else if (step.produces != null && typeof step.produces !== "string") {
+      push(`${at}의 결과 이름은 문자열이어야 합니다.`);
     }
+    if (step.role != null && typeof step.role !== "string") push(`${at}의 역할(role) 형식이 올바르지 않습니다.`);
+    if (step.roleEn != null && typeof step.roleEn !== "string") push(`${at}의 영어 역할(roleEn) 형식이 올바르지 않습니다.`);
   });
 
 
   // 검증 단계
   const checkVerdicts = new Set();
-  for (const check of bp.checks || []) {
+  for (const check of checks) {
+    if (!check || typeof check !== "object") { push("검증 항목 하나의 형식이 올바르지 않습니다."); continue; }
     const at = `${(check.afterStep ?? 0) + 1}번째 단계 뒤의 검증`;
     if (!steps[check.afterStep]) { push(`${at}가 없는 단계를 가리킵니다.`); continue; }
     if (!check.subject || !produced.has(check.subject)) {
@@ -478,7 +522,10 @@ function validateBlueprint(bp, ctx = {}) {
    */
   {
     const checkedSubjects = new Set(
-      (bp.checks || []).map((check) => (check.subject || "").trim()).filter(Boolean),
+      checks
+        .filter((check) => check && typeof check === "object")
+        .map((check) => String(check.subject || "").trim())
+        .filter(Boolean),
     );
     steps.forEach((step, index) => {
       if (step.effect !== "mutation") return;
@@ -514,8 +561,9 @@ function validateBlueprint(bp, ctx = {}) {
    */
   {
     const resultChecks = new Map();
-    for (const check of bp.checks || []) {
-      const subj = (check.subject || "").trim();
+    for (const check of checks) {
+      if (!check || typeof check !== "object") continue;
+      const subj = String(check.subject || "").trim();
       if (subj) resultChecks.set(subj, check);
     }
     steps.forEach((step, index) => {
@@ -552,7 +600,8 @@ function validateBlueprint(bp, ctx = {}) {
   }
 
   // 반복이 있는데 검증이 없으면 "마음에 들 때까지"를 글자 찾기로 흉내 내게 된다(실측).
-  for (const branch of bp.branches || []) {
+  for (const branch of branches) {
+    if (!branch || typeof branch !== "object") { push("갈림길 항목 하나의 형식이 올바르지 않습니다."); continue; }
     if (branch.repeatStep === undefined) continue;
     if (!checkVerdicts.has(branch.var)) {
       push(`${(branch.afterStep ?? 0) + 1}번째 단계 뒤의 반복이 검증 결과가 아니라 "${branch.var}"의 내용을 보고 돌지 말지 정합니다.`, {
@@ -569,15 +618,16 @@ function validateBlueprint(bp, ctx = {}) {
    *   정본은 데스크탑 shared/graph-blueprint.ts — 이 파일은 손복사본이고 패리티 게이트가 지킨다.
    */
   const emptinessTestedVars = new Set(
-    (bp.branches || [])
-      .filter((branch) => branch.op === "truthy" || branch.op === "falsy")
+    branches
+      .filter((branch) => branch && typeof branch === "object" && (branch.op === "truthy" || branch.op === "falsy"))
       .map((branch) => String(branch.var || "").trim())
       .filter(Boolean),
   );
-  for (const check of bp.checks || []) {
+  for (const check of checks) {
+    if (!check || typeof check !== "object") continue;
     const subject = String(check.subject || "").trim();
     if (!subject || !emptinessTestedVars.has(subject)) continue;
-    const branch = (bp.branches || []).find((b) => String(b.var || "").trim() === subject);
+    const branch = branches.find((b) => b && typeof b === "object" && String(b.var || "").trim() === subject);
     if (!branch) continue;
     // 위치를 본다 — 갈림길 뒤 값-있는 쪽의 검증은 비는 날 아예 안 돌므로 문제가 아니다.
     const at = typeof check.afterStep === "number" ? check.afterStep : -1;
@@ -599,7 +649,8 @@ function validateBlueprint(bp, ctx = {}) {
     );
   }
 
-  for (const branch of bp.branches || []) {
+  for (const branch of branches) {
+    if (!branch || typeof branch !== "object") continue;
     const at = `${(branch.afterStep ?? 0) + 1}번째 단계 뒤의 갈림길`;
     if (!steps[branch.afterStep]) { push(`${at}가 없는 단계를 가리킵니다.`); continue; }
     if (!OPS.has(branch.op)) { push(`${at}의 판단 방법을 알 수 없습니다.`); continue; }

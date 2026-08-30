@@ -29,7 +29,12 @@ function coreLine() {
   }
 }
 
-function run(ctx) {
+function run(ctx, args = []) {
+  if (args.length) {
+    const error = new Error("usage: agentlas version");
+    error.code = "INVALID_ARGUMENT";
+    throw error;
+  }
   ctx.out(`agentlas ${readVersion()}`);
   ctx.out(coreLine());
   return 0;

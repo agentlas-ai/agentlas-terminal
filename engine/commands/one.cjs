@@ -20,6 +20,7 @@
  *   agentlas one --list                One 대화 목록
  *   agentlas one --new "<프롬프트>"      새 One 대화로 시작
  *   agentlas one --chat <id> "<p>"     특정 One 대화에 이어 붙임
+ *   agentlas one -- "list 같은 옵션 모양의 프롬프트"
  *   공통: -p/--print · --runtime · --model · --effort · --permission
  */
 const readline = require("node:readline");
@@ -30,7 +31,7 @@ const { Renderer } = require("../ui/renderer.cjs");
 const permissions = require("../agentlas-permissions.cjs");
 const { EFFORTS } = require("../agentlas-workload-routing.cjs");
 const { projectCwd } = require("../project/paths.cjs");
-const { columnExists, runWriteTransaction } = require("../core/db.cjs");
+const { runWriteTransaction } = require("../core/db.cjs");
 const store = require("../sessions/store.cjs");
 
 /** 데스크탑 정본 신원(electron/architecture/manifest.ts + builtinAgentId). */
@@ -45,13 +46,8 @@ const ONE_ORIGIN_SURFACE = "one";
  * 걸러 낸다(설계). One 은 라우팅 후보가 아니라 **신원 행**이므로 직접 읽는다.
  */
 function resolveOneAgent(db) {
-  let row = null;
-  try {
-    row = db.prepare("SELECT * FROM installed_agents WHERE id=?").get(ONE_AGENT_ID)
-      || db.prepare("SELECT * FROM installed_agents WHERE slug=?").get(ONE_AGENT_SLUG);
-  } catch {
-    row = null;
-  }
+  const row = db.prepare("SELECT * FROM installed_agents WHERE id=?").get(ONE_AGENT_ID)
+    || db.prepare("SELECT * FROM installed_agents WHERE slug=?").get(ONE_AGENT_SLUG);
   return rowToAgent(row);
 }
 
@@ -78,26 +74,22 @@ function desktopOnePersona() {
 }
 
 function chatsHaveOriginSurface(db) {
-  return columnExists(db, "chats", "origin_surface");
+  return db.prepare("PRAGMA table_info(chats)").all().some((column) => column.name === "origin_surface");
 }
 
 /** One 소유 대화 목록(최근 순). origin_surface 열이 없는 구형 DB 는 에이전트 소유로 폴백. */
 function listOneChats(db, limit = 20) {
   const bounded = Math.max(1, Math.min(Number(limit) || 20, 200));
-  try {
-    if (chatsHaveOriginSurface(db)) {
-      return db.prepare(
-        "SELECT id, title, updated_at, origin_surface FROM chats " +
-        "WHERE origin_surface = ? ORDER BY updated_at DESC, rowid DESC LIMIT ?",
-      ).all(ONE_ORIGIN_SURFACE, bounded);
-    }
+  if (chatsHaveOriginSurface(db)) {
     return db.prepare(
-      "SELECT id, title, updated_at FROM chats WHERE agent_id IN (?, ?) AND (kind IS NULL OR kind <> 'division') " +
-      "ORDER BY updated_at DESC, rowid DESC LIMIT ?",
-    ).all(ONE_AGENT_ID, ONE_AGENT_SLUG, bounded);
-  } catch {
-    return [];
+      "SELECT id, title, updated_at, origin_surface FROM chats " +
+      "WHERE origin_surface = ? ORDER BY updated_at DESC, rowid DESC LIMIT ?",
+    ).all(ONE_ORIGIN_SURFACE, bounded);
   }
+  return db.prepare(
+    "SELECT id, title, updated_at FROM chats WHERE agent_id IN (?, ?) AND (kind IS NULL OR kind <> 'division') " +
+    "ORDER BY updated_at DESC, rowid DESC LIMIT ?",
+  ).all(ONE_AGENT_ID, ONE_AGENT_SLUG, bounded);
 }
 
 /**
@@ -121,18 +113,47 @@ function createOneChat(db, { agentId, title, workingFolder }) {
 }
 
 function parseArgs(args) {
-  const out = { print: false, list: false, fresh: false, chatId: null, runtime: null, model: null, effort: null, permission: null, rest: [] };
+  const out = { print: false, list: false, fresh: false, chatId: null, runtime: null, model: null, effort: null, permission: null, rest: [], error: null };
+  const readValue = (index, flag) => {
+    const value = args[index + 1];
+    if (typeof value !== "string" || !value || value === "--" || value.startsWith("--")) {
+      out.error = `${flag} requires a value`;
+      return null;
+    }
+    return value;
+  };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
+    if (a === "--") {
+      out.rest.push(...args.slice(i + 1));
+      break;
+    }
     if (a === "-p" || a === "--print") out.print = true;
-    else if (a === "--list" || a === "list") out.list = true;
-    else if (a === "--new" || a === "new") out.fresh = true;
-    else if (a === "--chat") out.chatId = args[++i];
-    else if (a === "--runtime") out.runtime = args[++i];
-    else if (a === "--model") out.model = args[++i];
-    else if (a === "--effort") out.effort = args[++i];
-    else if (a === "--permission") out.permission = args[++i];
+    else if (a === "--list") out.list = true;
+    else if (a === "--new") out.fresh = true;
+    else if (["--chat", "--runtime", "--model", "--effort", "--permission"].includes(a)) {
+      const value = readValue(i, a);
+      if (value === null) break;
+      if (a === "--chat") out.chatId = value;
+      else if (a === "--runtime") out.runtime = value;
+      else if (a === "--model") out.model = value;
+      else if (a === "--effort") out.effort = value;
+      else out.permission = value;
+      i += 1;
+    }
+    else if (a.startsWith("-")) {
+      out.error = `unknown option ${a}`;
+      break;
+    }
     else out.rest.push(a);
+  }
+  if (!out.error && out.list && (
+    out.fresh || out.chatId || out.runtime || out.model || out.effort || out.permission || out.rest.length > 0
+  )) {
+    out.error = "--list cannot be combined with a prompt or execution options";
+  }
+  if (!out.error && out.fresh && out.chatId) {
+    out.error = "--new cannot be combined with --chat";
   }
   return out;
 }
@@ -153,6 +174,10 @@ function renderList(ctx, rows) {
 
 async function runOne(ctx, args) {
   const parsed = parseArgs(args);
+  if (parsed.error) {
+    ctx.err(`invalid one arguments: ${parsed.error}`);
+    return 1;
+  }
   if (parsed.permission && !permissions.LEVELS.includes(String(parsed.permission))) {
     ctx.err(`unknown --permission ${parsed.permission} (use: ${permissions.LEVELS.join(" | ")})`);
     return 1;
@@ -163,12 +188,29 @@ async function runOne(ctx, args) {
   }
 
   const db = ctx.db();
+  const readChats = (limit) => {
+    try {
+      return listOneChats(db, limit);
+    } catch (error) {
+      ctx.err(`Could not read One conversations: ${String((error && error.message) || error)}`);
+      return null;
+    }
+  };
 
   // 목록은 신원 행이 없어도 답할 수 있어야 한다 — 대화는 chats 에 있고, One 행은
   // 실행에만 필요하다. 조회를 실행 전제조건 뒤에 두면 "볼 수도 없는" 화면이 된다.
-  if (parsed.list) return renderList(ctx, listOneChats(db, 20));
+  if (parsed.list) {
+    const rows = readChats(20);
+    return rows ? renderList(ctx, rows) : 1;
+  }
 
-  const agent = resolveOneAgent(db);
+  let agent;
+  try {
+    agent = resolveOneAgent(db);
+  } catch (error) {
+    ctx.err(`Could not read the Agentlas One identity: ${String((error && error.message) || error)}`);
+    return 1;
+  }
   if (!agent) {
     ctx.err(
       "Agentlas One is not present in the shared database yet.\n" +
@@ -212,14 +254,17 @@ async function runOne(ctx, args) {
   let chatId = null;
   let created = false;
   if (parsed.chatId) {
-    const row = listOneChats(db, 200).find((item) => item.id === parsed.chatId);
+    const rows = readChats(200);
+    if (!rows) return 1;
+    const row = rows.find((item) => item.id === parsed.chatId);
     if (!row) {
       ctx.err(`No One conversation with id ${parsed.chatId} (see: agentlas one --list)`);
       return 1;
     }
     chatId = row.id;
   } else if (!parsed.fresh) {
-    const recent = listOneChats(db, 1);
+    const recent = readChats(1);
+    if (!recent) return 1;
     if (recent.length) chatId = recent[0].id;
   }
   if (!chatId) {

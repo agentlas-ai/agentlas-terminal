@@ -13,6 +13,7 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { userDataDir: defaultUserDataDir } = require("../core/paths.cjs");
 const {
   hasSensitiveRuntimeArgument,
   mcpRuntimeHome,
@@ -39,6 +40,10 @@ const TOKEN_BUDGET = Object.freeze({
   experienceRetrievalMaxTokens: 800,
   experienceRetrievalMaxItems: 8,
 });
+
+function resolvedMcpUserDataDir(value) {
+  return typeof value === "string" && value.trim() ? value : defaultUserDataDir();
+}
 
 const MCP_REQUIREMENT_REQUIRED = [
   "schemaVersion", "kind", "requirementId", "catalogId", "reason", "capabilities",
@@ -144,8 +149,12 @@ function validateMcpPolicy(value) {
 
 function loadProjectMcpPolicy(cwd) {
   const file = path.join(cwd || process.cwd(), ".agentlas", "mcp-policy.json");
-  if (!fs.existsSync(file)) return null;
-  const { value } = readJsonFile(file, "MCP policy");
+  let value;
+  try { ({ value } = readJsonFile(file, "MCP policy")); }
+  catch (error) {
+    if (error && error.code === "ENOENT") return null;
+    throw error;
+  }
   return validateMcpPolicy(value);
 }
 
@@ -154,9 +163,10 @@ function loadProjectMcpPolicy(cwd) {
  * 소스: 프로세스 env + userData/credentials.env + ~/.agentlas/credentials.env.
  */
 function readCredentialNames(userDataDir, env = process.env) {
+  const resolvedUserDataDir = resolvedMcpUserDataDir(userDataDir);
   const names = new Set(Object.keys(env || {}).filter((key) => ENV_RE.test(key) && env[key]));
   const files = [
-    path.join(userDataDir, "credentials.env"),
+    path.join(resolvedUserDataDir, "credentials.env"),
     path.join(os.homedir(), ".agentlas", "credentials.env"),
   ];
   for (const file of files) {
@@ -193,7 +203,7 @@ function collectSystemMcpInventory(db, options = {}) {
     rows = [];
     registryStatus = "unavailable";
   }
-  const credentialNames = readCredentialNames(options.userDataDir || "", options.env || process.env);
+  const credentialNames = readCredentialNames(options.userDataDir, options.env || process.env);
   const inventory = [];
   const seen = new Set();
   for (const row of rows) {
@@ -279,7 +289,7 @@ function materializeTrustedSystemMcpServer(row, options = {}) {
   });
   if (options.createRuntimeHome !== false) {
     Object.defineProperty(server, "mcpRuntimeHome", {
-      value: mcpRuntimeHome(options.userDataDir, `${catalogId}\u0000${row.id}`),
+      value: mcpRuntimeHome(resolvedMcpUserDataDir(options.userDataDir), `${catalogId}\u0000${row.id}`),
       enumerable: false,
     });
   }

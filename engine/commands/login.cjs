@@ -9,6 +9,11 @@ const auth = require("../cloud/auth.cjs");
 
 async function run(ctx, args = []) {
   const ko = ctx.lang === "ko";
+  if (args.some((arg) => arg !== "--force") || args.filter((arg) => arg === "--force").length > 1) {
+    const error = new Error("usage: agentlas login [--force]");
+    error.code = "INVALID_ARGUMENT";
+    throw error;
+  }
   const force = args.includes("--force");
   if (!force) {
     const existing = auth.cloudSessionCookie();

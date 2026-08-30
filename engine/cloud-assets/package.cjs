@@ -52,6 +52,7 @@ const cas = require("./cas.cjs");
 // 터미널 업로드가 그 파일들을 아예 열지 않았다.
 const CLOUD_TEXT_EXTS = new Set(SECRET_SCAN_TEXT_EXTENSIONS);
 const CLOUD_AGENT_FILES = new Set(UPLOAD_AGENT_DEFINITION_FILES);
+const CLOUD_AGENT_FILE_KEYS = new Set([...CLOUD_AGENT_FILES].map((name) => name.toLowerCase()));
 const CLOUD_SKIP_DIRS = new Set(UPLOAD_SKIP_DIRECTORIES);
 const CLOUD_BLOCKED_FILE_RE = [/^\.env(?:\..*)?$/i, /^id_rsa(?:\.pub)?$/i, /^credentials(?:\..*)?$/i, /^secrets?(?:\..*)?$/i, /^cloud-asset-state\.v1\.json$/i, /(?:^|[._-])service-account(?:[._-]|$)/i, /\.(?:key|pem|p12|pfx|mobileprovision)$/i];
 const CLOUD_ROUTING_CARD_PATH = ".agentlas/routing-card.json";
@@ -385,7 +386,11 @@ const CLOUD_BULK_DATA_RE = /\.(log|jsonl|csv|tsv|lock)$/;
 function cloudTrimRank(rel, bytes) {
   const lower = String(rel || "").toLowerCase();
   const base = lower.split("/").pop() || lower;
-  if (CLOUD_AGENT_FILES.has(base)) return 0;
+  // The generated catalog intentionally carries case-distinct root names
+  // (`AGENTS.md`, `AGENT.md`, `agent.md`).  Ranking lower-cases paths, so the
+  // lookup must lower-case the catalog as well.  Otherwise a package at the
+  // byte limit can evict AGENTS.md while retaining an unrelated cache file.
+  if (CLOUD_AGENT_FILE_KEYS.has(base)) return 0;
   if (lower.startsWith(".agentlas/")) return 0;
   if (base === "agentlas.json" || base === "manifest.json" || base === "package.json") return 0;
   if (CLOUD_CAPABILITY_DIR_RE.test(lower)) return 0;
@@ -427,13 +432,16 @@ function scanCloudFolder(rootPath) {
     let freed = 0;
     while (totalBytes - freed + needBytes > CLOUD_MAX_TOTAL_BYTES) {
       let victimIndex = -1;
-      let victimRank = 0;
+      let victimRank = Number.POSITIVE_INFINITY;
       let victimBytes = -1;
       for (let index = 0; index < included.length; index += 1) {
         const candidate = included[index];
         const rank = cloudTrimRank(candidate.path, candidate.bytes);
         if (rank === 0) continue;
-        if (rank > victimRank || (rank === victimRank && candidate.bytes > victimBytes)) {
+        // Rank 1 is disposable build/cache output; larger numbers are closer
+        // to ordinary authored content.  Desktop's canonical trimmer removes
+        // the smallest positive rank first, then the largest file in that tier.
+        if (rank < victimRank || (rank === victimRank && candidate.bytes > victimBytes)) {
           victimIndex = index;
           victimRank = rank;
           victimBytes = candidate.bytes;
@@ -707,6 +715,60 @@ function scanCloudFolder(rootPath) {
   files.sort(cloudCodePointPathOrder);
   omissions.sort(cloudCodePointPathOrder);
   return { files, included, findings, omissions, totalBytes, localPackageMarker };
+}
+
+/**
+ * Generated metadata is added after the stable source scan.  Re-apply the
+ * public package limits at that exact boundary so injecting agentlas.json (or
+ * replacing a redacted public card) cannot turn a valid 400-file scan into a
+ * 401-file bundle that the server will reject.
+ */
+function cloudFitGeneratedMetadataToLimits(scan) {
+  const removeVictim = () => {
+    let victimIndex = -1;
+    let victimRank = Number.POSITIVE_INFINITY;
+    let victimBytes = -1;
+    for (let index = 0; index < scan.included.length; index += 1) {
+      const candidate = scan.included[index];
+      const rank = cloudTrimRank(candidate.path, candidate.bytes);
+      if (rank === 0) continue;
+      if (rank < victimRank || (rank === victimRank && candidate.bytes > victimBytes)) {
+        victimIndex = index;
+        victimRank = rank;
+        victimBytes = candidate.bytes;
+      }
+    }
+    if (victimIndex < 0) return false;
+    const victim = scan.included.splice(victimIndex, 1)[0];
+    scan.omissions.push({
+      path: victim.path,
+      reason: "trimmed-for-package-limits",
+      sourceBytes: victim.bytes,
+      sourceSha256: victim.sha256,
+      sourceHashKind: "content",
+    });
+    const record = scan.files.find((item) => item.path === victim.path && item.included);
+    if (record) {
+      record.included = false;
+      record.reason = "trimmed-for-package-limits";
+    }
+    return true;
+  };
+
+  scan.totalBytes = scan.included.reduce((sum, file) => sum + file.bytes, 0);
+  while (scan.included.length > CLOUD_MAX_FILES || scan.totalBytes > CLOUD_MAX_TOTAL_BYTES) {
+    if (!removeVictim()) {
+      const error = new Error(
+        "Agent Cloud package cannot fit required agent metadata within the package limits. " +
+        "Reduce the number or size of capability files and retry.",
+      );
+      error.code = "AGENTLAS_CLOUD_PACKAGE_LIMITS";
+      throw error;
+    }
+    scan.totalBytes = scan.included.reduce((sum, file) => sum + file.bytes, 0);
+  }
+  scan.included.sort(cloudCodePointPathOrder);
+  scan.omissions.sort(cloudCodePointPathOrder);
 }
 
 function cloudOmissionReceipt(omissions) {
@@ -1074,6 +1136,7 @@ async function packageCloudAgent(db, root, opts = {}) {
   }
   // 신원은 해시 계산 전에 채운다 — 클라우드 해시는 agentlas.json 을 포함한다.
   cloudEnsureAgentIdentity(scan, snapshot, rootPath.split("/").pop());
+  cloudFitGeneratedMetadataToLimits(scan);
   snapshot = cloudPackageSnapshot(scan.included);
   const routingCard = isPublicHubPublish ? readCloudRoutingCard(snapshot) : {};
   if (routingCard.finding) scan.findings.push(routingCard.finding);

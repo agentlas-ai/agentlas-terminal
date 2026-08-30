@@ -9,9 +9,11 @@
  */
 const path = require("node:path");
 const fs = require("node:fs");
+const crypto = require("node:crypto");
 const { spawnSync } = require("node:child_process");
 
 const PERM_RANK = { read: 0, write: 1, full: 2 };
+const MAX_TEXT_FILE_BYTES = 8 * 1024 * 1024;
 
 function pathDenied(reason) {
   throw new Error(`workspace path denied: ${reason}`);
@@ -126,9 +128,12 @@ function openRegularFile(file, flags, mode) {
 }
 
 function readUtf8File(file) {
-  if (!fs.statSync(file).isFile()) pathDenied("only regular files may be read");
   const fd = openRegularFile(file, fs.constants.O_RDONLY);
   try {
+    const stat = fs.fstatSync(fd);
+    if (stat.size > MAX_TEXT_FILE_BYTES) {
+      throw new Error(`text file exceeds ${MAX_TEXT_FILE_BYTES} byte limit`);
+    }
     return fs.readFileSync(fd, "utf8");
   } finally {
     fs.closeSync(fd);
@@ -136,6 +141,11 @@ function readUtf8File(file) {
 }
 
 function writeUtf8File(file, content) {
+  if (typeof content !== "string") throw new Error("content must be a string");
+  const contentBytes = Buffer.byteLength(content, "utf8");
+  if (contentBytes > MAX_TEXT_FILE_BYTES) {
+    throw new Error(`text content exceeds ${MAX_TEXT_FILE_BYTES} byte limit`);
+  }
   // Replace through a fresh inode instead of truncating an existing one. If the
   // workspace entry is a hard link to a file elsewhere, this updates only the
   // workspace path and cannot mutate the other link's inode.
@@ -218,6 +228,12 @@ const TOOLS = [
     },
     run(args, ctx) {
       const file = resolveExistingIn(ctx.cwd, args.path);
+      if (args.offset != null && (!Number.isInteger(args.offset) || args.offset < 1)) {
+        throw new Error("offset must be a positive integer");
+      }
+      if (args.limit != null && (!Number.isInteger(args.limit) || args.limit < 1)) {
+        throw new Error("limit must be a positive integer");
+      }
       let content = readUtf8File(file);
       if (args.offset || args.limit) {
         const lines = content.split("\n");
@@ -344,16 +360,17 @@ function toolAskFor(tool, args) {
 function runTool(name, args, ctx) {
   const tool = BY_NAME[name];
   if (!tool) return { ok: false, content: `unknown tool: ${name}` };
+  const context = ctx && typeof ctx === "object" ? ctx : {};
   const ask = toolAskFor(tool, args);
   let ruled = null;
-  if (ctx && ctx.db) {
+  if (context.db) {
     try {
       const permissions = require("./agentlas-permissions.cjs");
-      const verdict = permissions.decideCapability(ctx.db, {
+      const verdict = permissions.decideCapability(context.db, {
         ...ask,
-        permission: ctx.permission,
-        agentId: ctx.agentId,
-        chatId: ctx.chatId,
+        permission: context.permission,
+        agentId: context.agentId,
+        chatId: context.chatId,
       });
       ruled = verdict.ruled;
       if (ruled === "deny") {
@@ -369,15 +386,15 @@ function runTool(name, args, ctx) {
       ruled = null;
     }
   }
-  const rank = PERM_RANK[ctx.permission] ?? 0;
+  const rank = PERM_RANK[context.permission] ?? 0;
   if (ruled !== "allow" && (PERM_RANK[tool.minPerm] ?? 0) > rank) {
     return {
       ok: false,
-      content: `permission denied: '${name}' requires '${tool.minPerm}' but current is '${ctx.permission}'. Ask the user to run /permission ${tool.minPerm}.`,
+      content: `permission denied: '${name}' requires '${tool.minPerm}' but current is '${context.permission || "read"}'. Ask the user to run /permission ${tool.minPerm}.`,
     };
   }
   try {
-    return { ok: true, content: String(tool.run(args || {}, ctx)) };
+    return { ok: true, content: String(tool.run(args || {}, context)) };
   } catch (e) {
     return { ok: false, content: `${name} error: ${e && e.message ? e.message : String(e)}` };
   }
@@ -398,4 +415,14 @@ function openaiTools(permission) {
   }));
 }
 
-module.exports = { TOOLS, BY_NAME, allowedTools, runTool, anthropicTools, openaiTools, PERM_RANK, toolAskFor };
+module.exports = {
+  TOOLS,
+  BY_NAME,
+  allowedTools,
+  runTool,
+  anthropicTools,
+  openaiTools,
+  PERM_RANK,
+  MAX_TEXT_FILE_BYTES,
+  toolAskFor,
+};

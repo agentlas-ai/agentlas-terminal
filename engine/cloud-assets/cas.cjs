@@ -224,18 +224,27 @@ async function deleteCloudAgent(slug, options = {}) {
   ) {
     throw new Error("Agentlas Cloud delete returned an invalid or mismatched deletion receipt.");
   }
-  const stateValue = state.readCloudAssetState();
   const key = state.cloudDescriptorKey(descriptor);
-  const roots = stateValue.assets[key]?.sourceRoots || [];
+  // The server delete used this exact observed descriptor. Keep its roots even
+  // if another local process advances the same key before the local journal
+  // update; tombstones authenticate the deleted revision, not a later one.
+  const roots = [...(localEntry.sourceRoots || [])];
   const warnings = [];
-  for (const rootPath of roots) {
-    // 톰스톤: 삭제된 베이스는 재저장 시 절대 If-Match 베이스로 재사용되지 않는다.
-    stateValue.deletedBases.push({ rootPath, slug: descriptor.slug, scope: descriptor.scope, cloudId: descriptor.cloudId, revision: descriptor.revision });
-  }
-  delete stateValue.assets[key];
-  stateValue.deletedBases = stateValue.deletedBases.slice(-256);
   try {
-    state.writeCloudAssetState(stateValue);
+    state.updateCloudAssetState((stateValue) => {
+      for (const rootPath of roots) {
+        // 톰스톤: 삭제된 베이스는 재저장 시 절대 If-Match 베이스로 재사용되지 않는다.
+        stateValue.deletedBases.push({ rootPath, slug: descriptor.slug, scope: descriptor.scope, cloudId: descriptor.cloudId, revision: descriptor.revision });
+      }
+      const current = stateValue.assets[key];
+      if (
+        current && current.descriptor.cloudId === descriptor.cloudId &&
+        current.descriptor.revision === descriptor.revision
+      ) {
+        delete stateValue.assets[key];
+      }
+      stateValue.deletedBases = stateValue.deletedBases.slice(-256);
+    });
   } catch (error) {
     const stateError = new Error(
       `Cloud delete committed on the server, but this machine could not persist the deletion tombstone. ` +

@@ -13,23 +13,25 @@
  *  - 상태 파일은 <userData>/terminal/experience-intents-v1.json — v1과 동일
  *    포맷/경로. 쓰기는 0600 원자적 쓰기(임시파일+rename)만 사용한다.
  *
- * 검증 프리미티브(assert 계열, UNSAFE_TEXT_PATTERNS)는 engine/mcp/contract.cjs에도
- * 존재하지만, 의도 저장소는 mcp 서브시스템 변경과 독립적으로 보안 경계를
- * 유지해야 하므로 v1 원문을 여기 동결한다(우연한 규칙 완화 전파 방지).
+ * 검증 프리미티브(assert 계열, UNSAFE_TEXT_PATTERNS)는 MCP 계약과 분리해
+ * v1 원문을 여기 동결한다(우연한 규칙 완화 전파 방지). 파일 I/O와 lock은
+ * engine/mcp/contract.cjs의 공통 hardened primitive를 사용한다.
  */
 
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
+const {
+  readJsonFile,
+  writePrivateJsonAtomic,
+  withPrivateStateLock,
+} = require("../mcp/contract.cjs");
 
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{2,255}$/;
 const HASH_RE = /^sha256:[0-9a-f]{64}$/;
 const ENV_RE = /^[A-Z][A-Z0-9_]*$/;
 const EXPERIENCE_STATE_SCHEMA = "agentlas.terminal-experience-intents.v1";
 const EXPERIENCE_INTENT_SCHEMA = "agentlas.terminal-experience-intent.v1";
-const MAX_JSON_BYTES = 2 * 1024 * 1024;
-const EXPERIENCE_LOCK_STALE_MS = 30_000;
-const EXPERIENCE_LOCK_WAIT_MS = 2_000;
 
 const EXPERIENCE_PACK_REQUIRED = [
   "schemaVersion", "kind", "experiencePackId", "releaseId", "ownerRef", "version",
@@ -199,75 +201,15 @@ function validateExperiencePack(value) {
   return value;
 }
 
-function readJsonFile(filePath, label) {
-  const absolute = path.resolve(filePath);
-  const stat = fs.lstatSync(absolute);
-  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`${label} must be a regular file (symlinks are not accepted)`);
-  if (stat.size <= 0 || stat.size > MAX_JSON_BYTES) throw new Error(`${label} has an invalid size`);
-  let value;
-  try { value = JSON.parse(fs.readFileSync(absolute, "utf8")); } catch (error) { throw new Error(`${label} is not valid JSON: ${error.message}`); }
-  return { absolute, value };
-}
-
-function writePrivateJsonAtomic(filePath, value) {
-  const dir = path.dirname(filePath);
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  try { fs.chmodSync(dir, 0o700); } catch { /* best effort */ }
-  const temp = path.join(dir, `.${path.basename(filePath)}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`);
-  try {
-    fs.writeFileSync(temp, JSON.stringify(value, null, 2) + "\n", { encoding: "utf8", mode: 0o600, flag: "wx" });
-    fs.renameSync(temp, filePath);
-    try { fs.chmodSync(filePath, 0o600); } catch { /* best effort */ }
-  } finally {
-    try { fs.rmSync(temp, { force: true }); } catch { /* noop */ }
-  }
-}
-
 function experienceStatePath(userDataDir) {
   return path.join(userDataDir, "terminal", "experience-intents-v1.json");
 }
 
-function waitSync(milliseconds) {
-  // Atomics.wait은 지원 Node 20+에서 스핀 없이 대기하는 유일한 동기 sleep이다.
-  const signal = new Int32Array(new SharedArrayBuffer(4));
-  Atomics.wait(signal, 0, 0, milliseconds);
-}
-
 function withExperienceStateLock(userDataDir, action) {
-  const stateFile = experienceStatePath(userDataDir);
-  const dir = path.dirname(stateFile);
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  try { fs.chmodSync(dir, 0o700); } catch { /* best effort */ }
-  const lockFile = `${stateFile}.lock`;
-  const deadline = Date.now() + EXPERIENCE_LOCK_WAIT_MS;
-  let descriptor = null;
-  while (descriptor == null) {
-    try {
-      descriptor = fs.openSync(lockFile, "wx", 0o600);
-      fs.writeFileSync(descriptor, `${process.pid}\n${new Date().toISOString()}\n`, "utf8");
-    } catch (error) {
-      if (!error || error.code !== "EEXIST") throw error;
-      try {
-        const stat = fs.lstatSync(lockFile);
-        if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Terminal experience lock is unsafe");
-        if (Date.now() - stat.mtimeMs > EXPERIENCE_LOCK_STALE_MS) {
-          fs.unlinkSync(lockFile);
-          continue;
-        }
-      } catch (statError) {
-        if (statError && statError.code === "ENOENT") continue;
-        throw statError;
-      }
-      if (Date.now() >= deadline) throw new Error("Terminal experience state is busy; retry the command");
-      waitSync(25);
-    }
-  }
-  try {
-    return action();
-  } finally {
-    try { fs.closeSync(descriptor); } catch { /* noop */ }
-    try { fs.unlinkSync(lockFile); } catch { /* crash recovery handles leftovers */ }
-  }
+  return withPrivateStateLock(experienceStatePath(userDataDir), {
+    unsafe: "Terminal experience lock is unsafe",
+    busy: "Terminal experience state is busy; retry the command",
+  }, action);
 }
 
 function emptyExperienceState() {
@@ -276,10 +218,12 @@ function emptyExperienceState() {
 
 function loadExperienceState(userDataDir) {
   const file = experienceStatePath(userDataDir);
-  if (!fs.existsSync(file)) return emptyExperienceState();
-  const stat = fs.lstatSync(file);
-  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_JSON_BYTES) throw new Error("Terminal experience state is unsafe or too large");
-  const state = JSON.parse(fs.readFileSync(file, "utf8"));
+  let state;
+  try { ({ value: state } = readJsonFile(file, "Terminal experience state")); }
+  catch (error) {
+    if (error && error.code === "ENOENT") return emptyExperienceState();
+    throw error;
+  }
   assertExactKeys(state, new Set(["schemaVersion", "updatedAt", "intents"]), ["schemaVersion", "updatedAt", "intents"], "Terminal experience state");
   if (state.schemaVersion !== EXPERIENCE_STATE_SCHEMA || !Array.isArray(state.intents)) throw new Error("Terminal experience state schema is invalid");
   assertIsoDateOrNull(state.updatedAt, "Terminal experience state.updatedAt");
@@ -336,16 +280,16 @@ function publicExperienceIntent(intent) {
 
 function parseSimpleFlags(args) {
   const flags = { _: [] };
+  let passthrough = false;
   for (let index = 0; index < args.length; index += 1) {
     const token = String(args[index]);
-    if (token === "--json") flags.json = true;
-    else if (token.startsWith("--") && token.includes("=")) {
-      const at = token.indexOf("=");
-      flags[token.slice(2, at)] = token.slice(at + 1);
+    if (passthrough) { flags._.push(token); continue; }
+    if (token === "--") { passthrough = true; continue; }
+    if (token === "--json") {
+      if (flags.json === true) throw new Error("duplicate option: --json");
+      flags.json = true;
     } else if (token.startsWith("--")) {
-      const key = token.slice(2);
-      if (index + 1 < args.length && !String(args[index + 1]).startsWith("--")) flags[key] = String(args[++index]);
-      else flags[key] = true;
+      throw new Error(`unknown option: ${token}`);
     } else flags._.push(token);
   }
   return flags;
@@ -428,13 +372,14 @@ function cmdExperience(options) {
   const userData = options.userDataDir;
   if (!userData) throw new Error("Terminal userData path is required");
   if (sub === "list" || sub === "ls") {
+    if (flags._.length) throw new Error("usage: agentlas experience legacy-list [--json]");
     const list = loadExperienceState(userData).intents.map(publicExperienceIntent);
     emit(flags.json ? JSON.stringify({ localOnly: true, hubPublicationAttempted: false, intents: list }, null, 2) : renderExperienceList(list));
     return list;
   }
   if (sub === "inspect" || sub === "show") {
     const ref = flags._[0];
-    if (!ref) throw new Error("usage: agentlas experience inspect <pack-id|release-id|intent-id>");
+    if (!ref || flags._.length !== 1) throw new Error("usage: agentlas experience legacy-inspect <pack-id|release-id|intent-id> [--json]");
     const intent = findIntent(loadExperienceState(userData), ref);
     if (!intent) throw new Error(`local Experience Pack intent not found: ${ref}`);
     const projected = publicExperienceIntent(intent);
@@ -448,6 +393,7 @@ function cmdExperience(options) {
     return projected;
   }
   if (sub === "publish") {
+    if (flags._.length !== 1) throw new Error("usage: agentlas experience legacy-publish <experience-pack.json> [--json]");
     const intent = publishExperienceIntent(userData, flags._[0], options.cwd);
     emit(flags.json ? JSON.stringify(intent, null, 2) : [
       `Local publish intent saved: ${intent.experiencePackId}@${intent.version}`,
@@ -457,6 +403,7 @@ function cmdExperience(options) {
     return intent;
   }
   if (sub === "unpublish") {
+    if (flags._.length !== 1) throw new Error("usage: agentlas experience legacy-unpublish <pack-id|release-id|intent-id> [--json]");
     const intent = unpublishExperienceIntent(userData, flags._[0]);
     emit(flags.json ? JSON.stringify(intent, null, 2) : [
       `Local unpublish intent saved: ${intent.experiencePackId}@${intent.version}`,

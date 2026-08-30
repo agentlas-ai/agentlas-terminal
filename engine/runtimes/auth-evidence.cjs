@@ -23,13 +23,32 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
 const home = () => os.homedir();
+const MAX_AUTH_EVIDENCE_BYTES = 256 * 1024;
+const NOFOLLOW = fs.constants.O_NOFOLLOW || 0;
 
 function fileEvidence(rel, label) {
   const p = path.join(home(), ...rel);
+  let fd = null;
   try {
-    if (fs.existsSync(p) && fs.statSync(p).size > 0) return { status: "evidence", detail: label || p };
+    const before = fs.lstatSync(p);
+    if (
+      before.isSymbolicLink() || !before.isFile() || before.nlink !== 1 ||
+      before.size <= 0 || before.size > MAX_AUTH_EVIDENCE_BYTES
+    ) return null;
+    fd = fs.openSync(p, fs.constants.O_RDONLY | NOFOLLOW);
+    const after = fs.fstatSync(fd);
+    if (
+      after.isSymbolicLink() || !after.isFile() || after.nlink !== 1 ||
+      after.size <= 0 || after.size > MAX_AUTH_EVIDENCE_BYTES ||
+      after.dev !== before.dev || after.ino !== before.ino
+    ) return null;
+    return { status: "evidence", detail: label || p };
   } catch { /* unreadable == no evidence */ }
-  return null;
+  finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch { /* already closed */ }
+    }
+  }
 }
 
 function envEvidence(names) {

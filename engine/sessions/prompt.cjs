@@ -31,6 +31,63 @@ const TERMINAL_MEMORY_CORE = [
 ].join("\n");
 const MEMORY_DETAIL_RE = /\b(?:remember|memory|save this|record this|memory event)\b|기억|메모리|저장해|기록해|남겨/i;
 const CREDENTIAL_INDEX_RE = /\b(?:deploy|release|billing|auth|oauth|credential|api key|secret key|cloud)\b|배포|릴리스|출시|결제|인증|자격 증명|API\s*키|시크릿|클라우드/i;
+const PROJECT_SOUL_MAX_CHARS = 1_800;
+const ONE_STATE_MAX_CHARS = 64 * 1024;
+
+function sameFileIdentity(left, right) {
+  return left && right && String(left.dev) === String(right.dev) && String(left.ino) === String(right.ino);
+}
+
+/**
+ * Read a small local prompt file through one descriptor. The lstat/fstat
+ * identity check detects a path swap between the check and open; O_NOFOLLOW
+ * rejects symlink aliases, and the second fstat detects a concurrent rewrite.
+ * The byte cap is deliberately larger than the character cap for UTF-8 while
+ * still bounding the amount retained before decoding and slicing.
+ */
+function readBoundedText(file, maxChars) {
+  const charLimit = Math.max(0, Number(maxChars) || 0);
+  const byteLimit = Math.max(1, charLimit * 4 + 4);
+  const expected = fs.lstatSync(file);
+  if (!expected.isFile() || expected.isSymbolicLink() || expected.nlink !== 1) {
+    throw new Error(`prompt file is not a single-link regular file: ${file}`);
+  }
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
+  let fd = null;
+  try {
+    fd = fs.openSync(file, flags);
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.nlink !== 1 || !sameFileIdentity(expected, opened)) {
+      throw new Error(`prompt file identity changed before read: ${file}`);
+    }
+    const size = Number.isSafeInteger(Number(opened.size)) ? Number(opened.size) : byteLimit;
+    const readLimit = Math.min(size, byteLimit);
+    const data = Buffer.allocUnsafe(readLimit);
+    let offset = 0;
+    while (offset < readLimit) {
+      const count = fs.readSync(fd, data, offset, readLimit - offset, null);
+      if (!count) break;
+      offset += count;
+    }
+    const after = fs.fstatSync(fd);
+    const changed = !sameFileIdentity(opened, after)
+      || after.nlink !== 1
+      || Number(after.size) !== Number(opened.size)
+      || (after.mtimeNs != null && opened.mtimeNs != null
+        ? String(after.mtimeNs) !== String(opened.mtimeNs)
+        : after.mtimeMs !== opened.mtimeMs);
+    if (changed) throw new Error(`prompt file changed while reading: ${file}`);
+    const text = data.subarray(0, offset).toString("utf8");
+    return {
+      text: text.slice(0, charLimit),
+      truncated: offset < Number(opened.size) || text.length > charLimit,
+    };
+  } finally {
+    if (fd != null) {
+      try { fs.closeSync(fd); } catch { /* already closed */ }
+    }
+  }
+}
 
 function approximatePromptTokens(text) {
   return Math.ceil(Buffer.byteLength(String(text || ""), "utf8") / 3);
@@ -130,11 +187,10 @@ function cliMemoryContext(db, projectPath, agentId = null, task = "") {
   if (projectPath) {
     try {
       const soulPath = path.join(projectPath, arch.memoryDir || ".agentlas", arch.soulFile || "project-soul-memory.md");
-      if (fs.existsSync(soulPath)) {
-        let s = fs.readFileSync(soulPath, "utf8");
-        if (s.length > 1800) s = s.slice(0, 1800) + "\n…(truncated)";
-        if (s.trim()) sections.push(`### Project memory (${projectPath})\n${s.trim()}`);
-      }
+      const bounded = readBoundedText(soulPath, PROJECT_SOUL_MAX_CHARS);
+      let s = bounded.text;
+      if (bounded.truncated) s += "\n…(truncated)";
+      if (s.trim()) sections.push(`### Project memory (${projectPath})\n${s.trim()}`);
     } catch { /* ignore */ }
     const contextSlice = cliProjectContextSlice(projectPath, task);
     if (contextSlice) sections.push(contextSlice);
@@ -188,13 +244,13 @@ function loadOneDirective() {
   try {
     const root = process.env.AGENTLAS_ONE_DIR
       || require("node:path").join(require("node:os").homedir(), ".agentlas", "one");
-    const fs = require("node:fs");
     const path = require("node:path");
-    const state = JSON.parse(fs.readFileSync(path.join(root, "state.json"), "utf8"));
+    const state = JSON.parse(readBoundedText(path.join(root, "state.json"), ONE_STATE_MAX_CHARS).text);
     if (!state || state.on !== true) return "";
-    const text = fs.readFileSync(path.join(root, "directive.md"), "utf8").trim();
+    const bounded = readBoundedText(path.join(root, "directive.md"), ONE_DIRECTIVE_MAX_CHARS);
+    const text = bounded.text.trim();
     // 상한을 둔다 — 지시문이 남의 토큰 예산을 잠식하면 안 된다(메모리 예산과 같은 규칙).
-    return text.length > ONE_DIRECTIVE_MAX_CHARS ? text.slice(0, ONE_DIRECTIVE_MAX_CHARS) : text;
+    return text;
   } catch {
     return "";
   }
@@ -251,4 +307,5 @@ module.exports = {
   cliProjectContextSlice,
   augmentSystem,
   loadGlobalConnectionSkill,
+  readBoundedText,
 };

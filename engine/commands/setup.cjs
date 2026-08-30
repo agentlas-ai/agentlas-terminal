@@ -26,7 +26,12 @@ async function runWizard(ctx, rl) {
   });
 }
 
-async function run(ctx) {
+async function run(ctx, args = []) {
+  if (args.length) {
+    const error = new Error("usage: agentlas setup");
+    error.code = "INVALID_ARGUMENT";
+    throw error;
+  }
   if (!process.stdin.isTTY) {
     // 비-TTY에서 마법사를 돌리면 EOF로 이벤트 루프가 비어 exit 0으로 "조용히 성공"
     // 하는 함정이 있다 — 정직하게 거부한다.

@@ -28,13 +28,24 @@ function descriptor() {
 }
 
 async function run(ctx, args) {
-  if (args.includes("--info") || args.includes("--json")) {
+  const descriptorMode = ctx.output?.format === "json" || (args.length === 1 && ["--info", "--json"].includes(args[0]));
+  if (descriptorMode) {
+    if (args.some((arg) => !["--info", "--json"].includes(arg)) || new Set(args).size !== args.length) {
+      const error = new Error("Usage: agentlas acp [--info]");
+      error.code = "INVALID_ARGUMENT";
+      throw error;
+    }
     ctx.out(JSON.stringify(descriptor(), null, 2));
     return 0;
   }
-  if (args.includes("--help") || args.includes("help")) {
+  if (args.length === 1 && ["--help", "-h", "help"].includes(args[0])) {
     ctx.out("Usage: agentlas acp [--info]\n  Speak the Agent Client Protocol (v1) on stdio so an editor can run Agentlas as its agent.");
     return 0;
+  }
+  if (args.length) {
+    const error = new Error("Usage: agentlas acp [--info]");
+    error.code = "INVALID_ARGUMENT";
+    throw error;
   }
   // stdout is the protocol wire from here on: route everything human to stderr.
   const server = new AcpAgentServer({ ctx, input: process.stdin, output: process.stdout });

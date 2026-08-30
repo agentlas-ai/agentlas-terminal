@@ -32,7 +32,12 @@ function renderTelegram(ctx) {
   return 0;
 }
 
-function run(ctx) {
+function run(ctx, args = []) {
+  if (args.length) {
+    const error = new Error("usage: agentlas telegram");
+    error.code = "INVALID_ARGUMENT";
+    throw error;
+  }
   return renderTelegram(ctx);
 }
 

@@ -79,7 +79,7 @@ agentlas cd <agent>              # Print folder path of an agent (cd "$(agentlas
 agentlas search "<query>"        # Search Hub agents (no login required)
 agentlas install <slug>          # Install Hub agent locally (gated by security trust checks)
 agentlas plugin add <slug>       # Add Hub plugin (MCP server)
-agentlas plugin list             # List active plugins (= agentlas plugins)
+agentlas plugin list             # List active plugins
 agentlas build "<prompt>"        # Build, repair, and package agents or multi-agent teams
 agentlas upload <path>           # Upload package to private Agent Cloud (default)
 agentlas upload <path> --visibility marketplace   # Explicitly publish to public Agentlas Hub
@@ -114,8 +114,10 @@ agentlas research <sub>          # Research loadout (status|gather|search|read|p
 agentlas memory import <path> --agent <id> [--apply]
 agentlas evolve [list|apply <id>|revert <id>]
 agentlas ontology <sub>          # Manage project ontology (status|list|add)
-agentlas career-graph <sub>      # Ingest, query, verify, and trace career graph indices
-agentlas journal <sub>           # Run journal operations (status|verify|repair|gate)
+# Derived career-graph indexing is owned by the installed Hephaestus runtime;
+# use `agentlas ontology` for source registration.
+# Run-journal diagnosis is an expert Hephaestus path:
+# agentlas hep stormbreaker journal --run-id <id> --journal <path>
 agentlas project [status|init]   # Explicit entry point to initialize `.agentlas/` context
 agentlas context <sub>           # Context slice operations (refresh|locate|refs|slice|impact|verify)
 ```
@@ -216,7 +218,7 @@ Runtime Search Order (`engine/agentlas-core-harness.cjs`, `engine/hephaestus/run
 2. `~/.agentlas/runtime/current`
 3. Packaged Core (`<resources>/Hephaestus`, macOS: `/Applications/Agentlas.app/Contents/Resources/Hephaestus`)
 
-Commands including `storm`, `swarm`, `workforce`/`network`, `route`, `research`, `context`, `career-graph`, `journal`, `netadmin`, `hep`, `build`, `call`, `browser`, and `connect` pass directly through to this core runtime. If no core runtime is found, Agentlas Terminal halts with an explicit error and exit code 1 (no silent fallback).
+Commands including `storm`, `swarm`, `workforce`/`network`, `route`, `research`, `context`, `netadmin`, `hep`, `build`, `call`, `browser`, and `connect` pass directly through to this core runtime. Derived career-graph indexing and run-journal diagnosis are also owned by the installed Hephaestus runtime; Terminal keeps existing project data intact but no longer exposes separate `agentlas career-graph` or `agentlas journal` commands. If no core runtime is found, Agentlas Terminal halts with an explicit error and exit code 1 (no silent fallback).
 
 The terminal package owns REPL orchestration, session trees, agent registries, Hub/Cloud HTTP client surfaces, credential storage, MCP preflight probing, automation scheduling, and SQLite schema management.
 

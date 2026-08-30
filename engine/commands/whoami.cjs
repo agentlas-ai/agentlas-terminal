@@ -5,8 +5,13 @@
  */
 const auth = require("../cloud/auth.cjs");
 
-async function run(ctx) {
+async function run(ctx, args = []) {
   const ko = ctx.lang === "ko";
+  if (args.length) {
+    const error = new Error("usage: agentlas whoami");
+    error.code = "INVALID_ARGUMENT";
+    throw error;
+  }
   const cookie = auth.cloudSessionCookie();
   if (!cookie) {
     ctx.out(ko

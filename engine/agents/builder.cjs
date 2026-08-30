@@ -15,11 +15,14 @@
  * `agentlas import <folder>`로 언제든 설치할 수 있다.
  */
 const crypto = require("node:crypto");
+const path = require("node:path");
 const { runWriteTransaction } = require("../agentlas-sqlite-policy.cjs");
 const { columnExists } = require("../core/db.cjs");
 
 const BUILDER_SLUG = "agentlas-builder";
 const BUILDER_ID = "builtin-agentlas-builder";
+const MAX_BUILDER_OUTPUT_BYTES = 256 * 1024;
+const MAX_BUILT_FOLDER_BYTES = 4 * 1024;
 
 const BUILDER_SYSTEM_PROMPT = [
   "You are the Agentlas local agent builder, running inside the Agentlas terminal.",
@@ -45,12 +48,18 @@ const BUILDER_SYSTEM_PROMPT = [
 function ensureBuilderAgent(db) {
   const now = new Date().toISOString();
   const hasVisibility = columnExists(db, "installed_agents", "visibility");
-  runWriteTransaction(db, () => {
-    const existing = db.prepare("SELECT id FROM installed_agents WHERE id=? OR slug=?").get(BUILDER_ID, BUILDER_SLUG);
-    if (existing) {
-      db.prepare("UPDATE installed_agents SET system_prompt=?, name=?, name_en=?, tagline=?, tagline_en=? WHERE id=?")
-        .run(BUILDER_SYSTEM_PROMPT, "Agent Builder", "Agent Builder", "Builds Agentlas agents locally", "Builds Agentlas agents locally", existing.id);
-      return;
+  const identity = runWriteTransaction(db, () => {
+    const existing = db.prepare("SELECT id, slug FROM installed_agents WHERE id=? OR slug=?").all(BUILDER_ID, BUILDER_SLUG);
+    if (existing.length) {
+      if (existing.length !== 1 || existing[0].id !== BUILDER_ID || existing[0].slug !== BUILDER_SLUG) {
+        throw Object.assign(new Error("The reserved Agentlas builder identity is already used by another installed agent."), { code: "builder_identity_conflict", honestStop: true });
+      }
+      const visibilitySet = hasVisibility ? ", visibility='visible'" : "";
+      db.prepare(
+        `UPDATE installed_agents SET system_prompt=?, name=?, name_en=?, tagline=?, tagline_en=?, ` +
+        `builtin=1, role='orchestrator', tone='blue', trust_grade='A'${visibilitySet} WHERE id=?`,
+      ).run(BUILDER_SYSTEM_PROMPT, "Agent Builder", "Agent Builder", "Builds Agentlas agents locally", "Builds Agentlas agents locally", BUILDER_ID);
+      return { id: BUILDER_ID, slug: BUILDER_SLUG };
     }
     if (hasVisibility) {
       db.prepare(
@@ -63,10 +72,18 @@ function ensureBuilderAgent(db) {
         "VALUES (?,?,?,?,?,?,?,'[]','[]',NULL,'A',?,?,1,?)",
       ).run(BUILDER_ID, BUILDER_SLUG, "Agent Builder", "Agent Builder", "Builds Agentlas agents locally", "Builds Agentlas agents locally", BUILDER_SYSTEM_PROMPT, now, "blue", "orchestrator");
     }
+    return { id: BUILDER_ID, slug: BUILDER_SLUG };
   });
+  const stored = db.prepare("SELECT id, slug, builtin, role FROM installed_agents WHERE id=?").get(BUILDER_ID);
+  if (
+    !stored || stored.id !== identity.id || stored.slug !== identity.slug ||
+    Number(stored.builtin) !== 1 || stored.role !== "orchestrator"
+  ) {
+    throw Object.assign(new Error("The reserved Agentlas builder identity could not be verified after seeding."), { code: "builder_identity_conflict", honestStop: true });
+  }
   return {
-    id: BUILDER_ID,
-    slug: BUILDER_SLUG,
+    id: identity.id,
+    slug: identity.slug,
     name: "Agent Builder",
     nameEn: "Agent Builder",
     systemPrompt: BUILDER_SYSTEM_PROMPT,
@@ -77,10 +94,18 @@ function ensureBuilderAgent(db) {
 
 /** 빌더 산출물 마지막 줄에서 `BUILT: <folder>`를 뽑는다. */
 function parseBuiltFolder(finalText) {
-  const lines = String(finalText || "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const text = String(finalText || "");
+  if (Buffer.byteLength(text, "utf8") > MAX_BUILDER_OUTPUT_BYTES) return null;
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   for (let i = lines.length - 1; i >= 0; i -= 1) {
     const m = lines[i].match(/^BUILT:\s*(.+)$/);
-    if (m) return m[1].trim();
+    if (!m) continue;
+    const folder = m[1].trim();
+    if (!folder || Buffer.byteLength(folder, "utf8") > MAX_BUILT_FOLDER_BYTES || /[\u0000-\u001f\u007f]/.test(folder)) return null;
+    if (path.isAbsolute(folder) || /^[A-Za-z]:[\\/]/.test(folder) || folder.includes("\\")) return null;
+    const segments = folder.split("/");
+    if (segments.some((segment) => !segment || segment === "." || segment === "..")) return null;
+    return folder;
   }
   return null;
 }

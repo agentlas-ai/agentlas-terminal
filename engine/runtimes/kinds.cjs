@@ -94,15 +94,23 @@ const API_BACKEND_SPECS = ["anthropic", "openai", "google", "ollama", "upstage"]
 const RUNTIME_SPECS = [...NATIVE_CLI_KINDS, ...API_BACKEND_SPECS];
 
 /**
- * 저장 계약(automation 등)이 허용하는 kind 전체 — CLI + 로컬/BYOK 실행 kind.
- * 데스크탑 shared/runtime-kinds.ts 와 동형(터미널 표기: antigravity→agy, acp 미지원).
+ * 저장 계약(automation 등)이 허용하는 kind 전체.
+ *
+ * 공유 SQLite의 소유자는 Desktop이므로 Desktop shared/runtime-kinds.ts의 저장
+ * 어휘를 모두 받아야 한다. 이 Terminal이 아직 실행하지 못하는 kind도 구조적으로
+ * 정상인 핀은 "손상"이 아니라 pinned-runtime-unavailable로 정직하게 멈춘다.
+ * agy/gemini는 이전 Terminal·Desktop 행의 전진 호환 별칭이다.
  */
-const CONTRACT_RUNTIME_KINDS = [...CLI_KINDS, "byok", "ollama", "lmstudio", "mlx"];
+const CONTRACT_RUNTIME_KINDS = [
+  "claude-code", "codex", "antigravity", "kimi", "grok", "cursor",
+  "byok", "ollama", "lmstudio", "mlx", "acp", "agentlas",
+  "agy", "gemini",
+];
 
 /** 저장 계약이 허용하는 LLM 백엔드 — 데스크탑 shared/runtime-backends.ts 와 동일 15종. */
 const CONTRACT_RUNTIME_BACKENDS = [
   "anthropic", "openai", "google", "ollama", "lmstudio", "mlx", "upstage", "custom", "glm",
-  "kimi", "deepseek", "minimax", "xai", "openrouter", "cursor",
+  "kimi", "deepseek", "minimax", "xai", "openrouter", "cursor", "agentlas",
 ];
 
 module.exports = {

@@ -21,9 +21,9 @@ const { captureCoreJsonSync, resolveContextMapCoreRoot } = require("../agentlas-
 const terminalMemoryGovernance = require("../agentlas-memory-governance.cjs");
 const terminalExperienceIntake = require("../agentlas-experience-intake.cjs");
 const terminalExperienceExchange = require("../agentlas-experience-exchange.cjs");
+const permissions = require("../agentlas-permissions.cjs");
 const { routesMap } = require("../agents/routes.cjs");
 const { agentFolder } = require("../agents/files.cjs");
-const { ensureProjectMemoryCli } = require("./seed.cjs");
 const { projectCwd } = require("./paths.cjs");
 
 const SECRET_RE = [/\b(?:sk|pk|rk)-[A-Za-z0-9]{16,}/, /AKIA[0-9A-Z]{16}/, /ghp_[A-Za-z0-9]{20,}/, /xox[baprs]-[A-Za-z0-9-]{10,}/, /-----BEGIN [A-Z ]*PRIVATE KEY-----/, /\b(?:password|passwd|secret|api[_-]?key|access[_-]?token|bearer)\b\s*[:=]\s*\S+/i];
@@ -50,16 +50,7 @@ function langDirective(lang) {
 }
 
 function logCli(projectPath, rec) {
-  if (!projectPath) return;
-  try {
-    // 0.9.10 경계: 초기화되지 않은 프로젝트에 시드를 만들지 않는다. 로그는
-    // 이미 존재하는 .agentlas/ 에만 덧붙인다 (seed는 project init 전용).
-    const { initializedAgentlasProjectPathCli } = require("./state.cjs");
-    if (!initializedAgentlasProjectPathCli(projectPath)) return;
-    const dir = ensureProjectMemoryCli(projectPath);
-    if (!dir) return;
-    fs.appendFileSync(path.join(dir, loadArch().logFile || "memory-log.jsonl"), JSON.stringify(rec) + "\n", "utf8");
-  } catch { /* ignore */ }
+  return require("../memory-cli/curate.cjs").logCli(projectPath, rec);
 }
 
 function coerceText(v, max) {
@@ -242,51 +233,7 @@ function parseMemoryEventsCli(text) {
 }
 
 function curateCliReply(db, text, ctx) {
-  const { events, cleaned } = parseMemoryEventsCli(text);
-  const style = require("../agentlas-style.cjs");
-  // read 권한: 어떤 durable write도 없이 숨김 메타데이터만 제거해 돌려준다.
-  if (ctx && ctx.permission === "read") return style.sanitizeAssistantText(cleaned);
-  if (!events.length || !tableExists(db, "memory_entries")) return style.sanitizeAssistantText(cleaned);
-  ensureMemoryContextColumn(db);
-  const arch = loadArch();
-  const { randomUUID } = require("node:crypto");
-  const now = new Date().toISOString();
-  const rememberCurated = (memory) => {
-    if (!ctx || !Array.isArray(ctx.curatedMemories) || !memory) return;
-    if (!ctx.curatedMemories.some((item) => item.id === memory.id)) ctx.curatedMemories.push(memory);
-  };
-  const kinds = Array.isArray(arch.kinds) ? arch.kinds : [];
-  const scopes = Array.isArray(arch.scopes) ? arch.scopes : [];
-  for (const ev of events) {
-    const content = ev && typeof ev.content === "string" ? ev.content.trim() : "";
-    if (!content) continue;
-    if (ev.sensitivity === "secret" || SECRET_RE.some((re) => re.test(content))) continue;
-    const kind = kinds.includes(ev.memory_kind) ? ev.memory_kind : "fact";
-    let scope = ev.suggested_scope === "agent_team"
-      ? "team_memory"
-      : scopes.includes(ev.suggested_scope) ? ev.suggested_scope : "session";
-    const kindAllowsUserIdentity = ["fact", "decision", "preference", "procedure"].includes(kind);
-    if (scope === "user_identity" && (ev.confidence !== "high" || !kindAllowsUserIdentity)) scope = "session";
-    if (scope === "discard" || scope === "session") { logCli(ctx.projectPath, { action: scope, kind, content, at: now }); continue; }
-    if (scope === "project" && !ctx.projectPath) scope = "team_memory";
-    const ppath = scope === "project" ? ctx.projectPath : null;
-    const scopedAgentId = scope === "agent_repo" ? (ctx.agentId || null) : null;
-    const requestContext = normalizeRequestContext(ev, ctx, ppath);
-    try {
-      const dup = db.prepare("SELECT id,scope,kind,content,confidence,sensitivity,context_json FROM memory_entries WHERE scope=? AND kind=? AND lower(trim(content))=? AND superseded_at IS NULL AND (project_path IS ? OR project_path=?) AND (agent_id IS ? OR agent_id=?) LIMIT 1").get(scope, kind, content.toLowerCase(), ppath, ppath, scopedAgentId, scopedAgentId);
-      if (dup) {
-        rememberCurated({ ...dup, requestContext });
-        continue;
-      }
-      const memoryId = randomUUID();
-      const confidence = ev.confidence || "medium";
-      const sensitivity = ev.sensitivity || "internal";
-      db.prepare("INSERT INTO memory_entries (id,scope,kind,content,project_id,project_path,agent_id,chat_id,confidence,sensitivity,evidence_json,context_json,superseded_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)").run(memoryId, scope, kind, content, ctx.projectId || null, ppath, scopedAgentId, null, confidence, sensitivity, JSON.stringify(Array.isArray(ev.evidence_refs) ? ev.evidence_refs : []), JSON.stringify(requestContext), now);
-      rememberCurated({ id: memoryId, scope, kind, content, confidence, sensitivity, requestContext });
-      logCli(ctx.projectPath, { action: "written", scope, kind, content, request_context: requestContext, at: now });
-    } catch { /* ignore */ }
-  }
-  return style.sanitizeAssistantText(cleaned);
+  return require("../memory-cli/curate.cjs").curateCliReply(db, text, ctx);
 }
 
 const TERMINAL_MEMORY_CORE_MAX_TOKENS = 150;
@@ -382,9 +329,16 @@ function exactAgentBaseForExecution(db, agent, runtimeExperience = null) {
   const packageHash = /^[a-f0-9]{64}$/.test(rawHash) ? `sha256:${rawHash}` : null;
   const explicitDefinition = String(runtimeExperience?.agentDefinitionId || "");
   const explicitRelease = String(runtimeExperience?.baseAgentReleaseId || "");
+  const hasExplicitBinding = !!runtimeExperience && (
+    Object.prototype.hasOwnProperty.call(runtimeExperience, "agentDefinitionId") ||
+    Object.prototype.hasOwnProperty.call(runtimeExperience, "baseAgentReleaseId")
+  );
   if (portableId.test(explicitDefinition) && portableId.test(explicitRelease)) {
     return { agentDefinitionId: explicitDefinition, agentReleaseId: explicitRelease, packageHash, authority: "explicit-runtime-binding" };
   }
+  // A partially supplied runtime binding is an attempted exact authority, not
+  // permission to fall through to an unrelated installed/local identity.
+  if (hasExplicitBinding) return null;
   if (binding && portableId.test(String(binding.agent_definition_id)) && portableId.test(String(binding.agent_release_id))) {
     return { agentDefinitionId: binding.agent_definition_id, agentReleaseId: binding.agent_release_id, packageHash, authority: "installed-hub-binding" };
   }
@@ -400,7 +354,7 @@ function exactAgentBaseForExecution(db, agent, runtimeExperience = null) {
 }
 
 function finalizeExperienceExecutionCli(db, input) {
-  if (input.permission === "read") return null;
+  if (permissions.normalize(input.permission) === "read") return null;
   if (!input.agentId) return null;
   let agent;
   try { agent = db.prepare("SELECT * FROM installed_agents WHERE id=?").get(input.agentId); }

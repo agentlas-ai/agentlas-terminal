@@ -34,11 +34,21 @@ const EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max
 const PERM_LEVELS = ["read", "write", "full"];
 // 세션 인자를 받는 명령 — 완성 후보를 살아있는 세션 키(s1, s2…)로 채운다.
 const SESSION_ARG_COMMANDS = new Set(["/s", "/switch", "/kill", "/rm"]);
+// DB-backed agent/firm/session lists must not freeze readline or allocate an
+// unbounded candidate array when a local store contains many rows.
+const MAX_COMPLETION_CANDIDATES = 100;
 
 function uniqStartsWith(list, prefix) {
   const p = String(prefix || "");
-  const hits = [...new Set(list)].filter((v) => v.startsWith(p));
-  return hits.length ? hits : [];
+  const hits = [];
+  const seen = new Set();
+  for (const value of Array.isArray(list) ? list : []) {
+    if (typeof value !== "string" || !value.startsWith(p) || seen.has(value)) continue;
+    seen.add(value);
+    hits.push(value);
+    if (hits.length >= MAX_COMPLETION_CANDIDATES) break;
+  }
+  return hits;
 }
 
 /**

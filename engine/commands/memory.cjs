@@ -6,11 +6,12 @@
  * engine/agentlas-memory-import.cjs 가 소유한다(여기서는 주입만).
  * v1의 fail(process.exit)은 v2에서 throw 로 바꿔 엔진이 stderr+exit 1 처리한다.
  */
-const { cmdMemory } = require("../agentlas-memory-import.cjs");
+const { cmdMemory, parseMemoryArgs } = require("../agentlas-memory-import.cjs");
 
 function run(ctx, args) {
+  const parsed = parseMemoryArgs(args);
   cmdMemory({
-    db: ctx.db(),
+    db: parsed.help ? null : ctx.db(),
     args,
     out: ctx.out,
     fail: (msg) => { throw new Error(String(msg ?? "")); },

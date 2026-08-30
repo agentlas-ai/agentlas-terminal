@@ -11,6 +11,8 @@
  * 리스를 못 잡으면 실행하지 않는다(skip, 정직 보고).
  */
 const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
 const { findAgent, rowToAgent } = require("../agents/registry.cjs");
 const { resolveRuntime } = require("../runtimes/resolve.cjs");
 const { Orchestrator } = require("../sessions/orchestrator.cjs");
@@ -24,7 +26,11 @@ const store = require("./store.cjs");
 //    getAutomationExecutionContractState 동형) ──────────────────────────────
 // 손상된/미래 계약 값은 절대 조용히 넓혀 실행하지 않는다 — raw-row 게이트로
 // 무인 실행 직전에 검사한다(데스크탑 automation-scheduler.ts:538-549).
-const { CONTRACT_RUNTIME_KINDS, CONTRACT_RUNTIME_BACKENDS } = require("../runtimes/kinds.cjs");
+const {
+  CONTRACT_RUNTIME_KINDS,
+  CONTRACT_RUNTIME_BACKENDS,
+  canonicalRuntimeKind,
+} = require("../runtimes/kinds.cjs");
 const RUNTIME_KINDS = new Set(CONTRACT_RUNTIME_KINDS);
 const RUNTIME_BACKENDS = new Set(CONTRACT_RUNTIME_BACKENDS);
 const RUNTIME_SELECTION_KEYS = new Set(["kind", "backend", "source", "model", "longContext", "effort"]);
@@ -33,20 +39,84 @@ function decodeRuntimeSelection(raw) {
   if (raw == null) return { state: "missing" };
   try {
     const value = JSON.parse(raw);
+    // Desktop의 저장 디코더와 같은 레거시 보정. 예전 kind=gemini 행은 현재
+    // Antigravity 선택으로 간주하되, 당시 검증되지 않은 source/model은 버린다.
+    const normalized = value && value.kind === "gemini"
+      ? { ...value, kind: "antigravity", source: undefined, model: undefined }
+      : value;
     if (
-      value && typeof value === "object" && !Array.isArray(value) &&
-      Object.keys(value).every((key) => RUNTIME_SELECTION_KEYS.has(key)) &&
-      typeof value.kind === "string" && RUNTIME_KINDS.has(value.kind) &&
-      (value.backend === undefined || (typeof value.backend === "string" && RUNTIME_BACKENDS.has(value.backend))) &&
-      (value.source === undefined || (typeof value.source === "string" && value.source.length > 0 && value.source.length <= 2048)) &&
-      (value.model === undefined || (typeof value.model === "string" && value.model.length > 0 && value.model.length <= 512)) &&
-      (value.longContext === undefined || typeof value.longContext === "boolean") &&
-      (value.effort === undefined || (typeof value.effort === "string" && value.effort.length <= 128))
+      normalized && typeof normalized === "object" && !Array.isArray(normalized) &&
+      Object.keys(normalized).every((key) => RUNTIME_SELECTION_KEYS.has(key)) &&
+      typeof normalized.kind === "string" && RUNTIME_KINDS.has(normalized.kind) &&
+      (normalized.backend === undefined || (typeof normalized.backend === "string" && RUNTIME_BACKENDS.has(normalized.backend))) &&
+      (normalized.source === undefined || (typeof normalized.source === "string" && normalized.source.length > 0 && normalized.source.length <= 2048)) &&
+      (normalized.model === undefined || (typeof normalized.model === "string" && normalized.model.length > 0 && normalized.model.length <= 512)) &&
+      (normalized.longContext === undefined || typeof normalized.longContext === "boolean") &&
+      (normalized.effort === undefined || (typeof normalized.effort === "string" && normalized.effort.length <= 128))
     ) {
-      return { state: "valid", value };
+      return {
+        state: "valid",
+        value: {
+          ...normalized,
+          storedKind: normalized.kind,
+          kind: canonicalRuntimeKind(normalized.kind),
+        },
+      };
     }
   } catch { /* 손상 데이터는 아래에서 invalid — 진짜 없는 레거시 핀과 구분한다 */ }
   return { state: "invalid" };
+}
+
+const PIN_RUNTIME_IDENTITIES = Object.freeze({
+  "claude-code": { backend: "anthropic", source: "claude" },
+  codex: { backend: "openai", source: "codex" },
+  agy: { backend: "google", source: "agy" },
+  kimi: { backend: "kimi", source: "kimi" },
+  grok: { backend: "custom", source: "grok" },
+  cursor: { backend: "cursor", source: "cursor-agent" },
+  ollama: { backend: "ollama", source: "ollama" },
+});
+
+function sameExecutableSource(source, resolvedBin, expectedName) {
+  if (!source) return true;
+  const requested = String(source);
+  if (!resolvedBin) return requested === expectedName;
+  const requestedBase = path.basename(requested);
+  const resolvedBase = path.basename(String(resolvedBin));
+  if (requestedBase !== resolvedBase || requestedBase !== expectedName) return false;
+  if (!path.isAbsolute(requested)) return true;
+  try {
+    return fs.realpathSync(requested) === fs.realpathSync(String(resolvedBin));
+  } catch {
+    return false;
+  }
+}
+
+function materializePinnedRuntime(pin, resolver = resolveRuntime, context = {}) {
+  const label = pin.storedKind || pin.kind;
+  const unavailable = () => new Error(
+    `Pinned automation runtime is unavailable: ${label}${pin.model ? ` · ${pin.model}` : ""}`,
+  );
+  let runtime;
+  try {
+    runtime = resolver({ db: context.db, prefs: context.prefs, explicit: pin.kind });
+  } catch {
+    throw unavailable();
+  }
+  const identity = PIN_RUNTIME_IDENTITIES[pin.kind];
+  if (pin.backend && (!identity || pin.backend !== identity.backend)) throw unavailable();
+  if (pin.source && (!identity || !sameExecutableSource(pin.source, runtime.bin, identity.source))) {
+    throw unavailable();
+  }
+  return {
+    ...runtime,
+    ...(identity ? { backend: identity.backend, runtimeSource: pin.source || runtime.bin || identity.source } : {}),
+    ...(pin.model ? { model: pin.model } : {}),
+    ...(pin.effort ? { effort: pin.effort } : {}),
+    ...(pin.longContext !== undefined ? { longContext: pin.longContext } : {}),
+    source: "automation-pin",
+    pinAuthoritative: true,
+  };
 }
 
 function automationContractState(db, row) {
@@ -143,7 +213,23 @@ function runnerSkip(db, row, ko) {
 }
 
 /**
- * 자동화 1건 실행(헤드리스). 권한은 자동화 행의 permission 열(있으면), 없으면 "write".
+ * Automation permission is data, not a default capability. New stores use
+ * execution_permission; older stores use permission. If neither column is
+ * present, or either value is corrupt/empty, agentlas-permissions deliberately
+ * returns read so a damaged row cannot become a write-capable background run.
+ */
+function automationPermission(db, row) {
+  const raw = columnExists(db, "automations", "execution_permission")
+    ? row.execution_permission
+    : columnExists(db, "automations", "permission")
+      ? row.permission
+      : undefined;
+  return permissions.normalize(raw);
+}
+
+/**
+ * 자동화 1건 실행(헤드리스). 권한은 execution_permission/permission 열에서만
+ * 읽으며, 누락·손상 값은 agentlas-permissions를 거쳐 read로 fail-closed 한다.
  * opts:
  *   advanceSchedule  데몬 경로 true / run-now false (v1과 동일)
  *   scheduledFor     기록용 예정 시각(ISO)
@@ -175,7 +261,8 @@ async function runAutomationOnce(ctx, db, row, opts = {}) {
     return { ok: false, skipped: true, reason: "lease-unsupported" };
   }
   // run-now도 리스를 잡는다 — 앱 스케줄러가 같은 행을 동시에 돌리는 것을 방지.
-  if (!store.claimAutomation(db, row.id)) {
+  const lease = store.claimAutomationLease(db, row.id);
+  if (!lease) {
     ctx.err(ko
       ? `다른 실행기가 이 자동화 리스를 보유 중입니다(15분 TTL): ${row.name}`
       : `Another runner holds this automation (lease TTL 15 minutes): ${row.name}`);
@@ -190,11 +277,13 @@ async function runAutomationOnce(ctx, db, row, opts = {}) {
   let leaseRenewWarningEmitted = false;
   const leaseHeartbeat = setInterval(() => {
     try {
-      const renewed = store.renewAutomationLease(db, row.id);
+      const renewed = store.renewAutomationLeaseToken(db, row.id, new Date(), lease);
       if (!renewed) {
         leaseOwnershipLost = true;
         if (activeSession && typeof activeSession.kill === "function") activeSession.kill();
       } else {
+        lease.owner = renewed.owner;
+        lease.claimedAt = renewed.claimedAt;
         leaseRenewWarningEmitted = false;
       }
     } catch (error) {
@@ -211,6 +300,31 @@ async function runAutomationOnce(ctx, db, row, opts = {}) {
   }, Math.max(10, Number(opts.leaseHeartbeatMs) || 60_000));
   if (typeof leaseHeartbeat.unref === "function") leaseHeartbeat.unref();
 
+  const leaseLostResult = () => ({
+      ok: false,
+      skipped: true,
+      reason: "lease-lost",
+      error: "Automation execution lease ownership lost",
+  });
+  const completeRun = (status, error, ok) => {
+    const recorded = store.recordRun(db, row.id, status, error, opts.scheduledFor, lease);
+    if (recorded && recorded.leaseLost) return { leaseLost: true };
+    const advanced = store.advanceAfterRun(db, row, {
+      ok,
+      advanceSchedule: !!opts.advanceSchedule,
+      lease,
+    });
+    if (advanced && advanced.leaseLost) return { leaseLost: true };
+    if (!advanced || !advanced.updated) {
+      return {
+        bookkeepingError: advanced && advanced.error
+          ? advanced.error
+          : "automation completion state was not updated",
+      };
+    }
+    return { recorded, advanced };
+  };
+
   try {
     // ── raw-row 실행 계약 게이트 (데스크탑 automation-scheduler.ts:538-549 동형) ──
     // 손상된 계약 값으로는 무인 실행하지 않는다 — 문구까지 데스크탑과 동일.
@@ -218,15 +332,17 @@ async function runAutomationOnce(ctx, db, row, opts = {}) {
     if (contract.runtimeSelection === "invalid") {
       const msg = "pinned_runtime_contract_invalid: the saved runtime pin is malformed and requires an explicit runtime selection.";
       ctx.err(msg);
-      store.recordRun(db, row.id, "needs_input", msg, opts.scheduledFor);
-      store.advanceAfterRun(db, row, { ok: false, advanceSchedule: !!opts.advanceSchedule });
+      const completed = completeRun("needs_input", msg, false);
+      if (completed.leaseLost) return leaseLostResult();
+      if (completed.bookkeepingError) ctx.err(completed.bookkeepingError);
       return { ok: false, error: msg };
     }
     if (contract.hubMode === "invalid") {
       const msg = "automation_hub_mode_contract_invalid: the saved Hub routing policy is unknown and requires an explicit selection.";
       ctx.err(msg);
-      store.recordRun(db, row.id, "needs_input", msg, opts.scheduledFor);
-      store.advanceAfterRun(db, row, { ok: false, advanceSchedule: !!opts.advanceSchedule });
+      const completed = completeRun("needs_input", msg, false);
+      if (completed.leaseLost) return leaseLostResult();
+      if (completed.bookkeepingError) ctx.err(completed.bookkeepingError);
       return { ok: false, error: msg };
     }
 
@@ -237,17 +353,10 @@ async function runAutomationOnce(ctx, db, row, opts = {}) {
     let runtime = opts.runtime || null;
     if (!runtime && !opts.runtimeOverride && contract.runtimePin) {
       const pin = contract.runtimePin;
-      try {
-        runtime = resolveRuntime({ db, prefs: ctx.prefs, explicit: pin.kind });
-        if (pin.model) runtime.model = pin.model;
-      } catch {
-        throw new Error(`Pinned automation runtime is unavailable: ${pin.kind}${pin.model ? ` · ${pin.model}` : ""}`);
-      }
+      runtime = materializePinnedRuntime(pin, opts.resolveRuntime || resolveRuntime, { db, prefs: ctx.prefs });
     }
     if (!runtime) runtime = resolveRuntime({ db, prefs: ctx.prefs, explicit: opts.runtimeOverride || null });
-    // 권한: 자동화 행에 permission 열이 있으면 그 값, 없으면 write (v1 기본과 동일).
-    const rowPermission = columnExists(db, "automations", "permission") ? row.permission : null;
-    const permission = permissions.normalize(rowPermission || "write", "write");
+    const permission = automationPermission(db, row);
 
     ctx.err(ctx.ui.dim(`${agent.slug} · ${runtime.kind} · ${permission} · ${ko ? "자동화" : "automation"} ${String(row.id).slice(0, 8)}`));
 
@@ -281,14 +390,17 @@ async function runAutomationOnce(ctx, db, row, opts = {}) {
     const failed = session.status === "failed";
     const errMsg = failed ? String(session.lastError || "runtime turn failed").slice(0, 500) : null;
 
-    if (failed) {
-      ctx.err(errMsg);
-      store.recordRun(db, row.id, "error", errMsg, opts.scheduledFor);
-    } else {
-      store.recordRun(db, row.id, "ok", null, opts.scheduledFor);
+    if (failed) ctx.err(errMsg);
+    const completed = completeRun(failed ? "error" : "ok", failed ? errMsg : null, !failed);
+    if (completed.leaseLost) {
+      ctx.err("Automation execution lease ownership lost");
+      return leaseLostResult();
     }
-    const after = store.advanceAfterRun(db, row, { ok: !failed, advanceSchedule: !!opts.advanceSchedule });
-    if (after.maxRunsReached) {
+    if (completed.bookkeepingError) {
+      ctx.err(completed.bookkeepingError);
+      return { ok: false, error: completed.bookkeepingError };
+    }
+    if (completed.advanced.maxRunsReached) {
       ctx.err(ko ? "max_runs 도달 — 자동화를 비활성화했습니다." : "max_runs reached — automation disabled.");
     }
     return failed ? { ok: false, error: errMsg } : { ok: true, finalText };
@@ -298,12 +410,13 @@ async function runAutomationOnce(ctx, db, row, opts = {}) {
     if (leaseOwnershipLost) {
       return { ok: false, skipped: true, reason: "lease-lost", error: "Automation execution lease ownership lost" };
     }
-    store.recordRun(db, row.id, "error", msg, opts.scheduledFor);
-    store.advanceAfterRun(db, row, { ok: false, advanceSchedule: !!opts.advanceSchedule });
+    const completed = completeRun("error", msg, false);
+    if (completed.leaseLost) return leaseLostResult();
+    if (completed.bookkeepingError) ctx.err(completed.bookkeepingError);
     return { ok: false, error: msg };
   } finally {
     clearInterval(leaseHeartbeat);
-    store.releaseAutomation(db, row.id, store.LEASE_OWNER);
+    store.releaseAutomation(db, row.id, lease.owner, lease.claimedAt);
   }
 }
 
@@ -360,10 +473,8 @@ async function daemonTick(ctx, db, opts = {}) {
       ) opts.skipAnnounced.add(row.id);
       continue;
     }
-    // 스케줄이 없는(1회성) 행이 남으면 재발화 방지 (v1과 동일).
-    if (!row.schedule || !schedule.nextAutomationRun(row)) {
-      db.prepare("UPDATE automations SET enabled = 0 WHERE id = ? AND (schedule IS NULL OR schedule = '')").run(row.id);
-    }
+    // 1회성 종료는 advanceAfterRun 이 동일 lease fence 안에서 처리한다.
+    // 여기서 lease 해제 후 row id만 다시 쓰면 successor 실행을 끌 수 있다.
   }
   return ran;
 }
@@ -406,5 +517,8 @@ module.exports = {
   automationContractState,
   automationSessionChatId,
   runnerSkip,
+  automationPermission,
   decodeRuntimeSelection,
+  materializePinnedRuntime,
+  sameExecutableSource,
 };

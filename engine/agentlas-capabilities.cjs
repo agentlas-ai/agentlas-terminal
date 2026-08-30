@@ -24,22 +24,27 @@ const RUNTIME_CAPS = {
   upstage: { code: true, image: false, label: "solar" }, // Upstage Solar — Korean sovereign LLM (OpenAI-compatible)
 };
 
-// NOTE: grok은 CAPS(멀티모달 능력 인지)만 등록 — 터미널 스폰 러너(RUNTIME_BIN)가 아직 없어
-// CLI_KINDS에 넣으면 repl의 which(RUNTIME_BIN[k]) 탐지가 깨진다. 러너 추가 시 함께 확장할 것.
-// 목록의 정본은 runtimes/kinds.cjs — 여기서는 네이티브 스폰 러너 4종만 가져다 쓴다.
-const CLI_KINDS = require("./runtimes/kinds.cjs").NATIVE_CLI_KINDS;
+// 목록·별칭의 정본은 runtimes/kinds.cjs다. ACP 공용 러너가 추가된 뒤에도 이 파일이
+// 옛 native 4종만 보아 grok/kimi/cursor를 API backend로 잘못 만들지 않게 한다.
+const KINDS = require("./runtimes/kinds.cjs");
+const CLI_KINDS = KINDS.CLI_KINDS;
+const API_SPECS = new Set(KINDS.API_BACKEND_SPECS);
 
 function capsFor(spec) {
-  return RUNTIME_CAPS[spec] || { code: true, image: false, label: spec || "?" };
+  const canonical = KINDS.canonicalRuntimeKind(spec);
+  return RUNTIME_CAPS[canonical] || { code: true, image: false, label: canonical || "?" };
 }
 
 // runtime object ⇄ spec string
 function specOf(rt) {
   if (!rt) return "";
-  return rt.mode === "cli" ? rt.kind : rt.backend;
+  return rt.mode === "cli" ? KINDS.canonicalRuntimeKind(rt.kind) : rt.backend;
 }
 function runtimeFromSpec(spec) {
-  return CLI_KINDS.includes(spec) ? { mode: "cli", kind: spec } : { mode: "api", backend: spec, model: null };
+  const canonical = KINDS.canonicalRuntimeKind(spec);
+  if (CLI_KINDS.includes(canonical)) return { mode: "cli", kind: canonical };
+  if (API_SPECS.has(canonical)) return { mode: "api", backend: canonical, model: null };
+  return null;
 }
 
 // Image capability is judged only by the connected model from the complete
@@ -116,10 +121,12 @@ function clearImageJudgments() {
 // Image agents route to an installed image-capable runtime; otherwise keep the session default.
 function autoRuntimeFor(agent, { installedKinds, activeSpec }) {
   if (needsImage(agent)) {
-    if (capsFor(activeSpec).image) return activeSpec;
-    for (const k of ["agy", "gemini", "codex"]) if ((installedKinds || []).includes(k)) return k;
+    const canonicalActive = KINDS.canonicalRuntimeKind(activeSpec);
+    if (capsFor(canonicalActive).image) return canonicalActive;
+    const installed = new Set((installedKinds || []).map(KINDS.canonicalRuntimeKind));
+    for (const k of ["agy", "gemini", "codex"]) if (installed.has(k)) return k;
   }
-  return activeSpec;
+  return KINDS.canonicalRuntimeKind(activeSpec);
 }
 
 // short capability badge for display

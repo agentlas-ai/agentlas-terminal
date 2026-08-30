@@ -157,18 +157,29 @@ function parsePluginListFlags(args) {
     errors: [],
     positionals: [],
   };
+  const seen = new Set();
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === "--global") {
+      if (seen.has("global")) {
+        flags.errors.push("duplicate flag: --global");
+        return flags;
+      }
+      seen.add("global");
       flags.global = true;
       continue;
     }
     if (arg === "--project") {
+      if (seen.has("project")) {
+        flags.errors.push("duplicate flag: --project");
+        return flags;
+      }
       const next = args[i + 1];
       if (!next || next.startsWith("-")) {
         flags.errors.push("usage: agentlas plugin list --project <path>");
         return flags;
       }
+      seen.add("project");
       flags.project = next;
       i += 1;
       continue;
@@ -207,7 +218,7 @@ function run(ctx, args) {
   // SELF_HELP_COMMANDS 계약(index.cjs): `plugin --help` 는 여기로 ["help"] 가 되어
   // 들어온다. help 분기가 없으면 unknown action → usage exit 1 이라, 도움말을
   // 요청한 사용자가 오류 코드를 받는다.
-  if (action === "help" || action === "--help" || action === "-h") {
+  if ((action === "help" || action === "--help" || action === "-h") && args.length === 1) {
     const ko = ctx.lang !== "en";
     ctx.out(ko
       ? [
@@ -227,7 +238,7 @@ function run(ctx, args) {
     return 0;
   }
   if (action === "add") {
-    if (args.length !== 2) {
+    if (args.length !== 2 || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(String(args[1] || ""))) {
       ctx.err("usage: agentlas plugin add <slug>   (run agentlas plugin list first)");
       return 1;
     }

@@ -12,6 +12,8 @@ const HARNESS_ID = "agentlas-core/stormbreaker-goal-ultracode";
 const HARNESS_MODE = "stormbreaker-goal-ultracode";
 const CONTEXT_MAP_MIN_CORE_VERSION = "1.1.86";
 const CORE_MANIFEST_MAX_BYTES = 64 * 1024;
+const CORE_CAPTURE_MAX_BYTES = 16 * 1024 * 1024;
+const CORE_CAPTURE_TIMEOUT_MS = 120_000;
 const CORE_RUNTIME_MARKERS = [
   ["agentlas_cloud", "__main__.py"],
   ["schemas", "workforce-work-order.schema.json"],
@@ -222,13 +224,55 @@ async function captureCoreJson(moduleName, args, opts = {}, explicitRoot) {
   const child = spawnCoreModule(moduleName, args, { ...opts, stdio: ["ignore", "pipe", "pipe"] }, explicitRoot);
   if (!child) throw new Error("Agentlas Core runtime or Python 3.9+ is unavailable.");
   const result = await new Promise((resolve) => {
-    let stdout = "";
+    const stdoutChunks = [];
+    let stdoutBytes = 0;
     let stderr = "";
-    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+    let outputExceeded = false;
+    let timedOut = false;
+    let settled = false;
+    let forceKill = null;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (forceKill) clearTimeout(forceKill);
+      resolve(value);
+    };
+    const terminate = () => {
+      try { child.kill("SIGTERM"); } catch { /* already gone */ }
+      if (!forceKill) {
+        forceKill = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* already gone */ } }, 250);
+        forceKill.unref?.();
+      }
+    };
+    const timeoutMs = Number.isFinite(Number(opts.timeout)) && Number(opts.timeout) > 0
+      ? Number(opts.timeout)
+      : CORE_CAPTURE_TIMEOUT_MS;
+    const timeout = setTimeout(() => { timedOut = true; terminate(); }, timeoutMs);
+    timeout.unref?.();
+    child.stdout.on("data", (chunk) => {
+      if (outputExceeded) return;
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      stdoutBytes += bytes.length;
+      if (stdoutBytes > CORE_CAPTURE_MAX_BYTES) {
+        outputExceeded = true;
+        terminate();
+        return;
+      }
+      stdoutChunks.push(bytes);
+    });
     child.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString()).slice(-4000); });
-    child.on("error", (error) => resolve({ code: 1, stdout, stderr: String(error.message) }));
-    child.on("close", (code) => resolve({ code: code ?? 0, stdout, stderr }));
+    child.on("error", (error) => finish({ code: 1, stdout: "", stderr: String(error.message), outputExceeded, timedOut }));
+    child.on("close", (code) => finish({
+      code: code ?? 0,
+      stdout: outputExceeded ? "" : Buffer.concat(stdoutChunks, stdoutBytes).toString("utf8"),
+      stderr,
+      outputExceeded,
+      timedOut,
+    }));
   });
+  if (result.outputExceeded) throw new Error(`Agentlas Core ${moduleName} response exceeded ${CORE_CAPTURE_MAX_BYTES} bytes.`);
+  if (result.timedOut) throw new Error(`Agentlas Core ${moduleName} timed out after ${Number(opts.timeout) > 0 ? Number(opts.timeout) : CORE_CAPTURE_TIMEOUT_MS}ms.`);
   const json = parseJsonOutput(result.stdout);
   if (result.code !== 0 || !json) {
     throw new Error(result.stderr.trim() || `Agentlas Core ${moduleName} did not return JSON.`);
@@ -247,7 +291,8 @@ function captureCoreJsonSync(moduleName, args, opts = {}, explicitRoot) {
       ...opts,
       encoding: "utf8",
       windowsHide: true,
-      timeout: opts.timeout || 120_000,
+      maxBuffer: CORE_CAPTURE_MAX_BYTES,
+      timeout: opts.timeout || CORE_CAPTURE_TIMEOUT_MS,
       env: {
         ...(opts.env || process.env),
         HEPHAESTUS_RUNTIME_ROOT: root,
@@ -256,6 +301,13 @@ function captureCoreJsonSync(moduleName, args, opts = {}, explicitRoot) {
       },
     },
   );
+  if (result.error && result.error.code === "ENOBUFS") {
+    throw new Error(`Agentlas Core ${moduleName} response exceeded ${CORE_CAPTURE_MAX_BYTES} bytes.`);
+  }
+  if (result.error && result.error.code === "ETIMEDOUT") {
+    const timeoutMs = Number(opts.timeout) > 0 ? Number(opts.timeout) : CORE_CAPTURE_TIMEOUT_MS;
+    throw new Error(`Agentlas Core ${moduleName} timed out after ${timeoutMs}ms.`);
+  }
   const json = parseJsonOutput(result.stdout);
   if (result.status !== 0 || !json) {
     throw new Error(String(result.stderr || result.error?.message || `Agentlas Core ${moduleName} did not return JSON.`).trim());
@@ -279,6 +331,8 @@ module.exports = {
   HARNESS_MODE,
   CONTEXT_MAP_MIN_CORE_VERSION,
   CONTEXT_MAP_V3_RUNTIME_MARKERS,
+  CORE_CAPTURE_MAX_BYTES,
+  CORE_CAPTURE_TIMEOUT_MS,
   PY_BOOTSTRAP,
   readCoreRuntimeVersion,
   resolveCoreRuntimeRootFromCandidates,

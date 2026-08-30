@@ -38,20 +38,58 @@ function resolvePermission(ctx) {
 function splitRuntimeOverride(args) {
   const rest = [];
   let runtimeOverride = null;
+  let seen = false;
+  let passthrough = false;
   for (let i = 0; i < args.length; i += 1) {
-    if (args[i] === "--runtime" && args[i + 1]) {
-      runtimeOverride = String(args[++i]);
+    const token = String(args[i]);
+    if (passthrough) { rest.push(token); continue; }
+    if (token === "--") { passthrough = true; rest.push(token); continue; }
+    if (token === "--runtime" || token.startsWith("--runtime=")) {
+      if (seen) throw new Error("duplicate option: --runtime");
+      seen = true;
+      const inline = token.startsWith("--runtime=");
+      const value = inline ? token.slice(10) : args[++i];
+      if (value === undefined || value === "" || (!inline && String(value).startsWith("--"))) {
+        throw new Error("--runtime requires a value");
+      }
+      runtimeOverride = String(value);
       continue;
     }
-    rest.push(args[i]);
+    rest.push(token);
   }
   return { rest, runtimeOverride };
 }
 
+function validateStormArgs(args) {
+  const seen = new Set();
+  let passthrough = false;
+  let hasGoal = false;
+  for (const raw of args) {
+    const token = String(raw);
+    if (passthrough) { hasGoal = true; continue; }
+    if (token === "--") { passthrough = true; continue; }
+    if (token === "--research" || token === "--research-evidence") {
+      if (seen.has("research")) return { error: "duplicate option: --research", hasGoal };
+      seen.add("research");
+    } else if (token === "--background") {
+      if (seen.has("background")) return { error: "duplicate option: --background", hasGoal };
+      seen.add("background");
+    } else if (token.startsWith("-")) {
+      return { error: `unknown option: ${token} (use -- before a goal token that starts with '-')`, hasGoal };
+    } else hasGoal = true;
+  }
+  return { error: null, hasGoal };
+}
+
 async function run(ctx, args) {
-  const { rest, runtimeOverride } = splitRuntimeOverride(args);
+  let parsed;
+  try { parsed = splitRuntimeOverride(args); }
+  catch (error) { ctx.err(String((error && error.message) || error)); return 1; }
+  const { rest, runtimeOverride } = parsed;
+  const validation = validateStormArgs(rest);
+  if (validation.error) { ctx.err(validation.error); return 1; }
   // usage 경로(목표 텍스트 없음)는 SQLite를 열 이유가 없다.
-  if (!rest.some((token) => !["--research", "--research-evidence", "--background"].includes(String(token)))) {
+  if (!validation.hasGoal) {
     ctx.err("usage: agentlas storm <goal>  [--research] [--background] [--runtime <kind>]");
     return 1;
   }
@@ -68,4 +106,4 @@ async function run(ctx, args) {
   return r && r.ok ? 0 : 1;
 }
 
-module.exports = { run, splitRuntimeOverride };
+module.exports = { run, splitRuntimeOverride, validateStormArgs };

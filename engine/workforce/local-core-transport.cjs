@@ -26,6 +26,10 @@ const crypto = require("node:crypto");
 const { createLocalCoreClient } = require("../hephaestus/local-core.cjs");
 
 const SOURCE_SCOPES = new Set(["network", "local", "cloud", "hub"]);
+const MAX_MAPPED_NODES = 100_000;
+const MAX_MAPPED_DEPTH = 64;
+const MAX_MAPPED_STRING_BYTES = 16 * 1024 * 1024;
+const FORBIDDEN_OBJECT_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 
 /*
  * ── id 정규화 (실측 2026-08-05 라이브 런 실패의 수리) ──
@@ -87,16 +91,56 @@ function boundaryIssues(error) {
 }
 
 /** 깊은 순회로 문자열 값을 정확 일치 치환한 사본을 만든다. */
-function mapDeep(value, map) {
-  if (map.size === 0) return value;
-  if (typeof value === "string") return map.get(value) || value;
-  if (Array.isArray(value)) return value.map((item) => mapDeep(item, map));
+function mapDeep(value, map, state = { nodes: 0, stringBytes: 0 }, depth = 0) {
+  state.nodes += 1;
+  if (state.nodes > MAX_MAPPED_NODES || depth > MAX_MAPPED_DEPTH) {
+    const error = new Error("local Core payload exceeds the safe structure limit");
+    error.code = "local_core_payload_invalid";
+    throw error;
+  }
+  if (typeof value === "string") {
+    state.stringBytes += Buffer.byteLength(value, "utf8");
+    if (state.stringBytes > MAX_MAPPED_STRING_BYTES) {
+      const error = new Error("local Core payload exceeds the safe text limit");
+      error.code = "local_core_payload_invalid";
+      throw error;
+    }
+    return map.get(value) || value;
+  }
+  if (Array.isArray(value)) return value.map((item) => mapDeep(item, map, state, depth + 1));
   if (value && typeof value === "object") {
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) {
+      const error = new Error("local Core payload contains a non-plain object");
+      error.code = "local_core_payload_invalid";
+      throw error;
+    }
     const out = {};
-    for (const [key, item] of Object.entries(value)) out[key] = mapDeep(item, map);
+    for (const [key, item] of Object.entries(value)) {
+      if (FORBIDDEN_OBJECT_KEYS.has(key)) {
+        const error = new Error(`local Core payload contains a forbidden key: ${key}`);
+        error.code = "local_core_payload_invalid";
+        throw error;
+      }
+      out[key] = mapDeep(item, map, state, depth + 1);
+    }
     return out;
   }
   return value;
+}
+
+function stablePayloadDigest(value) {
+  const mapped = mapDeep(value, new Map());
+  const canonical = (item) => {
+    if (Array.isArray(item)) return `[${item.map(canonical).join(",")}]`;
+    if (item && typeof item === "object") {
+      return `{${Object.keys(item).sort().filter((key) => item[key] !== undefined)
+        .map((key) => `${JSON.stringify(key)}:${canonical(item[key])}`).join(",")}}`;
+    }
+    const encoded = JSON.stringify(item);
+    return encoded === undefined ? "null" : encoded;
+  };
+  return sha256hex(canonical(mapped));
 }
 
 function createLocalCoreHubTool({ sourceScope, projectDir, cwd, client } = {}) {
@@ -123,6 +167,8 @@ function createLocalCoreHubTool({ sourceScope, projectDir, cwd, client } = {}) {
   // 반송해야 한다 — 반응형 reasonCode 수리가 있었으면 루프의 selection 을 다시
   // 변환한 것과 다르다(exact binding).
   let lastCoreSelection = null;
+  let lastWorkOrderDigest = null;
+  let lastSelectionDigest = null;
 
   const invalid = (message) => {
     const error = new Error(message);
@@ -135,6 +181,9 @@ function createLocalCoreHubTool({ sourceScope, projectDir, cwd, client } = {}) {
       maps = buildIdMaps(args.workOrder);
       coreCandidateSet = null;
       lastValidationEnvelope = null;
+      lastCoreSelection = null;
+      lastSelectionDigest = null;
+      lastWorkOrderDigest = stablePayloadDigest(args.workOrder);
       // Current Core keeps the full dossier in its pinned session and returns a
       // numbered decision menu. Do not request the legacy full-echo form.
       let envelope;
@@ -169,6 +218,11 @@ function createLocalCoreHubTool({ sourceScope, projectDir, cwd, client } = {}) {
       if (!coreCandidateSet) {
         const error = new Error("validate_selection called before search_candidates — the federated lineage is missing");
         error.code = "local_core_lineage_missing";
+        throw error;
+      }
+      if (stablePayloadDigest(args.workOrder) !== lastWorkOrderDigest) {
+        const error = new Error("validate_selection workOrder differs from the searched local Core lineage");
+        error.code = "local_core_lineage_mismatch";
         throw error;
       }
       // The host-authored selection must point at the exact summary menu just
@@ -208,12 +262,21 @@ function createLocalCoreHubTool({ sourceScope, projectDir, cwd, client } = {}) {
       if (!envelope || typeof envelope.selectionValidation !== "object") throw invalid("local Core validation returned no selectionValidation receipt");
       lastValidationEnvelope = envelope;
       lastCoreSelection = coreSelection;
+      lastSelectionDigest = stablePayloadDigest(args.selection);
       return mapDeep(envelope.selectionValidation, maps.reverse);
     }
     if (name === "workforce.prepare_execution") {
       if (!lastValidationEnvelope) {
         const error = new Error("prepare_execution called before validate_selection — the federated lineage is missing");
         error.code = "local_core_lineage_missing";
+        throw error;
+      }
+      if (
+        stablePayloadDigest(args.workOrder) !== lastWorkOrderDigest ||
+        stablePayloadDigest(args.selection) !== lastSelectionDigest
+      ) {
+        const error = new Error("prepare_execution input differs from the validated local Core lineage");
+        error.code = "local_core_lineage_mismatch";
         throw error;
       }
       const envelope = await core.call(name, {

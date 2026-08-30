@@ -9,14 +9,14 @@
  *     넘기고, --json이면 human:false 원본 패스스루로 내려간다.
  *
  * v1 인자 가드 그대로:
- *   - help 토큰 → usage, exit 0
+ *   - 단독 help 토큰 → usage, exit 0
  *   - 인자가 없거나 --json뿐 → usage 실패 exit 1
  *     (빈 쿼리가 라우터로 새는 것 방지)
  */
 const { create, usageFor, isHelpToken } = require("../hephaestus/runtime.cjs");
 
 async function run(ctx, args) {
-  if (args.some(isHelpToken)) {
+  if (args.length === 1 && isHelpToken(args[0])) {
     ctx.out(usageFor("route", ctx.lang));
     return 0;
   }

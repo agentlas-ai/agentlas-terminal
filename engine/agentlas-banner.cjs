@@ -163,8 +163,12 @@ function cardBottom(label, inner, c) {
 function renderCompactSplash(ui, value, room) {
   const c = ui.c;
   const version = value.version ? "  v" + value.version : "";
+  const title = truncateWidth(
+    WORDMARK_COMPACT + version + "  ·  " + ui.t("banner.product"),
+    Math.max(1, room),
+  );
   ui.line("");
-  ui.line(CARD_MARGIN + c.bold(c.emerald(WORDMARK_COMPACT)) + c.faint(version) + c.dim("  ·  " + ui.t("banner.product")));
+  ui.line(CARD_MARGIN + c.bold(c.emerald(title)));
   ui.line(CARD_MARGIN + c.text(truncateWidth(ui.t("banner.session", value.runtime, value.subject, value.permission), room)));
   ui.line(CARD_MARGIN + c.faint(truncateWidth(ui.t("banner.location", value.cwd), room)));
   ui.line("");
@@ -186,7 +190,7 @@ function renderBanner(ctx) {
   const columns = ui.out.columns || 80;
   const inner = Math.min(CARD_MAX_INNER, columns - visWidth(CARD_MARGIN) * 2 - 2);
   if (inner < CARD_MIN_INNER) {
-    renderCompactSplash(ui, value, Math.max(20, columns - 4));
+    renderCompactSplash(ui, value, Math.max(1, columns - visWidth(CARD_MARGIN)));
     return;
   }
 

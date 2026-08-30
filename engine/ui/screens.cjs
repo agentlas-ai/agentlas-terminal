@@ -249,8 +249,8 @@ function settings(ui, db, en, ctx) {
     ? "change: /setup (wizard) · /runtime · /model · /effort · /permission · roles set · creds · env"
     : "변경: /setup (마법사) · /runtime · /model · /effort · /permission · roles set · creds · env"));
   ui.line(ui.c.dim(en
-    ? "Desktop-only here: theme, mobile pairing QR, auto-update, multimodal providers"
-    : "여기서 불가(데스크탑 전용): 테마, 모바일 페어링 QR, 자동 업데이트, 멀티모달 프로바이더"));
+    ? "also available: agentlas multimodal  ·  Desktop-only: theme, mobile pairing QR, auto-update"
+    : "추가 설정: agentlas multimodal  ·  데스크탑 전용: 테마, 모바일 페어링 QR, 자동 업데이트"));
 }
 
 /* ── /projects — 데스크탑 workspace + project/detail ── */
@@ -355,8 +355,6 @@ function firms(ui, db, en, ctx, arg) {
     } else if (org) {
       ui.line(ui.c.dim(en ? "  roster is declared in the org chart only" : "  로스터가 조직도 선언에만 있습니다"));
     }
-    const chats = count(db, "SELECT COUNT(*) n FROM chats WHERE firm_id = ? AND archived_at IS NULL", );
-    void chats;
     ui.line("");
     ui.line(ui.c.dim(en ? `run: /firm ${f.slug} "<task>"` : `실행: /firm ${f.slug} "<할 일>"`));
     return;

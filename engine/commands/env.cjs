@@ -21,7 +21,12 @@ function sharedEnvKeys() {
   return Object.keys(fromFiles).sort();
 }
 
-function run(ctx) {
+function run(ctx, args = []) {
+  if (args.length) {
+    const error = new Error("usage: agentlas env");
+    error.code = "INVALID_ARGUMENT";
+    throw error;
+  }
   const keys = sharedEnvKeys();
   ctx.out(`Shared env keys: ${keys.length} (values hidden; from credentials.env):`);
   for (const k of keys) ctx.out(`  ${k}`);

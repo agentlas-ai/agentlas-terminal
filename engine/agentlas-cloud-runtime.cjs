@@ -4,10 +4,9 @@ const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
 const crypto = require("node:crypto");
+const { looksSecret, redactSecrets } = require("./agentlas-secret-patterns.cjs");
 
 const TEXT_EXTS = new Set([".md", ".txt", ".json", ".jsonl", ".yaml", ".yml", ".toml", ".js", ".ts", ".tsx", ".cjs", ".mjs", ".sh"]);
-const SECRET_RE = /(sk-(?:ant-)?[A-Za-z0-9_-]{20,}|gh[opsu]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)/;
-const SECRET_ASSIGN_RE = /\b(?:api[_-]?key|secret|password|token)\s*[:=]\s*["']?([A-Za-z0-9+/=_-]{20,})["']?/i;
 const PROMPT_INJECTION_RE = /\b(ignore (?:all |previous |prior )?instructions|reveal (?:your )?system prompt|print hidden instructions)\b/i;
 const DESTRUCTIVE_RE = /\b(rm\s+-rf\s+(?:\/|~)|curl\b[^\n]{0,240}\|\s*(?:sudo\s+)?(?:sh|bash|zsh)|mkfs\.|dd\s+if=\/dev\/)\b/i;
 
@@ -133,7 +132,7 @@ function buildManifest(root, options = {}) {
 }
 
 function redact(text) {
-  return text.replace(SECRET_RE, "[REDACTED_SECRET]").replace(SECRET_ASSIGN_RE, (match, secret) => match.replace(secret, "[REDACTED_SECRET]"));
+  return redactSecrets(text, "[REDACTED_SECRET]");
 }
 
 function scanFiles(files) {
@@ -146,13 +145,13 @@ function scanFiles(files) {
     // `/token|secret/i` test blocked ordinary vocabulary — measured 2026-07-29,
     // it gave the live `web-master` package a BLOCK verdict for its own design
     // system (`token-architecture.md`, `reference-token-db.json`). Dropping it
-    // costs no coverage: the per-line SECRET_PATTERNS scan below reads every
+    // costs no coverage: the shared per-line credential scan below reads every
     // packaged file and is the check that actually looks at values.
     if (/^\.env(\.|$)/.test(file.path.split("/").pop() || "") || /(?:^|\/)(secrets|credentials|cookies)\//i.test(file.path)) {
       add("BLOCK", "credential-path", file, null, "Credential-like file path is excluded from Cloud package and public publish.");
     }
     file.content.split(/\r?\n/).forEach((line, index) => {
-      if (SECRET_RE.test(line) || SECRET_ASSIGN_RE.test(line)) add("BLOCK", "secret-like-value", file, index + 1, "Secret-like value detected and redacted.");
+      if (looksSecret(line)) add("BLOCK", "secret-like-value", file, index + 1, "Secret-like value detected and redacted.");
       if (PROMPT_INJECTION_RE.test(line)) add("WARN", "prompt-injection", file, index + 1, "Prompt-injection style instruction needs review.");
       if (DESTRUCTIVE_RE.test(line)) add("WARN", "destructive-command", file, index + 1, "Destructive or remote shell command needs review before execution.");
     });

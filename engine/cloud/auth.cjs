@@ -23,6 +23,95 @@ const { userDataDir } = require("../core/paths.cjs");
 const LOGIN_CALLBACK_PATH = "/callback";
 const LOGIN_TIMEOUT_MS = 180_000;
 const MAX_LOGIN_SESSION_BYTES = 16 * 1024;
+const MAX_LOGIN_SESSION_FILE_BYTES = MAX_LOGIN_SESSION_BYTES * 2;
+const O_NOFOLLOW = fs.constants.O_NOFOLLOW || 0;
+
+function sameFileIdentity(left, right) {
+  return !!left && !!right
+    && left.dev === right.dev
+    && left.ino === right.ino
+    && left.nlink === right.nlink;
+}
+
+function sameDirectoryIdentity(info) {
+  try {
+    const current = fs.lstatSync(info.path);
+    return current.isDirectory()
+      && !current.isSymbolicLink()
+      && current.dev === info.stat.dev
+      && current.ino === info.stat.ino;
+  } catch {
+    return false;
+  }
+}
+
+function ensureRealDirectory(directory, { create = false } = {}) {
+  const resolved = path.resolve(String(directory || ""));
+  if (create) fs.mkdirSync(resolved, { recursive: true, mode: 0o700 });
+  const stat = fs.lstatSync(resolved);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error("Refusing to use a symbolic-link Agentlas session directory.");
+  }
+  return { path: resolved, stat, realpath: fs.realpathSync.native(resolved) };
+}
+
+function ensureAuthDirectory({ create = false } = {}) {
+  const root = ensureRealDirectory(userDataDir(), { create });
+  const info = ensureRealDirectory(path.join(root.path, "auth"), { create });
+  // The auth directory must be a child of the configured user-data directory,
+  // not a mounted/symlinked redirect that merely passes the final lstat.
+  if (path.dirname(info.realpath) !== root.realpath) {
+    throw new Error("Refusing to use a redirected Agentlas session directory.");
+  }
+  return info;
+}
+
+function readBoundedFd(fd, maxBytes) {
+  const chunks = [];
+  let total = 0;
+  while (total <= maxBytes) {
+    const want = Math.min(8192, maxBytes - total + 1);
+    const buffer = Buffer.allocUnsafe(want);
+    const count = fs.readSync(fd, buffer, 0, want, null);
+    if (!count) break;
+    total += count;
+    if (total > maxBytes) return null;
+    chunks.push(buffer.subarray(0, count));
+  }
+  return Buffer.concat(chunks, total);
+}
+
+function readPrivateBoundedFile(filePath, maxBytes) {
+  let before;
+  let fd = null;
+  try {
+    before = fs.lstatSync(filePath);
+    if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1 || before.size > maxBytes) return null;
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | O_NOFOLLOW);
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.nlink !== 1
+      || opened.size > maxBytes || !sameFileIdentity(before, opened)) return null;
+    const contents = readBoundedFd(fd, maxBytes);
+    const after = fs.fstatSync(fd);
+    if (
+      contents === null || !after.isFile() || after.nlink !== 1 || !sameFileIdentity(opened, after) ||
+      after.size !== opened.size || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs ||
+      after.size !== contents.length
+    ) return null;
+    return contents.toString("utf8");
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+}
+
+function writeAll(fd, buffer) {
+  let offset = 0;
+  while (offset < buffer.length) offset += fs.writeSync(fd, buffer, offset, buffer.length - offset);
+}
 
 function validLoginSessionValue(value) {
   return typeof value === "string" && value.length > 0 &&
@@ -230,9 +319,11 @@ function cliSessionPath() {
 function readCliSessionValue() {
   try {
     const p = cliSessionPath();
-    const stat = fs.lstatSync(p);
-    if (stat.isSymbolicLink() || !stat.isFile() || stat.size > MAX_LOGIN_SESSION_BYTES * 2) return null;
-    const j = JSON.parse(fs.readFileSync(p, "utf8"));
+    const authDir = ensureAuthDirectory();
+    const raw = readPrivateBoundedFile(p, MAX_LOGIN_SESSION_FILE_BYTES);
+    if (raw === null) return null;
+    if (!sameDirectoryIdentity(authDir)) return null;
+    const j = JSON.parse(raw);
     return j && validLoginSessionValue(j.value) ? j.value : null;
   } catch {
     return null;
@@ -243,29 +334,56 @@ function saveCliSession(value) {
   if (!validLoginSessionValue(value)) throw new Error("Refusing to save an invalid Agentlas login session value.");
   const p = cliSessionPath();
   // 디렉터리 0700 + 파일 0600 — 기본 umask(0644)로 세션이 world-readable 이 되는 것을 막는다.
-  const dir = path.dirname(p);
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const authDir = ensureAuthDirectory({ create: true });
+  const dir = authDir.path;
   try { fs.chmodSync(dir, 0o700); } catch { /* win32 */ }
   const temp = path.join(dir, `.cli-session.${process.pid}.${crypto.randomUUID()}.tmp`);
+  const payload = Buffer.from(JSON.stringify({ version: 1, value, updatedAt: new Date().toISOString() }, null, 2) + "\n", "utf8");
+  if (payload.length > MAX_LOGIN_SESSION_FILE_BYTES) throw new Error("Refusing to save an oversized Agentlas login session.");
+  let fd = null;
   try {
-    fs.writeFileSync(temp, JSON.stringify({ version: 1, value, updatedAt: new Date().toISOString() }, null, 2) + "\n", {
-      encoding: "utf8",
-      mode: 0o600,
-      flag: "wx",
-    });
+    fd = fs.openSync(temp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW, 0o600);
+    const created = fs.fstatSync(fd);
+    if (!created.isFile() || created.nlink !== 1) throw new Error("Refusing to create an unsafe Agentlas login session file.");
+    writeAll(fd, payload);
+    fs.fsyncSync(fd);
+    const written = fs.fstatSync(fd);
+    if (!sameFileIdentity(created, written) || written.size !== payload.length) throw new Error("Agentlas login session changed while saving.");
+    fs.closeSync(fd);
+    fd = null;
+    if (!sameDirectoryIdentity(authDir)) throw new Error("Agentlas login session directory changed while saving.");
     fs.renameSync(temp, p);
+    const installed = fs.lstatSync(p);
+    if (installed.isSymbolicLink() || !installed.isFile() || installed.nlink !== 1) throw new Error("Refusing to install an unsafe Agentlas login session file.");
   } catch (error) {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch { /* preserve original */ }
+    }
     try { fs.rmSync(temp, { force: true }); } catch { /* preserve original */ }
     throw error;
   }
-  try { fs.chmodSync(p, 0o600); } catch { /* win32 */ }
   return p;
 }
 
 function deleteCliSession() {
   const p = cliSessionPath();
-  if (!fs.existsSync(p)) return { existed: false, path: p };
-  fs.rmSync(p);
+  let authDir;
+  try { authDir = ensureAuthDirectory(); } catch (error) {
+    if (error?.code === "ENOENT") return { existed: false, path: p };
+    throw error;
+  }
+  let stat;
+  try { stat = fs.lstatSync(p); } catch (error) {
+    if (error?.code === "ENOENT") return { existed: false, path: p };
+    throw error;
+  }
+  if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1) {
+    throw new Error("Refusing to delete an unsafe Agentlas login session file.");
+  }
+  if (!sameDirectoryIdentity(authDir)) throw new Error("Agentlas login session directory changed while deleting.");
+  const current = fs.lstatSync(p);
+  if (!sameFileIdentity(stat, current)) throw new Error("Agentlas login session changed while deleting.");
+  fs.unlinkSync(p);
   return { existed: true, path: p };
 }
 

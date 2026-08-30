@@ -28,6 +28,52 @@ const EFFORTS = Object.freeze(["none", "minimal", "low", "medium", "high", "xhig
 const EFFORT_TOKEN_RE = /^[a-z][a-z0-9-]{0,23}$/;
 const CAPABILITIES = new Set(["code", "image", "tools", "long-context"]);
 const PHASES = new Set(["plan", "delegate", "synthesize"]);
+const MAX_CODEX_MODEL_CACHE_BYTES = 2 * 1024 * 1024;
+const MAX_DECISION_RECEIPT_BYTES = 16 * 1024 * 1024;
+const MAX_DECISION_RECEIPT_RECORD_BYTES = 1024 * 1024;
+
+function sameFileIdentity(left, right) {
+  return Boolean(left && right && left.dev === right.dev && left.ino === right.ino);
+}
+
+function safeRegularFile(stat, maxBytes, { nonEmpty = false } = {}) {
+  return Boolean(
+    stat && stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1 &&
+    Number.isSafeInteger(stat.size) && stat.size >= (nonEmpty ? 1 : 0) && stat.size <= maxBytes,
+  );
+}
+
+function readBoundedRegularFile(file, maxBytes) {
+  const before = fs.lstatSync(file);
+  if (!safeRegularFile(before, maxBytes, { nonEmpty: true })) throw new Error("model inventory must be a bounded single-link regular file");
+  const noFollow = fs.constants.O_NOFOLLOW || 0;
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | noFollow);
+  try {
+    const opened = fs.fstatSync(fd);
+    if (!safeRegularFile(opened, maxBytes, { nonEmpty: true }) || !sameFileIdentity(before, opened)) {
+      throw new Error("model inventory changed while opening");
+    }
+    const chunks = [];
+    let total = 0;
+    while (total <= maxBytes) {
+      const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes + 1 - total));
+      const count = fs.readSync(fd, buffer, 0, buffer.length, null);
+      if (!count) break;
+      chunks.push(buffer.subarray(0, count));
+      total += count;
+    }
+    if (total > maxBytes) throw new Error("model inventory exceeds its safety limit");
+    const after = fs.fstatSync(fd);
+    if (
+      !safeRegularFile(after, maxBytes, { nonEmpty: true }) || !sameFileIdentity(opened, after) ||
+      after.size !== opened.size || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs ||
+      total !== after.size
+    ) throw new Error("model inventory changed while reading");
+    return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks, total));
+  } finally {
+    fs.closeSync(fd);
+  }
+}
 
 function cleanText(value, max = 240) {
   return String(value || "").replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
@@ -161,11 +207,12 @@ function defaultAvailableModels(runtime) {
 }
 
 function readCodexModelInventory(codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex")) {
-  const file = path.join(codexHome, "models_cache.json");
   try {
-    const stat = fs.statSync(file);
-    if (!stat.isFile() || stat.size <= 0 || stat.size > 2 * 1024 * 1024) return [];
-    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    const realHome = fs.realpathSync(codexHome);
+    const homeStat = fs.lstatSync(realHome);
+    if (!homeStat.isDirectory() || homeStat.isSymbolicLink()) return [];
+    const file = path.join(realHome, "models_cache.json");
+    const parsed = JSON.parse(readBoundedRegularFile(file, MAX_CODEX_MODEL_CACHE_BYTES));
     if (!Array.isArray(parsed.models)) return [];
     const out = [];
     const seen = new Set();
@@ -517,22 +564,48 @@ function appendDecisionReceipt(receipt, file = defaultReceiptPath()) {
   const directory = path.dirname(file);
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   try { fs.chmodSync(directory, 0o700); } catch { /* Windows/best effort */ }
+  const realDirectory = fs.realpathSync(directory);
+  const directoryStat = fs.lstatSync(realDirectory);
+  if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
+    throw new Error("model routing receipt directory must be a real directory");
+  }
+  const target = path.join(realDirectory, path.basename(file));
+  const line = Buffer.from(JSON.stringify(receipt) + "\n", "utf8");
+  if (line.length <= 1 || line.length > MAX_DECISION_RECEIPT_RECORD_BYTES) {
+    throw new Error("model routing receipt record exceeds its safety limit");
+  }
+  let before = null;
   try {
-    const stat = fs.lstatSync(file);
-    if (stat.isSymbolicLink()) throw new Error("model routing receipt path must not be a symlink");
+    before = fs.lstatSync(target);
+    if (before.isSymbolicLink()) {
+      throw new Error("model routing receipt path must not be a symlink");
+    }
+    if (!safeRegularFile(before, MAX_DECISION_RECEIPT_BYTES - line.length)) {
+      throw new Error("model routing receipt path must be a bounded single-link regular file");
+    }
   } catch (error) {
     if (error && error.code !== "ENOENT") throw error;
   }
   const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | (fs.constants.O_NOFOLLOW || 0);
-  const fd = fs.openSync(file, flags, 0o600);
+  const fd = fs.openSync(target, flags, 0o600);
   try {
-    fs.writeSync(fd, JSON.stringify(receipt) + "\n", null, "utf8");
+    const opened = fs.fstatSync(fd);
+    if (
+      !safeRegularFile(opened, MAX_DECISION_RECEIPT_BYTES - line.length) ||
+      (before && !sameFileIdentity(before, opened))
+    ) throw new Error("model routing receipt changed while opening");
+    fs.fchmodSync(fd, 0o600);
+    const written = fs.writeSync(fd, line, 0, line.length, null);
+    if (written !== line.length) throw new Error("model routing receipt write was incomplete");
     fs.fsyncSync(fd);
+    const after = fs.fstatSync(fd);
+    if (!safeRegularFile(after, MAX_DECISION_RECEIPT_BYTES) || !sameFileIdentity(opened, after)) {
+      throw new Error("model routing receipt changed while writing");
+    }
   } finally {
     fs.closeSync(fd);
   }
-  try { fs.chmodSync(file, 0o600); } catch { /* Windows/best effort */ }
-  return file;
+  return target;
 }
 
 function plannerSystemPrompt({ language = "English", maxTasks = 12, mode = "swarm", liveRuntimeInventory = [] } = {}) {

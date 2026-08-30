@@ -27,7 +27,10 @@ const MAX_NOTICE_LENGTH = 400;
 const NOTICE_PATTERNS = [
   /\byou'?ve hit\b/i,                 // "You've hit your weekly/usage limit" (claude·codex 실측)
   /\busage limit\b/i,
-  /\brate.?limit(ed)?\b/i,
+  /\brate.?limit (?:exceeded|reached)\b/i,
+  /^(?:error:\s*)?rate.?limit (?:has been )?(?:exceeded|reached)\b/i,
+  /\b(?:your|the) rate.?limit (?:has been|is) (?:exceeded|reached)\b/i,
+  /\byou (?:are (?:currently )?|have been )rate.?limited\b/i,
   /\bquota (exceeded|reached)\b/i,
   /\bresets? (at|on)\b/i,             // "resets Aug 8 at 6pm"
   /\btry again (at|later)\b/i,

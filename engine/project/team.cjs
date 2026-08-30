@@ -18,24 +18,49 @@
  *    갱신하고, 없으면 만든다(데스크탑이 만든 프로젝트도 그대로 이어받는다).
  */
 const crypto = require("node:crypto");
+const os = require("node:os");
 const path = require("node:path");
 const fs = require("node:fs");
 const { runWriteTransaction } = require("../agentlas-sqlite-policy.cjs");
 const { findAgent } = require("../agents/registry.cjs");
+const { userDataDir } = require("../core/paths.cjs");
 
 function canonical(p) {
   const resolved = path.resolve(String(p || ""));
-  try { return fs.realpathSync.native(resolved); } catch { return resolved; }
+  let root;
+  try { root = fs.realpathSync.native(resolved); }
+  catch { throw Object.assign(new Error(`project folder does not exist: ${resolved}`), { code: "project_folder_invalid", honestStop: true }); }
+  const stat = fs.lstatSync(root);
+  let home = path.resolve(os.homedir());
+  let data = path.resolve(userDataDir());
+  try { home = fs.realpathSync.native(home); } catch { /* compare unresolved */ }
+  try { data = fs.realpathSync.native(data); } catch { /* compare unresolved */ }
+  if (
+    !stat.isDirectory() || stat.isSymbolicLink() ||
+    path.parse(root).root === root || root === home ||
+    root === data || root.startsWith(`${data}${path.sep}`)
+  ) {
+    throw Object.assign(new Error(`refusing unsafe project folder: ${resolved}`), { code: "project_folder_invalid", honestStop: true });
+  }
+  return root;
 }
 
 /** slug/이름 목록 → 검증된 순서 풀. 못 찾은 이름은 정직하게 실패. */
 function resolveTeam(db, tokens) {
+  if (tokens.length > 64) {
+    throw Object.assign(new Error("a project team may contain at most 64 agents"), { code: "team_too_large", honestStop: true });
+  }
   const pool = [];
+  const seen = new Set();
   for (const token of tokens) {
     const agent = findAgent(db, token);
     if (!agent) {
       throw Object.assign(new Error(`agent not found: ${token}`), { code: "team_agent_not_found", honestStop: true, token });
     }
+    if (seen.has(agent.id)) {
+      throw Object.assign(new Error(`duplicate project team agent: ${token}`), { code: "team_agent_duplicate", honestStop: true, token });
+    }
+    seen.add(agent.id);
     // 설치 에이전트는 로컬이다(installed_agents에 있음 = 이 머신에서 실행 가능).
     pool.push({
       agentId: agent.id,

@@ -27,9 +27,9 @@ function resolvePermission(ctx) {
   // persistent()가 fail-closed 로 강등한다.
   try {
     const policy = require("../agentlas-permissions.cjs");
-    return policy.persistent(ctx && ctx.prefs && ctx.prefs.permission, "write");
+    return policy.persistent(ctx && ctx.prefs && ctx.prefs.permission, "read");
   } catch {
-    return "write";
+    return "read";
   }
 }
 
@@ -37,14 +37,54 @@ function resolvePermission(ctx) {
 function splitRuntimeOverride(args) {
   const rest = [];
   let runtimeOverride = null;
+  let seen = false;
+  let passthrough = false;
   for (let i = 0; i < args.length; i += 1) {
-    if (args[i] === "--runtime" && args[i + 1]) {
-      runtimeOverride = String(args[++i]);
+    const token = String(args[i]);
+    if (passthrough) { rest.push(token); continue; }
+    if (token === "--") { passthrough = true; rest.push(token); continue; }
+    if (token === "--runtime" || token.startsWith("--runtime=")) {
+      if (seen) throw new Error("duplicate option: --runtime");
+      seen = true;
+      const inline = token.startsWith("--runtime=");
+      const value = inline ? token.slice(10) : args[++i];
+      if (value === undefined || value === "" || (!inline && String(value).startsWith("--"))) {
+        throw new Error("--runtime requires a value");
+      }
+      runtimeOverride = String(value);
       continue;
     }
-    rest.push(args[i]);
+    rest.push(token);
   }
   return { rest, runtimeOverride };
+}
+
+function validateWorkforceArgs(args) {
+  const seen = new Set();
+  let passthrough = false;
+  let hasTask = false;
+  for (let i = 0; i < args.length; i += 1) {
+    const token = String(args[i]);
+    if (passthrough) { hasTask = true; continue; }
+    if (token === "--") { passthrough = true; continue; }
+    if (token === "--benchmark" || token === "--json") {
+      const key = token.slice(2);
+      if (seen.has(key)) return { error: `duplicate option: ${token}`, hasTask };
+      seen.add(key);
+    } else if (token === "--parallel" || token === "-n" || token.startsWith("--parallel=")) {
+      if (seen.has("parallel")) return { error: "duplicate option: --parallel", hasTask };
+      seen.add("parallel");
+      const inline = token.startsWith("--parallel=");
+      const raw = inline ? token.slice(11) : args[++i];
+      const value = Number(raw);
+      if (raw === undefined || raw === "" || (!inline && String(raw).startsWith("--")) || !Number.isInteger(value) || value < 1 || value > 8) {
+        return { error: "--parallel requires a positive integer (maximum 8)", hasTask };
+      }
+    } else if (token.startsWith("-")) {
+      return { error: `unknown option: ${token} (use -- before a task token that starts with '-')`, hasTask };
+    } else hasTask = true;
+  }
+  return { error: null, hasTask };
 }
 
 /**
@@ -56,13 +96,15 @@ async function dispatch(ctx, command, args) {
     case "workforce":
     case "network":
     case "taskforce": {
-      const { rest, runtimeOverride } = splitRuntimeOverride(args);
+      let parsed;
+      try { parsed = splitRuntimeOverride(args); }
+      catch (error) { ctx.err(String((error && error.message) || error)); return 1; }
+      const { rest, runtimeOverride } = parsed;
+      const validation = validateWorkforceArgs(rest);
+      if (validation.error) { ctx.err(validation.error); return 1; }
       // usage 경로(작업 텍스트 없음)는 SQLite를 열 이유가 없다 — cmdWorkforce 의
       // parseArgs 와 동일한 판정: 플래그가 아닌 토큰이 하나도 없으면 빈 작업이다.
-      const hasTask = rest.some((token, i) =>
-        !["--benchmark", "--json", "--parallel", "-n"].includes(String(token))
-        && !(i > 0 && ["--parallel", "-n"].includes(String(rest[i - 1]))));
-      if (!hasTask) {
+      if (!validation.hasTask) {
         ctx.err("usage: agentlas workforce <task> [--parallel N] [--benchmark] [--json] [--runtime <kind>]");
         return 1;
       }
@@ -107,11 +149,13 @@ async function dispatch(ctx, command, args) {
     case "hep-hub": {
       const sourceScope = command.slice(4); // network|local|cloud|hub
       const ko = ctx.lang !== "en";
-      const { rest, runtimeOverride } = splitRuntimeOverride(args);
-      const hasTask = rest.some((token, i) =>
-        !["--benchmark", "--json", "--parallel", "-n"].includes(String(token))
-        && !(i > 0 && ["--parallel", "-n"].includes(String(rest[i - 1]))));
-      if (!hasTask) {
+      let parsed;
+      try { parsed = splitRuntimeOverride(args); }
+      catch (error) { ctx.err(String((error && error.message) || error)); return 1; }
+      const { rest, runtimeOverride } = parsed;
+      const validation = validateWorkforceArgs(rest);
+      if (validation.error) { ctx.err(validation.error); return 1; }
+      if (!validation.hasTask) {
         ctx.err(`usage: agentlas ${command} "<task>" [--parallel N] [--json] [--runtime <kind>]`);
         return 1;
       }
@@ -162,4 +206,4 @@ function run(ctx, args) {
   return dispatch(ctx, "workforce", args);
 }
 
-module.exports = { run, dispatch };
+module.exports = { run, dispatch, splitRuntimeOverride, validateWorkforceArgs };

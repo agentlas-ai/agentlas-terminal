@@ -7,11 +7,13 @@
 const { installHubAgent } = require("../hub/install.cjs");
 
 async function run(ctx, args) {
-  const slug = (args[0] || "").trim();
-  if (!slug) {
-    ctx.err("usage: agentlas install <slug>");
-    return 1;
+  if (args.length !== 1 || String(args[0] || "").startsWith("-")) {
+    const error = new Error("usage: agentlas install <slug>");
+    error.code = "INVALID_ARGUMENT";
+    throw error;
   }
+  const slug = String(args[0]).trim();
+  if (!slug) throw Object.assign(new Error("usage: agentlas install <slug>"), { code: "INVALID_ARGUMENT" });
   let agent;
   try {
     agent = await installHubAgent(ctx.db(), slug);

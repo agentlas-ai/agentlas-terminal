@@ -15,6 +15,39 @@ const schedule = require("../automation/schedule.cjs");
 const store = require("../automation/store.cjs");
 const daemon = require("../automation/daemon.cjs");
 
+function parseOptions(args, schema) {
+  const values = new Set(schema.values || []);
+  const booleans = new Set(schema.booleans || []);
+  const out = {};
+  for (let i = 0; i < args.length; i += 1) {
+    const token = String(args[i]);
+    if (!token.startsWith("--") || token === "--") throw new Error(`unexpected argument: ${token}`);
+    const at = token.indexOf("=");
+    const key = token.slice(2, at >= 0 ? at : undefined);
+    if (!values.has(key) && !booleans.has(key)) throw new Error(`unknown option: --${key}`);
+    if (Object.prototype.hasOwnProperty.call(out, key)) throw new Error(`duplicate option: --${key}`);
+    if (booleans.has(key)) {
+      if (at >= 0) throw new Error(`--${key} does not take a value`);
+      out[key] = true;
+      continue;
+    }
+    const value = at >= 0 ? token.slice(at + 1) : args[++i];
+    if (value === undefined || value === "" || (at < 0 && String(value).startsWith("--"))) {
+      throw new Error(`--${key} requires a value`);
+    }
+    out[key] = String(value);
+  }
+  return out;
+}
+
+function intervalOption(raw, minimum, label = "--interval") {
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < minimum) {
+    throw new Error(`${label} requires an integer of at least ${minimum} seconds`);
+  }
+  return parsed;
+}
+
 function resolveFirm(db, token) {
   const q = String(token || "").trim();
   if (!q) return null;
@@ -34,6 +67,7 @@ async function run(ctx, args) {
   const fail = (msg) => { ctx.err(msg); return 1; };
 
   if (sub === "list") {
+    if (args.length !== 1 && args.length !== 0) return fail(`unexpected argument: ${String(args[1])}`);
     const rows = store.listAutomations(db);
     if (!rows.length) {
       ctx.out(ko
@@ -62,17 +96,14 @@ async function run(ctx, args) {
 
   if (sub === "add") {
     // agentlas automation add --name "..." --agent <slug>|--firm <slug> --cron "0 9 * * *" --prompt "..."
-    const flags = {};
-    for (let i = 1; i < args.length; i++) {
-      const a = args[i];
-      if (a === "--name") flags.name = args[++i];
-      else if (a === "--agent") flags.agent = args[++i];
-      else if (a === "--firm") flags.firm = args[++i];
-      else if (a === "--cron") flags.cron = args[++i];
-      else if (a === "--prompt") flags.prompt = args[++i];
-      else if (a === "--tz") flags.tz = args[++i];
-      else if (a === "--disabled") flags.disabled = true;
-    }
+    let flags;
+    try {
+      flags = parseOptions(args.slice(1), {
+        values: ["name", "agent", "firm", "cron", "prompt", "tz"],
+        booleans: ["disabled"],
+      });
+    } catch (error) { return fail(String((error && error.message) || error)); }
+    if (flags.agent && flags.firm) return fail("use only one of --agent or --firm");
     if (!flags.cron || !flags.prompt || (!flags.agent && !flags.firm)) {
       ctx.err(ko
         ? '사용법: agentlas automation add --name "이름" --agent <슬러그>|--firm <슬러그> --cron "0 9 * * *" --prompt "지시" [--tz Asia/Seoul] [--disabled]'
@@ -128,9 +159,15 @@ async function run(ctx, args) {
   if (sub === "on" || sub === "off") {
     const idPrefix = args[1];
     if (!idPrefix) return fail(usage(`${sub} <id>`));
+    if (args.length !== 2) return fail(`unexpected argument: ${String(args[2])}`);
     const row = store.getAutomationByPrefix(db, idPrefix);
     if (!row) return fail(missingAutomation(idPrefix));
-    store.setEnabled(db, row, sub === "on");
+    const outcome = store.setEnabledChecked(db, row, sub === "on");
+    if (!outcome.changed) {
+      return fail(ko
+        ? `자동화가 변경되는 동안 사라졌습니다: ${row.id}`
+        : `Automation changed before it could be updated: ${row.id}`);
+    }
     ctx.out(`${sub === "on" ? (ko ? "활성화됨" : "Enabled") : (ko ? "비활성화됨" : "Disabled")}: ${row.id.slice(0, 8)}  ${row.name}`);
     return 0;
   }
@@ -138,14 +175,20 @@ async function run(ctx, args) {
   if (sub === "remove" || sub === "rm") {
     const idPrefix = args[1];
     if (!idPrefix) return fail(usage("remove <id>"));
+    if (args.length !== 2) return fail(`unexpected argument: ${String(args[2])}`);
     const row = store.getAutomationByPrefix(db, idPrefix);
     if (!row) return fail(missingAutomation(idPrefix));
-    store.removeAutomation(db, row.id);
+    if (!store.removeAutomation(db, row.id)) {
+      return fail(ko
+        ? `자동화가 삭제되는 동안 사라졌습니다: ${row.id}`
+        : `Automation changed before it could be deleted: ${row.id}`);
+    }
     ctx.out(`${ko ? "삭제됨" : "Deleted"}: ${row.id.slice(0, 8)}  ${row.name}`);
     return 0;
   }
 
   if (sub === "runs") {
+    if (args.length !== 1) return fail(`unexpected argument: ${String(args[1])}`);
     const rows = store.listRuns(db, 15);
     if (!rows.length) {
       ctx.out(ko ? "실행 기록이 없습니다." : "No run history.");
@@ -165,11 +208,11 @@ async function run(ctx, args) {
 
   if (sub === "run") {
     const idPrefix = args[1];
-    let runtimeOverride = null;
-    for (let i = 2; i < args.length; i++) {
-      if (args[i] === "--runtime") runtimeOverride = args[++i];
-    }
     if (!idPrefix) return fail(usage("run <id>"));
+    let runFlags;
+    try { runFlags = parseOptions(args.slice(2), { values: ["runtime"], booleans: [] }); }
+    catch (error) { return fail(String((error && error.message) || error)); }
+    const runtimeOverride = runFlags.runtime || null;
     const row = store.getAutomationByPrefix(db, idPrefix);
     if (!row) return fail(missingAutomation(idPrefix));
     // run-now는 스케줄을 건드리지 않는다 (앱의 advanceSchedule=false와 동일).
@@ -190,17 +233,19 @@ async function run(ctx, args) {
   }
 
   if (sub === "daemon") {
+    let daemonFlags;
+    try { daemonFlags = parseOptions(args.slice(1), { values: ["interval", "runtime"], booleans: [] }); }
+    catch (error) { return fail(String((error && error.message) || error)); }
     let interval = 30;
-    let runtimeOverride = null;
-    for (let i = 1; i < args.length; i++) {
-      if (args[i] === "--interval") interval = Math.max(10, Number(args[++i]) || 30);
-      else if (args[i] === "--runtime") runtimeOverride = args[++i];
-    }
+    try { if (daemonFlags.interval !== undefined) interval = intervalOption(daemonFlags.interval, 10); }
+    catch (error) { return fail(String((error && error.message) || error)); }
+    const runtimeOverride = daemonFlags.runtime || null;
     return daemon.automationDaemon(ctx, db, { intervalSec: interval, runtimeOverride });
   }
 
   // 1회 due 스윕 후 종료 — launchd/cron 이 poke 하는 진입점(상주 루프 아님).
   if (sub === "tick") {
+    if (args.length !== 1) return fail(`unexpected argument: ${String(args[1])}`);
     await daemon.daemonTick(ctx, db, {});
     return 0;
   }
@@ -209,6 +254,7 @@ async function run(ctx, args) {
   if (sub === "install" || sub === "uninstall" || sub === "status") {
     const launchd = require("../automation/launchd.cjs");
     if (sub === "status") {
+      if (args.length !== 1) return fail(`unexpected argument: ${String(args[1])}`);
       const st = launchd.launchdStatus();
       if (!st.supported) { ctx.out(ko ? "launchd 상주는 macOS 전용입니다. 다른 OS 는 `agentlas automation daemon` 을 켜 두세요." : "launchd persistence is macOS-only. On other systems keep `agentlas automation daemon` running."); return 0; }
       ctx.out(`${st.loaded ? ctx.ui.green("✓") : ctx.ui.dim("○")} ${ko ? "상주(launchd)" : "persistence (launchd)"}: ${st.loaded ? (ko ? "실행 중" : "loaded") : st.installed ? (ko ? "설치됨(미로드)" : "installed (not loaded)") : (ko ? "미설치" : "not installed")}`);
@@ -217,8 +263,12 @@ async function run(ctx, args) {
       return 0;
     }
     if (sub === "install") {
+      let installFlags;
+      try { installFlags = parseOptions(args.slice(1), { values: ["interval"], booleans: [] }); }
+      catch (error) { return fail(String((error && error.message) || error)); }
       let interval = 300;
-      for (let i = 1; i < args.length; i++) if (args[i] === "--interval") interval = Math.max(30, Number(args[++i]) || 300);
+      try { if (installFlags.interval !== undefined) interval = intervalOption(installFlags.interval, 30); }
+      catch (error) { return fail(String((error && error.message) || error)); }
       const st = launchd.enableLaunchd({ intervalSec: interval });
       if (st.error) { ctx.err(`${ctx.ui.red("✖")} ${st.error}`); return 1; }
       ctx.out(`${ctx.ui.green("✓")} ${ko ? "상주를 켰습니다 — 앱/창이 꺼져 있어도 자동화가 발동합니다" : "persistence on — automations fire even with the app/window closed"} (${interval}s)`);
@@ -226,6 +276,7 @@ async function run(ctx, args) {
       return 0;
     }
     // uninstall
+    if (args.length !== 1) return fail(`unexpected argument: ${String(args[1])}`);
     const st = launchd.disableLaunchd();
     if (st.error) { ctx.err(`${ctx.ui.red("✖")} ${st.error}`); return 1; }
     ctx.out(`${ctx.ui.green("✓")} ${ko ? "상주를 껐습니다. 자동화는 포그라운드 daemon 을 켜 둘 때만 발동합니다." : "persistence off. Automations fire only while a foreground daemon runs."}`);
@@ -236,4 +287,4 @@ async function run(ctx, args) {
   return 1;
 }
 
-module.exports = { run };
+module.exports = { run, parseOptions, intervalOption };

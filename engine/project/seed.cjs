@@ -60,34 +60,83 @@ function removeLegacySuperOntologyFiles(dir) {
   }
 }
 
+function privateSeedName(value, fallback) {
+  const name = String(value || fallback || "").trim();
+  if (!name || name !== path.basename(name) || name === "." || name === ".." || name.length > 180) {
+    throw new Error("Agentlas project seed contains an unsafe file name");
+  }
+  return name;
+}
+
+function ensurePrivateDirectory(dir) {
+  try { fs.mkdirSync(dir, { recursive: false, mode: 0o700 }); }
+  catch (error) { if (!error || error.code !== "EEXIST") throw error; }
+  const listed = fs.lstatSync(dir);
+  if (!listed.isDirectory() || listed.isSymbolicLink()) {
+    throw new Error("Agentlas project state path must be a real directory");
+  }
+  if (process.platform !== "win32") fs.chmodSync(dir, 0o700);
+  return dir;
+}
+
+function ensurePrivateSeedFile(file, content) {
+  let fd = null;
+  const noFollow = fs.constants.O_NOFOLLOW || 0;
+  try {
+    try {
+      fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow, 0o600);
+      const bytes = Buffer.from(String(content), "utf8");
+      const written = fs.writeSync(fd, bytes, 0, bytes.length, null);
+      if (written !== bytes.length) throw new Error("Agentlas project seed write was incomplete");
+      fs.fsyncSync(fd);
+    } catch (error) {
+      if (!error || error.code !== "EEXIST") throw error;
+      if (fd != null) { try { fs.closeSync(fd); } catch { /* ignore */ } fd = null; }
+      fd = fs.openSync(file, fs.constants.O_RDONLY | noFollow);
+    }
+    const opened = fs.fstatSync(fd);
+    const listed = fs.lstatSync(file);
+    if (
+      !opened.isFile() || opened.nlink !== 1 ||
+      !listed.isFile() || listed.isSymbolicLink() || listed.nlink !== 1 ||
+      opened.dev !== listed.dev || opened.ino !== listed.ino
+    ) throw new Error("Agentlas project seed target must be a single-link regular file");
+    try { fs.fchmodSync(fd, 0o600); } catch { /* Windows/ACL-only host */ }
+    return file;
+  } finally {
+    if (fd != null) try { fs.closeSync(fd); } catch { /* ignore */ }
+  }
+}
+
 function ensureProjectMemoryCli(projectPath, projectName) {
   const arch = loadArch();
   try {
-    const dir = path.join(projectPath, arch.memoryDir || ".agentlas");
-    fs.mkdirSync(dir, { recursive: true });
+    const root = path.resolve(projectPath);
+    const canonicalRoot = fs.realpathSync.native(root);
+    const rootStat = fs.lstatSync(root);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || path.parse(canonicalRoot).root === canonicalRoot) return null;
+    const memoryDirName = privateSeedName(arch.memoryDir, ".agentlas");
+    const dir = ensurePrivateDirectory(path.join(root, memoryDirName));
     removeLegacySuperOntologyFiles(dir);
-    const name = projectName || path.basename(projectPath) || "Project";
-    ensureLocalCredentialStoreCli(projectPath, name, arch);
-    ensureSoulCredentialIndexCli(projectPath, name, arch);
-    const sitemap = path.join(dir, arch.sitemapFile || "sitemap.json");
-    if (!fs.existsSync(sitemap)) {
-      const now = new Date().toISOString();
-      fs.writeFileSync(sitemap, JSON.stringify({ project: name, created_at: now, updated_at: now, nodes: [] }, null, 2), "utf8");
-    }
-    const skillRegistryFile = arch.skillRegistryFile || "skill-registry.json";
-    const skillTrialsFile = arch.skillTrialsFile || "skill-trials.jsonl";
-    const curatorDecisionsFile = arch.curatorDecisionsFile || "curator-decisions.jsonl";
-    const ontologyRuntimeFile = arch.ontologyRuntimeFile || "ontology-runtime.json";
-    const ontologySourceManifestFile = arch.ontologySourceManifestFile || "ontology-sources.json";
-    const ontologyInboxDir = arch.ontologyInboxDir || "ontology-inbox";
-    const ontologyDbFile = arch.ontologyDbFile || "ontology-runtime.sqlite";
-    const careerGraphConfigFile = arch.careerGraphConfigFile || "career-graph.json";
-    const careerGraphSourceManifestFile = arch.careerGraphSourceManifestFile || "career-graph-sources.json";
-    const careerGraphInboxDir = arch.careerGraphInboxDir || "career-graph-inbox";
-    const careerGraphDbFile = arch.careerGraphDbFile || "career-graph.sqlite";
+    const name = String(projectName || path.basename(root) || "Project").slice(0, 200);
+    ensureLocalCredentialStoreCli(root, name, arch);
+    ensureSoulCredentialIndexCli(root, name, arch);
+    const sitemap = path.join(dir, privateSeedName(arch.sitemapFile, "sitemap.json"));
+    const now = new Date().toISOString();
+    ensurePrivateSeedFile(sitemap, JSON.stringify({ project: name, created_at: now, updated_at: now, nodes: [] }, null, 2));
+    const skillRegistryFile = privateSeedName(arch.skillRegistryFile, "skill-registry.json");
+    const skillTrialsFile = privateSeedName(arch.skillTrialsFile, "skill-trials.jsonl");
+    const curatorDecisionsFile = privateSeedName(arch.curatorDecisionsFile, "curator-decisions.jsonl");
+    const ontologyRuntimeFile = privateSeedName(arch.ontologyRuntimeFile, "ontology-runtime.json");
+    const ontologySourceManifestFile = privateSeedName(arch.ontologySourceManifestFile, "ontology-sources.json");
+    const ontologyInboxDir = privateSeedName(arch.ontologyInboxDir, "ontology-inbox");
+    const ontologyDbFile = privateSeedName(arch.ontologyDbFile, "ontology-runtime.sqlite");
+    const careerGraphConfigFile = privateSeedName(arch.careerGraphConfigFile, "career-graph.json");
+    const careerGraphSourceManifestFile = privateSeedName(arch.careerGraphSourceManifestFile, "career-graph-sources.json");
+    const careerGraphInboxDir = privateSeedName(arch.careerGraphInboxDir, "career-graph-inbox");
+    const careerGraphDbFile = privateSeedName(arch.careerGraphDbFile, "career-graph.sqlite");
     const skillRegistry = path.join(dir, skillRegistryFile);
-    if (!fs.existsSync(skillRegistry)) {
-      fs.writeFileSync(skillRegistry, JSON.stringify({
+    ensurePrivateSeedFile(skillRegistry, JSON.stringify({
         schemaVersion: "1.0",
         kind: "agentlas-skill-lifecycle-registry",
         state: "local_candidate",
@@ -127,18 +176,15 @@ function ensureProjectMemoryCli(projectPath, projectName) {
           lowRiskCanaryOnly: true,
           severeFailureTolerance: 0,
         },
-      }, null, 2), "utf8");
-    }
-    const ontologyInbox = path.join(dir, ontologyInboxDir);
-    if (!fs.existsSync(ontologyInbox)) fs.mkdirSync(ontologyInbox, { recursive: true });
+      }, null, 2));
+    const ontologyInbox = ensurePrivateDirectory(path.join(dir, ontologyInboxDir));
     const ontologyRuntime = path.join(dir, ontologyRuntimeFile);
-    if (!fs.existsSync(ontologyRuntime)) {
-      fs.writeFileSync(ontologyRuntime, JSON.stringify({
+    ensurePrivateSeedFile(ontologyRuntime, JSON.stringify({
         schemaVersion: "1.0",
         kind: "agentlas-ontology-runtime",
         state: "active",
         activation: "automatic",
-        projectRoot: projectPath,
+        projectRoot: root,
         projectName: name,
         dbPath: path.join(dir, ontologyDbFile),
         inboxPath: ontologyInbox,
@@ -161,27 +207,22 @@ function ensureProjectMemoryCli(projectPath, projectName) {
           durableWrites: "candidate-ticket-only",
           workingMemory: "runtime-cache-only",
         },
-      }, null, 2), "utf8");
-    }
+      }, null, 2));
     const ontologySources = path.join(dir, ontologySourceManifestFile);
-    if (!fs.existsSync(ontologySources)) {
-      fs.writeFileSync(ontologySources, JSON.stringify({
+    ensurePrivateSeedFile(ontologySources, JSON.stringify({
         schemaVersion: "1.0",
         kind: "agentlas-ontology-source-manifest",
-        projectRoot: projectPath,
+        projectRoot: root,
         sources: [],
-      }, null, 2), "utf8");
-    }
-    const careerGraphInbox = path.join(dir, careerGraphInboxDir);
-    if (!fs.existsSync(careerGraphInbox)) fs.mkdirSync(careerGraphInbox, { recursive: true });
+      }, null, 2));
+    const careerGraphInbox = ensurePrivateDirectory(path.join(dir, careerGraphInboxDir));
     const careerGraphConfig = path.join(dir, careerGraphConfigFile);
-    if (!fs.existsSync(careerGraphConfig)) {
-      fs.writeFileSync(careerGraphConfig, JSON.stringify({
+    ensurePrivateSeedFile(careerGraphConfig, JSON.stringify({
         schemaVersion: "1.0",
         kind: "agentlas-career-graph",
         state: "active",
         model: "ledger_first_derived_index",
-        projectRoot: projectPath,
+        projectRoot: root,
         projectName: name,
         dbPath: path.join(dir, careerGraphDbFile),
         inboxPath: careerGraphInbox,
@@ -193,20 +234,16 @@ function ensureProjectMemoryCli(projectPath, projectName) {
           neverScanHomeDirectory: true,
           neverScanSiblingProjects: true,
         },
-      }, null, 2), "utf8");
-    }
+      }, null, 2));
     const careerGraphSources = path.join(dir, careerGraphSourceManifestFile);
-    if (!fs.existsSync(careerGraphSources)) {
-      fs.writeFileSync(careerGraphSources, JSON.stringify({
+    ensurePrivateSeedFile(careerGraphSources, JSON.stringify({
         schemaVersion: "1.0",
         kind: "agentlas-career-graph-source-manifest",
-        projectRoot: projectPath,
+        projectRoot: root,
         sources: [],
-      }, null, 2), "utf8");
-    }
+      }, null, 2));
     for (const fileName of [skillTrialsFile, curatorDecisionsFile]) {
-      const filePath = path.join(dir, fileName);
-      if (!fs.existsSync(filePath)) fs.writeFileSync(filePath, "", "utf8");
+      ensurePrivateSeedFile(path.join(dir, fileName), "");
     }
     return dir;
   } catch { return null; }

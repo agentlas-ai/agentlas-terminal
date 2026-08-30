@@ -23,22 +23,52 @@ const fs = require("node:fs");
 
 function usage(ko) {
   return ko
-    ? "사용법: agentlas build \"<만들고 싶은 에이전트>\"  [--runtime <kind>] [--print]"
-    : "Usage: agentlas build \"<the agent you want>\"  [--runtime <kind>] [--print]";
+    ? "사용법: agentlas build \"<만들고 싶은 에이전트>\"  [--runtime <kind>] [--print] [-- <옵션처럼 시작하는 요청>]"
+    : "Usage: agentlas build \"<the agent you want>\"  [--runtime <kind>] [--print] [-- <request starting like an option>]";
+}
+
+function parseArgs(args) {
+  const flags = { runtime: null, print: false };
+  const rest = [];
+  const seen = new Set();
+  let passthrough = false;
+  for (let i = 0; i < args.length; i += 1) {
+    const token = String(args[i]);
+    if (passthrough) { rest.push(token); continue; }
+    if (token === "--") { passthrough = true; continue; }
+    if (token === "--print" || token === "-p") {
+      if (seen.has("print")) throw new Error("duplicate option: --print");
+      seen.add("print");
+      flags.print = true;
+      continue;
+    }
+    if (token === "--runtime" || token.startsWith("--runtime=")) {
+      if (seen.has("runtime")) throw new Error("duplicate option: --runtime");
+      seen.add("runtime");
+      const inline = token.startsWith("--runtime=");
+      const value = inline ? token.slice(10) : args[++i];
+      if (value === undefined || value === "" || (!inline && String(value).startsWith("--"))) {
+        throw new Error("--runtime requires a value");
+      }
+      flags.runtime = String(value);
+      continue;
+    }
+    if (token.startsWith("-")) {
+      throw new Error(`unknown option: ${token} (use -- before a request that starts with '-')`);
+    }
+    rest.push(token);
+  }
+  return { flags, rest };
 }
 
 async function run(ctx, args) {
   const ko = ctx.lang === "ko";
-  if (args.some((a) => a === "--help" || a === "-h" || a === "help")) { ctx.out(usage(ko)); return 0; }
+  if (args.length === 1 && ["--help", "-h", "help"].includes(args[0])) { ctx.out(usage(ko)); return 0; }
 
-  // --runtime/--print 만 벗겨내고 나머지는 요청 문장.
-  const flags = {};
-  const rest = [];
-  for (let i = 0; i < args.length; i += 1) {
-    if (args[i] === "--runtime" && args[i + 1]) { flags.runtime = args[++i]; continue; }
-    if (args[i] === "--print" || args[i] === "-p") { flags.print = true; continue; }
-    rest.push(args[i]);
-  }
+  let parsed;
+  try { parsed = parseArgs(args); }
+  catch (error) { ctx.err(String((error && error.message) || error)); return 1; }
+  const { flags, rest } = parsed;
   const request = rest.join(" ").trim();
   if (!request) { ctx.err("✖ " + usage(ko)); return 1; }
 
@@ -111,4 +141,4 @@ async function run(ctx, args) {
   }
 }
 
-module.exports = { run };
+module.exports = { run, parseArgs };

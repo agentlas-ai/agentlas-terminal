@@ -17,8 +17,11 @@
  */
 const net = require("node:net");
 const crypto = require("node:crypto");
+const fs = require("node:fs");
 const path = require("node:path");
 const { userDataDir } = require("./paths.cjs");
+
+const DAEMON_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 
 /** 데몬 소켓 주소 — control-socket.ts 의 defaultControlSocketPath 와 같은 규칙. */
 function daemonSocketPath() {
@@ -41,11 +44,13 @@ function callDaemon(method, params, timeoutMs) {
   return new Promise((resolve, reject) => {
     const socket = net.connect(daemonSocketPath());
     const id = crypto.randomUUID();
-    let buffer = "";
+    let buffer = Buffer.alloc(0);
+    let responseBytes = 0;
     let settled = false;
     const finish = (fn) => {
       if (settled) return;
       settled = true;
+      buffer = Buffer.alloc(0);
       clearTimeout(timer);
       socket.destroy();
       fn();
@@ -56,10 +61,19 @@ function callDaemon(method, params, timeoutMs) {
     );
     socket.on("connect", () => socket.write(`${JSON.stringify({ id, method, params })}\n`));
     socket.on("data", (chunk) => {
-      buffer += chunk.toString("utf8");
+      if (settled) return;
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      responseBytes += bytes.length;
+      if (responseBytes > DAEMON_MAX_RESPONSE_BYTES) {
+        const error = new Error(`daemon response exceeded ${DAEMON_MAX_RESPONSE_BYTES} bytes`);
+        error.code = "DAEMON_RESPONSE_BODY_LIMIT";
+        finish(() => reject(error));
+        return;
+      }
+      buffer = buffer.length ? Buffer.concat([buffer, bytes]) : bytes;
       let nl;
-      while ((nl = buffer.indexOf("\n")) >= 0) {
-        const line = buffer.slice(0, nl).trim();
+      while (!settled && (nl = buffer.indexOf(0x0a)) >= 0) {
+        const line = buffer.subarray(0, nl).toString("utf8").trim();
         buffer = buffer.slice(nl + 1);
         if (!line) continue;
         let message;
@@ -109,8 +123,23 @@ function sharesOurStore(pong) {
     );
     return false;
   }
-  const path = require("node:path");
-  if (path.resolve(theirs) === path.resolve(ours)) return true;
+  let oursStat;
+  let theirsStat;
+  try {
+    oursStat = fs.statSync(path.resolve(ours));
+    theirsStat = fs.statSync(path.resolve(theirs));
+  } catch {
+    console.error(
+      `[daemon] could not verify the database identity (${theirs}) against this command (${ours}).\n`
+      + "[daemon] Running the graph locally instead, so the work cannot land in a different store.",
+    );
+    return false;
+  }
+  if (
+    oursStat.isFile() && theirsStat.isFile() &&
+    String(oursStat.dev) === String(theirsStat.dev) &&
+    String(oursStat.ino) === String(theirsStat.ino)
+  ) return true;
   console.error(
     `[daemon] the daemon opened a different database (${theirs}) than this command (${ours}).\n`
     + "[daemon] Running the graph locally instead, so the work cannot land in a different store.",
@@ -118,4 +147,4 @@ function sharesOurStore(pong) {
   return false;
 }
 
-module.exports = { daemonSocketPath, callDaemon, daemonAvailable, sharesOurStore };
+module.exports = { daemonSocketPath, callDaemon, daemonAvailable, sharesOurStore, DAEMON_MAX_RESPONSE_BYTES };

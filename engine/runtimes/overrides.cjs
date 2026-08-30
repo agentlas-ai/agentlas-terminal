@@ -7,9 +7,10 @@
  * 스키마 소유권은 데스크탑에 있으므로 여기서는 방어적으로만 읽는다(tableExists/
  * columnExists) — 구버전 DB에서 열이 없으면 "오버라이드 없음"으로 조용히 전진.
  *
- * 해석 사다리(오너 계약): 명시(--runtime) > 에이전트별 오버라이드 > prefs >
- * active_runtime > detected. resolve.cjs 는 건드리지 않는다 — 이 모듈이
- * 오버라이드 층만 앞에 얹고 나머지는 resolve.cjs 에 위임한다.
+ * 해석 사다리(오너 계약): 명시(--runtime) > 에이전트별 오버라이드 > 역할별
+ * Dashboard 후보 풀 > prefs > active_runtime > detected. 역할 풀은 사용자가
+ * Orchestrator/Worker별로 정한 실행 우선순위이므로 전역 legacy prefs보다 앞선다.
+ * resolve.cjs 는 건드리지 않는다 — 이 모듈이 앞의 두 층을 얹는다.
  */
 const { tableExists, columnExists } = require("../core/db.cjs");
 const { RUNTIME_BIN, whichSync } = require("./detect.cjs");

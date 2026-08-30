@@ -31,12 +31,18 @@ function chatDeletionCascadesFromAgent(db) {
 
 function run(ctx, args) {
   const ko = ctx.lang === "ko";
-  // 동의 플래그를 슬러그보다 앞에 써도 되도록 첫 번째 비플래그 인자를 대상으로 본다.
-  const token = args.find((a) => !String(a).startsWith("-"));
-  if (!token) {
-    ctx.err(ko ? "사용법: agentlas uninstall <agent>" : "Usage: agentlas uninstall <agent>");
-    return 1;
+  const consentFlags = new Set(["--yes", "-y", "--force"]);
+  const unknownOptions = args.filter((arg) => String(arg).startsWith("-") && !consentFlags.has(arg));
+  const tokens = args.filter((arg) => !String(arg).startsWith("-"));
+  const confirmations = args.filter((arg) => consentFlags.has(arg));
+  if (unknownOptions.length || tokens.length !== 1 || confirmations.length > 1) {
+    const error = new Error(ko
+      ? "사용법: agentlas uninstall <agent> [--yes]"
+      : "Usage: agentlas uninstall <agent> [--yes]");
+    error.code = "INVALID_ARGUMENT";
+    throw error;
   }
+  const token = tokens[0];
   const db = ctx.db();
   const agent = findAgent(db, token);
   if (!agent) {
@@ -83,7 +89,7 @@ function run(ctx, args) {
    * 쓰고 그 파일의 스키마는 기기마다 다르다 — 아직 옛 사다리에 있는 기기에서는 파괴가
    * 여전히 사실이다. 판단은 열려 있는 DB 의 외래키에서 읽는다.
    */
-  const consented = args.some((a) => a === "--yes" || a === "-y" || a === "--force");
+  const consented = confirmations.length === 1;
   const cascades = ctx.tableExists(db, "chats") && chatDeletionCascadesFromAgent(db);
   let chatCount = 0;
   let messageCount = 0;

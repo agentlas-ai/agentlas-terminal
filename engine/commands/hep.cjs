@@ -13,7 +13,7 @@
 const { create, usageFor, isHelpToken } = require("../hephaestus/runtime.cjs");
 
 async function run(ctx, args) {
-  if (args.length && args.some(isHelpToken)) {
+  if (args.length === 1 && isHelpToken(args[0])) {
     ctx.out(usageFor("hep", ctx.lang));
     return 0;
   }

@@ -32,42 +32,93 @@ const AUTOMATION_HEADING = "## Automation";
 const ASK_OPEN = "<<agentlas-ask>>";
 const ASK_CLOSE = "<</agentlas-ask>>";
 
+// Fence payloads are model-authored input. Keep parsing and downstream
+// side-effect loops bounded; oversized entries are refused, not truncated.
+const MAX_FENCE_JSON_BYTES = 256 * 1024;
+const MAX_DELEGATIONS = 64;
+const MAX_AUTOMATIONS = 64;
+const MAX_ASKS = 32;
+const MAX_STEPS = 32;
+const MAX_DELEGATE_ENTRY_BYTES = 16 * 1024;
+const MAX_AUTOMATION_ENTRY_BYTES = 32 * 1024;
+const MAX_STEPS_BYTES = 64 * 1024;
+const MAX_TARGET_BYTES = 256;
+const MAX_BRIEF_BYTES = 8 * 1024;
+const MAX_NAME_BYTES = 256;
+const MAX_PROMPT_BYTES = 16 * 1024;
+const MAX_AGENT_BYTES = 256;
+const MAX_SCHEDULE_BYTES = 512;
+const MAX_ASK_BODY_BYTES = 64 * 1024;
+
+function utf8Bytes(value) {
+  return Buffer.byteLength(String(value || ""), "utf8");
+}
+
+function boundedString(value, maxBytes) {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  return utf8Bytes(trimmed) <= maxBytes ? trimmed : null;
+}
+
+function jsonBytes(value) {
+  try { return utf8Bytes(JSON.stringify(value)); } catch { return Infinity; }
+}
+
 /* ── ## Delegate (delegate.ts parseDelegations 포팅) ─────────────────────── */
 
 function parseDelegateBlock(text) {
   const idx = text.lastIndexOf(DELEGATE_HEADING);
-  if (idx < 0) return { delegations: [], synthesisAllocation: null, cleanedText: text.trim() };
+  if (idx < 0) return { delegations: [], synthesisAllocation: null, cleanedText: text.trim(), errors: [] };
 
   const after = text.slice(idx + DELEGATE_HEADING.length);
   const fence = after.match(/```(?:json)?\s*([\s\S]*?)```/);
   let delegations = [];
   let synthesisAllocation = null;
+  const errors = [];
   if (fence) {
-    try {
-      const data = JSON.parse(fence[1].trim());
+    const jsonText = fence[1].trim();
+    if (utf8Bytes(jsonText) > MAX_FENCE_JSON_BYTES) {
+      errors.push("Delegate JSON exceeds " + MAX_FENCE_JSON_BYTES + " bytes");
+    } else try {
+      const data = JSON.parse(jsonText);
       const rawDelegations = Array.isArray(data)
         ? data
         : data && typeof data === "object" && Array.isArray(data.delegations)
           ? data.delegations
           : [];
-      if (!Array.isArray(data) && data && typeof data === "object" && data.synthesis) {
-        synthesisAllocation = workloadRouting.normalizeAllocation(data.synthesis, "synthesize");
+      if (rawDelegations.length > MAX_DELEGATIONS) {
+        errors.push("Delegate block exceeds maximum of " + MAX_DELEGATIONS + " entries");
+      } else {
+        if (!Array.isArray(data) && data && typeof data === "object" && data.synthesis) {
+          synthesisAllocation = workloadRouting.normalizeAllocation(data.synthesis, "synthesize");
+        }
+        delegations = rawDelegations
+          .map((d, index) => {
+            if (!d || typeof d !== "object" || Array.isArray(d)) return null;
+            if (jsonBytes(d) > MAX_DELEGATE_ENTRY_BYTES) {
+              errors.push("Delegate entry " + (index + 1) + " exceeds " + MAX_DELEGATE_ENTRY_BYTES + " bytes");
+              return null;
+            }
+            const target = boundedString(d.target, MAX_TARGET_BYTES);
+            const brief = boundedString(d.brief, MAX_BRIEF_BYTES);
+            if (target === null || brief === null) {
+              errors.push("Delegate entry " + (index + 1) + " contains an oversized string");
+              return null;
+            }
+            // Desktop 계약: target 만 필수. allocation 은 정규화 실패 시 null 로 남고
+            // (레거시 텍스트 위임과 동일) 실행 측이 현재 모델 폴백 영수증을 남긴다.
+            return target
+              ? { target, brief, allocation: workloadRouting.normalizeAllocation(d.allocation, "delegate") }
+              : null;
+          })
+          .filter(Boolean);
       }
-      delegations = rawDelegations
-        .map((d) => {
-          if (!d || typeof d !== "object") return null;
-          const target = typeof d.target === "string" ? d.target.trim() : "";
-          const brief = typeof d.brief === "string" ? d.brief.trim() : "";
-          // Desktop 계약: target 만 필수. allocation 은 정규화 실패 시 null 로 남고
-          // (레거시 텍스트 위임과 동일) 실행 측이 현재 모델 폴백 영수증을 남긴다.
-          return target
-            ? { target, brief, allocation: workloadRouting.normalizeAllocation(d.allocation, "delegate") }
-            : null;
-        })
-        .filter(Boolean);
     } catch {
       delegations = [];
+      errors.push("Delegate JSON parse failed");
     }
+  } else {
+    errors.push("Delegate heading present but no JSON fence found");
   }
 
   let cut = text.length;
@@ -77,7 +128,7 @@ function parseDelegateBlock(text) {
     cut = idx; // 펜스 없으면 dangling heading 도 제거 (Desktop 과 동일)
   }
   const cleanedText = (text.slice(0, idx) + text.slice(cut)).trim();
-  return { delegations, synthesisAllocation, cleanedText };
+  return { delegations, synthesisAllocation, cleanedText, errors };
 }
 
 /* ── ## Automation (automation-emitter.ts parseAutomations 포팅, 정직 거부판) ── */
@@ -182,21 +233,43 @@ function parseAutomationBlock(text) {
   let automations = [];
 
   if (fence) {
-    try {
-      const data = JSON.parse(fence[1].trim());
+    const jsonText = fence[1].trim();
+    if (utf8Bytes(jsonText) > MAX_FENCE_JSON_BYTES) {
+      errors.push("Automation JSON exceeds " + MAX_FENCE_JSON_BYTES + " bytes");
+    } else try {
+      const data = JSON.parse(jsonText);
       if (Array.isArray(data)) {
-        automations = data
-          .map((d) => {
+        if (data.length > MAX_AUTOMATIONS) {
+          errors.push("Automation block exceeds maximum of " + MAX_AUTOMATIONS + " entries");
+        } else {
+          automations = data
+          .map((d, index) => {
             if (!d || typeof d !== "object") {
               errors.push("Automation entry was not an object");
               return null;
             }
-            const name = typeof d.name === "string" ? d.name.trim() : "";
-            const prompt = typeof d.prompt === "string" ? d.prompt.trim() : "";
-            const agent = typeof d.agent === "string" ? d.agent.trim() : "";
-            const hubAgent = typeof d.hubAgent === "string" ? d.hubAgent.trim() : "";
+            if (jsonBytes(d) > MAX_AUTOMATION_ENTRY_BYTES) {
+              errors.push("Automation entry " + (index + 1) + " exceeds " + MAX_AUTOMATION_ENTRY_BYTES + " bytes");
+              return null;
+            }
+            const name = boundedString(d.name, MAX_NAME_BYTES);
+            const prompt = boundedString(d.prompt, MAX_PROMPT_BYTES);
+            const agent = boundedString(d.agent, MAX_AGENT_BYTES);
+            const hubAgent = boundedString(d.hubAgent, MAX_AGENT_BYTES);
+            if (name === null || prompt === null || agent === null || hubAgent === null) {
+              errors.push("Automation entry " + (index + 1) + " contains an oversized string");
+              return null;
+            }
             if (!name || !prompt) {
               errors.push(`Automation "${name || "(unnamed)"}" missing name/prompt`);
+              return null;
+            }
+            if (typeof d.schedule === "string" && utf8Bytes(d.schedule.trim()) > MAX_SCHEDULE_BYTES) {
+              errors.push("Automation " + name + " schedule exceeds " + MAX_SCHEDULE_BYTES + " bytes");
+              return null;
+            }
+            if (d.schedule && typeof d.schedule === "object" && jsonBytes(d.schedule) > MAX_SCHEDULE_BYTES) {
+              errors.push("Automation " + name + " schedule exceeds " + MAX_SCHEDULE_BYTES + " bytes");
               return null;
             }
             const resolved = resolveScheduleHonest(d.schedule, errors);
@@ -204,6 +277,14 @@ function parseAutomationBlock(text) {
             // steps[] 는 wire 패리티로 보존만 한다. Desktop 은 stepsToGraph 로
             // 그래프를 합성하지만 터미널 데몬은 prompt_template 단일 실행이다 —
             // 그래프 합성을 위장하지 않는다(비합성은 apply 쪽 영수증에 표기).
+            if (Array.isArray(d.steps) && d.steps.length > MAX_STEPS) {
+              errors.push("Automation " + name + " exceeds maximum of " + MAX_STEPS + " steps");
+              return null;
+            }
+            if (Array.isArray(d.steps) && jsonBytes(d.steps) > MAX_STEPS_BYTES) {
+              errors.push("Automation " + name + " steps exceed " + MAX_STEPS_BYTES + " bytes");
+              return null;
+            }
             const steps = Array.isArray(d.steps) && d.steps.length
               ? d.steps.filter((s) => !!s && typeof s === "object")
               : undefined;
@@ -218,6 +299,7 @@ function parseAutomationBlock(text) {
             };
           })
           .filter(Boolean);
+        }
       } else {
         errors.push("Automation block was not a JSON array");
       }
@@ -241,6 +323,7 @@ function parseAutomationBlock(text) {
 /* ── <<agentlas-ask>> (renderer/lib/ask-question.ts extractQuestions 포팅) ── */
 
 function tryParseAsk(body) {
+  if (utf8Bytes(body) > MAX_ASK_BODY_BYTES) return null;
   // body 가 ```json 펜스로 감싸진 경우도 허용 (Desktop confirm/index.ts:77-80 동일)
   const stripped = body
     .replace(/^```(?:json)?\s*/i, "")
@@ -297,7 +380,7 @@ function extractAsks(text) {
       break;
     }
     const parsed = tryParseAsk(afterOpen.slice(0, close).trim());
-    if (parsed) asks.push(parsed);
+    if (parsed && asks.length < MAX_ASKS) asks.push(parsed);
     // 파싱 실패해도 닫힌 펜스는 본문에서 제거 — malformed JSON raw 를 사용자에게 노출하지 않는다.
     remaining = afterOpen.slice(close + ASK_CLOSE.length);
   }
@@ -328,6 +411,7 @@ function parseReplyFences(text) {
   // 2. Delegate
   const del = parseDelegateBlock(working);
   working = del.cleanedText;
+  errors.push(...(del.errors || []));
 
   // 3. Automation
   const auto = parseAutomationBlock(working);

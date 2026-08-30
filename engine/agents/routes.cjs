@@ -5,6 +5,7 @@
  */
 const fs = require("node:fs");
 const path = require("node:path");
+const { randomUUID } = require("node:crypto");
 const { userDataDir } = require("../core/paths.cjs");
 
 function routesPath() {
@@ -14,26 +15,47 @@ function routesPath() {
 function routesMap() {
   try {
     const parsed = JSON.parse(fs.readFileSync(routesPath(), "utf8"));
-    return parsed && typeof parsed === "object" ? parsed : {};
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return Object.create(null);
+    return Object.assign(Object.create(null), parsed);
   } catch {
-    return {};
+    return Object.create(null);
   }
 }
 
 /** 원자적 사설 쓰기 (0600) — 데스크탑과 파일을 공유하므로 부분 쓰기가 보이면 안 된다. */
 function saveRoutes(routes) {
   const file = routesPath();
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
-  const fd = fs.openSync(tmp, "wx", 0o600);
+  const parent = path.dirname(file);
+  fs.mkdirSync(parent, { recursive: true });
+  const tmp = path.join(parent, `.${path.basename(file)}.${randomUUID()}.tmp`);
+  let fd = null;
   try {
-    fs.writeFileSync(fd, JSON.stringify(routes, null, 2), "utf8");
+    fd = fs.openSync(
+      tmp,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+      0o600,
+    );
+    fs.writeFileSync(fd, JSON.stringify(routes, null, 2) + "\n", "utf8");
     fs.fsyncSync(fd);
-  } finally {
     fs.closeSync(fd);
+    fd = null;
+    fs.renameSync(tmp, file);
+    fsyncDirectoryBestEffort(parent);
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
+    try { fs.unlinkSync(tmp); } catch { /* rename consumed it, or cleanup is best-effort */ }
   }
-  fs.renameSync(tmp, file);
-  try { fs.chmodSync(file, 0o600); } catch { /* win32 */ }
+}
+
+function fsyncDirectoryBestEffort(directory) {
+  try {
+    const fd = fs.openSync(directory, fs.constants.O_RDONLY);
+    try { fs.fsyncSync(fd); }
+    finally { fs.closeSync(fd); }
+  } catch {
+    // Some filesystems do not support directory fsync. The same-directory
+    // rename still keeps readers on either the complete old or complete new map.
+  }
 }
 
 function routeForAgent(agentId) {

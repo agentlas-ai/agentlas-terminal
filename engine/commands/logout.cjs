@@ -5,8 +5,13 @@
  */
 const auth = require("../cloud/auth.cjs");
 
-function run(ctx) {
+function run(ctx, args = []) {
   const ko = ctx.lang === "ko";
+  if (args.length) {
+    const error = new Error("usage: agentlas logout");
+    error.code = "INVALID_ARGUMENT";
+    throw error;
+  }
   let result;
   try {
     result = auth.deleteCliSession();

@@ -23,6 +23,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { dbPath, userDataDir } = require("../core/paths.cjs");
+const { runCwd, projectCwd } = require("../project/paths.cjs");
 
 // 캡처 드라이버가 검증된 런타임만. 정본(runtimes/kinds.cjs)의 RUNTIME_BIN에는 kimi/grok/cursor도
 // 있지만 buildArgs/텍스트 추출 계약이 없으므로 캡처 검증 파생본만 쓴다 — 새 kind 를
@@ -726,8 +727,12 @@ async function runApi(backend, model, system, prompt, options) {
   model = model || DEFAULT_API_MODEL[backend];
   const fetchImpl = options.fetch || globalThis.fetch;
   if (typeof fetchImpl !== "function") throw new Error("fetch is unavailable in this runtime (run through the app runtime).");
+  const request = (url, init) => fetchImpl(
+    url,
+    options.signal ? { ...init, signal: options.signal } : init,
+  );
   if (backend === "ollama") {
-    const resp = await fetchImpl("http://127.0.0.1:11434/api/chat", {
+    const resp = await request("http://127.0.0.1:11434/api/chat", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ model, stream: false, messages: [{ role: "system", content: system }, { role: "user", content: prompt }] }),
@@ -760,7 +765,7 @@ async function runApi(backend, model, system, prompt, options) {
     const systemField = backend === "anthropic"
       ? [{ type: "text", text: system, cache_control: { type: "ephemeral" } }]
       : system;
-    const resp = await fetchImpl(`${base}/v1/messages`, {
+    const resp = await request(`${base}/v1/messages`, {
       method: "POST",
       headers: { "content-type": "application/json", ...authHeaders, "anthropic-version": "2023-06-01" },
       body: JSON.stringify({ model, max_tokens: 4096, system: systemField, messages: [{ role: "user", content: prompt }] }),
@@ -781,7 +786,7 @@ async function runApi(backend, model, system, prompt, options) {
           : readCustomApiBaseUrl())
         : "https://api.openai.com/v1";
     const label = backend === "custom" ? "Custom API" : backend === "upstage" ? "Upstage" : "OpenAI";
-    const resp = await fetchImpl(`${base}/chat/completions`, {
+    const resp = await request(`${base}/chat/completions`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: "Bearer " + key },
       body: JSON.stringify({ model, messages: [{ role: "system", content: system }, { role: "user", content: prompt }] }),
@@ -795,7 +800,7 @@ async function runApi(backend, model, system, prompt, options) {
   }
   if (backend === "google") {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`;
-    const resp = await fetchImpl(url, {
+    const resp = await request(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: [{ role: "user", parts: [{ text: prompt }] }] }),
@@ -809,29 +814,6 @@ async function runApi(backend, model, system, prompt, options) {
     );
   }
   throw new Error("Unsupported backend: " + backend);
-}
-
-// ── 작업 폴더 규칙 (v1 runCwd/projectCwd 포팅) ─────────────────────────
-function runCwd() {
-  const dir = path.join(userDataDir(), "agent-cwd");
-  try {
-    fs.mkdirSync(dir, { recursive: true });
-    return dir;
-  } catch {
-    return os.homedir();
-  }
-}
-
-// 에이전트가 실행될 작업 폴더 = 사용자가 명령을 친 현재 디렉터리(= 대상 프로젝트).
-// 단, home/userData/agent-cwd 같은 "프로젝트 아님" 위치면 안전한 전용 폴더로 폴백.
-function projectCwd() {
-  try {
-    const cwd = process.cwd();
-    if (!cwd || cwd === os.homedir() || cwd === userDataDir() || cwd === runCwd()) return runCwd();
-    return cwd;
-  } catch {
-    return runCwd();
-  }
 }
 
 // ── 자식 env 빌더 (v1 buildChildEnvCli 포팅) ───────────────────────────
