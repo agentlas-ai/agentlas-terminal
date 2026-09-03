@@ -707,18 +707,144 @@ function assertSafeLogRecord(record) {
   }
 }
 
-function appendJsonlOnce(filePath, record) {
+const FS_O_NOFOLLOW = fs.constants.O_NOFOLLOW || 0;
+const FS_O_DIRECTORY = fs.constants.O_DIRECTORY || 0;
+
+function sameFsIdentity(left, right) {
+  return Boolean(
+    left && right &&
+    Number(left.dev) === Number(right.dev) &&
+    Number(left.ino) === Number(right.ino) &&
+    Number(left.nlink) === Number(right.nlink),
+  );
+}
+
+// Directory link counts can legitimately change when a child directory is
+// created or removed (and some filesystems expose entry counts here). The
+// directory anchor therefore binds dev+ino and only requires a live link.
+function sameDirectoryIdentity(left, right) {
+  return Boolean(
+    left && right &&
+    Number(left.dev) === Number(right.dev) &&
+    Number(left.ino) === Number(right.ino) &&
+    Number(left.nlink) > 0 && Number(right.nlink) > 0,
+  );
+}
+
+function pathWithin(rootPath, candidatePath) {
+  const relative = path.relative(path.resolve(rootPath), path.resolve(candidatePath));
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function openDirectoryAnchor(directoryPath, rootPath = null) {
+  const requestedPath = path.resolve(String(directoryPath));
+  const before = fs.lstatSync(requestedPath);
+  if (!before.isDirectory() || before.isSymbolicLink()) throw new Error("memory mirror parent is not a private directory");
+  const canonicalPath = fs.realpathSync(requestedPath);
+  if (rootPath && !pathWithin(rootPath, canonicalPath)) throw new Error("memory mirror parent escaped its project root");
+  const after = fs.lstatSync(requestedPath);
+  if (!sameDirectoryIdentity(before, after) || after.isSymbolicLink()) throw new Error("memory mirror parent changed during anchoring");
+  const flags = fs.constants.O_RDONLY | FS_O_DIRECTORY | FS_O_NOFOLLOW;
+  let fd = null;
+  try {
+    fd = fs.openSync(canonicalPath, flags);
+  } catch (error) {
+    // Windows does not expose a directory-open flag/handle that can be fstat'd
+    // consistently. Keep the lstat+realpath anchor there; POSIX hosts use the
+    // stronger directory FD path above.
+    if (process.platform !== "win32") throw error;
+  }
+  if (fd != null) {
+    const opened = fs.fstatSync(fd);
+    if (!sameDirectoryIdentity(after, opened) || (rootPath && !pathWithin(rootPath, canonicalPath))) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+      throw new Error("memory mirror parent identity changed during open");
+    }
+    return { fd, requestedPath, canonicalPath, identity: opened };
+  }
+  return { fd, requestedPath, canonicalPath, identity: after };
+}
+
+function directoryAnchorMatches(anchor, rootPath = null) {
+  try {
+    const current = fs.lstatSync(anchor.requestedPath);
+    if (!current.isDirectory() || current.isSymbolicLink()) return false;
+    const canonical = fs.realpathSync(anchor.requestedPath);
+    if (canonical !== anchor.canonicalPath || (rootPath && !pathWithin(rootPath, canonical))) return false;
+    const canonicalStat = fs.lstatSync(anchor.canonicalPath);
+    const fdStat = anchor.fd == null ? anchor.identity : fs.fstatSync(anchor.fd);
+    return sameDirectoryIdentity(current, anchor.identity) && sameDirectoryIdentity(canonicalStat, anchor.identity) && sameDirectoryIdentity(fdStat, anchor.identity);
+  } catch {
+    return false;
+  }
+}
+
+function safeTargetStat(filePath) {
+  const stat = fs.lstatSync(filePath);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > MAX_MIRROR_BYTES) return null;
+  return stat;
+}
+
+function unlinkOwnedLock(lockPath, lockIdentity) {
+  try {
+    const current = fs.lstatSync(lockPath);
+    if (sameFsIdentity(current, lockIdentity) && current.isFile() && !current.isSymbolicLink() && current.nlink === 1) {
+      fs.unlinkSync(lockPath);
+    }
+  } catch { /* a replaced or already-removed lock is not ours to delete */ }
+}
+
+function appendFdAll(fd, buffer) {
+  let offset = 0;
+  while (offset < buffer.length) {
+    const written = fs.writeSync(fd, buffer, offset, buffer.length - offset, null);
+    if (!Number.isInteger(written) || written <= 0) throw new Error("memory mirror append made no progress");
+    offset += written;
+  }
+}
+
+function appendJsonlOnce(filePath, record, options = {}) {
   assertSafeLogRecord(record);
-  let stat;
-  try { stat = fs.lstatSync(filePath); } catch { return false; }
-  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > MAX_MIRROR_BYTES) return false;
-  const lockPath = `${filePath}.lock`;
+  const requestedPath = path.resolve(String(filePath));
+  const parentPath = path.dirname(requestedPath);
+  const rootPath = options.rootPath ? path.resolve(String(options.rootPath)) : null;
+  let parent;
+  try { parent = openDirectoryAnchor(parentPath, rootPath); } catch { return false; }
+  const expectedParentPath = options.expectedParentPath ? path.resolve(String(options.expectedParentPath)) : null;
+  const expectedParentIdentity = options.expectedParentIdentity || null;
+  if (
+    (expectedParentPath && parent.canonicalPath !== expectedParentPath) ||
+    (expectedParentIdentity && !sameDirectoryIdentity(parent.identity, expectedParentIdentity))
+  ) {
+    if (parent.fd != null) {
+      try { fs.closeSync(parent.fd); } catch { /* ignore */ }
+    }
+    return false;
+  }
+  const fileName = path.basename(requestedPath);
+  const canonicalPath = path.join(parent.canonicalPath, fileName);
+  const lockPath = path.join(parent.canonicalPath, `${fileName}.lock`);
   let lockFd = null;
+  let lockIdentity = null;
+  let targetFd = null;
   for (let attempt = 0; attempt < 50 && lockFd == null; attempt += 1) {
     try {
-      lockFd = fs.openSync(lockPath, "wx", 0o600);
+      lockFd = fs.openSync(lockPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | FS_O_NOFOLLOW, 0o600);
+      try {
+        lockIdentity = fs.fstatSync(lockFd);
+      } catch {
+        try { fs.closeSync(lockFd); } catch { /* ignore */ }
+        lockFd = null;
+        break;
+      }
+      if (!lockIdentity.isFile() || lockIdentity.isSymbolicLink() || lockIdentity.nlink !== 1) {
+        try { fs.closeSync(lockFd); } catch { /* ignore */ }
+        lockFd = null;
+        break;
+      }
+      try { fs.fchmodSync(lockFd, 0o600); } catch { /* preserve platform compatibility */ }
     } catch (error) {
-      if (!error || error.code !== "EEXIST") return false;
+      if (!error || error.code !== "EEXIST") break;
       try {
         const lockStat = fs.lstatSync(lockPath);
         if (lockStat.isFile() && !lockStat.isSymbolicLink() && Date.now() - lockStat.mtimeMs > 30_000) {
@@ -729,12 +855,24 @@ function appendJsonlOnce(filePath, record) {
       Atomics.wait(LOG_LOCK_WAIT, 0, 0, 20);
     }
   }
-  if (lockFd == null) return false;
+  if (lockFd == null) {
+    try { fs.closeSync(parent.fd); } catch { /* ignore */ }
+    return false;
+  }
   try {
-    stat = fs.lstatSync(filePath);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > MAX_MIRROR_BYTES) return false;
+    if (!directoryAnchorMatches(parent, rootPath) ||
+      (expectedParentPath && parent.canonicalPath !== expectedParentPath) ||
+      (expectedParentIdentity && !sameDirectoryIdentity(parent.identity, fs.lstatSync(parent.canonicalPath)))) return false;
+    const initial = safeTargetStat(canonicalPath);
+    if (!initial) return false;
+    targetFd = fs.openSync(canonicalPath, fs.constants.O_RDWR | fs.constants.O_APPEND | FS_O_NOFOLLOW);
+    const opened = fs.fstatSync(targetFd);
+    if (!sameFsIdentity(initial, opened) || opened.nlink !== 1 || opened.size > MAX_MIRROR_BYTES) return false;
+    if (!directoryAnchorMatches(parent, rootPath)) return false;
+    const beforeRead = safeTargetStat(canonicalPath);
+    if (!beforeRead || !sameFsIdentity(beforeRead, opened)) return false;
     let current = "";
-    try { current = fs.readFileSync(filePath, "utf8"); } catch { return false; }
+    try { current = fs.readFileSync(targetFd, "utf8"); } catch { return false; }
     for (const line of current.split(/\r?\n/)) {
       if (!line.trim()) continue;
       try {
@@ -742,12 +880,31 @@ function appendJsonlOnce(filePath, record) {
         if (parsed && parsed.id === record.id) return true;
       } catch { /* preserve unrelated malformed local lines */ }
     }
-    fs.appendFileSync(filePath, JSON.stringify(record) + "\n", { encoding: "utf8", mode: 0o600 });
-    try { fs.chmodSync(filePath, 0o600); } catch { /* Windows/ACL-only host */ }
+    const payload = Buffer.from(JSON.stringify(record) + "\n", "utf8");
+    if (opened.size + payload.length > MAX_MIRROR_BYTES) return false;
+    if (!directoryAnchorMatches(parent, rootPath)) return false;
+    const beforeWrite = safeTargetStat(canonicalPath);
+    const currentFdStat = fs.fstatSync(targetFd);
+    if (!beforeWrite || !sameFsIdentity(beforeWrite, currentFdStat) || currentFdStat.nlink !== 1) return false;
+    appendFdAll(targetFd, payload);
+    try { fs.fsyncSync(targetFd); } catch { /* preserve platform compatibility */ }
+    try { fs.fchmodSync(targetFd, 0o600); } catch { /* Windows/ACL-only host */ }
+    const afterWrite = safeTargetStat(canonicalPath);
+    const afterFdStat = fs.fstatSync(targetFd);
+    if (!directoryAnchorMatches(parent, rootPath) ||
+      (expectedParentPath && parent.canonicalPath !== expectedParentPath) ||
+      (expectedParentIdentity && !sameDirectoryIdentity(parent.identity, fs.lstatSync(parent.canonicalPath))) ||
+      !afterWrite || !sameFsIdentity(afterWrite, afterFdStat) || afterFdStat.nlink !== 1) return false;
     return true;
   } finally {
+    if (targetFd != null) {
+      try { fs.closeSync(targetFd); } catch { /* ignore */ }
+    }
     try { fs.closeSync(lockFd); } catch { /* ignore */ }
-    try { fs.unlinkSync(lockPath); } catch { /* a stale lock is recovered on the next turn */ }
+    unlinkOwnedLock(lockPath, lockIdentity);
+    if (parent.fd != null) {
+      try { fs.closeSync(parent.fd); } catch { /* ignore */ }
+    }
   }
 }
 
@@ -758,16 +915,34 @@ function mirrorCoreLogs(projectPathValue, ticket, decisionBatch, options = {}) {
   const memoryDir = options.memoryDir || ".agentlas";
   const stateDir = path.join(root, memoryDir);
   let state;
-  try { state = fs.lstatSync(stateDir); } catch { return { ticket: false, decisions: false }; }
-  if (!state.isDirectory() || state.isSymbolicLink()) return { ticket: false, decisions: false };
-  const ticketPath = path.join(stateDir, options.ticketFile || "memory-tickets.jsonl");
-  const decisionPath = path.join(stateDir, options.decisionFile || "curator-decisions.jsonl");
+  let stateReal;
+  let stateIdentity;
+  try {
+    state = fs.lstatSync(stateDir);
+    if (!state.isDirectory() || state.isSymbolicLink()) return { ticket: false, decisions: false };
+    stateReal = fs.realpathSync(stateDir);
+    if (!pathWithin(root, stateReal)) return { ticket: false, decisions: false };
+    const stateAfter = fs.lstatSync(stateDir);
+    if (!sameDirectoryIdentity(state, stateAfter) || stateAfter.isSymbolicLink()) return { ticket: false, decisions: false };
+    stateIdentity = fs.lstatSync(stateReal);
+    if (!stateIdentity.isDirectory() || stateIdentity.isSymbolicLink() || !sameDirectoryIdentity(stateAfter, stateIdentity)) {
+      return { ticket: false, decisions: false };
+    }
+  } catch { return { ticket: false, decisions: false }; }
+  const ticketPath = path.join(stateReal, options.ticketFile || "memory-tickets.jsonl");
+  const decisionPath = path.join(stateReal, options.decisionFile || "curator-decisions.jsonl");
+  const appendOptions = (targetPath) => {
+    const targetParent = path.dirname(path.resolve(targetPath));
+    return targetParent === stateReal
+      ? { rootPath: root, expectedParentPath: stateReal, expectedParentIdentity: stateIdentity }
+      : { rootPath: root };
+  };
   // Core JSONL files are a best-effort projection of the authoritative DB
   // receipt. Filesystem trouble must not undo or crash a completed host turn.
   let ticketWritten = false;
   let decisionsWritten = false;
-  try { ticketWritten = appendJsonlOnce(ticketPath, ticket); } catch { /* DB receipt remains authoritative */ }
-  try { decisionsWritten = appendJsonlOnce(decisionPath, decisionBatch); } catch { /* DB receipt remains authoritative */ }
+  try { ticketWritten = appendJsonlOnce(ticketPath, ticket, appendOptions(ticketPath)); } catch { /* DB receipt remains authoritative */ }
+  try { decisionsWritten = appendJsonlOnce(decisionPath, decisionBatch, appendOptions(decisionPath)); } catch { /* DB receipt remains authoritative */ }
   return { ticket: ticketWritten, decisions: decisionsWritten };
 }
 

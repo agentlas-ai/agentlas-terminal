@@ -237,8 +237,16 @@ function parseAutomationBlock(text) {
     if (utf8Bytes(jsonText) > MAX_FENCE_JSON_BYTES) {
       errors.push("Automation JSON exceeds " + MAX_FENCE_JSON_BYTES + " bytes");
     } else try {
-      const data = JSON.parse(jsonText);
-      if (Array.isArray(data)) {
+      const raw = JSON.parse(jsonText);
+      // Desktop automation-emitter accepts both the legacy array and the
+      // current session-edit object (name + full graph). Normalize the latter
+      // to one entry before applying the same bounded validation below.
+      const data = Array.isArray(raw)
+        ? raw
+        : raw && typeof raw === "object"
+          ? [raw]
+          : null;
+      if (data) {
         if (data.length > MAX_AUTOMATIONS) {
           errors.push("Automation block exceeds maximum of " + MAX_AUTOMATIONS + " entries");
         } else {
@@ -301,7 +309,7 @@ function parseAutomationBlock(text) {
           .filter(Boolean);
         }
       } else {
-        errors.push("Automation block was not a JSON array");
+        errors.push("Automation block was neither a JSON array nor a JSON object");
       }
     } catch (err) {
       errors.push(`Automation JSON parse failed: ${(err && err.message) || String(err)}`);

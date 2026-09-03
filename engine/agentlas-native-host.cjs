@@ -87,16 +87,41 @@ function geminiMcpIsolationArgs() {
   return ["--allowed-mcp-server-names", `__agentlas_no_mcp_${crypto.randomUUID()}__`];
 }
 
-function assertManagedDirectory(dir) {
+function sameManagedDirectoryIdentity(left, right) {
+  return Boolean(left && right) &&
+    left.isDirectory() && right.isDirectory() &&
+    !left.isSymbolicLink() && !right.isSymbolicLink() &&
+    left.dev === right.dev && left.ino === right.ino;
+}
+
+function assertManagedDirectory(dir, parent = null) {
   const requestedPath = path.resolve(dir);
+  if (parent) recheckManagedDirectory(parent);
   fs.mkdirSync(requestedPath, { recursive: true, mode: 0o700 });
   const stat = fs.lstatSync(requestedPath);
   if (!stat.isDirectory() || stat.isSymbolicLink()) {
     throw new Error(`managed runtime directory must be a real directory: ${requestedPath}`);
   }
   const realPath = fs.realpathSync.native(requestedPath);
+  let canonical;
+  try { canonical = fs.lstatSync(realPath); } catch { canonical = null; }
+  if (!sameManagedDirectoryIdentity(stat, canonical)) {
+    throw new Error(`managed runtime directory identity changed while resolving: ${requestedPath}`);
+  }
+  if (parent) {
+    recheckManagedDirectory(parent);
+    const relative = path.relative(parent.realPath, realPath);
+    if (!relative || path.isAbsolute(relative) || relative === ".." || relative.startsWith(`..${path.sep}`)) {
+      throw new Error(`managed runtime directory escaped its parent: ${requestedPath}`);
+    }
+  }
   try { fs.chmodSync(requestedPath, 0o700); } catch { /* Windows/best-effort */ }
-  return { requestedPath, realPath, dev: stat.dev, ino: stat.ino };
+  const identity = { requestedPath, realPath, dev: stat.dev, ino: stat.ino };
+  // The chmod above is a pathname operation. Bind the returned anchor to the
+  // same inode after it, so a successor cannot become the directory identity.
+  recheckManagedDirectory(identity);
+  if (parent) recheckManagedDirectory(parent);
+  return identity;
 }
 
 function recheckManagedDirectory(identity) {
@@ -119,6 +144,15 @@ function recheckManagedDirectory(identity) {
     throw new Error(`managed runtime directory changed while publishing: ${identity.requestedPath}`);
   }
   return stat;
+}
+
+function managedUserDataDirectory(env = process.env) {
+  const identity = assertManagedDirectory(userDataDir(env));
+  // Every user-data-derived path below is built from this canonical anchor.
+  // Rechecking immediately after the initial mkdir/lstat closes the final-path
+  // symlink and deterministic root-successor cases before any child exists.
+  recheckManagedDirectory(identity);
+  return identity;
 }
 
 function managedFileLocation(file, directory = null) {
@@ -330,12 +364,13 @@ function writeManagedFile(file, content, location = null) {
 function prepareCodexRuntimeEnv(env = process.env) {
   const base = { ...env };
   const sourceHome = path.resolve(base.CODEX_HOME || path.join(os.homedir(), ".codex"));
-  const dataHome = path.resolve(userDataDir(base));
+  const dataDirectory = managedUserDataDirectory(base);
+  const realDataHome = dataDirectory.realPath;
   const explicitTarget = Boolean(base.AGENTLAS_CODEX_HOME);
-  const targetHome = path.resolve(base.AGENTLAS_CODEX_HOME || path.join(dataHome, "runtime-homes", "codex"));
-  fs.mkdirSync(dataHome, { recursive: true, mode: 0o700 });
-  const targetDirectory = assertManagedDirectory(targetHome);
-  const realDataHome = fs.realpathSync(dataHome);
+  const targetHome = path.resolve(base.AGENTLAS_CODEX_HOME || path.join(realDataHome, "runtime-homes", "codex"));
+  const targetParent = explicitTarget ? null : dataDirectory;
+  const targetDirectory = assertManagedDirectory(targetHome, targetParent);
+  recheckManagedDirectory(dataDirectory);
   const realTargetHome = targetDirectory.realPath;
   let realSourceHome = sourceHome;
   try { realSourceHome = fs.realpathSync(sourceHome); } catch (error) { if (!error || error.code !== "ENOENT") throw error; }
@@ -350,12 +385,14 @@ function prepareCodexRuntimeEnv(env = process.env) {
   // CODEX_HOME has no replace-config CLI flag: profiles and `mcp_servers={}`
   // merge with the user's global config. A dedicated home is the only reliable
   // way to exclude global/project/plugin MCP while keeping Agentlas sessions.
-  const configLocation = managedFileLocation(path.join(targetHome, "config.toml"), targetDirectory);
+  const configLocation = managedFileLocation(path.join(realTargetHome, "config.toml"), targetDirectory);
   writeManagedFile(
     configLocation.file,
     "# Managed by Agentlas Terminal. MCP is supplied only for explicit full-access turns.\n",
     configLocation,
   );
+  recheckManagedDirectory(dataDirectory);
+  recheckManagedDirectory(targetDirectory);
 
   if (sourceHome !== targetHome) {
     const sourceAuth = path.join(sourceHome, "auth.json");
@@ -375,6 +412,9 @@ function prepareCodexRuntimeEnv(env = process.env) {
       }
     }
   }
+
+  recheckManagedDirectory(dataDirectory);
+  recheckManagedDirectory(targetDirectory);
 
   base.CODEX_HOME = realTargetHome;
   return base;
@@ -400,8 +440,11 @@ function selectedMcpServers(servers, options = {}) {
 }
 function wrappedMcpServerMap(servers, options = {}) {
   const result = {};
-  for (const server of selectedMcpServers(servers, options)) {
-    const wrapped = wrapStdioServer(server, { dataDir: userDataDir(options.env || process.env) });
+  const selected = selectedMcpServers(servers, options);
+  if (!selected.length) return result;
+  const dataDir = options.dataDir || managedUserDataDirectory(options.env || process.env).realPath;
+  for (const server of selected) {
+    const wrapped = wrapStdioServer(server, { dataDir });
     const baseKey = mcpKey(server);
     let key = baseKey;
     if (Object.prototype.hasOwnProperty.call(result, key)) {
@@ -415,9 +458,10 @@ function wrappedMcpServerMap(servers, options = {}) {
 // Full-access turns only: claude --mcp-config with the exact host-authorized
 // stdio servers. Empty means empty; there is no legacy or provider seed.
 function cliMcpConfigPath(servers, options = {}) {
-  const dir = path.join(userDataDir(options.env || process.env), "mcp");
-  const directory = assertManagedDirectory(dir);
-  const mcpServers = wrappedMcpServerMap(servers, options);
+  const dataDirectory = managedUserDataDirectory(options.env || process.env);
+  const dir = path.join(dataDirectory.realPath, "mcp");
+  const directory = assertManagedDirectory(dir, dataDirectory);
+  const mcpServers = wrappedMcpServerMap(servers, { ...options, dataDir: dataDirectory.realPath });
   const body = JSON.stringify({ mcpServers }, null, 2);
   // 서로 다른 동시 실행이 하나의 agentlas-cli-mcp.json을 덮어쓰지 않도록 내용 주소 파일을 쓴다.
   const digest = crypto.createHash("sha256").update(body).digest("hex").slice(0, 20);
@@ -425,6 +469,8 @@ function cliMcpConfigPath(servers, options = {}) {
   // Always delegate the idempotent case to the identity-checked writer; a
   // caller-side read followed by an early return would reopen a TOCTOU gap.
   writeManagedFile(location.file, body, location);
+  recheckManagedDirectory(dataDirectory);
+  recheckManagedDirectory(directory);
   return { file: location.file, names: Object.keys(mcpServers) };
 }
 // Full-access turns only: codex -c mcp_servers.* with the same exact Build
@@ -859,7 +905,10 @@ function geminiSystemDefaultsSourcePath(env = process.env) {
 }
 
 function geminiMcpIsolationReadiness(env = process.env) {
-  const managed = path.resolve(userDataDir(env), "mcp");
+  let dataDirectory;
+  try { dataDirectory = managedUserDataDirectory(env); }
+  catch { return { ready: false, reason: "managed-user-data-unavailable" }; }
+  const managed = path.join(dataDirectory.realPath, "mcp");
   for (const source of [geminiSystemSettingsSourcePath(env), geminiSystemDefaultsSourcePath(env)]) {
     let stat;
     try { stat = fs.lstatSync(source); }
@@ -880,7 +929,10 @@ function geminiMcpIsolationReadiness(env = process.env) {
 function prepareGeminiRuntimeEnv(env = process.env, options = {}) {
   const base = { ...env };
   const exactAllowlist = options.mcpAllowlistMode === "exact";
-  const mcpServers = wrappedMcpServerMap(options.mcpServers, { exactAllowlist, env: base });
+  const selected = selectedMcpServers(options.mcpServers);
+  if (!selected.length) return base;
+  const dataDirectory = managedUserDataDirectory(base);
+  const mcpServers = wrappedMcpServerMap(selected, { exactAllowlist, env: base, dataDir: dataDirectory.realPath });
   if (!Object.keys(mcpServers).length) return base;
   const readiness = geminiMcpIsolationReadiness(base);
   if (!readiness.ready) {
@@ -888,8 +940,8 @@ function prepareGeminiRuntimeEnv(env = process.env, options = {}) {
     error.code = "AGENTLAS_GEMINI_MCP_ISOLATION_UNAVAILABLE";
     throw error;
   }
-  const dir = path.join(userDataDir(base), "mcp");
-  const directory = assertManagedDirectory(dir);
+  const dir = path.join(dataDirectory.realPath, "mcp");
+  const directory = assertManagedDirectory(dir, dataDirectory);
   const names = Object.keys(mcpServers);
   const body = JSON.stringify({ mcpServers, mcp: { allowed: names } }, null, 2);
   const digest = crypto.createHash("sha256").update(body).digest("hex").slice(0, 20);
@@ -897,6 +949,8 @@ function prepareGeminiRuntimeEnv(env = process.env, options = {}) {
   // Keep the idempotent read and return inside writeManagedFile's identity
   // checks; do not leave a caller-side read/early-return race here.
   writeManagedFile(location.file, body, location);
+  recheckManagedDirectory(dataDirectory);
+  recheckManagedDirectory(directory);
   base.GEMINI_CLI_SYSTEM_SETTINGS_PATH = location.file;
   return base;
 }

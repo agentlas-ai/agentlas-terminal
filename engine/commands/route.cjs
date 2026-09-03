@@ -25,7 +25,10 @@ async function run(ctx, args) {
     return 1;
   }
   const runtime = create(ctx);
-  const raw = args.includes("--json");
+  // Global output flags are consumed by the top-level parser before this
+  // command sees argv. Preserve JSON mode for the downstream Hephaestus
+  // renderer so `agentlas route <query> --json` cannot become a human preview.
+  const raw = args.includes("--json") || ctx.output?.format === "json";
   const query = args.filter((value) => value !== "--json").join(" ").trim();
   return runtime.cmdHep(
     query

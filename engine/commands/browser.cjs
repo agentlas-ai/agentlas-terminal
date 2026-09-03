@@ -61,7 +61,16 @@ function parseBrowserRest(rest, { values = [], positionals, usage }) {
   return parsed;
 }
 
-function siteUrl(site) { return /^[a-z][a-z0-9+.-]*:\/\//i.test(site) ? site : `https://${site}`; }
+function siteUrl(site) {
+  const raw = String(site || "").trim();
+  const candidate = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `https://${raw}`;
+  let parsed;
+  try { parsed = new URL(candidate); } catch { throw browserArgumentError("browser URL must be a valid HTTP(S) URL"); }
+  if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || parsed.username || parsed.password) {
+    throw browserArgumentError("browser URL must use http:// or https:// without embedded credentials");
+  }
+  return parsed.href;
+}
 
 function statusDot(ui, status) {
   if (status === "valid") return ui.green("●");
@@ -123,7 +132,7 @@ async function browserLogin(ctx, site) {
     // 로그인은 사용자가 직접 한다.
     try {
       const page = await cdp.attachPage({ selection: "new" });
-      try { await page.navigate(url, { waitMs: 1500 }); } finally { page.close(); }
+      try { await page.navigate(url, { waitMs: 1500 }); } finally { await page.close({ closeTarget: true }); }
       vault.logBrowserAction(db, { site: row.site, action: "login.open", target: url, result: "navigated" });
       ctx.out(`${ctx.ui.green("✓")} ${ko ? "새 브라우저 탭을 로그인 페이지로 열었습니다" : "opened a new browser tab for login"}: ${url}`);
     } catch (e) {
@@ -155,17 +164,18 @@ function browserMark(ctx, site, status) {
 
 async function browserGo(ctx, url) {
   const ko = ctx.lang === "ko";
+  const targetUrl = siteUrl(url);
   if (!(await cdp.cdpReady())) {
     ctx.err(ko
-      ? `Agentlas 브라우저가 실행 중이 아닙니다. 먼저 열어 주세요: agentlas browser ${siteUrl(url)}`
-      : `The Agentlas browser is not running. Open it first: agentlas browser ${siteUrl(url)}`);
+      ? `Agentlas 브라우저가 실행 중이 아닙니다. 먼저 열어 주세요: agentlas browser ${targetUrl}`
+      : `The Agentlas browser is not running. Open it first: agentlas browser ${targetUrl}`);
     return 1;
   }
   try {
     const page = await cdp.attachPage({ selection: "new" });
     let title;
-    try { await page.navigate(siteUrl(url), { waitMs: 1500 }); title = await page.evalExpr("document.title"); } finally { page.close(); }
-    ctx.out(`${ctx.ui.green("✓")} ${ko ? "새 브라우저 탭에서 열었습니다" : "opened a new browser tab"}: ${siteUrl(url)}${title ? ctx.ui.dim(` — ${title}`) : ""}`);
+    try { await page.navigate(targetUrl, { waitMs: 1500 }); title = await page.evalExpr("document.title"); } finally { await page.close({ closeTarget: true }); }
+    ctx.out(`${ctx.ui.green("✓")} ${ko ? "새 브라우저 탭에서 열었습니다" : "opened a new browser tab"}: ${targetUrl}${title ? ctx.ui.dim(` — ${title}`) : ""}`);
     return 0;
   } catch (e) { ctx.err(`${ctx.ui.red("✖")} ${String((e && e.message) || e)}`); return 1; }
 }

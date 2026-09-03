@@ -47,16 +47,47 @@ const LEGACY_SUPER_ONTOLOGY_FILES = Object.freeze([
   "super-ontology-memory-bridge.jsonl",
 ]);
 
-function removeLegacySuperOntologyFiles(dir) {
+function sameEntryIdentity(left, right) {
+  return Boolean(
+    left && right && left.dev === right.dev && left.ino === right.ino &&
+    left.nlink === right.nlink && (left.mode & fs.constants.S_IFMT) === (right.mode & fs.constants.S_IFMT),
+  );
+}
+
+function removeLegacySuperOntologyFiles(dir, anchor = null) {
+  let effectiveAnchor = anchor;
+  if (!effectiveAnchor) {
+    try { effectiveAnchor = privateDirectoryAnchor(dir); }
+    catch (error) {
+      if (error && error.code === "ENOENT") return;
+      throw error;
+    }
+  }
+  const base = effectiveAnchor.realpath;
   for (const fileName of LEGACY_SUPER_ONTOLOGY_FILES) {
-    const filePath = path.join(dir, fileName);
+    assertPrivateDirectoryAnchor(effectiveAnchor);
+    const filePath = path.join(base, fileName);
     let stat;
     try { stat = fs.lstatSync(filePath); } catch (error) {
       if (error && error.code === "ENOENT") continue;
       throw error;
     }
     // 알려진 레거시 산출물은 파일/링크였다. 같은 이름의 디렉터리는 사용자 데이터일 수 있다.
-    if (stat.isFile() || stat.isSymbolicLink()) fs.unlinkSync(filePath);
+    if (stat.isFile() || stat.isSymbolicLink()) {
+      // A successor can appear after the first lstat. Refuse to unlink unless
+      // the exact same directory entry is still present.
+      assertPrivateDirectoryAnchor(effectiveAnchor);
+      let current;
+      try { current = fs.lstatSync(filePath); } catch (error) {
+        if (error && error.code === "ENOENT") continue;
+        throw error;
+      }
+      if (!sameEntryIdentity(stat, current)) {
+        throw new Error("Agentlas legacy project file changed before removal");
+      }
+      fs.unlinkSync(filePath);
+    }
+    assertPrivateDirectoryAnchor(effectiveAnchor);
   }
 }
 
@@ -68,23 +99,91 @@ function privateSeedName(value, fallback) {
   return name;
 }
 
-function ensurePrivateDirectory(dir) {
-  try { fs.mkdirSync(dir, { recursive: false, mode: 0o700 }); }
-  catch (error) { if (!error || error.code !== "EEXIST") throw error; }
-  const listed = fs.lstatSync(dir);
-  if (!listed.isDirectory() || listed.isSymbolicLink()) {
-    throw new Error("Agentlas project state path must be a real directory");
-  }
-  if (process.platform !== "win32") fs.chmodSync(dir, 0o700);
-  return dir;
+function sameDirectoryIdentity(left, right) {
+  return Boolean(
+    left && right && left.isDirectory() && right.isDirectory() &&
+    !left.isSymbolicLink() && !right.isSymbolicLink() &&
+    left.dev === right.dev && left.ino === right.ino,
+  );
 }
 
-function ensurePrivateSeedFile(file, content) {
+function privateDirectoryAnchor(dir) {
+  const requested = path.resolve(dir);
+  const stat = fs.lstatSync(requested);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error("Agentlas project state path must be a real directory");
+  }
+  const realpath = fs.realpathSync.native(requested);
+  const canonical = fs.lstatSync(realpath);
+  if (!sameDirectoryIdentity(stat, canonical)) {
+    throw new Error("Agentlas project state directory changed while resolving");
+  }
+  return { path: requested, realpath, stat };
+}
+
+function assertPrivateDirectoryAnchor(anchor) {
+  const current = privateDirectoryAnchor(anchor.path);
+  if (!sameDirectoryIdentity(anchor.stat, current.stat) || current.realpath !== anchor.realpath) {
+    throw new Error("Agentlas project state directory changed while seeding");
+  }
+  return current;
+}
+
+function removeFreshPrivateDirectory(dir, expected) {
+  if (!expected || !expected.isDirectory() || expected.isSymbolicLink()) return;
+  try {
+    const listed = fs.lstatSync(dir);
+    if (!sameDirectoryIdentity(expected, listed)) return;
+    const realpath = fs.realpathSync.native(dir);
+    const canonical = fs.lstatSync(realpath);
+    if (!sameDirectoryIdentity(expected, canonical)) return;
+    // Only remove the empty directory created by this invocation. Never use a
+    // recursive cleanup or touch a changed/successor entry.
+    fs.rmdirSync(realpath);
+  } catch { /* leave unknown successors and recovery artifacts untouched */ }
+}
+
+function ensurePrivateDirectory(dir, parentAnchor = null) {
+  let created = false;
+  let createdStat = null;
+  try {
+    if (parentAnchor) assertPrivateDirectoryAnchor(parentAnchor);
+    try {
+      fs.mkdirSync(dir, { recursive: false, mode: 0o700 });
+      created = true;
+    } catch (error) { if (!error || error.code !== "EEXIST") throw error; }
+    const listed = fs.lstatSync(dir);
+    if (!listed.isDirectory() || listed.isSymbolicLink()) {
+      throw new Error("Agentlas project state path must be a real directory");
+    }
+    if (created) createdStat = listed;
+    if (parentAnchor) {
+      const realpath = fs.realpathSync.native(dir);
+      const expected = path.join(parentAnchor.realpath, path.basename(path.resolve(dir)));
+      if (realpath !== expected || !realpath.startsWith(`${parentAnchor.realpath}${path.sep}`)) {
+        throw new Error("Agentlas project state directory escaped its anchor");
+      }
+      assertPrivateDirectoryAnchor(parentAnchor);
+    }
+    if (process.platform !== "win32") fs.chmodSync(dir, 0o700);
+    if (parentAnchor) assertPrivateDirectoryAnchor(parentAnchor);
+    return dir;
+  } catch (error) {
+    if (created && createdStat) removeFreshPrivateDirectory(dir, createdStat);
+    throw error;
+  }
+}
+
+function ensurePrivateSeedFile(file, content, anchor = null) {
   let fd = null;
   const noFollow = fs.constants.O_NOFOLLOW || 0;
+  // Resolve direct seed files against the anchored directory so a swap of the
+  // requested `.agentlas` path cannot redirect creation into an outside link.
+  const target = anchor ? path.join(anchor.realpath, path.basename(file)) : file;
   try {
+    if (anchor) assertPrivateDirectoryAnchor(anchor);
     try {
-      fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow, 0o600);
+      fd = fs.openSync(target, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow, 0o600);
       const bytes = Buffer.from(String(content), "utf8");
       const written = fs.writeSync(fd, bytes, 0, bytes.length, null);
       if (written !== bytes.length) throw new Error("Agentlas project seed write was incomplete");
@@ -92,17 +191,18 @@ function ensurePrivateSeedFile(file, content) {
     } catch (error) {
       if (!error || error.code !== "EEXIST") throw error;
       if (fd != null) { try { fs.closeSync(fd); } catch { /* ignore */ } fd = null; }
-      fd = fs.openSync(file, fs.constants.O_RDONLY | noFollow);
+      fd = fs.openSync(target, fs.constants.O_RDONLY | noFollow);
     }
     const opened = fs.fstatSync(fd);
-    const listed = fs.lstatSync(file);
+    const listed = fs.lstatSync(target);
     if (
       !opened.isFile() || opened.nlink !== 1 ||
       !listed.isFile() || listed.isSymbolicLink() || listed.nlink !== 1 ||
       opened.dev !== listed.dev || opened.ino !== listed.ino
     ) throw new Error("Agentlas project seed target must be a single-link regular file");
     try { fs.fchmodSync(fd, 0o600); } catch { /* Windows/ACL-only host */ }
-    return file;
+    if (anchor) assertPrivateDirectoryAnchor(anchor);
+    return target;
   } finally {
     if (fd != null) try { fs.closeSync(fd); } catch { /* ignore */ }
   }
@@ -115,15 +215,20 @@ function ensureProjectMemoryCli(projectPath, projectName) {
     const canonicalRoot = fs.realpathSync.native(root);
     const rootStat = fs.lstatSync(root);
     if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || path.parse(canonicalRoot).root === canonicalRoot) return null;
+    const rootAnchor = privateDirectoryAnchor(root);
     const memoryDirName = privateSeedName(arch.memoryDir, ".agentlas");
-    const dir = ensurePrivateDirectory(path.join(root, memoryDirName));
-    removeLegacySuperOntologyFiles(dir);
+    const dir = ensurePrivateDirectory(path.join(root, memoryDirName), rootAnchor);
+    assertPrivateDirectoryAnchor(rootAnchor);
+    const dirAnchor = privateDirectoryAnchor(dir);
+    removeLegacySuperOntologyFiles(dir, dirAnchor);
     const name = String(projectName || path.basename(root) || "Project").slice(0, 200);
-    ensureLocalCredentialStoreCli(root, name, arch);
-    ensureSoulCredentialIndexCli(root, name, arch);
-    const sitemap = path.join(dir, privateSeedName(arch.sitemapFile, "sitemap.json"));
+    assertPrivateDirectoryAnchor(rootAnchor);
+    ensureLocalCredentialStoreCli(root, name, arch, rootAnchor);
+    ensureSoulCredentialIndexCli(root, name, arch, rootAnchor);
+    assertPrivateDirectoryAnchor(rootAnchor);
+    const sitemap = path.join(dirAnchor.realpath, privateSeedName(arch.sitemapFile, "sitemap.json"));
     const now = new Date().toISOString();
-    ensurePrivateSeedFile(sitemap, JSON.stringify({ project: name, created_at: now, updated_at: now, nodes: [] }, null, 2));
+    ensurePrivateSeedFile(sitemap, JSON.stringify({ project: name, created_at: now, updated_at: now, nodes: [] }, null, 2), dirAnchor);
     const skillRegistryFile = privateSeedName(arch.skillRegistryFile, "skill-registry.json");
     const skillTrialsFile = privateSeedName(arch.skillTrialsFile, "skill-trials.jsonl");
     const curatorDecisionsFile = privateSeedName(arch.curatorDecisionsFile, "curator-decisions.jsonl");
@@ -135,7 +240,7 @@ function ensureProjectMemoryCli(projectPath, projectName) {
     const careerGraphSourceManifestFile = privateSeedName(arch.careerGraphSourceManifestFile, "career-graph-sources.json");
     const careerGraphInboxDir = privateSeedName(arch.careerGraphInboxDir, "career-graph-inbox");
     const careerGraphDbFile = privateSeedName(arch.careerGraphDbFile, "career-graph.sqlite");
-    const skillRegistry = path.join(dir, skillRegistryFile);
+    const skillRegistry = path.join(dirAnchor.realpath, skillRegistryFile);
     ensurePrivateSeedFile(skillRegistry, JSON.stringify({
         schemaVersion: "1.0",
         kind: "agentlas-skill-lifecycle-registry",
@@ -176,9 +281,10 @@ function ensureProjectMemoryCli(projectPath, projectName) {
           lowRiskCanaryOnly: true,
           severeFailureTolerance: 0,
         },
-      }, null, 2));
-    const ontologyInbox = ensurePrivateDirectory(path.join(dir, ontologyInboxDir));
-    const ontologyRuntime = path.join(dir, ontologyRuntimeFile);
+      }, null, 2), dirAnchor);
+    assertPrivateDirectoryAnchor(dirAnchor);
+    const ontologyInbox = ensurePrivateDirectory(path.join(dirAnchor.realpath, ontologyInboxDir), dirAnchor);
+    const ontologyRuntime = path.join(dirAnchor.realpath, ontologyRuntimeFile);
     ensurePrivateSeedFile(ontologyRuntime, JSON.stringify({
         schemaVersion: "1.0",
         kind: "agentlas-ontology-runtime",
@@ -186,9 +292,9 @@ function ensureProjectMemoryCli(projectPath, projectName) {
         activation: "automatic",
         projectRoot: root,
         projectName: name,
-        dbPath: path.join(dir, ontologyDbFile),
+        dbPath: path.join(dirAnchor.realpath, ontologyDbFile),
         inboxPath: ontologyInbox,
-        sourceManifest: path.join(dir, ontologySourceManifestFile),
+        sourceManifest: path.join(dirAnchor.realpath, ontologySourceManifestFile),
         defaultScope: "internal",
         autoIngestPolicy: {
           mode: "inbox_and_registered_sources_only",
@@ -207,16 +313,17 @@ function ensureProjectMemoryCli(projectPath, projectName) {
           durableWrites: "candidate-ticket-only",
           workingMemory: "runtime-cache-only",
         },
-      }, null, 2));
-    const ontologySources = path.join(dir, ontologySourceManifestFile);
+      }, null, 2), dirAnchor);
+    const ontologySources = path.join(dirAnchor.realpath, ontologySourceManifestFile);
     ensurePrivateSeedFile(ontologySources, JSON.stringify({
         schemaVersion: "1.0",
         kind: "agentlas-ontology-source-manifest",
         projectRoot: root,
         sources: [],
-      }, null, 2));
-    const careerGraphInbox = ensurePrivateDirectory(path.join(dir, careerGraphInboxDir));
-    const careerGraphConfig = path.join(dir, careerGraphConfigFile);
+      }, null, 2), dirAnchor);
+    assertPrivateDirectoryAnchor(dirAnchor);
+    const careerGraphInbox = ensurePrivateDirectory(path.join(dirAnchor.realpath, careerGraphInboxDir), dirAnchor);
+    const careerGraphConfig = path.join(dirAnchor.realpath, careerGraphConfigFile);
     ensurePrivateSeedFile(careerGraphConfig, JSON.stringify({
         schemaVersion: "1.0",
         kind: "agentlas-career-graph",
@@ -224,9 +331,9 @@ function ensureProjectMemoryCli(projectPath, projectName) {
         model: "ledger_first_derived_index",
         projectRoot: root,
         projectName: name,
-        dbPath: path.join(dir, careerGraphDbFile),
+        dbPath: path.join(dirAnchor.realpath, careerGraphDbFile),
         inboxPath: careerGraphInbox,
-        sourceManifest: path.join(dir, careerGraphSourceManifestFile),
+        sourceManifest: path.join(dirAnchor.realpath, careerGraphSourceManifestFile),
         canonicalSourcePolicy: {
           sourceOfTruth: "markdown_jsonl_json",
           graphIsRebuildable: true,
@@ -234,16 +341,16 @@ function ensureProjectMemoryCli(projectPath, projectName) {
           neverScanHomeDirectory: true,
           neverScanSiblingProjects: true,
         },
-      }, null, 2));
-    const careerGraphSources = path.join(dir, careerGraphSourceManifestFile);
+      }, null, 2), dirAnchor);
+    const careerGraphSources = path.join(dirAnchor.realpath, careerGraphSourceManifestFile);
     ensurePrivateSeedFile(careerGraphSources, JSON.stringify({
         schemaVersion: "1.0",
         kind: "agentlas-career-graph-source-manifest",
         projectRoot: root,
         sources: [],
-      }, null, 2));
+      }, null, 2), dirAnchor);
     for (const fileName of [skillTrialsFile, curatorDecisionsFile]) {
-      ensurePrivateSeedFile(path.join(dir, fileName), "");
+      ensurePrivateSeedFile(path.join(dirAnchor.realpath, fileName), "", dirAnchor);
     }
     return dir;
   } catch { return null; }

@@ -11,9 +11,16 @@ const { cmdVariant } = require("../experience/variant.cjs");
 
 function run(ctx, args) {
   let code = 0;
+  // The dispatcher consumes global output flags before invoking a command.
+  // Preserve the legacy variant parser's JSON switch at this boundary so the
+  // command cannot fall back to a human error/usage stream when callers use
+  // the common `--json` contract.
+  const commandArgs = ctx.output?.format === "json" && !args.includes("--json")
+    ? [...args, "--json"]
+    : args;
   cmdVariant({
     db: ctx.db(),
-    args,
+    args: commandArgs,
     userDataDir: userDataDir(),
     cwd: process.cwd(),
     out: ctx.out,

@@ -580,9 +580,21 @@ function captureRuntime(kind, systemPrompt, prompt, opts) {
     onStdout = (chunk) => append(stdoutChunks, chunk);
     onStderr = (chunk) => append(stderrChunks, chunk);
     onError = (error) => finishReject(terminationError || error);
-    onClose = (code) => {
+    onClose = (code, signal) => {
       if (terminationError) {
         finishReject(terminationError);
+        return;
+      }
+      if (signal) {
+        const error = new Error(`${kind} terminated by ${signal}`);
+        error.code = "AGENTLAS_CAPTURE_CHILD_SIGNAL";
+        finishReject(error);
+        return;
+      }
+      if (code == null) {
+        const error = new Error(`${kind} exited without a completion status.`);
+        error.code = "AGENTLAS_CAPTURE_CHILD_EXIT";
+        finishReject(error);
         return;
       }
       const stdout = Buffer.concat(stdoutChunks).toString("utf8");

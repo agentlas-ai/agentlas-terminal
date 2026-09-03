@@ -22,6 +22,14 @@ const { deleteCloudAgent } = require("./cas.cjs");
 const { listOwnedCloudAgents, restoreOwnedCloudAgent } = require("./restore.cjs");
 const workforceDeps = require("../workforce/deps.cjs");
 const workforceCapture = require("../workforce/capture.cjs");
+const {
+  DEFAULT_OPTIONS,
+  single: outputSingle,
+  list: outputList,
+  render: renderOutput,
+  parseOutputFlags,
+  terminalTextOf,
+} = require("../cli-output.cjs");
 
 const PURPOSE_QUESTION = "What concrete work should this agent complete, and what should the finished result look like?";
 
@@ -168,6 +176,13 @@ function writePurposeRepairCopy(root, projection) {
 
 const CLOUD_VALUE_FLAGS = ["limit", "name", "purpose", "scope", "slug", "visibility"];
 const CLOUD_BOOLEAN_FLAGS = ["dry-run", "json", "llm-review", "overwrite", "strict"];
+const CLOUD_OUTPUT_FIELDS = Object.freeze({
+  json: "json",
+  yaml: "yaml",
+  quiet: "quiet",
+  "no-headers": "noHeaders",
+  "no-color": "noColor",
+});
 
 function cloudArgumentError(message) {
   const error = new Error(message);
@@ -198,12 +213,14 @@ function parseCloudFlags(args, spec = {}) {
     if (!String(a).startsWith("--")) throw cloudArgumentError(`unknown option: ${a}`);
     const equal = String(a).indexOf("=");
     const key = String(a).slice(2, equal === -1 ? undefined : equal);
-    if (!key || (!values.has(key) && !booleans.has(key))) throw cloudArgumentError(`unknown option: --${key || ""}`);
+    if (!key || (!values.has(key) && !booleans.has(key) && !Object.hasOwn(CLOUD_OUTPUT_FIELDS, key))) {
+      throw cloudArgumentError(`unknown option: --${key || ""}`);
+    }
     if (seen.has(key)) throw cloudArgumentError(`duplicate option: --${key}`);
     seen.add(key);
-    if (booleans.has(key)) {
+    if (booleans.has(key) || Object.hasOwn(CLOUD_OUTPUT_FIELDS, key)) {
       if (equal !== -1) throw cloudArgumentError(`--${key} does not take a value`);
-      flags[key] = true;
+      flags[Object.hasOwn(CLOUD_OUTPUT_FIELDS, key) ? CLOUD_OUTPUT_FIELDS[key] : key] = true;
       continue;
     }
     let value;
@@ -219,6 +236,79 @@ function parseCloudFlags(args, spec = {}) {
     flags[key] = value;
   }
   return flags;
+}
+
+function cloudOutputOptions(ctx, flags = {}) {
+  const output = { ...DEFAULT_OPTIONS, ...(ctx.output || {}) };
+  if (flags.json) output.format = "json";
+  if (flags.yaml) output.format = "yaml";
+  if (flags.quiet) output.quiet = true;
+  if (flags.noHeaders) output.noHeaders = true;
+  if (flags.noColor) output.noColor = true;
+  return output;
+}
+
+function cloudStructuredRequested(ctx) {
+  const output = cloudOutputOptions(ctx);
+  // noColor is automatically enabled for a non-TTY by the common parser. That
+  // is already honored by the existing plain human output; only an explicit
+  // TTY no-color request needs the structured adapter below.
+  const explicitNoColor = Boolean(output.noColor && process.stdout.isTTY);
+  return output.quiet || output.noHeaders || output.format !== "table" || explicitNoColor;
+}
+
+function cloudRows(value) {
+  if (Array.isArray(value)) return value;
+  if (!value || typeof value !== "object") return [value];
+  for (const key of ["results", "agents", "items", "entries"]) {
+    if (Array.isArray(value[key])) return value[key];
+  }
+  return [value];
+}
+
+function cloudResultId(value) {
+  if (!value || typeof value !== "object") return value;
+  return value.slug || value.id || value.cloudId || value.packageHash ||
+    value.manifest?.slug || value.suite || value.name || value.status || "";
+}
+
+function cloudResultSchema() {
+  return Object.freeze({
+    idField: cloudResultId,
+    columns: [{ header: "result", field: (value) => value }],
+    renderHuman(result, options = {}) {
+      const data = result.data;
+      const rows = cloudRows(data);
+      if (rows.length === 1 && rows[0] === data && (!data || typeof data !== "object")) {
+        return terminalTextOf(data);
+      }
+      if (rows.length > 1 || (data && typeof data === "object" && Array.isArray(data.results))) {
+        const lines = [];
+        if (!options.noHeaders) lines.push("RESULT");
+        for (const row of rows) {
+          const id = terminalTextOf(cloudResultId(row), 256);
+          const name = row && typeof row === "object" ? terminalTextOf(row.name || row.title || row.status || "", 256) : "";
+          lines.push(name && name !== id ? `${id}  ${name}` : id);
+        }
+        return lines.join("\n");
+      }
+      return terminalTextOf(JSON.stringify(data), 16 * 1024);
+    },
+  });
+}
+
+function cloudMachineResult(value, output) {
+  const schema = cloudResultSchema();
+  if (output.quiet) return outputList(cloudRows(value), schema);
+  return outputSingle(value, schema);
+}
+
+function addJsonFlag(args) {
+  const source = Array.isArray(args) ? [...args] : [];
+  const separator = source.indexOf("--");
+  if (separator === -1) return [...source, "--json"];
+  source.splice(separator, 0, "--json");
+  return source;
 }
 
 function requireCloudPositionals(flags, min, max, usage) {
@@ -319,10 +409,14 @@ const CLOUD_HELP = [
   "Private save rule: no public review or routing card; local secret/path/hash checks remain.",
 ].join("\n");
 
-async function runCloud(ctx, args) {
+async function runCloudInternal(ctx, args) {
   const sub = args[0] || "help";
   if (sub === "help" || sub === "--help" || sub === "-h") {
     requireCloudPositionals(parseCloudFlags(args.slice(1), { values: [], booleans: ["json"] }), 0, 0, "usage: agentlas cloud help");
+    if (args.includes("--json")) {
+      ctx.out(JSON.stringify({ help: CLOUD_HELP }, null, 2));
+      return 0;
+    }
     ctx.out(CLOUD_HELP);
     return 0;
   }
@@ -523,6 +617,58 @@ async function runCloud(ctx, args) {
   return (sub === "save" || sub === "publish") && result.status === "blocked" ? 1 : 0;
 }
 
+const CLOUD_OUTPUT_TOKENS = new Set(["--json", "--yaml", "--quiet", "-q", "--no-headers", "--no-color"]);
+
+function withCloudOutputFlags(ctx, args) {
+  if (!Array.isArray(args) || !args.some((arg) => CLOUD_OUTPUT_TOKENS.has(arg))) return { ctx, args };
+  const parsed = parseOutputFlags(args);
+  return {
+    ctx: { ...ctx, output: { ...DEFAULT_OPTIONS, ...(ctx.output || {}), ...parsed.options } },
+    args: parsed.rest,
+  };
+}
+
+async function runCloud(ctx, args) {
+  const normalized = withCloudOutputFlags(ctx, args);
+  ctx = normalized.ctx;
+  args = normalized.args;
+  if (!cloudStructuredRequested(ctx)) return runCloudInternal(ctx, args);
+
+  const capturedOut = [];
+  const capturedErr = [];
+  const machineCtx = {
+    ...ctx,
+    // The internal command has a legacy --json switch. Capture that stable
+    // wire first, then let the shared renderer apply YAML/quiet/table policy.
+    output: { ...ctx.output, format: "json", quiet: false, noHeaders: false, noColor: true },
+    out(value = "") { capturedOut.push(String(value)); },
+    err(value = "") { capturedErr.push(String(value)); },
+  };
+  const code = await runCloudInternal(machineCtx, addJsonFlag(args));
+  const raw = capturedOut.join("\n").trim();
+  if (!raw) {
+    if (capturedErr.length || code) {
+      const error = new Error(capturedErr.join("\n") || "Cloud command did not produce a machine-readable result.");
+      error.code = capturedErr.length ? "CLOUD_FAILED" : "CLOUD_OUTPUT_MISSING";
+      throw error;
+    }
+    return code;
+  }
+  let result;
+  try {
+    result = JSON.parse(raw);
+  } catch (error) {
+    const outputError = new Error("Cloud command returned invalid machine-readable output.");
+    outputError.code = "CLOUD_OUTPUT_INVALID";
+    outputError.details = { cause: String((error && error.message) || error).slice(0, 200) };
+    throw outputError;
+  }
+  const output = cloudOutputOptions(ctx);
+  const text = renderOutput(cloudMachineResult(result, output), output);
+  if (text) ctx.out(text);
+  return code;
+}
+
 async function runUpload(ctx, args) {
   if (!args.length) {
     ctx.err("usage: agentlas upload <path> [--visibility marketplace]");
@@ -531,7 +677,9 @@ async function runUpload(ctx, args) {
   // 기본 = owner-private save. marketplace는 오직 명시적 플래그로만 publish가 된다.
   // --visibility 인자는 그대로 넘긴다 — cloudVisibilityForAction이 재검증한다.
   const action = cloudActionForTopLevelUpload(args);
-  return runCloud(ctx, [action, ...args]);
+  // Top-level upload already owns its structured adapter. Keep the cloud
+  // internals on the legacy JSON wire so upload can parse it exactly once.
+  return runCloudInternal(ctx, [action, ...args]);
 }
 
 module.exports = {

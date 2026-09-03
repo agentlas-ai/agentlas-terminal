@@ -289,11 +289,17 @@ function autofillOutputChecks(bp) {
     .map((check) => String(check.subject || "").trim())
     .filter(Boolean));
   bp.steps.forEach((step, index) => {
-    if (step.effect !== "mutation") return;
+    // The blueprint is untrusted model output. Validate malformed step entries
+    // below instead of letting the autofill pass throw before validation can
+    // turn them into a bounded retry.
+    if (!step || typeof step !== "object" || step.effect !== "mutation") return;
     for (const value of Array.isArray(step.consumes) ? step.consumes : []) {
       const name = String(value == null ? "" : value).trim();
       if (!name || checked.has(name)) continue;
-      const madeAt = bp.steps.findIndex((s, i) => i < index && (s.produces || "").trim() === name);
+      const madeAt = bp.steps.findIndex((s, i) =>
+        i < index && s && typeof s === "object" && typeof s.produces === "string"
+          && s.produces.trim() === name,
+      );
       if (madeAt < 0) continue;
       checks.push({
         afterStep: madeAt,
@@ -528,12 +534,15 @@ function validateBlueprint(bp, ctx = {}) {
         .filter(Boolean),
     );
     steps.forEach((step, index) => {
-      if (step.effect !== "mutation") return;
+      if (!step || typeof step !== "object" || step.effect !== "mutation") return;
       const consumes = Array.isArray(step.consumes) ? step.consumes : [];
       for (const value of consumes) {
         const name = String(value == null ? "" : value).trim();
         if (!name || checkedSubjects.has(name)) continue;
-        const madeAt = steps.findIndex((s, i) => i < index && (s.produces || "").trim() === name);
+        const madeAt = steps.findIndex((s, i) =>
+          i < index && s && typeof s === "object" && typeof s.produces === "string"
+            && s.produces.trim() === name,
+        );
         if (madeAt < 0) continue;
         push(
           `"${step.title || `${index + 1}번째 단계`}"는 바깥으로 나가는데, 그 앞에서 만든 `
@@ -567,7 +576,7 @@ function validateBlueprint(bp, ctx = {}) {
       if (subj) resultChecks.set(subj, check);
     }
     steps.forEach((step, index) => {
-      if (step.effect !== "mutation") return;
+      if (!step || typeof step !== "object" || step.effect !== "mutation") return;
       const result = String(step.produces || "").trim();
       if (!result) {
         push(

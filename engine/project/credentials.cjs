@@ -45,6 +45,24 @@ function credentialAssertDirectoryAnchor(anchor, label, containedBy = null) {
   return current;
 }
 
+function credentialRootAnchor(projectPath, expected = null) {
+  if (expected) {
+    credentialAssertDirectoryAnchor(expected, "credential project root");
+    return expected;
+  }
+  const root = credentialProjectRootCli(projectPath);
+  return credentialDirectoryAnchor(root, "credential project root");
+}
+
+function credentialContainedPath(anchor, relativePath, label) {
+  const candidate = path.resolve(anchor.realpath, String(relativePath || ""));
+  const relative = path.relative(anchor.realpath, candidate);
+  if (path.isAbsolute(relative) || relative === ".." || relative.startsWith(`..${path.sep}`)) {
+    throw new Error(`${label} escaped the managed project`);
+  }
+  return candidate;
+}
+
 function credentialSameFileIdentity(left, right) {
   return Boolean(
     left && right && left.isFile() && right.isFile() &&
@@ -163,18 +181,42 @@ function credentialProjectRootCli(projectPath) {
   return root;
 }
 
-function ensureManagedDirectoryCli(root, relativePath, mode = 0o700) {
-  let current = root;
+function ensureManagedDirectoryCli(root, relativePath, mode = 0o700, rootAnchor = null) {
+  const base = rootAnchor ? rootAnchor.realpath : root;
+  if (rootAnchor) credentialAssertDirectoryAnchor(rootAnchor, "credential project root");
+  const requested = rootAnchor
+    ? credentialContainedPath(rootAnchor, relativePath, "credential managed directory")
+    : path.resolve(base, String(relativePath || ""));
+  const relative = path.relative(base, requested);
+  if (path.isAbsolute(relative) || relative === ".." || relative.startsWith(`..${path.sep}`)) {
+    throw new Error("credential managed directory escaped the project");
+  }
+  let current = base;
   for (const segment of String(relativePath || "").split(/[\\/]+/).filter(Boolean)) {
     current = path.join(current, segment);
+    if (rootAnchor) credentialAssertDirectoryAnchor(rootAnchor, "credential project root");
+    let listed;
     try {
-      const stat = fs.lstatSync(current);
-      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("credential store directories must not be symbolic links");
+      listed = fs.lstatSync(current);
+      if (!listed.isDirectory() || listed.isSymbolicLink()) throw new Error("credential store directories must not be symbolic links");
     } catch (error) {
       if (!error || error.code !== "ENOENT") throw error;
       fs.mkdirSync(current, { recursive: false, mode });
+      listed = fs.lstatSync(current);
+    }
+    if (rootAnchor) {
+      const canonical = fs.realpathSync.native(current);
+      if (canonical !== current || !canonical.startsWith(`${rootAnchor.realpath}${path.sep}`)) {
+        throw new Error("credential managed directory escaped the project");
+      }
+      const currentStat = fs.lstatSync(current);
+      if (!credentialSameDirectoryIdentity(listed, currentStat)) {
+        throw new Error("credential managed directory changed while it was being used");
+      }
+      credentialAssertDirectoryAnchor(rootAnchor, "credential project root");
     }
   }
+  if (rootAnchor) credentialAssertDirectoryAnchor(rootAnchor, "credential project root");
   return current;
 }
 
@@ -219,10 +261,12 @@ function assertManagedSnapshotUnchangedCli(filePath, snapshot) {
   ) throw new Error("credential store file changed before replacement");
 }
 
-function replaceManagedFileCli(tempPath, filePath, snapshot) {
+function replaceManagedFileCli(tempPath, filePath, snapshot, parentAnchor = null) {
+  if (parentAnchor) credentialAssertDirectoryAnchor(parentAnchor, "credential managed parent");
   assertManagedSnapshotUnchangedCli(filePath, snapshot);
   try {
     fs.renameSync(tempPath, filePath);
+    if (parentAnchor) credentialAssertDirectoryAnchor(parentAnchor, "credential managed parent");
     return;
   } catch (error) {
     if (
@@ -230,34 +274,41 @@ function replaceManagedFileCli(tempPath, filePath, snapshot) {
       !["EEXIST", "EPERM", "EACCES"].includes(error && error.code)
     ) throw error;
   }
+  if (parentAnchor) credentialAssertDirectoryAnchor(parentAnchor, "credential managed parent");
   assertManagedSnapshotUnchangedCli(filePath, snapshot);
   const backup = `${filePath}.agentlas-${process.pid}-${crypto.randomUUID()}.bak`;
   fs.renameSync(filePath, backup);
   try {
+    if (parentAnchor) credentialAssertDirectoryAnchor(parentAnchor, "credential managed parent");
     fs.renameSync(tempPath, filePath);
   } catch (error) {
     try { if (!fs.existsSync(filePath)) fs.renameSync(backup, filePath); } catch { /* leave recoverable backup */ }
     throw error;
   }
+  if (parentAnchor) credentialAssertDirectoryAnchor(parentAnchor, "credential managed parent");
   try { fs.rmSync(backup, { force: true }); } catch { /* committed target is authoritative */ }
 }
 
 function writeManagedTextAtomicCli(filePath, text, options = {}) {
+  const parentAnchor = options.parentAnchor || null;
+  if (parentAnchor) credentialAssertDirectoryAnchor(parentAnchor, "credential managed parent");
   const snapshot = options.snapshot || readManagedTextSnapshotCli(filePath, options.maxBytes);
   const bytes = Buffer.byteLength(text, "utf8");
   if (bytes > (options.maxBytes || MAX_MANAGED_CREDENTIAL_METADATA_BYTES)) throw new Error("credential store file exceeds its safety limit");
   const temp = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${process.pid}.${crypto.randomUUID()}.tmp`);
   try {
+    if (parentAnchor) credentialAssertDirectoryAnchor(parentAnchor, "credential managed parent");
     fs.writeFileSync(temp, text, { encoding: "utf8", mode: options.mode || snapshot.mode || 0o600, flag: "wx" });
-    replaceManagedFileCli(temp, filePath, snapshot);
+    if (parentAnchor) credentialAssertDirectoryAnchor(parentAnchor, "credential managed parent");
+    replaceManagedFileCli(temp, filePath, snapshot, parentAnchor);
   } finally {
     try { fs.rmSync(temp, { force: true }); } catch { /* best-effort cleanup */ }
   }
 }
 
-function ensureManagedTextFileCli(filePath, content, mode = 0o600) {
+function ensureManagedTextFileCli(filePath, content, mode = 0o600, parentAnchor = null) {
   const snapshot = readManagedTextSnapshotCli(filePath);
-  if (!snapshot.exists) writeManagedTextAtomicCli(filePath, content, { snapshot, mode });
+  if (!snapshot.exists) writeManagedTextAtomicCli(filePath, content, { snapshot, mode, parentAnchor });
   return snapshot.exists ? snapshot.text : content;
 }
 
@@ -341,15 +392,17 @@ ${credentialIndexSectionContentCli(arch)}
 ## Auto-curated memory
 `;
 }
-function ensureSoulCredentialIndexCli(projectPath, projectName, arch) {
-  const root = credentialProjectRootCli(projectPath);
+function ensureSoulCredentialIndexCli(projectPath, projectName, arch, expectedRoot = null) {
+  const rootAnchor = credentialRootAnchor(projectPath, expectedRoot);
+  const root = rootAnchor.realpath;
   const memoryDir = (arch && arch.memoryDir) || ".agentlas";
   const soulFile = (arch && arch.soulFile) || "project-soul-memory.md";
-  const dir = ensureManagedDirectoryCli(root, memoryDir);
-  const soul = path.join(dir, soulFile);
+  const dir = ensureManagedDirectoryCli(root, memoryDir, 0o700, rootAnchor);
+  const dirAnchor = credentialDirectoryAnchor(dir, "credential memory directory", rootAnchor);
+  const soul = credentialContainedPath(dirAnchor, soulFile, "credential soul file");
   const snapshot = readManagedTextSnapshotCli(soul);
   if (!snapshot.exists) {
-    writeManagedTextAtomicCli(soul, projectSoulTemplateCli(projectName, arch), { snapshot, mode: 0o600 });
+    writeManagedTextAtomicCli(soul, projectSoulTemplateCli(projectName, arch), { snapshot, mode: 0o600, parentAnchor: dirAnchor });
     return soul;
   }
   const content = snapshot.text;
@@ -359,8 +412,9 @@ function ensureSoulCredentialIndexCli(projectPath, projectName, arch) {
     const next = content.includes(marker)
       ? content.replace(marker, `\n${section}\n## Project Purpose`)
       : `${content.trimEnd()}\n\n${section}\n`;
-    writeManagedTextAtomicCli(soul, next.endsWith("\n") ? next : next + "\n", { snapshot, mode: 0o600 });
+    writeManagedTextAtomicCli(soul, next.endsWith("\n") ? next : next + "\n", { snapshot, mode: 0o600, parentAnchor: dirAnchor });
   }
+  credentialAssertDirectoryAnchor(rootAnchor, "credential project root");
   return soul;
 }
 function envExampleContentCli(cfg) {
@@ -404,9 +458,10 @@ Examples:
 Do not commit files from this folder.
 `;
 }
-function ensureAgentlasCredentialIgnoreCli(projectPath, cfg) {
-  const root = credentialProjectRootCli(projectPath);
-  const gitignorePath = path.join(root, ".gitignore");
+function ensureAgentlasCredentialIgnoreCli(projectPath, cfg, expectedRoot = null) {
+  const rootAnchor = credentialRootAnchor(projectPath, expectedRoot);
+  const root = rootAnchor.realpath;
+  const gitignorePath = credentialContainedPath(rootAnchor, ".gitignore", "credential ignore file");
   const marker = "# Agentlas local credentials";
   const block = `${marker}
 .env
@@ -424,33 +479,41 @@ ${cfg.credentialsDir}/*
   const existing = snapshot.text;
   if (existing.includes(marker)) {
     if (!/^\._\*$/m.test(existing)) {
-      writeManagedTextAtomicCli(gitignorePath, `${existing.trimEnd()}\n._*\n`, { snapshot, mode: snapshot.mode || 0o644 });
+      writeManagedTextAtomicCli(gitignorePath, `${existing.trimEnd()}\n._*\n`, { snapshot, mode: snapshot.mode || 0o644, parentAnchor: rootAnchor });
     }
+    credentialAssertDirectoryAnchor(rootAnchor, "credential project root");
     return;
   }
   const next = existing.trimEnd() ? `${existing.trimEnd()}\n\n${block}` : block;
   writeManagedTextAtomicCli(gitignorePath, next.endsWith("\n") ? next : next + "\n", {
     snapshot,
     mode: snapshot.exists ? snapshot.mode : 0o644,
+    parentAnchor: rootAnchor,
   });
+  credentialAssertDirectoryAnchor(rootAnchor, "credential project root");
 }
-function ensureLocalCredentialStoreCli(projectPath, projectName, arch) {
-  const root = credentialProjectRootCli(projectPath);
+function ensureLocalCredentialStoreCli(projectPath, projectName, arch, expectedRoot = null) {
+  const rootAnchor = credentialRootAnchor(projectPath, expectedRoot);
+  const root = rootAnchor.realpath;
   const cfg = localCredentialConfigCli(arch || loadArch());
-  const dir = ensureManagedDirectoryCli(root, (arch && arch.memoryDir) || ".agentlas");
-  const signingDir = ensureManagedDirectoryCli(root, cfg.signingDir);
-  const credentialsDir = ensureManagedDirectoryCli(root, cfg.credentialsDir);
-  const envExample = path.join(root, cfg.envExampleFile);
-  ensureManagedTextFileCli(envExample, envExampleContentCli(cfg), 0o600);
-  const signingReadme = path.join(signingDir, cfg.readmeFile);
-  ensureManagedTextFileCli(signingReadme, signingReadmeContentCli(cfg), 0o600);
-  const credentialsReadme = path.join(credentialsDir, cfg.readmeFile);
-  ensureManagedTextFileCli(credentialsReadme, credentialsReadmeContentCli(cfg), 0o600);
-  const mapPath = path.join(dir, cfg.mapFile);
+  const dir = ensureManagedDirectoryCli(root, (arch && arch.memoryDir) || ".agentlas", 0o700, rootAnchor);
+  const memoryAnchor = credentialDirectoryAnchor(dir, "credential memory directory", rootAnchor);
+  const signingDir = ensureManagedDirectoryCli(root, cfg.signingDir, 0o700, rootAnchor);
+  const signingAnchor = credentialDirectoryAnchor(signingDir, "credential signing directory", rootAnchor);
+  const credentialsDir = ensureManagedDirectoryCli(root, cfg.credentialsDir, 0o700, rootAnchor);
+  const credentialsAnchor = credentialDirectoryAnchor(credentialsDir, "credential files directory", rootAnchor);
+  const envExample = credentialContainedPath(rootAnchor, cfg.envExampleFile, "credential env example");
+  ensureManagedTextFileCli(envExample, envExampleContentCli(cfg), 0o600, rootAnchor);
+  const signingReadme = credentialContainedPath(signingAnchor, cfg.readmeFile, "credential signing README");
+  ensureManagedTextFileCli(signingReadme, signingReadmeContentCli(cfg), 0o600, signingAnchor);
+  const credentialsReadme = credentialContainedPath(credentialsAnchor, cfg.readmeFile, "credential README");
+  ensureManagedTextFileCli(credentialsReadme, credentialsReadmeContentCli(cfg), 0o600, credentialsAnchor);
+  const mapPath = credentialContainedPath(memoryAnchor, cfg.mapFile, "credential map");
   const mapText = ensureManagedTextFileCli(
     mapPath,
     JSON.stringify(localCredentialsMapSkeletonCli(root, projectName, cfg), null, 2) + "\n",
     0o600,
+    memoryAnchor,
   );
   let mapValue;
   try { mapValue = JSON.parse(mapText); }
@@ -458,7 +521,8 @@ function ensureLocalCredentialStoreCli(projectPath, projectName, arch) {
   if (!mapValue || typeof mapValue !== "object" || Array.isArray(mapValue)) {
     throw new Error("credential map must contain a JSON object");
   }
-  ensureAgentlasCredentialIgnoreCli(root, cfg);
+  ensureAgentlasCredentialIgnoreCli(root, cfg, rootAnchor);
+  credentialAssertDirectoryAnchor(rootAnchor, "credential project root");
   return { cfg, mapPath, projectRoot: root };
 }
 function readJsonObjectCli(file, fallback, options = {}) {
@@ -513,7 +577,7 @@ function resolveCredentialDestinationCli(projectPath, destRel) {
   const rel = safeCredentialDestRelCli(destRel);
   const rootAnchor = credentialDirectoryAnchor(root, "credential project root");
   const parentRel = path.dirname(rel);
-  const parent = parentRel === "." ? root : ensureManagedDirectoryCli(root, parentRel);
+  const parent = parentRel === "." ? rootAnchor.realpath : ensureManagedDirectoryCli(rootAnchor.realpath, parentRel, 0o700, rootAnchor);
   const realParent = fs.realpathSync.native(parent);
   const relativeParent = path.relative(root, realParent);
   if (path.isAbsolute(relativeParent) || relativeParent === ".." || relativeParent.startsWith(`..${path.sep}`)) {

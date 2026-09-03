@@ -106,54 +106,301 @@ function agentById(db, id) {
   }
 }
 
+function evolutionSameDirectoryIdentity(left, right) {
+  return Boolean(
+    left && right && left.isDirectory() && right.isDirectory() &&
+    !left.isSymbolicLink() && !right.isSymbolicLink() &&
+    left.dev === right.dev && left.ino === right.ino,
+  );
+}
+
+function evolutionDirectoryAnchor(target, label, containedBy = null) {
+  if (typeof target !== "string" || !path.isAbsolute(target) || /[\u0000\r\n]/.test(target)) {
+    throw new Error(`${label} must be an absolute directory`);
+  }
+  const requested = path.resolve(target);
+  let stat;
+  try { stat = fs.lstatSync(requested); }
+  catch (error) { throw new Error(`${label} is not an existing directory: ${error.message || error}`); }
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error(`${label} must be a real non-symbolic-link directory`);
+  }
+  let realpath;
+  try { realpath = fs.realpathSync.native(requested); }
+  catch (error) { throw new Error(`${label} could not be canonicalized: ${error.message || error}`); }
+  if (containedBy && !(
+    realpath === containedBy.realpath || realpath.startsWith(`${containedBy.realpath}${path.sep}`)
+  )) {
+    throw new Error(`${label} escapes its managed parent`);
+  }
+  let canonical;
+  try { canonical = fs.lstatSync(realpath); }
+  catch (error) { throw new Error(`${label} could not be rechecked: ${error.message || error}`); }
+  if (!evolutionSameDirectoryIdentity(stat, canonical)) {
+    throw new Error(`${label} changed during canonicalization`);
+  }
+  return { path: requested, realpath, dev: stat.dev, ino: stat.ino, stat };
+}
+
+function evolutionAssertDirectoryAnchor(anchor, label, containedBy = null) {
+  const current = evolutionDirectoryAnchor(anchor.path, label, containedBy);
+  if (!evolutionSameDirectoryIdentity(anchor.stat || anchor, current.stat || current) || current.realpath !== anchor.realpath) {
+    throw new Error(`${label} changed during evolution`);
+  }
+  return current;
+}
+
+function evolutionSameFileIdentity(left, right) {
+  return Boolean(
+    left && right && left.isFile() && right.isFile() &&
+    !left.isSymbolicLink() && !right.isSymbolicLink() &&
+    left.dev === right.dev && left.ino === right.ino,
+  );
+}
+
+function evolutionFileIdentity(file, { allowMissing = false, allowHardLinks = false } = {}) {
+  let stat;
+  try { stat = fs.lstatSync(file); }
+  catch (error) {
+    if (allowMissing && error && error.code === "ENOENT") return null;
+    throw error;
+  }
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error("Evolution target must be a regular non-symbolic-link file");
+  }
+  if (!allowHardLinks && stat.nlink !== 1) throw new Error("Evolution target must not be hard-linked");
+  return stat;
+}
+
 function targetFilePath(agentFolder, agent, targetPath) {
-  const dir = agentFolder(agent);
-  const safe = path.resolve(dir, targetPath);
-  if (safe !== path.join(dir, targetPath) && !safe.startsWith(path.resolve(dir) + path.sep)) {
+  const rawDir = agentFolder(agent);
+  if (typeof rawDir !== "string" || !path.isAbsolute(rawDir) || /[\u0000\r\n]/.test(rawDir)) {
+    throw new Error("Evolution agent folder must be an absolute safe path");
+  }
+  const dir = path.resolve(String(rawDir || ""));
+  const parent = evolutionDirectoryAnchor(path.dirname(dir), "Evolution agent parent");
+  const directory = evolutionDirectoryAnchor(dir, "Evolution agent folder", parent);
+  evolutionAssertDirectoryAnchor(parent, "Evolution agent parent");
+  evolutionAssertDirectoryAnchor(directory, "Evolution agent folder", parent);
+  const safe = path.resolve(directory.realpath, targetPath);
+  if (
+    safe !== path.join(directory.realpath, targetPath) ||
+    !(safe === directory.realpath || safe.startsWith(`${directory.realpath}${path.sep}`)) ||
+    path.dirname(safe) !== directory.realpath
+  ) {
     throw new Error("Evolution target escapes the agent folder");
   }
-  return safe;
+  return { file: safe, parent, directory };
 }
 
 function currentTargetHash(file) {
+  let fd;
   try {
-    const content = fs.readFileSync(file, "utf8");
-    return { exists: true, content, hash: sha256(content) };
+    const before = evolutionFileIdentity(file, { allowMissing: true });
+    if (!before) return { exists: false, content: "", hash: ABSENT_TARGET_HASH, stat: null };
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const opened = fs.fstatSync(fd);
+    if (!evolutionSameFileIdentity(before, opened) || opened.nlink !== 1) {
+      throw new Error("Evolution target changed while opening");
+    }
+    const content = fs.readFileSync(fd, "utf8");
+    const after = fs.fstatSync(fd);
+    if (!evolutionSameFileIdentity(before, after) || after.nlink !== 1 || after.size !== Buffer.byteLength(content, "utf8")) {
+      throw new Error("Evolution target changed while reading");
+    }
+    return { exists: true, content, hash: sha256(content), stat: after };
   } catch (error) {
-    if (error && error.code === "ENOENT") return { exists: false, content: "", hash: ABSENT_TARGET_HASH };
+    if (error && error.code === "ENOENT") return { exists: false, content: "", hash: ABSENT_TARGET_HASH, stat: null };
+    throw error;
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch { /* preserve read failure */ }
+  }
+}
+
+function evolutionAssertTarget(file, expected) {
+  const current = evolutionFileIdentity(file, { allowMissing: true });
+  if (expected ? !evolutionSameFileIdentity(expected, current) : current) {
+    throw new Error("Evolution target changed before publication");
+  }
+  return current;
+}
+
+function evolutionRemoveOwnedFile(file, expected, anchors) {
+  evolutionAssertDirectoryAnchor(anchors.parent, "Evolution agent parent");
+  evolutionAssertDirectoryAnchor(anchors.directory, "Evolution agent folder", anchors.parent);
+  const current = evolutionFileIdentity(file);
+  if (!evolutionSameFileIdentity(expected, current) || current.nlink !== 1) {
+    throw new Error("Evolution target changed before cleanup");
+  }
+  fs.unlinkSync(file);
+  evolutionAssertDirectoryAnchor(anchors.parent, "Evolution agent parent");
+  evolutionAssertDirectoryAnchor(anchors.directory, "Evolution agent folder", anchors.parent);
+}
+
+function evolutionRemoveOwnedTemp(file, expected) {
+  if (!expected) return;
+  try {
+    const current = evolutionFileIdentity(file, { allowMissing: true });
+    if (current && evolutionSameFileIdentity(expected, current) && current.nlink === 1) fs.unlinkSync(file);
+  } catch { /* leave unknown successors as recovery artifacts */ }
+}
+
+function evolutionRestoreBackup(backup, file, expected, anchors) {
+  if (!backup || !expected) return false;
+  try {
+    const current = evolutionFileIdentity(file, { allowMissing: true });
+    if (current) return false;
+    const saved = evolutionFileIdentity(backup);
+    if (!evolutionSameFileIdentity(expected, saved) || saved.nlink !== 1) return false;
+    fs.linkSync(backup, file);
+    const restored = evolutionFileIdentity(file, { allowHardLinks: true });
+    if (!evolutionSameFileIdentity(expected, restored) || restored.nlink < 2) return false;
+    fs.unlinkSync(backup);
+    return true;
+  } catch { return false; }
+}
+
+function writeTargetAtomic(file, content, anchors, expected = null) {
+  if (!anchors || !anchors.directory || !anchors.parent) throw new Error("Evolution target has no directory anchor");
+  evolutionAssertDirectoryAnchor(anchors.parent, "Evolution agent parent");
+  evolutionAssertDirectoryAnchor(anchors.directory, "Evolution agent folder", anchors.parent);
+  const current = evolutionAssertTarget(file, expected);
+  let mode = current ? current.mode & 0o777 : 0o600;
+  const temp = path.join(anchors.directory.realpath, `.${path.basename(file)}.${process.pid}.${randomUUID()}.tmp`);
+  let tempStat = null;
+  let backup = null;
+  let published = false;
+  let fd;
+  try {
+    fd = fs.openSync(
+      temp,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW || 0),
+      mode,
+    );
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.nlink !== 1) throw new Error("Evolution temporary target is unsafe");
+    // Keep the descriptor identity as soon as the exclusive create succeeds;
+    // a later write/fsync failure may still need to remove exactly this temp.
+    tempStat = opened;
+    const bytes = Buffer.from(content, "utf8");
+    let offset = 0;
+    while (offset < bytes.length) {
+      const written = fs.writeSync(fd, bytes, offset, bytes.length - offset, null);
+      if (!Number.isInteger(written) || written <= 0) throw new Error("Evolution temporary target write stalled");
+      offset += written;
+    }
+    try { fs.fchmodSync(fd, mode); }
+    catch (error) {
+      if (process.platform !== "win32") throw error;
+      /* Windows/ACL-only host: the descriptor mode is best effort. */
+    }
+    fs.fsyncSync(fd);
+    const written = fs.fstatSync(fd);
+    if (!evolutionSameFileIdentity(opened, written) || written.nlink !== 1 || written.size !== bytes.length) {
+      throw new Error("Evolution temporary target changed while writing");
+    }
+    tempStat = written;
+  } catch (error) {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch { /* preserve original */ }
+    evolutionRemoveOwnedTemp(temp, tempStat);
+    throw error;
+  }
+  if (fd !== undefined) {
+    try { fs.closeSync(fd); } catch (error) {
+      evolutionRemoveOwnedTemp(temp, tempStat);
+      throw error;
+    }
+  }
+  try {
+    evolutionAssertDirectoryAnchor(anchors.parent, "Evolution agent parent");
+    evolutionAssertDirectoryAnchor(anchors.directory, "Evolution agent folder", anchors.parent);
+    evolutionAssertTarget(file, expected);
+    if (current) {
+      backup = `${file}.previous-${process.pid}-${randomUUID()}`;
+      fs.renameSync(file, backup);
+      const moved = evolutionFileIdentity(backup);
+      if (!evolutionSameFileIdentity(current, moved) || moved.nlink !== 1) {
+        evolutionRestoreBackup(backup, file, current, anchors);
+        throw new Error("Evolution target changed before publication");
+      }
+      evolutionAssertDirectoryAnchor(anchors.parent, "Evolution agent parent");
+      evolutionAssertDirectoryAnchor(anchors.directory, "Evolution agent folder", anchors.parent);
+      if (evolutionFileIdentity(file, { allowMissing: true })) {
+        throw new Error("Evolution target successor appeared during publication");
+      }
+    }
+    evolutionAssertDirectoryAnchor(anchors.parent, "Evolution agent parent");
+    evolutionAssertDirectoryAnchor(anchors.directory, "Evolution agent folder", anchors.parent);
+    if (evolutionFileIdentity(file, { allowMissing: true })) {
+      throw new Error("Evolution target successor appeared during publication");
+    }
+    fs.linkSync(temp, file);
+    // Keep ownership through every post-link check.  If any later check fails,
+    // the catch block may remove this exact inode before restoring the backup;
+    // a boolean tied only to the temporary link would leave a half-published
+    // target behind after the temp name is unlinked.
+    published = true;
+    const linkedTarget = evolutionFileIdentity(file, { allowHardLinks: true });
+    const linkedTemp = evolutionFileIdentity(temp, { allowHardLinks: true });
+    if (!evolutionSameFileIdentity(tempStat, linkedTarget) || !evolutionSameFileIdentity(tempStat, linkedTemp) || linkedTarget.nlink < 2 || linkedTemp.nlink < 2) {
+      throw new Error("Evolution target identity changed after publication");
+    }
+    evolutionAssertDirectoryAnchor(anchors.parent, "Evolution agent parent");
+    evolutionAssertDirectoryAnchor(anchors.directory, "Evolution agent folder", anchors.parent);
+    fs.unlinkSync(temp);
+    const installed = evolutionFileIdentity(file);
+    if (!evolutionSameFileIdentity(tempStat, installed) || installed.nlink !== 1) {
+      throw new Error("Evolution target identity changed after publication");
+    }
+    // Finish mode verification through an O_NOFOLLOW descriptor.  A pathname
+    // chmod here could follow a target symlink installed by a concurrent
+    // writer after the identity check and mutate an outside file.
+    let finalFd;
+    try {
+      finalFd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      const openedFinal = fs.fstatSync(finalFd);
+      if (!evolutionSameFileIdentity(tempStat, openedFinal) || openedFinal.nlink !== 1) {
+        throw new Error("Evolution target identity changed after publication");
+      }
+      try { fs.fchmodSync(finalFd, mode); }
+      catch (chmodError) {
+        if (process.platform !== "win32") throw chmodError;
+        /* Windows/ACL-only host: the final mode is best effort. */
+      }
+      const final = fs.fstatSync(finalFd);
+      if (!evolutionSameFileIdentity(tempStat, final) || final.nlink !== 1 ||
+          (process.platform !== "win32" && (final.mode & 0o777) !== mode)) {
+        throw new Error("Evolution target identity changed after publication");
+      }
+    } finally {
+      if (finalFd !== undefined) try { fs.closeSync(finalFd); } catch { /* preserve final verification */ }
+    }
+    if (backup) {
+      const old = evolutionFileIdentity(backup, { allowMissing: true });
+      if (old && evolutionSameFileIdentity(current, old) && old.nlink === 1) fs.unlinkSync(backup);
+      backup = null;
+    }
+    published = false;
+  } catch (error) {
+    if (published) {
+      try {
+        const target = evolutionFileIdentity(file, { allowMissing: true, allowHardLinks: true });
+        if (target && evolutionSameFileIdentity(tempStat, target)) fs.unlinkSync(file);
+      } catch { /* leave unknown successor untouched */ }
+    }
+    evolutionRemoveOwnedTemp(temp, tempStat);
+    if (backup) evolutionRestoreBackup(backup, file, current, anchors);
     throw error;
   }
 }
 
-function writeTargetAtomic(file, content) {
-  const dir = path.dirname(file);
-  fs.mkdirSync(dir, { recursive: true });
-  let mode = 0o600;
-  try {
-    const stat = fs.lstatSync(file);
-    if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("Evolution target must be a regular non-symbolic-link file");
-    mode = stat.mode & 0o777;
-  } catch (error) {
-    if (!error || error.code !== "ENOENT") throw error;
-  }
-  const temp = path.join(dir, `.${path.basename(file)}.${process.pid}.${randomUUID()}.tmp`);
-  try {
-    fs.writeFileSync(temp, content, { encoding: "utf8", mode, flag: "wx" });
-    fs.renameSync(temp, file);
-    try { fs.chmodSync(file, mode); } catch { /* Windows/ACL-only host */ }
-  } catch (error) {
-    try { fs.rmSync(temp, { force: true }); } catch { /* preserve original */ }
-    throw error;
-  }
-}
-
-function restoreTargetAfterFailure(file, before, expectedCurrentHash) {
+function restoreTargetAfterFailure(file, before, expectedCurrentHash, anchors) {
   const current = currentTargetHash(file);
   if (current.hash !== expectedCurrentHash) {
     throw new Error("Evolution persistence failed and the target changed again before rollback; manual repair is required");
   }
-  if (before.exists) writeTargetAtomic(file, before.content);
-  else fs.rmSync(file, { force: true });
+  if (before.exists) writeTargetAtomic(file, before.content, anchors, current.stat);
+  else evolutionRemoveOwnedFile(file, current.stat, anchors);
 }
 
 function printCard(out, entry, index) {
@@ -283,8 +530,15 @@ function cmdApply(db, id, out, fail, agentFolder) {
   }
   const agent = agentById(db, row.agent_id);
   if (!agent) return fail(`Agent not found for proposal: ${row.agent_id}`);
-  const file = targetFilePath(agentFolder, agent, row.target_path);
-  const before = currentTargetHash(file);
+  let target;
+  let before;
+  try {
+    target = targetFilePath(agentFolder, agent, row.target_path);
+    before = currentTargetHash(target.file);
+  } catch (error) {
+    return fail(error && error.message ? error.message : String(error));
+  }
+  const { file } = target;
   if (before.hash !== row.before_hash) {
     return fail("Agent prompt changed after this proposal was created; review it in the desktop app and re-propose.");
   }
@@ -295,7 +549,7 @@ function cmdApply(db, id, out, fail, agentFolder) {
       const locked = db.prepare("SELECT status FROM agent_evolution_proposals WHERE id=?").get(row.id);
       if (!locked || locked.status !== "candidate") throw new Error("Evolution proposal changed before apply; reload and review it again");
       if (currentTargetHash(file).hash !== row.before_hash) throw new Error("Agent prompt changed before apply; reload and review it again");
-      writeTargetAtomic(file, row.after_content);
+      writeTargetAtomic(file, row.after_content, target, before.stat);
       wroteTarget = true;
       if (currentTargetHash(file).hash !== row.after_hash) throw new Error("Applied content did not match the approved hash");
       db.prepare("UPDATE installed_agents SET system_prompt = ? WHERE id = ?").run(row.after_content, row.agent_id);
@@ -310,7 +564,7 @@ function cmdApply(db, id, out, fail, agentFolder) {
     });
   } catch (error) {
     if (wroteTarget) {
-      try { restoreTargetAfterFailure(file, before, sha256(row.after_content)); }
+      try { restoreTargetAfterFailure(file, before, sha256(row.after_content), target); }
       catch (rollbackError) { return fail(`${error.message}. ${rollbackError.message}`); }
     }
     return fail(`${error.message}; the original target was restored.`);
@@ -331,8 +585,15 @@ function cmdRevert(db, id, out, fail, agentFolder) {
   if (!applyReceipt) return fail("Revert requires the verified apply receipt.");
   const agent = agentById(db, row.agent_id);
   if (!agent) return fail(`Agent not found for proposal: ${row.agent_id}`);
-  const file = targetFilePath(agentFolder, agent, row.target_path);
-  const before = currentTargetHash(file);
+  let target;
+  let before;
+  try {
+    target = targetFilePath(agentFolder, agent, row.target_path);
+    before = currentTargetHash(target.file);
+  } catch (error) {
+    return fail(error && error.message ? error.message : String(error));
+  }
+  const { file } = target;
   if (before.hash !== row.after_hash) {
     return fail("Agent prompt changed after this proposal was applied; revert blocked to avoid clobbering newer edits.");
   }
@@ -346,8 +607,8 @@ function cmdRevert(db, id, out, fail, agentFolder) {
       // A proposal may have created the prompt asset from an absent baseline.
       // Restoring that baseline means removing the created file, not writing an
       // empty file (whose sha256 can never equal ABSENT_TARGET_HASH).
-      if (row.before_hash === ABSENT_TARGET_HASH) fs.rmSync(file, { force: true });
-      else writeTargetAtomic(file, row.before_content);
+      if (row.before_hash === ABSENT_TARGET_HASH) evolutionRemoveOwnedFile(file, before.stat, target);
+      else writeTargetAtomic(file, row.before_content, target, before.stat);
       wroteTarget = true;
       if (currentTargetHash(file).hash !== row.before_hash) throw new Error("Reverted content did not match the original hash");
       db.prepare("UPDATE installed_agents SET system_prompt = ? WHERE id = ?").run(row.before_content, row.agent_id);
@@ -362,7 +623,7 @@ function cmdRevert(db, id, out, fail, agentFolder) {
     });
   } catch (error) {
     if (wroteTarget) {
-      try { restoreTargetAfterFailure(file, before, row.before_hash); }
+      try { restoreTargetAfterFailure(file, before, row.before_hash, target); }
       catch (rollbackError) { return fail(`${error.message}. ${rollbackError.message}`); }
     }
     return fail(`${error.message}; the applied target was restored.`);

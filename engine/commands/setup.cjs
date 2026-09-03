@@ -35,7 +35,11 @@ async function run(ctx, args = []) {
   if (!process.stdin.isTTY) {
     // 비-TTY에서 마법사를 돌리면 EOF로 이벤트 루프가 비어 exit 0으로 "조용히 성공"
     // 하는 함정이 있다 — 정직하게 거부한다.
-    ctx.err(ctx.lang === "ko" ? "setup은 대화형 터미널에서만 실행됩니다." : "setup requires an interactive terminal.");
+    const message = ctx.lang === "ko" ? "setup은 대화형 터미널에서만 실행됩니다." : "setup requires an interactive terminal.";
+    const error = new Error(message);
+    error.code = "INTERACTIVE_REQUIRED";
+    if (ctx.output?.format === "json" && typeof ctx.fail === "function") ctx.fail(error);
+    else ctx.err(message);
     return 1;
   }
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });

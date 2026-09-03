@@ -26,6 +26,7 @@ const permissions = require("../agentlas-permissions.cjs");
 const palette = require("./palette.cjs");
 const { readVersion } = require("../agentlas-banner.cjs");
 const { resolveProjectController, withProjectControllerContext } = require("../project/controller.cjs");
+const { truncateWidth } = require("./width.cjs");
 
 function loadRenderer() {
   try {
@@ -299,12 +300,18 @@ async function startShell(ctx, opts = {}) {
     render(width) {
       const lines = super.render(width);
       if (this.getText() === "" && lines.length >= 3) {
-        const hint = ui.c.faint(en
+        const hintText = en
           ? "type a task  ·  / for commands"
-          : "할 일을 문장으로  ·  / 명령");
+          : "할 일을 문장으로  ·  / 명령";
         // 에디터가 줄을 폭까지 공백으로 채운다 — 그대로 덧붙이면 힌트가 오른쪽 끝으로 밀린다.
-        // 꼬리 공백만 걷어내고 커서 바로 뒤에 붙인다(ANSI 리셋은 보존).
-        lines[1] = lines[1].replace(/[ \t]+(\u001b\[0m)?$/, "$1") + " " + hint;
+        // 꼬리 공백만 걷어내고 커서 바로 뒤에 붙인다(ANSI 리셋은 보존). 에디터의
+        // 좌측 패딩과 빈 커서가 이미 두 칸을 차지하므로, 구분자까지 뺀 남은 폭을
+        // 먼저 계산한다. 평문을 폭 제한한 뒤 스타일을 입혀 ANSI/그래핌을 보존한다.
+        const prefix = lines[1].replace(/[ \t]+(\u001b\[0m)?$/, "$1");
+        const hintRoom = Math.max(0, Math.floor(width) - 3);
+        lines[1] = hintRoom > 0
+          ? prefix + " " + ui.c.faint(truncateWidth(hintText, hintRoom))
+          : prefix;
       }
       return lines;
     }

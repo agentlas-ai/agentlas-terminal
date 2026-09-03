@@ -187,6 +187,16 @@ async function runOne(ctx, args) {
     return 1;
   }
 
+  // Check the interactive boundary before opening the shared DB or creating
+  // a conversation. A piped/CI invocation with no prompt must fail without
+  // leaving an empty One chat behind.
+  const prompt = parsed.rest.join(" ").trim();
+  const interactive = !prompt;
+  if (!parsed.list && interactive && !process.stdin.isTTY) {
+    ctx.err("Usage: agentlas one \"<prompt>\"   (interactive One needs a TTY)");
+    return 1;
+  }
+
   const db = ctx.db();
   const readChats = (limit) => {
     try {
@@ -248,8 +258,6 @@ async function runOne(ctx, args) {
 
   const permission = permissions.normalize(parsed.permission || (ctx.prefs && ctx.prefs.permission) || "write");
   const cwd = projectCwd();
-  const prompt = parsed.rest.join(" ").trim();
-
   // 이어 갈 대화 고르기 — 새 개념을 만들지 않고 기존 One 대화를 쓴다.
   let chatId = null;
   let created = false;
@@ -286,7 +294,6 @@ async function runOne(ctx, args) {
   const orch = new Orchestrator({ db, lang: ctx.lang });
   const session = orch.spawn({ agent, runtime, permission, cwd, chatId, title: prompt ? prompt.slice(0, 60) : "One" });
 
-  const interactive = !prompt;
   let renderer = null;
   if (!parsed.print) {
     renderer = new Renderer(ctx.uiInstance);
@@ -308,12 +315,6 @@ async function runOne(ctx, args) {
     return session.status === "failed" ? 1 : 0;
   }
 
-  // 대화형 — 답할 사람이 있는 자리에서만 연다. 파이프/자동화에서는 정직하게 멈춘다.
-  if (!process.stdin.isTTY) {
-    if (renderer) renderer.detach();
-    ctx.err("Usage: agentlas one \"<prompt>\"   (interactive One needs a TTY)");
-    return 1;
-  }
   const rl = readline.createInterface({ input: process.stdin, output: process.stderr, terminal: true });
   let failed = false;
   try {

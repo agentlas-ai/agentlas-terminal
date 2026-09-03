@@ -14,7 +14,40 @@
 const crypto = require("node:crypto");
 const { runWriteTransaction } = require("../agentlas-sqlite-policy.cjs");
 
+const REDACTED_USERINFO_URL = "[redacted-userinfo-url]";
+
 function nowIso() { return new Date().toISOString(); }
+
+function parseHttpUrl(input, allowBareHost) {
+  const raw = String(input || "").trim();
+  if (!raw) return null;
+  try {
+    const hasScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw);
+    if (!hasScheme && !allowBareHost) return null;
+    const parsed = new URL(hasScheme ? raw : `https://${raw}`);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed : null;
+  } catch { return null; }
+}
+
+/** Detect URL credentials without returning or logging the credential-bearing value. */
+function siteHasUrlUserinfo(input) {
+  const raw = String(input || "");
+  const parsed = parseHttpUrl(raw, true);
+  if (parsed && (parsed.username || parsed.password)) return true;
+  // Also fail closed for malformed legacy URLs that visibly place an '@'
+  // inside an explicit HTTP(S) authority.
+  return /https?:\/\/[^\s/?#]*@[^\s/?#]+/iu.test(raw);
+}
+
+/** Audit targets are free-form, so only explicit HTTP(S) URL userinfo is redacted. */
+function targetHasUrlUserinfo(input) {
+  return /https?:\/\/[^\s/?#]*@[^\s/?#]+/iu.test(String(input || ""));
+}
+
+function safeAuditTarget(input) {
+  if (input === undefined || input === null) return null;
+  return targetHasUrlUserinfo(input) ? REDACTED_USERINFO_URL : input;
+}
 
 /** 입력을 host 로 정규화한다(데스크탑 normalizeSite 와 같은 규칙 — userinfo 는 거부). */
 function normalizeSite(input) {
@@ -39,15 +72,17 @@ function listBrowserSites(db) {
        ORDER BY s.updated_at DESC`,
     ).all();
   } catch { return []; }
-  return rows.map((r) => ({
-    id: String(r.id),
-    site: String(r.site),
-    label: r.label ?? null,
-    username: r.username ?? null,
-    session: { status: r.sess_status ?? "none", capturedAt: r.sess_captured ?? null },
-    createdAt: String(r.created_at),
-    updatedAt: String(r.updated_at),
-  }));
+  return rows
+    .filter((r) => !siteHasUrlUserinfo(String(r.site)))
+    .map((r) => ({
+      id: String(r.id),
+      site: String(r.site),
+      label: r.label ?? null,
+      username: r.username ?? null,
+      session: { status: r.sess_status ?? "none", capturedAt: r.sess_captured ?? null },
+      createdAt: String(r.created_at),
+      updatedAt: String(r.updated_at),
+    }));
 }
 
 function getBrowserSite(db, site) {
@@ -111,10 +146,11 @@ function setBrowserSession(db, site, status) {
 /** 되돌릴 수 없는/외부로 나가는 행동을 날짜 로그에 남긴다(데스크탑과 같은 테이블). */
 function logBrowserAction(db, { site = null, action, target = null, result = null, approval = null, meta = null } = {}) {
   try {
+    const normalizedSite = site ? normalizeSite(site) : "";
     runWriteTransaction(db, () => {
       db.prepare(
         "INSERT INTO browser_action_logs (id, ts, site, action, target, result, approval, meta) VALUES (?,?,?,?,?,?,?,?)",
-      ).run(crypto.randomUUID(), nowIso(), site, action, target, result, approval, meta ? JSON.stringify(meta) : null);
+      ).run(crypto.randomUUID(), nowIso(), normalizedSite || null, action, safeAuditTarget(target), result, approval, meta ? JSON.stringify(meta) : null);
     });
   } catch { /* 로그 실패는 치명적이지 않다 */ }
 }

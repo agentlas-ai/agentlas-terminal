@@ -17,6 +17,43 @@ const {
 } = require("../hub/plugins.cjs");
 const { webBaseUrl } = require("../cloud/hub-client.cjs");
 const { terminalProjectCandidateCli, initializedAgentlasProjectPathCli } = require("../project/state.cjs");
+const {
+  DEFAULT_OPTIONS,
+  list: outputList,
+  render,
+  parseOutputFlags,
+  terminalTextOf,
+} = require("../cli-output.cjs");
+
+const OUTPUT_FLAGS = new Set(["--json", "--yaml", "--quiet", "-q", "--no-headers", "--no-color"]);
+
+function withOutputFlags(ctx, args) {
+  if (!args.some((arg) => OUTPUT_FLAGS.has(arg))) return { ctx, args };
+  const parsed = parseOutputFlags(args);
+  return {
+    ctx: { ...ctx, output: { ...(ctx.output || DEFAULT_OPTIONS), ...parsed.options } },
+    args: parsed.rest,
+  };
+}
+
+function isMachineOutput(ctx) {
+  const output = ctx.output || DEFAULT_OPTIONS;
+  return output.quiet || output.format === "json" || output.format === "yaml";
+}
+
+function emitMachinePluginList(ctx, rows) {
+  const schema = {
+    idField: "slug",
+    columns: [
+      { header: "slug", field: "slug" },
+      { header: "name", field: "name" },
+      { header: "installed", field: "installed" },
+    ],
+  };
+  const result = outputList(rows, schema);
+  if (typeof ctx.emit === "function") ctx.emit(result);
+  else ctx.out(render(result, ctx.output || DEFAULT_OPTIONS));
+}
 
 async function pluginAdd(ctx, slug) {
   if (!slug) {
@@ -121,18 +158,37 @@ async function pluginList(ctx) {
     return 1;
   }
   if (!plugins.length) {
-    ctx.out("No Hub plugins are available.");
+    if (isMachineOutput(ctx)) emitMachinePluginList(ctx, []);
+    else ctx.out("No Hub plugins are available.");
     return 0;
   }
   // 설치 여부는 ~/.agentlas/plugins/<slug>/plugin.json 마커(3채널 공유 규약)로 판정한다.
   const installedSlugs = new Set(listInstalledLocalPlugins().map((entry) => entry.slug.toLowerCase()));
-  for (const plugin of plugins.slice(0, 60)) {
-    const slugText = String(plugin.slug || "");
-    const installedMark = installedSlugs.has(slugText.toLowerCase()) ? ctx.ui.green(" [installed]") : "";
-    ctx.out(`${ctx.ui.accent(slugText.padEnd(32).slice(0, 32))} ${String(plugin.name || "").slice(0, 44)}${installedMark}`);
+  const rows = plugins.slice(0, 60).map((plugin) => ({
+    slug: String(plugin.slug || ""),
+    name: String(plugin.name || "").slice(0, 44),
+    installed: installedSlugs.has(String(plugin.slug || "").toLowerCase()),
+  }));
+  if (isMachineOutput(ctx)) {
+    if (ctx.output?.quiet) {
+      ctx.out(rows.map((row) => terminalTextOf(row.slug, 256)).filter(Boolean).join("\n"));
+    } else {
+      emitMachinePluginList(ctx, rows);
+    }
+    return 0;
+  }
+  const accent = ctx.output?.noColor ? (value) => String(value) : ctx.ui.accent;
+  const green = ctx.output?.noColor ? (value) => String(value) : ctx.ui.green;
+  const dim = ctx.output?.noColor ? (value) => String(value) : ctx.ui.dim;
+  for (const row of rows) {
+    const installedMark = row.installed ? green(" [installed]") : "";
+    const plugin = row;
+    const slugText = plugin.slug;
+    const nameText = plugin.name;
+    ctx.out(`${accent(slugText.padEnd(32).slice(0, 32))} ${nameText}${installedMark}`);
   }
   ctx.out("");
-  ctx.out(ctx.ui.dim("Install: agentlas plugin add <slug>"));
+  ctx.out(dim("Install: agentlas plugin add <slug>"));
   return 0;
 }
 
@@ -146,7 +202,9 @@ async function pluginListWithProject(ctx, projectPath) {
     ctx.err("project is not initialized for plugin listing. Run `agentlas project init` in that folder first.");
     return 1;
   }
-  ctx.out("Scope: global Hub plugin catalog (project compatibility and local installation state are not evaluated).");
+  if (!isMachineOutput(ctx)) {
+    ctx.out("Scope: global Hub plugin catalog (project compatibility and local installation state are not evaluated).");
+  }
   return pluginList(ctx);
 }
 
@@ -214,6 +272,16 @@ async function runPluginList(ctx, args) {
 }
 
 function run(ctx, args) {
+  let normalized;
+  try {
+    normalized = withOutputFlags(ctx, args);
+  } catch (error) {
+    if (typeof ctx.fail === "function") ctx.fail(error);
+    else ctx.err(String((error && error.message) || error));
+    return 1;
+  }
+  ctx = normalized.ctx;
+  args = normalized.args;
   const action = args[0];
   // SELF_HELP_COMMANDS 계약(index.cjs): `plugin --help` 는 여기로 ["help"] 가 되어
   // 들어온다. help 분기가 없으면 unknown action → usage exit 1 이라, 도움말을

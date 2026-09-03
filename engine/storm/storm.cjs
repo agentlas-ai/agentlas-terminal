@@ -26,7 +26,16 @@ const {
   loadCoreStormbreakerHarness,
   resolveCoreRuntimeRoot,
   spawnCoreModule,
+  CORE_CAPTURE_MAX_BYTES,
+  CORE_CAPTURE_TIMEOUT_MS,
 } = require("../agentlas-core-harness.cjs");
+
+// Route evidence is advisory, but it must not be able to pin a Storm run on a
+// hung or chatty helper. Keep the bounds aligned with the canonical Core JSON
+// capture contract; tests may use the internal context overrides below to
+// exercise the failure paths without waiting two minutes or allocating 16 MB.
+const ROUTE_EVIDENCE_MAX_BYTES = CORE_CAPTURE_MAX_BYTES || 16 * 1024 * 1024;
+const ROUTE_EVIDENCE_TIMEOUT_MS = CORE_CAPTURE_TIMEOUT_MS || 120_000;
 
 /**
  * create(deps) — v1 parity 팩토리와 동일한 D-주입 생성.
@@ -108,12 +117,91 @@ function create(deps) {
       ui.beginTurn();
       ui.startSpinner(ui.lang === "ko" ? "Stormbreaker 라우팅 근거 수집 중…" : "Stormbreaker gathering route evidence…");
       result = await new Promise((resolve) => {
-        const child = spawnHephaestus(args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
-        let stdout = "";
-        let stderrTail = [];
-        child.stdout.on("data", (c) => { stdout += c.toString(); });
-        child.stderr.on("data", (c) => {
-          for (const ln of c.toString().split("\n")) {
+        const requestedTimeout = Number(ctx.routeEvidenceTimeoutMs);
+        const timeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0
+          ? Math.min(Math.max(1, Math.trunc(requestedTimeout)), ROUTE_EVIDENCE_TIMEOUT_MS)
+          : ROUTE_EVIDENCE_TIMEOUT_MS;
+        const requestedMaxBytes = Number(ctx.routeEvidenceMaxBytes);
+        const maxBytes = Number.isFinite(requestedMaxBytes) && requestedMaxBytes > 0
+          ? Math.min(Math.max(1, Math.trunc(requestedMaxBytes)), ROUTE_EVIDENCE_MAX_BYTES)
+          : ROUTE_EVIDENCE_MAX_BYTES;
+        let child;
+        try {
+          child = spawnHephaestus(args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+        } catch (error) {
+          resolve({ code: 1, stdout: "", stderr: String((error && error.message) || error) });
+          return;
+        }
+        if (!child) {
+          resolve({ code: 1, stdout: "", stderr: "Hephaestus route evidence process could not be started." });
+          return;
+        }
+
+        const stdoutChunks = [];
+        let stdoutBytes = 0;
+        const stderrTail = [];
+        let outputExceeded = false;
+        let timedOut = false;
+        let settled = false;
+        let forceKill = null;
+        let timeout = null;
+        const stopChild = () => {
+          try { child.stdout?.pause?.(); } catch { /* already closed */ }
+          try { child.stderr?.pause?.(); } catch { /* already closed */ }
+          if (!forceKill) {
+            forceKill = setTimeout(() => {
+              forceKill = null;
+              try { child.kill("SIGKILL"); } catch { /* already gone */ }
+            }, 250);
+            forceKill.unref?.();
+          }
+          try { child.kill("SIGTERM"); } catch { /* already gone */ }
+        };
+        const finish = (value, keepForceKill = false) => {
+          if (settled) return;
+          settled = true;
+          if (timeout) clearTimeout(timeout);
+          if (forceKill && !keepForceKill) {
+            clearTimeout(forceKill);
+            forceKill = null;
+          }
+          resolve(value);
+        };
+        const finishStopped = (value) => {
+          stopChild();
+          finish(value, true);
+        };
+        timeout = setTimeout(() => {
+          timedOut = true;
+          finishStopped({
+            code: 1,
+            stdout: "",
+            stderr: stderrTail.join("\n"),
+            outputExceeded,
+            timedOut,
+          });
+        }, timeoutMs);
+        timeout.unref?.();
+        child.stdout?.on("data", (chunk) => {
+          if (settled || outputExceeded) return;
+          const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          stdoutBytes += bytes.length;
+          if (stdoutBytes > maxBytes) {
+            outputExceeded = true;
+            finishStopped({
+              code: 1,
+              stdout: "",
+              stderr: stderrTail.join("\n"),
+              outputExceeded,
+              timedOut,
+            });
+            return;
+          }
+          stdoutChunks.push(bytes);
+        });
+        child.stderr?.on("data", (chunk) => {
+          if (settled) return;
+          for (const ln of chunk.toString().split("\n")) {
             const line = ln.trim();
             if (!line) continue;
             stderrTail.push(line);
@@ -121,8 +209,32 @@ function create(deps) {
             ui.updateSpinner(line.slice(0, 100));
           }
         });
-        child.on("error", (err) => resolve({ code: 1, stdout, stderr: String(err.message) }));
-        child.on("close", (code) => resolve({ code: code ?? 0, stdout, stderr: stderrTail.join("\n") }));
+        child.on("error", (err) => {
+          if (forceKill) {
+            clearTimeout(forceKill);
+            forceKill = null;
+          }
+          finish({
+            code: 1,
+            stdout: "",
+            stderr: String(err.message),
+            outputExceeded,
+            timedOut,
+          });
+        });
+        child.on("close", (code) => {
+          if (forceKill) {
+            clearTimeout(forceKill);
+            forceKill = null;
+          }
+          finish({
+            code: code ?? 0,
+            stdout: outputExceeded ? "" : Buffer.concat(stdoutChunks, stdoutBytes).toString("utf8"),
+            stderr: stderrTail.join("\n"),
+            outputExceeded,
+            timedOut,
+          });
+        });
       });
       ui.stopSpinner();
       ui.endTurn();
@@ -185,7 +297,11 @@ function create(deps) {
       const raw = (result.stdout || result.stderr || "").trim();
       if (raw) ui.markdown(raw.slice(0, 4000));
     }
-    if (result.code !== 0 && !json) {
+    if (result.timedOut && !json) {
+      ui.warn(`Hephaestus route evidence timed out after ${Number(ctx.routeEvidenceTimeoutMs) > 0 ? Math.min(Math.max(1, Math.trunc(Number(ctx.routeEvidenceTimeoutMs))), ROUTE_EVIDENCE_TIMEOUT_MS) : ROUTE_EVIDENCE_TIMEOUT_MS}ms; Agentlas parent planner will continue from the original goal.`);
+    } else if (result.outputExceeded && !json) {
+      ui.warn(`Hephaestus route evidence exceeded ${Number(ctx.routeEvidenceMaxBytes) > 0 ? Math.min(Math.max(1, Math.trunc(Number(ctx.routeEvidenceMaxBytes))), ROUTE_EVIDENCE_MAX_BYTES) : ROUTE_EVIDENCE_MAX_BYTES} bytes; Agentlas parent planner will continue from the original goal.`);
+    } else if (result.code !== 0 && !json) {
       ui.warn(`Hephaestus route evidence unavailable (${result.code}); Agentlas parent planner will continue from the original goal.`);
     }
 

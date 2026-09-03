@@ -17,8 +17,14 @@ async function run(ctx, args) {
   const { cmdExperienceExchange } = require("../agentlas-experience-exchange.cjs");
   const intents = require("../experience/intents.cjs");
   const { cloudSessionCookie, fetchHub } = require("../cloud/hub-client.cjs");
+  // agentlas.cjs consumes global output flags before dispatch. The exchange
+  // module still owns the legacy `--json` switch, so restore that meaning at
+  // this adapter boundary instead of silently falling back to human prose.
+  const commandArgs = ctx.output?.format === "json" && !args.includes("--json")
+    ? [...args, "--json"]
+    : args;
   await cmdExperienceExchange({
-    args,
+    args: commandArgs,
     userDataDir: userDataDir(),
     cwd: process.cwd(),
     out: ctx.out,
