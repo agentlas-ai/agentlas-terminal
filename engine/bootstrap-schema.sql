@@ -1,4 +1,4 @@
--- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-08-29T13:29:10Z)
+-- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-09-04T23:48:50Z)
 --
 -- ★생성물이다. 손으로 고치지 말고 재생성하라:
 --     node scripts/gen-bootstrap-schema.cjs
@@ -6,7 +6,7 @@
 -- 정본은 Desktop 의 마이그레이션 사다리(agentlas_desktop/electron/store/db.ts, SCHEMA_VERSION).
 -- 이 파일은 그 사다리를 **빈 DB** 에 끝까지 돌린 결과의 덤프이므로, 터미널이 만든 DB 는
 -- 처음부터 사다리 머리에 있다 — 데스크탑이 나중에 승급할 것이 남지 않는다.
-PRAGMA user_version=106;
+PRAGMA user_version=110;
 CREATE TABLE active_runtime (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         kind TEXT NOT NULL
@@ -332,7 +332,8 @@ CREATE TABLE automation_runs (
         occurrence_id TEXT,
         graph_digest TEXT,
         checkpoint_json TEXT,
-        resume_of_run_id TEXT
+        resume_of_run_id TEXT,
+        dry_run INTEGER NOT NULL DEFAULT 0 CHECK(dry_run IN (0, 1))
       , node_failures_json TEXT, resume_consumed_at TEXT);
 CREATE TABLE automation_sessions (
         id TEXT PRIMARY KEY,
@@ -892,6 +893,182 @@ CREATE TABLE judgment_verdicts (
       hits          INTEGER NOT NULL DEFAULT 1,
       PRIMARY KEY (kind, signature)
     );
+CREATE TABLE long_run_domain_bindings (
+        long_run_id TEXT PRIMARY KEY,
+        domain TEXT NOT NULL CHECK(domain IN ('science')),
+        object_type TEXT NOT NULL CHECK(object_type IN ('loop_session')),
+        object_id TEXT NOT NULL,
+        external_project_id TEXT NOT NULL,
+        contract_id TEXT,
+        contract_version INTEGER CHECK(contract_version IS NULL OR contract_version > 0),
+        contract_content_sha256 TEXT,
+        object_version INTEGER NOT NULL CHECK(object_version > 0),
+        state_sha256 TEXT NOT NULL,
+        event_cursor INTEGER NOT NULL DEFAULT 0 CHECK(event_cursor >= 0),
+        projection_status TEXT NOT NULL DEFAULT 'current'
+          CHECK(projection_status IN ('current','stale','error')),
+        last_error TEXT,
+        synced_at TEXT NOT NULL,
+        FOREIGN KEY(long_run_id) REFERENCES long_runs(id) ON DELETE CASCADE,
+        UNIQUE(domain, object_type, object_id)
+      );
+CREATE TABLE long_run_events (
+        run_id TEXT NOT NULL,
+        seq INTEGER NOT NULL CHECK(seq > 0),
+        kind TEXT NOT NULL,
+        actor_kind TEXT NOT NULL CHECK(actor_kind IN ('host','user','worker','runtime','tool','system')),
+        actor_id TEXT,
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        occurred_at TEXT NOT NULL,
+        PRIMARY KEY(run_id, seq),
+        FOREIGN KEY(run_id) REFERENCES long_runs(id) ON DELETE CASCADE
+      );
+CREATE TABLE long_run_messages (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        from_worker_id TEXT NOT NULL,
+        to_worker_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('task','result','question','steer','cancel','receipt')),
+        body_ref TEXT NOT NULL,
+        artifact_refs_json TEXT NOT NULL DEFAULT '[]',
+        state TEXT NOT NULL DEFAULT 'queued'
+          CHECK(state IN ('queued','delivered','acknowledged','failed','cancelled')),
+        created_at TEXT NOT NULL,
+        delivered_at TEXT,
+        acknowledged_at TEXT,
+        FOREIGN KEY(run_id) REFERENCES long_runs(id) ON DELETE CASCADE,
+        FOREIGN KEY(from_worker_id) REFERENCES long_run_workers(id) ON DELETE CASCADE,
+        FOREIGN KEY(to_worker_id) REFERENCES long_run_workers(id) ON DELETE CASCADE
+      );
+CREATE TABLE long_run_tasks (
+        run_id TEXT NOT NULL,
+        id TEXT NOT NULL,
+        parent_task_id TEXT,
+        title TEXT NOT NULL,
+        objective TEXT NOT NULL,
+        acceptance_criteria_json TEXT NOT NULL DEFAULT '[]',
+        dependency_ids_json TEXT NOT NULL DEFAULT '[]',
+        criterion_indices_json TEXT NOT NULL DEFAULT '[]',
+        state TEXT NOT NULL DEFAULT 'todo' CHECK(state IN (
+          'todo','doing','waiting_worker','waiting_tool','waiting_user',
+          'verifying','blocked','completed','failed','cancelled'
+        )),
+        assigned_worker_id TEXT,
+        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+        attempt_limit INTEGER CHECK(attempt_limit IS NULL OR attempt_limit > 0),
+        evidence_ref TEXT,
+        blocked_reason TEXT,
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        PRIMARY KEY(run_id, id),
+        FOREIGN KEY(run_id) REFERENCES long_runs(id) ON DELETE CASCADE
+      );
+CREATE TABLE long_run_verification_receipts (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        task_id TEXT,
+        criterion_index INTEGER NOT NULL CHECK(criterion_index >= 0),
+        verifier_worker_id TEXT,
+        verdict TEXT NOT NULL CHECK(verdict IN ('passed','failed','inconclusive')),
+        evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+        artifact_refs_json TEXT NOT NULL DEFAULT '[]',
+        summary TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(run_id) REFERENCES long_runs(id) ON DELETE CASCADE,
+        FOREIGN KEY(verifier_worker_id) REFERENCES long_run_workers(id) ON DELETE SET NULL
+      );
+CREATE TABLE "long_run_worker_attempts" (
+        id TEXT PRIMARY KEY,
+        worker_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        task_id TEXT,
+        invocation_run_id TEXT,
+        attempt INTEGER NOT NULL CHECK(attempt > 0),
+        state TEXT NOT NULL CHECK(state IN (
+          'running','completed','failed','interrupted','cancelled','uncertain'
+        )),
+        runtime_selection_json TEXT NOT NULL,
+        native_coordinate_json TEXT,
+        continuity_capsule_json TEXT,
+        app_instance_id TEXT,
+        side_effect_state TEXT NOT NULL DEFAULT 'none'
+          CHECK(side_effect_state IN ('none','committed','uncertain')),
+        error_code TEXT,
+        error_message TEXT,
+        started_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        FOREIGN KEY(worker_id) REFERENCES long_run_workers(id) ON DELETE CASCADE,
+        FOREIGN KEY(run_id) REFERENCES long_runs(id) ON DELETE CASCADE,
+        UNIQUE(worker_id, attempt)
+      );
+CREATE TABLE long_run_workers (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        parent_worker_id TEXT,
+        task_id TEXT,
+        role TEXT NOT NULL CHECK(role IN ('controller','specialist','verifier','executor','multimodal')),
+        agent_definition_id TEXT,
+        agent_release_json TEXT,
+        runtime_selection_json TEXT NOT NULL,
+        capability_descriptor_id TEXT,
+        workspace_binding_json TEXT NOT NULL,
+        permission_profile TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN (
+          'provisioning','idle','running','waiting','blocked','completed',
+          'failed','interrupted','cancelled'
+        )),
+        current_attempt INTEGER NOT NULL DEFAULT 0 CHECK(current_attempt >= 0),
+        last_heartbeat_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(run_id) REFERENCES long_runs(id) ON DELETE CASCADE,
+        FOREIGN KEY(parent_worker_id) REFERENCES long_run_workers(id) ON DELETE SET NULL
+      );
+CREATE TABLE long_runs (
+        id TEXT PRIMARY KEY,
+        goal_id TEXT NOT NULL UNIQUE,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        surface TEXT NOT NULL CHECK(surface IN ('one','work','science')),
+        execution_location TEXT NOT NULL DEFAULT 'desktop-local'
+          CHECK(execution_location IN ('desktop-local','web-hosted')),
+        root_chat_id TEXT,
+        project_id TEXT,
+        science_job_id TEXT,
+        objective TEXT NOT NULL,
+        acceptance_criteria_json TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL CHECK(status IN (
+          'draft','queued','running','waiting_worker','waiting_tool','waiting_user',
+          'verifying','pausing','paused','blocked','completed','failed','cancelling','cancelled'
+        )),
+        pause_reason TEXT CHECK(pause_reason IS NULL OR pause_reason IN (
+          'user','app_closed','budget','runtime_unavailable','approval_required','crash_recovery'
+        )),
+        runtime_fallback_policy TEXT NOT NULL DEFAULT 'locked'
+          CHECK(runtime_fallback_policy IN ('locked','preapproved_safe')),
+        max_cycles INTEGER CHECK(max_cycles IS NULL OR max_cycles > 0),
+        max_cost_usd REAL CHECK(max_cost_usd IS NULL OR max_cost_usd >= 0),
+        wallclock_deadline TEXT,
+        max_workers INTEGER CHECK(max_workers IS NULL OR max_workers > 0),
+        cycle_count INTEGER NOT NULL DEFAULT 0 CHECK(cycle_count >= 0),
+        cost_used_usd REAL NOT NULL DEFAULT 0 CHECK(cost_used_usd >= 0),
+        last_progress_key TEXT,
+        stall_streak INTEGER NOT NULL DEFAULT 0 CHECK(stall_streak >= 0),
+        stall_window INTEGER NOT NULL DEFAULT 3 CHECK(stall_window > 0),
+        blocked_reason TEXT,
+        app_instance_id TEXT,
+        last_event_seq INTEGER NOT NULL DEFAULT 0 CHECK(last_event_seq >= 0),
+        version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        started_at TEXT,
+        paused_at TEXT,
+        completed_at TEXT,
+        FOREIGN KEY(root_chat_id) REFERENCES chats(id) ON DELETE SET NULL,
+        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL
+      );
 CREATE TABLE mcp_servers (
         id TEXT PRIMARY KEY,
         catalog_id TEXT,
@@ -1179,6 +1356,21 @@ CREATE TABLE run_history (
         skipped_count INTEGER DEFAULT 0,
         error TEXT
       , outcome TEXT, outcome_reason TEXT, acknowledged_at TEXT);
+CREATE TABLE science_runtime_event_outbox (
+      delivery_id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      chat_id TEXT NOT NULL,
+      source_run_event_id TEXT NOT NULL UNIQUE,
+      source_sequence INTEGER NOT NULL CHECK(source_sequence >= 1),
+      source_kind TEXT NOT NULL,
+      source_event_sha256 TEXT NOT NULL CHECK(length(source_event_sha256) = 64),
+      event_json TEXT NOT NULL CHECK(length(event_json) BETWEEN 2 AND 262144),
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','delivered')),
+      created_at TEXT NOT NULL,
+      delivered_at TEXT,
+      UNIQUE(run_id, source_sequence),
+      CHECK((status = 'pending' AND delivered_at IS NULL) OR (status = 'delivered' AND delivered_at IS NOT NULL))
+    );
 CREATE TABLE task_agent_participants (
         task_id TEXT NOT NULL,
         agent_id TEXT,
@@ -1453,6 +1645,43 @@ CREATE INDEX idx_invocation_steers_chat
 CREATE INDEX idx_invocation_steers_queue
       ON invocation_steers(status, queued_at, id);
 CREATE INDEX idx_judgment_verdicts_recency ON judgment_verdicts(last_hit_at);
+CREATE INDEX idx_long_run_attempts_invocation
+        ON long_run_worker_attempts(invocation_run_id, worker_id, attempt)
+        WHERE invocation_run_id IS NOT NULL;
+CREATE INDEX idx_long_run_attempts_run_state
+        ON long_run_worker_attempts(run_id, state, started_at DESC);
+CREATE INDEX idx_long_run_domain_bindings_status
+        ON long_run_domain_bindings(domain, projection_status, synced_at DESC);
+CREATE INDEX idx_long_run_events_kind
+        ON long_run_events(run_id, kind, seq DESC);
+CREATE INDEX idx_long_run_messages_delivery
+        ON long_run_messages(to_worker_id, state, created_at);
+CREATE INDEX idx_long_run_tasks_state
+        ON long_run_tasks(run_id, state, sort_order, created_at);
+CREATE INDEX idx_long_run_tasks_worker
+        ON long_run_tasks(run_id, assigned_worker_id, state)
+        WHERE assigned_worker_id IS NOT NULL;
+CREATE INDEX idx_long_run_verification_criterion
+        ON long_run_verification_receipts(run_id, criterion_index, created_at DESC);
+CREATE INDEX idx_long_run_verification_task
+        ON long_run_verification_receipts(run_id, task_id, created_at DESC)
+        WHERE task_id IS NOT NULL;
+CREATE INDEX idx_long_run_workers_parent
+        ON long_run_workers(parent_worker_id, created_at)
+        WHERE parent_worker_id IS NOT NULL;
+CREATE INDEX idx_long_run_workers_run_state
+        ON long_run_workers(run_id, state, created_at);
+CREATE INDEX idx_long_runs_chat
+        ON long_runs(root_chat_id, updated_at DESC) WHERE root_chat_id IS NOT NULL;
+CREATE INDEX idx_long_runs_project
+        ON long_runs(project_id, updated_at DESC) WHERE project_id IS NOT NULL;
+CREATE UNIQUE INDEX idx_long_runs_science_job
+        ON long_runs(science_job_id)
+        WHERE surface = 'science' AND science_job_id IS NOT NULL;
+CREATE INDEX idx_long_runs_status_updated
+        ON long_runs(status, updated_at DESC);
+CREATE INDEX idx_long_runs_surface_updated
+        ON long_runs(surface, updated_at DESC);
 CREATE INDEX idx_memory_agent ON memory_entries(agent_id, superseded_at);
 CREATE INDEX idx_memory_chat ON memory_entries(chat_id);
 CREATE INDEX idx_memory_decisions_ticket_action
@@ -1507,6 +1736,10 @@ CREATE INDEX idx_run_events_run_seq
 CREATE INDEX idx_run_events_ts
         ON run_events(ts DESC);
 CREATE INDEX idx_run_history_automation ON run_history(automation_id);
+CREATE INDEX idx_science_runtime_event_outbox_pending
+      ON science_runtime_event_outbox(status, created_at, delivery_id);
+CREATE INDEX idx_science_runtime_event_outbox_run
+      ON science_runtime_event_outbox(run_id, source_sequence);
 CREATE INDEX idx_seat_occupants_agent
         ON one_seat_occupants(agent_id) WHERE agent_id IS NOT NULL;
 CREATE UNIQUE INDEX idx_seat_occupants_current
@@ -1533,3 +1766,19 @@ CREATE UNIQUE INDEX idx_telegram_bindings_one_room
         WHERE target_kind = 'one' AND telegram_chat_id IS NOT NULL;
 CREATE INDEX idx_telegram_bindings_target
         ON telegram_bindings(target_kind, target_id);
+CREATE TRIGGER trg_science_runtime_event_outbox_delete
+    BEFORE DELETE ON science_runtime_event_outbox
+    BEGIN
+      SELECT RAISE(ABORT, 'science-runtime-outbox-append-only');
+    END;
+CREATE TRIGGER trg_science_runtime_event_outbox_identity_update
+    BEFORE UPDATE ON science_runtime_event_outbox
+    BEGIN
+      SELECT CASE WHEN NEW.delivery_id != OLD.delivery_id OR NEW.run_id != OLD.run_id OR NEW.chat_id != OLD.chat_id
+        OR NEW.source_run_event_id != OLD.source_run_event_id OR NEW.source_sequence != OLD.source_sequence
+        OR NEW.source_kind != OLD.source_kind OR NEW.source_event_sha256 != OLD.source_event_sha256
+        OR NEW.event_json != OLD.event_json OR NEW.created_at != OLD.created_at
+        THEN RAISE(ABORT, 'science-runtime-outbox-identity-immutable') END;
+      SELECT CASE WHEN NOT (NEW.status = OLD.status OR (OLD.status = 'pending' AND NEW.status = 'delivered'))
+        THEN RAISE(ABORT, 'science-runtime-outbox-state-invalid') END;
+    END;
