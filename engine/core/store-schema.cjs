@@ -26,7 +26,10 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
-const BOOTSTRAP_SCHEMA_FILE = path.join(path.dirname(__dirname), "bootstrap-schema.sql");
+// env 오버라이드는 테스트 전용(scripts/verify-desktop-release-order.cjs 가 "필요 스키마를
+// 올리면 게이트가 실제로 빨간불이 되는가"를 실측할 때만 쓴다). 평소엔 배포된 부트스트랩을 읽는다.
+const BOOTSTRAP_SCHEMA_FILE = process.env.AGENTLAS_BOOTSTRAP_SCHEMA_FILE
+  || path.join(path.dirname(__dirname), "bootstrap-schema.sql");
 
 let _expected;
 

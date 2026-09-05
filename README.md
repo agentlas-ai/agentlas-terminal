@@ -321,6 +321,21 @@ Release verification enforces tag identity (`vX.Y.Z`), contract tests, smoke tes
 
 Detailed release logs and source-to-registry boundaries are documented in [CHANGELOG.md](CHANGELOG.md).
 
+**Ordering rule: the Desktop release must ship before the terminal core that requires it.**
+The terminal vendors the Desktop app's compiled core and reads its shipped `PRAGMA user_version`
+into `engine/bootstrap-schema.sql` (`node scripts/gen-bootstrap-schema.cjs`); at runtime it refuses
+to touch a shared store older than that (`engine/core/store-schema.cjs`, `AGENTLAS_STORE_SCHEMA_TOO_OLD`).
+That refusal is honest but only safe if the Desktop release carrying that schema is already in users'
+hands — the Desktop app is a separate, manually-triggered release (`agentlas_desktop/.github/workflows/
+release-signed-mac.yml`), so it can lag behind what the terminal's vendored core now requires.
+`npm run verify:desktop-release-order` (wired into `prepublishOnly` and `test/smoke.sh`) enforces this:
+it compares the schema the vendored core requires against `desktopCompatibleRelease`/
+`desktopCompatibleSchemaVersion` declared in `engine/vendor/desktop-core.manifest.json` — the Desktop
+release the terminal claims is already shipped — and fails the terminal release if the core needs a
+newer schema than that. **Ship the Desktop release first, then update those two manifest fields
+(`node scripts/write-desktop-core-manifest.cjs --desktop-release vX.Y.Z --desktop-schema-version N …`),
+then publish the terminal.**
+
 ## License
 
 [Apache-2.0](LICENSE) — Agentlas Terminal is the independent terminal runtime for the [Agentlas OS](https://github.com/agentlas-ai/Agentlas-OS) package contract.

@@ -3,5 +3,8 @@
   "url": "https://github.com/agentlas-ai/agentlas-terminal/releases/download/desktop-core-v16/desktop-core.tar.gz",
   "sha256": "563370a5cb53afd0e6688e7b5fe30e5bc0e9022f70a9239f5e95fb1da6309868",
   "sizeBytes": 18173415,
-  "writtenAt": "2026-08-30T02:34:26.615Z"
+  "writtenAt": "2026-08-30T02:34:26.615Z",
+  "desktopCompatibleRelease": "v1.1.1",
+  "desktopCompatibleSchemaVersion": 107,
+  "desktopCompatibleNote": "Last agentlas_desktop release actually shipped by a successful release-signed-mac.yml run (2026-09-03, run 33702059022). electron/store/db.ts SCHEMA_VERSION at that tag is 107 (verified with `git show v1.1.1:electron/store/db.ts`). scripts/verify-desktop-release-order.cjs fails the release when the vendored core (engine/bootstrap-schema.sql) needs a schema newer than this."
 }
