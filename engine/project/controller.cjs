@@ -142,7 +142,7 @@ function resolveProjectForCwd(db, cwd) {
     .filter(({ root }) => pathContains(root, target))
     .sort((a, b) => b.root.length - a.root.length);
   if (!matches.length) {
-    throw Object.assign(new Error("This folder is not connected to an Agentlas project. Connect it in Desktop Work, or pass an exact agent for an advanced direct invocation."), { code: "project_not_connected", honestStop: true });
+    throw Object.assign(new Error("This folder is not connected to an Agentlas project. Connect it right here with `agentlas project use <agent>` (`agentlas agents` lists what is installed), or in Desktop Work, or pass an exact agent for a direct invocation."), { code: "project_not_connected", honestStop: true });
   }
   const bestLength = matches[0].root.length;
   const best = matches.filter((entry) => entry.root.length === bestLength);

@@ -236,7 +236,7 @@ async function runOne(ctx, args) {
   if (persona.prompt) agent.systemPrompt = persona.prompt;
   else if (persona.reason) {
     ctx.err(ctx.uiInstance.c.dim(
-      `One persona came from the shared database row, not the Desktop contract — ${persona.reason}`,
+      `One is using its built-in persona (${persona.reason}) — Desktop's persona contract takes over when Desktop is installed.`,
     ));
   }
 
