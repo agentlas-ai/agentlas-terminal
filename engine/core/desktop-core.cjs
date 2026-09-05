@@ -171,6 +171,20 @@ function assertSharedStoreSchemaBeforeCoreInit() {
 
 let _cache = undefined;
 
+function configureSharedCoreIdentity(root) {
+  const file = path.join(root, "electron", "install-identity.js");
+  // Older cores predate this boundary. New cores require their caller to name
+  // its storage namespace before importing vault/runtime modules. Terminal is
+  // explicitly a follower of the official Desktop shared store; an arbitrary
+  // Node process importing vault no longer receives this authority by default.
+  if (!fs.existsSync(file)) return;
+  const identity = require(file);
+  if (typeof identity.configureInstallIdentity !== "function" || !identity.OFFICIAL_INSTALL_IDENTITY) {
+    throw new Error("desktop_core_install_identity_contract_invalid");
+  }
+  identity.configureInstallIdentity(identity.OFFICIAL_INSTALL_IDENTITY);
+}
+
 /**
  * 재사용 코어를 로드한다. 반환: { root, require(rel), runGraph, ... } 또는 null.
  *  · require(rel): 코어 안의 임의 컴파일 모듈을 상대경로로 로드(예: "store/automations").
@@ -206,6 +220,7 @@ function loadDesktopCore(options = {}) {
   const req = (rel) => require(path.join(root, "electron", rel.replace(/\.js$/, "") + ".js"));
   let kernel;
   try {
+    configureSharedCoreIdentity(root);
     const store = req("store/db");
     if (migrationRole === "follower") {
       // 옛 벤더 번들은 이 계약을 모른다(옵션·env 를 무시하고 사다리를 돈다). 조용히 넘어가지
@@ -312,6 +327,7 @@ function loadCoreAcpRuntime() {
   try {
     installRetiredProjectProvisioningHook();
     installNativeModuleHook();
+    configureSharedCoreIdentity(root);
     const mod = require(file);
     _acpCache = { root, module: mod };
   } catch (e) {
