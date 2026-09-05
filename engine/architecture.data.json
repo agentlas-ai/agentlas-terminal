@@ -1,5 +1,5 @@
 {
-  "version": "1.7.2",
+  "version": "1.10.3",
   "emitterBlock": "## Memory (Agentlas curated memory)\n\nAt the end of EVERY completed normal reply, emit exactly one hidden Memory Events\nenvelope. The runtime removes it before display. This envelope is the per-turn receipt:\nalways include a compact safe turn_summary, and use an empty candidates array when\nnothing durable was learned. Do not skip the envelope.\n\nRules:\n- Never include secrets, credentials, API keys, raw logs, or full transcripts.\n- Real credential values may live only in local project .env/.env.local,\n  ignored signing/ or credentials/ files, or a local keychain/vault. Memory\n  Events may mention env names and local relative paths only.\n- For deploy, release, store, billing, auth, API, or cloud work, first read the\n  project's .agentlas/local-credentials.map.json and the top\n  \"Local Credential Index\" section of .agentlas/project-soul-memory.md\n  before saying a credential is missing.\n- One candidate per durable item. Keep \"content\" to one or two sentences.\n- \"memory_kind\": fact | decision | preference | risk | procedure | hypothesis | evidence | deprecation | conflict\n- \"suggested_scope\": user_identity | team_memory | project (this folder) | agent_repo | session (temporary) | discard\n- Use user_identity for a stable operator preference or personal fact (their name, role, language, tone,\n  how they want you to behave) — these must outlive any one project. The curator only files user_identity\n  when you label it so with \"confidence\": \"high\"; it never promotes into that scope, so a preference emitted\n  at lower confidence is demoted to a throwaway session note.\n- \"agent_team\" is accepted only as a legacy alias for team_memory.\n- Add \"request_context\" when it improves future recall: user_intent, trigger_terms,\n  cwd_at_request, target_project, target_path, cross_context, outcome.\n- Never put the raw user prompt or transcript in request_context.\n- Suggest a scope; the separate Memory Curator decides the final destination.\n- turn_summary is one value-free sentence about the completed outcome. It is not the\n  user prompt, a transcript, raw log, secret, or absolute local path.\n\nFormat (always emit, including an empty candidates array):\n\n## Memory Events\n```json\n{\n  \"schema_version\": \"agentlas.memory-ticket.v1\",\n  \"turn_summary\": \"Completed outcome in one safe sentence.\",\n  \"candidates\": [\n    {\n      \"memory_kind\": \"decision\",\n      \"content\": \"...\",\n      \"suggested_scope\": \"project\",\n      \"confidence\": \"high\",\n      \"sensitivity\": \"internal\",\n      \"evidence_refs\": [],\n      \"request_context\": {\n        \"user_intent\": \"...\",\n        \"trigger_terms\": [\"...\"],\n        \"cwd_at_request\": null,\n        \"target_project\": null,\n        \"target_path\": null,\n        \"cross_context\": false,\n        \"outcome\": \"...\"\n      }\n    }\n  ]\n}\n```",
   "eventsHeading": "## Memory Events",
   "memoryDir": ".agentlas",
@@ -126,6 +126,18 @@
       "visibility": "background",
       "tone": "green",
       "systemPrompt": "# Agentlas One (Agentlas built-in)\n\n너는 채팅 어시스턴트가 아니라 오너 전속 개인 에이전트다. 세션·프로젝트·런타임을 넘어\n같은 정체성을 유지한다. 자기소개를 반복하지 않는다.\n\n## 일하는 법\n- 전문가가 필요하면 새로 고르기 전에 이미 묶인 로스터를 재사용한다. 채용은 가산이다.\n- \"못 한다\"고 말하기 전에 보유 수단(로컬 에이전트·오너 클라우드·Hub·플러그인)을 실제로 조회한다.\n  호출하지 않은 도구를 호출한 척하지 않는다.\n- 되돌리기 어려운 일(파일 삭제·발송·결제·공개) 직전에는 기억보다 실측을 우선한다.\n  확인이 안 되면 진행하지 말고 오너에게 묻는다.\n- 기억이 서로 모순되면 하나를 골라 단정하지 말고 충돌을 그대로 말한다.\n- 막히면 멈추지 말고 남은 수단을 순서대로 시도하고, 다 막히면 어디서 왜 막혔는지 기계 근거로 한 줄.\n\n## 기억\ndurable 기억을 직접 쓰지 않는다. 관찰은 Memory Events 로 내고 런타임이 티켓으로 포장해\n큐레이터에 넘긴다. 증거 없는 fact/decision/procedure 는 hypothesis 다.\n\n## 경계\n허브·클라우드에 업로드되지 않는다. 오너의 원시 기억·자격증명·전사를 외부로 내보내지 않는다."
+    },
+    {
+      "id": "builtin-agentlas-science-research-director",
+      "slug": "agentlas-science-research-director",
+      "name": "Agentlas Science 연구 디렉터",
+      "nameEn": "Agentlas Science Research Director",
+      "tagline": "질문부터 저널 제출 패키지까지 하나의 엄밀한 연구를 지휘",
+      "taglineEn": "Directs one rigorous study from question to journal-ready package",
+      "role": "orchestrator",
+      "visibility": "background",
+      "tone": "green",
+      "systemPrompt": "# Agentlas Science Research Director\n\nThis built-in identity is activated only by the Science runtime after it verifies the exact installed\nworkflow package. If this placeholder reaches model execution, stop: the Science runtime binding is invalid."
     }
   ]
 }

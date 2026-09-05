@@ -230,20 +230,36 @@ function dirSizeMB(p) {
 }
 
 /** 외부 패키지 집합을 그 package.json dependencies 로 재귀 확장한다(node_modules 는 평평하다). */
-function expandExternalDeps(pkgNames, nodeModulesRoot) {
-  const all = new Set();
-  const queue = [...pkgNames];
-  while (queue.length) {
-    const name = queue.pop();
-    if (all.has(name)) continue;
-    all.add(name);
-    const pkgJsonPath = path.join(nodeModulesRoot, name, "package.json");
-    if (!fs.existsSync(pkgJsonPath)) continue; // node builtin 이거나(없음) 뒤에서 정직하게 실패
-    let deps = {};
-    try { deps = JSON.parse(fs.readFileSync(pkgJsonPath, "utf8")).dependencies || {}; } catch { /* malformed — skip */ }
-    for (const dep of Object.keys(deps)) if (!all.has(dep)) queue.push(dep);
+// npm은 버전 충돌이 있으면 최상위 node_modules 로 끌어올리지(hoist) 않고 요구한
+// 패키지 자신의 node_modules 안에 중첩해 둔다(예: bl@4 는 buffer@5 를 요구하는데 다른
+// 곳은 buffer@6+ 을 요구해 최상위엔 못 올라가고 node_modules/bl/node_modules/buffer 로
+// 남는다 — 실측 2026-09-05). 정적 스캔은 "누가 요구했는지"를 아니까, Node 의 실제 해석
+// 규칙(요구한 패키지 자신의 node_modules 를 먼저 본 뒤에야 최상위로 올라간다)을 그대로
+// 따라간다. 반환값은 이름→실제 디렉터리 지도라 최상위/중첩 어느 쪽이든 정확한 경로로 복사한다.
+function resolvePkgDir(nodeModulesRoot, name, parentDir) {
+  if (parentDir) {
+    const nested = path.join(parentDir, "node_modules", name);
+    if (fs.existsSync(path.join(nested, "package.json"))) return nested;
   }
-  return all;
+  const top = path.join(nodeModulesRoot, name);
+  if (fs.existsSync(path.join(top, "package.json"))) return top;
+  return null;
+}
+
+function expandExternalDeps(pkgNames, nodeModulesRoot) {
+  const resolved = new Map(); // name -> dir (or null if unresolved)
+  const queue = [...pkgNames].map((name) => ({ name, parentDir: null }));
+  while (queue.length) {
+    const { name, parentDir } = queue.pop();
+    if (resolved.has(name)) continue;
+    const dir = resolvePkgDir(nodeModulesRoot, name, parentDir);
+    resolved.set(name, dir);
+    if (!dir) continue; // node builtin 이거나(없음) 뒤에서 정직하게 실패
+    let deps = {};
+    try { deps = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8")).dependencies || {}; } catch { /* malformed — skip */ }
+    for (const dep of Object.keys(deps)) if (!resolved.has(dep)) queue.push({ name: dep, parentDir: dir });
+  }
+  return resolved;
 }
 
 function main() {
@@ -299,10 +315,15 @@ function main() {
   console.log(`  external (재귀 확장): ${external.size} → ${fullExternal.size}`);
   let copied = 0;
   let prunedExternalArtifacts = 0;
-  for (const dep of [...fullExternal].sort()) {
-    if (skip.has(dep)) continue;
-    const src = path.join(nodeModulesRoot, dep);
-    if (!fs.existsSync(src)) { console.error(`✖ missing external dep in desktop node_modules: ${dep}`); process.exit(1); }
+  for (const dep of [...fullExternal.keys()].sort()) {
+    // @types/* 는 컴파일 타임 타입 선언만 있고 런타임 .js 진입점이 없다 — 어떤 dist 파일도
+    // 이걸 require() 하지 않는다. 그런데도 dependencies.json 재귀 확장 중에 끌려 들어올 수
+    // 있다(실측: molstar 가 "@types/benchmark" 을 dependencies 에 선언해 둠) — 그 패키지
+    // 디렉터리 이름이 하필 금지어(benchmark)와 겹쳐 disallowedExternalArtifacts 가 오탐한다.
+    // 타입 선언은 애초에 실을 이유가 없으니 통째로 건너뛴다.
+    if (skip.has(dep) || dep.startsWith("@types/")) continue;
+    const src = fullExternal.get(dep);
+    if (!src) { console.error(`✖ missing external dep in desktop node_modules: ${dep}`); process.exit(1); }
     prunedExternalArtifacts += copyRuntimePackage(src, path.join(vendorNodeModules, dep));
     copied += 1;
   }
@@ -323,7 +344,7 @@ function main() {
       source: "agentlas-desktop-dist",
       rootEntry: path.relative(distRoot, ROOT_ENTRY),
       internalFileCount: internal.size,
-      externalDeps: [...fullExternal].filter((d) => !skip.has(d)).sort(),
+      externalDeps: [...fullExternal.keys()].filter((d) => !skip.has(d) && !d.startsWith("@types/")).sort(),
       directExternalDeps: [...external].sort(),
       builtinPluginPackages,
       prunedInternal: PRUNE_INTERNAL,
