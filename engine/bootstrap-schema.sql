@@ -1,4 +1,4 @@
--- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-09-05T02:02:31Z)
+-- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-09-05T17:16:28Z)
 --
 -- ★생성물이다. 손으로 고치지 말고 재생성하라:
 --     node scripts/gen-bootstrap-schema.cjs
@@ -6,7 +6,7 @@
 -- 정본은 Desktop 의 마이그레이션 사다리(agentlas_desktop/electron/store/db.ts, SCHEMA_VERSION).
 -- 이 파일은 그 사다리를 **빈 DB** 에 끝까지 돌린 결과의 덤프이므로, 터미널이 만든 DB 는
 -- 처음부터 사다리 머리에 있다 — 데스크탑이 나중에 승급할 것이 남지 않는다.
-PRAGMA user_version=111;
+PRAGMA user_version=112;
 CREATE TABLE active_runtime (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         kind TEXT NOT NULL
@@ -495,6 +495,13 @@ CREATE TABLE capability_grants (
       scope TEXT NOT NULL DEFAULT 'global',
       source TEXT NOT NULL DEFAULT 'chip',
       created_at TEXT NOT NULL,
+      binding_version INTEGER NOT NULL DEFAULT 0,
+      user_identity TEXT,
+      workspace_identity TEXT,
+      requester_identity TEXT,
+      resource_identity TEXT,
+      permission_scope TEXT CHECK(permission_scope IS NULL OR permission_scope IN ('read','write','full')),
+      tool_identity TEXT,
       UNIQUE(capability, pattern, scope)
     );
 CREATE TABLE chat_goal_contracts (
@@ -1570,6 +1577,11 @@ CREATE INDEX idx_browser_logs_ts ON browser_action_logs(ts DESC);
 CREATE UNIQUE INDEX idx_browser_perm_site_action
         ON browser_permissions(site, action_type);
 CREATE UNIQUE INDEX idx_browser_sessions_site ON browser_sessions(site);
+CREATE INDEX idx_capability_grants_exact_binding
+      ON capability_grants(
+        binding_version, user_identity, workspace_identity,
+        requester_identity, resource_identity, permission_scope
+      );
 CREATE INDEX idx_capability_grants_scope ON capability_grants(scope);
 CREATE UNIQUE INDEX idx_chat_goal_contracts_active_chat
       ON chat_goal_contracts(chat_id)
