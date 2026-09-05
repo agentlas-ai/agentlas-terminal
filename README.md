@@ -76,6 +76,7 @@ Run `agentlas help` for the authoritative command list. Below is the organized c
 ```sh
 agentlas                         # Open the connected project's controller session
 agentlas run [agent] [prompt]    # Project-first run; optional agent is one explicit turn
+agentlas one ["<prompt>"] [--list|--new] # Personal agent One — continues the same shared-DB One conversation
 agentlas firm <firm> [task]      # Delegate task to firm CEO
 agentlas cd <agent>              # Print folder path of an agent (cd "$(agentlas cd x)")
 ```
@@ -92,10 +93,11 @@ agentlas upload <path> --visibility marketplace   # Explicitly publish to public
 agentlas connect <sub>           # Connect external platforms (e.g. Telegram)
 agentlas import <folder>         # Import local agent or firm directory
 agentlas native prepare <agent>  # Generate native CLI context files
-agentlas list                    # List installed agents/firms and active runtimes
+agentlas agents                  # List installed agents/firms and active runtimes (alias: list)
 agentlas uninstall <agent> [--yes] # Remove an installed agent (fails if chat history exists unless --yes)
 agentlas experience <sub>        # Manage agent experience (list|inspect|validate|save|publish|status|export|unpublish|withdraw)
 agentlas variant resolve --base-release <id> # Preview local variant compatibility
+agentlas roles [set <role> <runtime>] # Inspect or set the orchestrator/worker model roles
 ```
 
 ### EXECUTE
@@ -126,13 +128,16 @@ agentlas ontology <sub>          # Manage project ontology (status|list|add)
 # agentlas hep stormbreaker journal --run-id <id> --journal <path>
 agentlas project [status|init]   # Explicit entry point to initialize `.agentlas/` context
 agentlas context <sub>           # Context slice operations (refresh|locate|refs|slice|impact|verify)
+agentlas graph [list|show|run <name>] # Saved automation graphs (built in Desktop's Graph editor)
 ```
 
 Only in projects explicitly initialized with `agentlas project init` do single runs, team executions, Stormbreaker, and Workforce receive local Context Slices. Read, write, or full permissions do not create or alter `.agentlas/` or `.gitignore` files. Code maps, source paths, and file contents are never transmitted during Hub/Cloud search.
 
 ### ACCOUNT & OPS
 ```sh
-agentlas login | logout | whoami  # Agentlas Cloud authentication (loopback browser flow)
+agentlas login                    # Agentlas Cloud authentication (loopback browser flow)
+agentlas logout                   # Clear the saved CLI session
+agentlas whoami                   # Show the signed-in account
 agentlas billing                  # Check account credit balance
 agentlas cloud <sub>              # Manage private Agent Cloud packages (save|publish|package|list|restore|delete|search|install|security scan|runtime bundle|field-test)
 agentlas automation <sub>         # Scheduled automations (list|add|on|off|remove|run <id>|runs|daemon)
@@ -150,6 +155,8 @@ agentlas update                   # Check for latest package updates on npm
 agentlas oberon <sub>             # AI film rendering pipeline: scaffold|render|list|open (= agentlas film)
 agentlas hep <sub...>             # Native Hephaestus passthrough
 agentlas netadmin <sub>           # Local network administration (init|status|reindex|bench|add-source)
+agentlas acp [--info]             # Run as an ACP agent for editors (Zed, JetBrains, …)
+agentlas document pdf <html|url>  # Export a document to PDF
 agentlas version | help
 ```
 
@@ -165,7 +172,7 @@ $ agentlas lst
 Command list: agentlas help  ·  To run this exact prompt: agentlas run -p "lst"
 ```
 
-Desktop-only surface names (`site`, `trex`, `prompts`, `dashboard`, `marketplace`, `library`, `settings`, `apps`, `quests`, `bookmarks`, `one`) also halt with typo guard guidance directing you to equivalent terminal commands. To run a single word as a prompt, wrap it in quotes or pass `run -p`.
+Desktop-only surface names (`site`, `sites`, `trex`, `slides`, `prompts`, `dashboard`, `marketplace`, `library`, `settings`, `apps`, `quests`, `bookmarks`) also halt with typo guard guidance directing you to equivalent terminal commands. To run a single word as a prompt, wrap it in quotes or pass `run -p`. (`agentlas one` is a real terminal command — the shared-DB personal agent, not a Desktop-only surface — see PROJECT WORK below.)
 
 ### Permission Levels
 
