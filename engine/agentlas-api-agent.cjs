@@ -341,7 +341,18 @@ async function runOllamaLoop(req) {
     }
     if (!resp.ok) {
       idle.clear();
-      throw new Error(`Ollama ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 200)}`);
+      const body = (await resp.text().catch(() => "")).slice(0, 200);
+      /*
+       * ★"model 'x' not found" 는 낼 수는 있는데 푸는 길이 없는 오류였다 — 사용자는
+       * 이 컴퓨터에 무엇이 받아져 있는지 모른다. 서버가 살아 있으면 실제 목록을 붙인다.
+       */
+      if (/not found/i.test(body)) {
+        const hint = await require("./runtimes/ollama.cjs")
+          .describeMissingModel(req.model, { env: ctx.env })
+          .catch(() => null);
+        if (hint) throw new Error(hint);
+      }
+      throw new Error(`Ollama ${resp.status}: ${body}`);
     }
     let text = "";
     let started = false;

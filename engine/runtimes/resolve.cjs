@@ -132,6 +132,12 @@ function resolveRuntime({ db, prefs, explicit }) {
     "  npm i -g @openai/codex                # Codex CLI",
     "  npm i -g @google/gemini-cli           # Gemini CLI (legacy)",
     "",
+    // 구독이 아예 없는 사람에게도 길이 하나는 있어야 한다. 로컬 모델은 실행 파일이
+    // 아니라 서버라 위 자동 감지에 절대 안 잡힌다 — 그래서 여기에 이름으로 적는다.
+    "No subscription? Local models work too:",
+    "  ollama serve && ollama pull qwen3",
+    "  agentlas --runtime ollama             # picks an installed model automatically",
+    "",
     "Already installed? Make sure its binary is on PATH (agentlas doctor shows what was detected).",
   ].join("\n"));
 }

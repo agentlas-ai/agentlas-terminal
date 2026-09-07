@@ -117,9 +117,10 @@ async function askModel(ctx, prompt, opts = {}) {
       const cwd = opts.cwd || process.cwd();
       const ui = quietSink();
       res = runtime.kind === "ollama"
+        // 모델 이름은 서버가 가진 목록에서만 나온다 — 지어낸 기본값은 없는 모델 404 다.
         ? await require("../agentlas-api-agent.cjs").runApiTurn({
           backend: "ollama",
-          model: runtime.model || "llama3.1",
+          model: (await require("../runtimes/ollama.cjs").resolveOllamaModel(runtime.model, { env: process.env })).model,
           system: "",
           messages: [{ role: "user", content: prompt }],
           ctx: { cwd, permission: "read", env: process.env, db },

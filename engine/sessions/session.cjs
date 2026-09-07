@@ -278,6 +278,14 @@ class Session extends EventEmitter {
       const ctrl = new AbortController();
       this._apiAbort = ctrl;
       const apiTurn = this._apiTurnImpl || require("../agentlas-api-agent.cjs").runApiTurn;
+      /*
+       * ★모델 이름을 지어내지 않는다(2026-09-07 실측). `--runtime ollama` 는 모델 없이
+       * 도달하는데, 예전에는 여기서 `|| "llama3.1"` 로 이름을 지어내 그 모델이 없는
+       * 기계에서는 실행이 통째로 404 로 죽었다 — 정작 다른 모델은 받아져 있었다.
+       * 이제 서버가 가진 목록에서만 고르고, 못 고르면 푸는 길과 함께 정직하게 멈춘다.
+       */
+      const { resolveOllamaModel } = require("../runtimes/ollama.cjs");
+      const ollamaChoice = await resolveOllamaModel(this.runtime.model, { env: process.env });
       try {
         const history = store.chatHistory(this.db, this.chatId).map((row) => ({
           role: row.role,
@@ -285,7 +293,7 @@ class Session extends EventEmitter {
         }));
         res = await apiTurn({
           backend: "ollama",
-          model: this.runtime.model || "llama3.1",
+          model: ollamaChoice.model,
           system: systemPrompt,
           messages: history,
           ctx: {

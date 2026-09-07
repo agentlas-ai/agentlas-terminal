@@ -22,6 +22,22 @@ function hasCloudSessionCredential() {
   }
 }
 
+/*
+ * 로컬 모델(Ollama)은 PATH 의 실행 파일이 아니라 **떠 있는 서버**다. which() 만 보는
+ * 런타임 줄은 그것을 영원히 못 본다 — 그래서 모델 두 개가 멀쩡히 받아져 있는 기계에서도
+ * doctor 는 "런타임 없음"만 말했다(2026-09-07 실측). 인벤토리는 서버에게 묻는다.
+ */
+async function probeLocalModels() {
+  try {
+    const { probeOllama, ollamaHost } = require("../runtimes/ollama.cjs");
+    const probe = await probeOllama({ timeoutMs: 1500 });
+    if (!probe) return { provider: "ollama", host: ollamaHost(), reachable: false, models: [] };
+    return { provider: "ollama", host: probe.host, reachable: true, version: probe.version, models: probe.models };
+  } catch {
+    return null;
+  }
+}
+
 function roleDetail(selection, role, en) {
   if (!selection) return en ? "not set" : "미설정";
   const provider = selection.kind === "byok" ? selection.backend || "byok" : selection.kind;
@@ -48,10 +64,12 @@ async function run(ctx, args = []) {
     const clis = listAvailableCliRuntimes().map((c) => ({ kind: c.kind, path: c.path, authEvidence: runtimeAuthEvidence(c.kind).status }));
     const active = activeRuntimeRow(db);
     const activeKind = sharedRuntimeKind(active);
+    const localModels = await probeLocalModels();
     return (() => {
       ctx.out(JSON.stringify({
         database: { path: dbPath(), exists: fs.existsSync(dbPath()) },
         runtimes: clis,
+        localModels,
         activeRuntime: active ? { ...active, runtimeKind: activeKind, authEvidence: runtimeAuthEvidence(activeKind).status } : null,
         modelRoles: {
           orchestrator: resolvedModelRole(db, "orchestrator"),
@@ -112,6 +130,28 @@ async function run(ctx, args = []) {
       : "PATH에 에이전트 CLI 없음 (claude / codex / gemini / kimi / grok / cursor-agent)");
     // 막다른 길 방지: 무엇을 설치해야 하는지 그 자리에서 알려준다.
     ctx.out(ctx.ui.dim("      npm i -g @anthropic-ai/claude-code  ·  @openai/codex  ·  @google/gemini-cli"));
+  }
+
+  // 2-b) 로컬 모델 — CLI 구독이 없어도 여기서 돌 수 있다. 실행 파일이 아니라 서버라
+  // 위의 런타임 줄에는 절대 안 잡힌다.
+  const local = await probeLocalModels();
+  if (local && local.reachable && local.models.length) {
+    ok(
+      en ? "local models" : "로컬 모델",
+      `ollama ${local.version} @ ${local.host} — ${local.models.join(", ")}`,
+    );
+    if (!clis.length) {
+      ctx.out(ctx.ui.dim(en
+        ? `      no CLI needed: agentlas --runtime ollama`
+        : `      CLI 없이 실행: agentlas --runtime ollama`));
+    }
+  } else if (local && local.reachable) {
+    warn(
+      en ? "local models" : "로컬 모델",
+      en
+        ? `ollama is running at ${local.host} but no model is pulled — try: ollama pull qwen3`
+        : `${local.host} 에 ollama 는 떠 있는데 받아진 모델이 없습니다 — ollama pull qwen3`,
+    );
   }
   try {
     const db = ctx.db();

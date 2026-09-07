@@ -655,7 +655,8 @@ const DEFAULT_API_MODEL = {
   anthropic: "claude-sonnet-4-6",
   openai: "gpt-4o-mini",
   google: "gemini-1.5-flash",
-  ollama: "llama3.1",
+  // ollama 는 기본 모델을 적지 않는다 — 이 컴퓨터에 무엇이 받아져 있는지는 서버만 안다.
+  // 지어낸 이름(`llama3.1`)은 그 모델이 없는 기계에서 실행을 통째로 404 로 죽였다.
   upstage: "solar-pro2",
   custom: "deepseek-chat",
   glm: "glm-4.6",
@@ -744,7 +745,11 @@ async function runApi(backend, model, system, prompt, options) {
     options.signal ? { ...init, signal: options.signal } : init,
   );
   if (backend === "ollama") {
-    const resp = await request("http://127.0.0.1:11434/api/chat", {
+    const ollama = require("../runtimes/ollama.cjs");
+    // 모델이 안 정해졌으면 서버가 가진 목록에서 고른다(지어낸 기본값 금지).
+    // 호스트도 OLLAMA_HOST 를 따른다 — 원격/비표준 포트 Ollama 가 그동안 도달 불가였다.
+    if (!model) model = (await ollama.resolveOllamaModel(null, {})).model;
+    const resp = await request(`${ollama.ollamaHost()}/api/chat`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ model, stream: false, messages: [{ role: "system", content: system }, { role: "user", content: prompt }] }),
