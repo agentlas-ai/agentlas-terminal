@@ -1,4 +1,4 @@
--- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-09-05T17:16:28Z)
+-- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-09-08T09:38:29Z)
 --
 -- ★생성물이다. 손으로 고치지 말고 재생성하라:
 --     node scripts/gen-bootstrap-schema.cjs
@@ -6,7 +6,7 @@
 -- 정본은 Desktop 의 마이그레이션 사다리(agentlas_desktop/electron/store/db.ts, SCHEMA_VERSION).
 -- 이 파일은 그 사다리를 **빈 DB** 에 끝까지 돌린 결과의 덤프이므로, 터미널이 만든 DB 는
 -- 처음부터 사다리 머리에 있다 — 데스크탑이 나중에 승급할 것이 남지 않는다.
-PRAGMA user_version=112;
+PRAGMA user_version=113;
 CREATE TABLE active_runtime (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         kind TEXT NOT NULL
@@ -495,6 +495,9 @@ CREATE TABLE capability_grants (
       scope TEXT NOT NULL DEFAULT 'global',
       source TEXT NOT NULL DEFAULT 'chip',
       created_at TEXT NOT NULL,
+      -- v1 exact durable-consent binding. Legacy rows stay NULL/0 and keep
+      -- their historical scope semantics; new allow-always rows must carry
+      -- every identity component so an old grant cannot broaden a new one.
       binding_version INTEGER NOT NULL DEFAULT 0,
       user_identity TEXT,
       workspace_identity TEXT,
@@ -544,7 +547,7 @@ CREATE TABLE chat_messages (
         chat_id TEXT NOT NULL,
         role TEXT NOT NULL CHECK(role IN ('user','assistant','system')),
         text TEXT NOT NULL,
-        created_at TEXT NOT NULL,
+        created_at TEXT NOT NULL, host_notice_json TEXT,
         FOREIGN KEY(chat_id) REFERENCES chats(id) ON DELETE CASCADE
       );
 CREATE TABLE "chat_runtime_sessions" (
