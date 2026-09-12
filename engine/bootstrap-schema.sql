@@ -1,4 +1,4 @@
--- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-09-12T12:43:48Z)
+-- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-09-12T13:06:29Z)
 --
 -- ★생성물이다. 손으로 고치지 말고 재생성하라:
 --     node scripts/gen-bootstrap-schema.cjs
@@ -6,7 +6,7 @@
 -- 정본은 Desktop 의 마이그레이션 사다리(agentlas_desktop/electron/store/db.ts, SCHEMA_VERSION).
 -- 이 파일은 그 사다리를 **빈 DB** 에 끝까지 돌린 결과의 덤프이므로, 터미널이 만든 DB 는
 -- 처음부터 사다리 머리에 있다 — 데스크탑이 나중에 승급할 것이 남지 않는다.
-PRAGMA user_version=115;
+PRAGMA user_version=116;
 CREATE TABLE active_runtime (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         kind TEXT NOT NULL
@@ -1549,6 +1549,21 @@ CREATE TABLE "telegram_bindings" (
         designated_graph_id TEXT,
         legacy_notice_at TEXT
       , seat_id TEXT);
+CREATE TABLE work_start_intents (
+          intent_id TEXT PRIMARY KEY,
+          input_digest TEXT NOT NULL,
+          project_id TEXT NOT NULL REFERENCES projects(id),
+          chat_id TEXT NOT NULL UNIQUE REFERENCES chats(id),
+          task_id TEXT NOT NULL REFERENCES tasks(id),
+          prompt_text TEXT NOT NULL,
+          options_json TEXT NOT NULL CHECK(json_valid(options_json)),
+          runtime_selection_json TEXT NOT NULL CHECK(json_valid(runtime_selection_json)),
+          status TEXT NOT NULL CHECK(status IN ('queued','claimed','accepted','failed')),
+          claim_token TEXT,
+          error_code TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
 CREATE INDEX idx_agent_app_ops_app_created
         ON agent_app_operations(app_id, created_at DESC);
 CREATE INDEX idx_agent_apps_chat_updated
@@ -1847,6 +1862,8 @@ CREATE UNIQUE INDEX idx_telegram_bindings_one_room
         WHERE target_kind = 'one' AND telegram_chat_id IS NOT NULL;
 CREATE INDEX idx_telegram_bindings_target
         ON telegram_bindings(target_kind, target_id);
+CREATE INDEX idx_work_start_intents_project
+          ON work_start_intents(project_id, created_at DESC);
 CREATE TRIGGER trg_science_runtime_event_outbox_delete
     BEFORE DELETE ON science_runtime_event_outbox
     BEGIN
