@@ -1,4 +1,4 @@
--- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-09-12T18:31:38Z)
+-- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-09-12T19:22:16Z)
 --
 -- ★생성물이다. 손으로 고치지 말고 재생성하라:
 --     node scripts/gen-bootstrap-schema.cjs
@@ -6,7 +6,7 @@
 -- 정본은 Desktop 의 마이그레이션 사다리(agentlas_desktop/electron/store/db.ts, SCHEMA_VERSION).
 -- 이 파일은 그 사다리를 **빈 DB** 에 끝까지 돌린 결과의 덤프이므로, 터미널이 만든 DB 는
 -- 처음부터 사다리 머리에 있다 — 데스크탑이 나중에 승급할 것이 남지 않는다.
-PRAGMA user_version=118;
+PRAGMA user_version=119;
 CREATE TABLE active_runtime (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         kind TEXT NOT NULL
@@ -1241,6 +1241,31 @@ CREATE TABLE memory_relation_edges (
         CHECK(score IS NULL OR (score >= -1.0 AND score <= 1.0)),
         UNIQUE(from_memory_id, to_memory_id, relation_type)
       );
+CREATE TABLE memory_revocation_cleanup_targets (
+        target_id TEXT PRIMARY KEY,
+        source_memory_id TEXT NOT NULL,
+        revocation_id TEXT REFERENCES memory_revocations(revocation_id) ON DELETE CASCADE,
+        target_kind TEXT NOT NULL CHECK(target_kind IN ('project-files','agent-nest-scan')),
+        target_ref TEXT NOT NULL,
+        target_ref_hash TEXT NOT NULL
+          CHECK(length(target_ref_hash) = 64 AND target_ref_hash NOT GLOB '*[^0-9a-f]*'),
+        state TEXT NOT NULL CHECK(state IN ('writing','registered','pending','leased','complete')),
+        lease_kind TEXT CHECK(lease_kind IN ('writer','cleanup')),
+        lease_token TEXT,
+        lease_expires_at TEXT,
+        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+        progress_cursor TEXT,
+        next_attempt_at TEXT,
+        last_error_code TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        UNIQUE(source_memory_id, target_kind, target_ref_hash),
+        CHECK(
+          (lease_kind IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL)
+          OR (lease_kind IS NOT NULL AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)
+        )
+      );
 CREATE TABLE memory_revocation_sources (
           source_memory_id TEXT PRIMARY KEY,
           revocation_id TEXT NOT NULL REFERENCES memory_revocations(revocation_id) ON DELETE CASCADE
@@ -1839,6 +1864,10 @@ CREATE INDEX idx_memory_relation_owner
         ON memory_relation_edges(owner_scope_key, relation_type, score DESC);
 CREATE INDEX idx_memory_relation_to
         ON memory_relation_edges(to_memory_id, relation_type, score DESC);
+CREATE INDEX idx_memory_revocation_cleanup_due
+        ON memory_revocation_cleanup_targets(state, next_attempt_at, lease_expires_at, created_at);
+CREATE INDEX idx_memory_revocation_cleanup_revocation
+        ON memory_revocation_cleanup_targets(revocation_id, state);
 CREATE INDEX idx_memory_revocations_owner_epoch
           ON memory_revocations(owner_key, revoked_epoch DESC);
 CREATE INDEX idx_memory_scope ON memory_entries(scope, superseded_at);
