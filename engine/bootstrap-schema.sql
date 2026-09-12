@@ -1,4 +1,4 @@
--- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-09-08T09:38:29Z)
+-- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-09-12T09:08:02Z)
 --
 -- ★생성물이다. 손으로 고치지 말고 재생성하라:
 --     node scripts/gen-bootstrap-schema.cjs
@@ -6,7 +6,7 @@
 -- 정본은 Desktop 의 마이그레이션 사다리(agentlas_desktop/electron/store/db.ts, SCHEMA_VERSION).
 -- 이 파일은 그 사다리를 **빈 DB** 에 끝까지 돌린 결과의 덤프이므로, 터미널이 만든 DB 는
 -- 처음부터 사다리 머리에 있다 — 데스크탑이 나중에 승급할 것이 남지 않는다.
-PRAGMA user_version=113;
+PRAGMA user_version=114;
 CREATE TABLE active_runtime (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         kind TEXT NOT NULL
@@ -223,6 +223,15 @@ CREATE TABLE agent_surface_jobs (
         FOREIGN KEY(surface_id) REFERENCES agent_surfaces(id) ON DELETE CASCADE,
         UNIQUE(surface_id, job_id)
       );
+CREATE TABLE agent_surface_revisions (
+        surface_id TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK(revision > 0),
+        manifest_json TEXT NOT NULL,
+        reference_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(surface_id, revision),
+        FOREIGN KEY(surface_id) REFERENCES agent_surfaces(id) ON DELETE CASCADE
+      );
 CREATE TABLE agent_surfaces (
         id TEXT PRIMARY KEY,
         chat_id TEXT NOT NULL,
@@ -235,7 +244,7 @@ CREATE TABLE agent_surfaces (
         state_json TEXT NOT NULL DEFAULT '{}',
         provenance_json TEXT NOT NULL DEFAULT '[]',
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL, artifact_revision INTEGER NOT NULL DEFAULT 1, state_revision INTEGER NOT NULL DEFAULT 0,
         FOREIGN KEY(chat_id) REFERENCES chats(id) ON DELETE CASCADE,
         FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL
       );
