@@ -1,4 +1,4 @@
--- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-09-12T09:08:02Z)
+-- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-09-12T12:43:48Z)
 --
 -- ★생성물이다. 손으로 고치지 말고 재생성하라:
 --     node scripts/gen-bootstrap-schema.cjs
@@ -6,7 +6,7 @@
 -- 정본은 Desktop 의 마이그레이션 사다리(agentlas_desktop/electron/store/db.ts, SCHEMA_VERSION).
 -- 이 파일은 그 사다리를 **빈 DB** 에 끝까지 돌린 결과의 덤프이므로, 터미널이 만든 DB 는
 -- 처음부터 사다리 머리에 있다 — 데스크탑이 나중에 승급할 것이 남지 않는다.
-PRAGMA user_version=114;
+PRAGMA user_version=115;
 CREATE TABLE active_runtime (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         kind TEXT NOT NULL
@@ -1111,6 +1111,49 @@ CREATE TABLE mcp_servers (
         enabled INTEGER NOT NULL DEFAULT 1,
         installed_at TEXT NOT NULL
       );
+CREATE TABLE media_operation_events (
+          operation_id TEXT NOT NULL,
+          sequence INTEGER NOT NULL CHECK(sequence > 0),
+          from_lifecycle TEXT,
+          to_lifecycle TEXT NOT NULL,
+          cancellation TEXT NOT NULL,
+          reason_code TEXT NOT NULL,
+          detail_json TEXT,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY(operation_id, sequence),
+          FOREIGN KEY(operation_id) REFERENCES media_operations(id) ON DELETE CASCADE
+        );
+CREATE TABLE media_operations (
+          id TEXT PRIMARY KEY,
+          modality TEXT NOT NULL CHECK(modality IN ('image','video','audio')),
+          provider_id TEXT NOT NULL,
+          model_id TEXT NOT NULL,
+          client_request_key TEXT NOT NULL UNIQUE,
+          input_digest TEXT NOT NULL,
+          intent_json TEXT NOT NULL,
+          spend_limit_usd REAL,
+          capabilities_json TEXT NOT NULL,
+          lifecycle TEXT NOT NULL CHECK(lifecycle IN ('submit_intent','submitting','provider_accepted','running','verifying','succeeded','failed','outcome_unknown')),
+          provider_operation_id TEXT,
+          provider_checkpoint_json TEXT,
+          provider_status TEXT,
+          cancellation TEXT NOT NULL CHECK(cancellation IN ('none','requested','confirmed','unconfirmed')),
+          cancel_requested_at TEXT,
+          cancel_confirmed_at TEXT,
+          result_path TEXT,
+          result_sha256 TEXT,
+          result_receipt_json TEXT,
+          failure_code TEXT,
+          failure_message TEXT,
+          poll_attempts INTEGER NOT NULL DEFAULT 0 CHECK(poll_attempts >= 0),
+          version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          CHECK(spend_limit_usd IS NULL OR spend_limit_usd >= 0),
+          CHECK((result_path IS NULL AND result_sha256 IS NULL AND result_receipt_json IS NULL)
+            OR (result_path IS NOT NULL AND result_sha256 IS NOT NULL AND result_receipt_json IS NOT NULL)),
+          CHECK(lifecycle != 'succeeded' OR result_path IS NOT NULL)
+        );
 CREATE TABLE memory_decisions (
         decision_id TEXT PRIMARY KEY,
         ticket_id TEXT NOT NULL,
@@ -1716,6 +1759,10 @@ CREATE INDEX idx_long_runs_status_updated
         ON long_runs(status, updated_at DESC);
 CREATE INDEX idx_long_runs_surface_updated
         ON long_runs(surface, updated_at DESC);
+CREATE INDEX idx_media_operation_events_created
+          ON media_operation_events(operation_id, created_at);
+CREATE INDEX idx_media_operations_recovery
+          ON media_operations(modality, lifecycle, cancellation, updated_at);
 CREATE INDEX idx_memory_agent ON memory_entries(agent_id, superseded_at);
 CREATE INDEX idx_memory_chat ON memory_entries(chat_id);
 CREATE INDEX idx_memory_decisions_ticket_action
