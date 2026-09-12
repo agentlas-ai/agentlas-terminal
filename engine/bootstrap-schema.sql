@@ -1,4 +1,4 @@
--- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-09-12T13:06:29Z)
+-- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-09-12T13:20:46Z)
 --
 -- ★생성물이다. 손으로 고치지 말고 재생성하라:
 --     node scripts/gen-bootstrap-schema.cjs
@@ -6,7 +6,7 @@
 -- 정본은 Desktop 의 마이그레이션 사다리(agentlas_desktop/electron/store/db.ts, SCHEMA_VERSION).
 -- 이 파일은 그 사다리를 **빈 DB** 에 끝까지 돌린 결과의 덤프이므로, 터미널이 만든 DB 는
 -- 처음부터 사다리 머리에 있다 — 데스크탑이 나중에 승급할 것이 남지 않는다.
-PRAGMA user_version=116;
+PRAGMA user_version=117;
 CREATE TABLE active_runtime (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         kind TEXT NOT NULL
@@ -1287,6 +1287,17 @@ CREATE TABLE model_roles (
         updated_at TEXT NOT NULL,
         CHECK(role = 'worker' OR inherit = 0)
       );
+CREATE TABLE office_task_context (
+          chat_id TEXT PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+          revision INTEGER NOT NULL,
+          receipt_json TEXT
+        );
+CREATE TABLE office_task_context_operations (
+          operation_id TEXT PRIMARY KEY,
+          request_sha256 TEXT NOT NULL,
+          receipt_json TEXT NOT NULL,
+          chat_id TEXT REFERENCES chats(id) ON DELETE CASCADE
+        );
 CREATE TABLE one_artifact_bindings (
       id TEXT PRIMARY KEY,
       task_id TEXT NOT NULL,
@@ -1552,9 +1563,9 @@ CREATE TABLE "telegram_bindings" (
 CREATE TABLE work_start_intents (
           intent_id TEXT PRIMARY KEY,
           input_digest TEXT NOT NULL,
-          project_id TEXT NOT NULL REFERENCES projects(id),
-          chat_id TEXT NOT NULL UNIQUE REFERENCES chats(id),
-          task_id TEXT NOT NULL REFERENCES tasks(id),
+          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          chat_id TEXT NOT NULL UNIQUE REFERENCES chats(id) ON DELETE CASCADE,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
           prompt_text TEXT NOT NULL,
           options_json TEXT NOT NULL CHECK(json_valid(options_json)),
           runtime_selection_json TEXT NOT NULL CHECK(json_valid(runtime_selection_json)),
@@ -1803,6 +1814,7 @@ CREATE INDEX idx_memory_tickets_project_created
 CREATE INDEX idx_memory_tickets_status_created
         ON memory_tickets(emitter_status, state, created_at DESC);
 CREATE INDEX idx_occupants_seat_time ON one_seat_occupants(seat_id, since);
+CREATE INDEX idx_office_task_context_operations_chat ON office_task_context_operations(chat_id);
 CREATE INDEX idx_one_artifact_binding_chat
       ON one_artifact_bindings(chat_id, created_at);
 CREATE INDEX idx_one_artifact_binding_exact
