@@ -1,4 +1,4 @@
--- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-09-12T13:20:46Z)
+-- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-09-12T18:31:38Z)
 --
 -- ★생성물이다. 손으로 고치지 말고 재생성하라:
 --     node scripts/gen-bootstrap-schema.cjs
@@ -6,7 +6,7 @@
 -- 정본은 Desktop 의 마이그레이션 사다리(agentlas_desktop/electron/store/db.ts, SCHEMA_VERSION).
 -- 이 파일은 그 사다리를 **빈 DB** 에 끝까지 돌린 결과의 덤프이므로, 터미널이 만든 DB 는
 -- 처음부터 사다리 머리에 있다 — 데스크탑이 나중에 승급할 것이 남지 않는다.
-PRAGMA user_version=117;
+PRAGMA user_version=118;
 CREATE TABLE active_runtime (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         kind TEXT NOT NULL
@@ -1191,6 +1191,12 @@ CREATE TABLE memory_entries (
         superseded_at TEXT,
         created_at TEXT NOT NULL
       , context_json TEXT NOT NULL DEFAULT '{}', embedding_model TEXT, embedding_adapter TEXT, embedding_model_sha256 TEXT, embedding_content_hash TEXT, embedding_dimensions INTEGER, embedding_json TEXT);
+CREATE TABLE memory_episode_quarantines (
+          ticket_id TEXT PRIMARY KEY REFERENCES memory_tickets(ticket_id) ON DELETE CASCADE,
+          revocation_id TEXT NOT NULL REFERENCES memory_revocations(revocation_id) ON DELETE CASCADE,
+          reason TEXT NOT NULL CHECK(reason IN ('legacy-unlinked-dedup')),
+          created_at TEXT NOT NULL
+        );
 CREATE TABLE memory_episodes (
         episode_id TEXT PRIMARY KEY,
         ticket_id TEXT NOT NULL UNIQUE,
@@ -1213,6 +1219,10 @@ CREATE TABLE memory_episodes (
         CHECK(summary_hash IS NULL OR
           (length(summary_hash) = 64 AND summary_hash NOT GLOB '*[^0-9a-f]*'))
       );
+CREATE TABLE memory_forget_clock (
+          id INTEGER PRIMARY KEY CHECK(id = 1),
+          epoch INTEGER NOT NULL CHECK(epoch >= 0)
+        );
 CREATE TABLE memory_relation_edges (
         relation_id TEXT PRIMARY KEY,
         from_memory_id TEXT NOT NULL,
@@ -1231,6 +1241,27 @@ CREATE TABLE memory_relation_edges (
         CHECK(score IS NULL OR (score >= -1.0 AND score <= 1.0)),
         UNIQUE(from_memory_id, to_memory_id, relation_type)
       );
+CREATE TABLE memory_revocation_sources (
+          source_memory_id TEXT PRIMARY KEY,
+          revocation_id TEXT NOT NULL REFERENCES memory_revocations(revocation_id) ON DELETE CASCADE
+        );
+CREATE TABLE memory_revocations (
+          revocation_id TEXT PRIMARY KEY,
+          owner_key TEXT NOT NULL
+            CHECK(length(owner_key) = 64 AND owner_key NOT GLOB '*[^0-9a-f]*'),
+          memory_kind TEXT NOT NULL,
+          content_hash TEXT NOT NULL
+            CHECK(length(content_hash) = 64 AND content_hash NOT GLOB '*[^0-9a-f]*'),
+          source_memory_id TEXT NOT NULL,
+          revoked_epoch INTEGER NOT NULL CHECK(revoked_epoch > 0),
+          revoked_at TEXT NOT NULL,
+          UNIQUE(owner_key, memory_kind, content_hash)
+        );
+CREATE TABLE memory_run_epochs (
+          run_id TEXT PRIMARY KEY,
+          intake_epoch INTEGER NOT NULL CHECK(intake_epoch >= 0),
+          captured_at TEXT NOT NULL
+        );
 CREATE TABLE memory_tickets (
         ticket_id TEXT PRIMARY KEY,
         turn_key TEXT NOT NULL UNIQUE,
@@ -1793,6 +1824,8 @@ CREATE INDEX idx_memory_agent ON memory_entries(agent_id, superseded_at);
 CREATE INDEX idx_memory_chat ON memory_entries(chat_id);
 CREATE INDEX idx_memory_decisions_ticket_action
         ON memory_decisions(ticket_id, action, candidate_index);
+CREATE INDEX idx_memory_episode_quarantines_revocation
+          ON memory_episode_quarantines(revocation_id);
 CREATE INDEX idx_memory_episodes_agent_created
         ON memory_episodes(agent_id, created_at DESC);
 CREATE INDEX idx_memory_episodes_project_created
@@ -1806,6 +1839,8 @@ CREATE INDEX idx_memory_relation_owner
         ON memory_relation_edges(owner_scope_key, relation_type, score DESC);
 CREATE INDEX idx_memory_relation_to
         ON memory_relation_edges(to_memory_id, relation_type, score DESC);
+CREATE INDEX idx_memory_revocations_owner_epoch
+          ON memory_revocations(owner_key, revoked_epoch DESC);
 CREATE INDEX idx_memory_scope ON memory_entries(scope, superseded_at);
 CREATE INDEX idx_memory_tickets_agent_created
         ON memory_tickets(agent_id, created_at DESC);
@@ -1876,6 +1911,13 @@ CREATE INDEX idx_telegram_bindings_target
         ON telegram_bindings(target_kind, target_id);
 CREATE INDEX idx_work_start_intents_project
           ON work_start_intents(project_id, created_at DESC);
+CREATE TRIGGER trg_memory_capture_run_epoch
+        AFTER INSERT ON run_events
+        WHEN NEW.kind = 'invoke_started'
+        BEGIN
+          INSERT OR IGNORE INTO memory_run_epochs (run_id, intake_epoch, captured_at)
+          SELECT NEW.run_id, epoch, NEW.ts FROM memory_forget_clock WHERE id = 1;
+        END;
 CREATE TRIGGER trg_science_runtime_event_outbox_delete
     BEFORE DELETE ON science_runtime_event_outbox
     BEGIN
@@ -1892,3 +1934,4 @@ CREATE TRIGGER trg_science_runtime_event_outbox_identity_update
       SELECT CASE WHEN NOT (NEW.status = OLD.status OR (OLD.status = 'pending' AND NEW.status = 'delivered'))
         THEN RAISE(ABORT, 'science-runtime-outbox-state-invalid') END;
     END;
+INSERT OR IGNORE INTO memory_forget_clock (id, epoch) VALUES (1, 0);

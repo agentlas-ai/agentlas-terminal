@@ -61,6 +61,7 @@ function main() {
   let db;
   let version;
   let rows;
+  const singletonSeeds = [];
   try {
     const core = require(coreDb);
     core.initStore();
@@ -78,6 +79,15 @@ function main() {
                    name`,
       )
       .all();
+    // Schema-only dumps omit this required initial row. Copy only the named
+    // singleton from the fresh temporary ladder, never application/user rows.
+    if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory_forget_clock'").get()) {
+      const clock = db.prepare("SELECT id, epoch FROM memory_forget_clock WHERE id = 1").get();
+      if (!clock || clock.id !== 1 || !Number.isSafeInteger(clock.epoch) || clock.epoch < 0) {
+        throw new Error("fresh Desktop ladder did not initialize memory_forget_clock");
+      }
+      singletonSeeds.push(`INSERT OR IGNORE INTO memory_forget_clock (id, epoch) VALUES (1, ${clock.epoch});`);
+    }
   } finally {
     Module._load = origLoad;
     try { db && db.close(); } catch { /* noop */ }
@@ -96,7 +106,7 @@ function main() {
     `PRAGMA user_version=${version};`,
   ].join("\n");
   const body = rows.map((r) => `${String(r.sql).trim()};`).join("\n");
-  fs.writeFileSync(out, `${header}\n${body}\n`, "utf8");
+  fs.writeFileSync(out, `${header}\n${body}\n${singletonSeeds.join("\n")}\n`, "utf8");
   fs.rmSync(tmpDir, { recursive: true, force: true });
   console.log(`written: ${out} (user_version=${version}, ${rows.length} objects)`);
 }
