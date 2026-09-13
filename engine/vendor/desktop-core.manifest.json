@@ -1,10 +1,10 @@
 {
   "version": "18",
   "url": "https://github.com/agentlas-ai/agentlas-terminal/releases/download/desktop-core-v18/desktop-core.tar.gz",
-  "sha256": "fd2f8c7cc23adcedf678c2ba03b7db33c16f50e4b0788fef38192ba749a27093",
-  "sizeBytes": 53479853,
-  "writtenAt": "2026-09-13T06:12:44.959Z",
+  "sha256": "f62f0785eab8701a1427715b4a2d7986f8ed4f443f55e117deb1d3cec2de6920",
+  "sizeBytes": 53479042,
+  "writtenAt": "2026-09-13T07:19:12.252Z",
   "desktopCompatibleRelease": "v1.2.1",
   "desktopCompatibleSchemaVersion": 119,
-  "desktopCompatibleNote": "Declared by write-desktop-core-manifest.cjs on 2026-09-13T06:12:44.958Z — verify with `git -C ../agentlas_desktop show v1.2.1:electron/store/db.ts` before trusting this."
+  "desktopCompatibleNote": "Declared by write-desktop-core-manifest.cjs on 2026-09-13T07:19:12.252Z — verify with `git -C ../agentlas_desktop show v1.2.1:electron/store/db.ts` before trusting this."
 }
