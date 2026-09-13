@@ -1,4 +1,4 @@
--- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-09-12T19:22:16Z)
+-- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-09-13T06:12:07Z)
 --
 -- ★생성물이다. 손으로 고치지 말고 재생성하라:
 --     node scripts/gen-bootstrap-schema.cjs
