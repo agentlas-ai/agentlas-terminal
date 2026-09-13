@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.68 — 2026-09-13
+
+- 데스크탑 v1.2.0 코어(desktop-core v17, 저장소 스키마 119)를 벤더링합니다. 첫 실행 부트스트랩이 스키마 119 를 만들고, 데스크탑이 아직 1.1.x 이면 정직하게 `AGENTLAS_STORE_SCHEMA_TOO_OLD` 로 멈춥니다.
+
 ## 1.0.67 — 2026-08-30
 
 - Cloud local state, source markers, and project credential imports now use
