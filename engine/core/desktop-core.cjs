@@ -162,7 +162,7 @@ function assertSharedStoreSchemaBeforeCoreInit() {
   const { assertStoreSchemaCompatible } = require("./store-schema.cjs");
   let probe = null;
   try {
-    probe = openRaw(file);
+    probe = openRaw(file, { readOnly: true });
     assertStoreSchemaCompatible(probe, file);
   } finally {
     try { probe && probe.close(); } catch { /* noop */ }

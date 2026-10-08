@@ -12,7 +12,10 @@
  * 무결성을 확인한 뒤에만 푼다 — 받아온 걸 검증 없이 실행하지 않는다.
  *
  * 매니페스트(engine/vendor/desktop-core.manifest.json, git 커밋 — 이 파일만 작다)가
- * {version, url, sha256, sizeBytes} 를 담는다. 실물(52MB)은 그 url 이 가리키는 곳에서 온다.
+ * 기존 매니페스트는 {version, url, sha256, sizeBytes} 를 담는다. 플랫폼별 코어를
+ * 배포할 때는 {version, platformAssets: {darwin, win32-x64, linux-x64}} 를 쓰며,
+ * 각 자산은 {url, sha256, sizeBytes} 를 담는다. 플랫폼 항목이 없는 경우 다른
+ * 플랫폼의 네이티브 모듈을 실행하지 않고 정직하게 멈춘다.
  */
 const crypto = require("node:crypto");
 const fs = require("node:fs");
@@ -23,7 +26,8 @@ const { userDataDir } = require("./paths.cjs");
 const MAX_MANIFEST_BYTES = 64 * 1024;
 const MAX_MARKER_BYTES = 64 * 1024;
 const MAX_RUN_GRAPH_BYTES = 16 * 1024 * 1024;
-const MAX_ARCHIVE_BYTES = 128 * 1024 * 1024;
+// Core19's verified multi-platform Sharp/Canvas archive is 216,675,247 bytes.
+const MAX_ARCHIVE_BYTES = 256 * 1024 * 1024;
 const MAX_ARCHIVE_LIST_BYTES = 8 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES = 100_000;
 const MAX_ARCHIVE_ENTRY_BYTES = 4 * 1024;
@@ -127,23 +131,42 @@ function cacheDir(version) {
 }
 function cacheDistDir(version) { return path.join(cacheDir(version), "dist"); }
 
+function manifestAssetForCurrentPlatform(manifest) {
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) return null;
+  // Older published manifests contain one cross-platform archive. Preserve that
+  // contract; once platformAssets is present, a missing target must fail closed.
+  if (!Object.hasOwn(manifest, "platformAssets")) return manifest;
+  const assets = manifest.platformAssets;
+  if (!assets || typeof assets !== "object" || Array.isArray(assets)) return null;
+  let target = null;
+  if (process.platform === "darwin" && ["arm64", "x64"].includes(process.arch)) target = "darwin";
+  else if (process.platform === "win32" && process.arch === "x64") target = "win32-x64";
+  else if (process.platform === "linux" && process.arch === "x64") target = "linux-x64";
+  if (!target || !Object.hasOwn(assets, target)) return null;
+  const asset = assets[target];
+  if (!asset || typeof asset !== "object" || Array.isArray(asset)) return null;
+  return { version: manifest.version, url: asset.url, sha256: asset.sha256, sizeBytes: asset.sizeBytes };
+}
+
 function normalizedCacheManifest(manifest) {
-  const version = normalizedCacheVersion(manifest?.version);
-  const sha256 = typeof manifest?.sha256 === "string" ? manifest.sha256.toLowerCase() : "";
+  const asset = manifestAssetForCurrentPlatform(manifest);
+  const version = normalizedCacheVersion(asset?.version);
+  const sha256 = typeof asset?.sha256 === "string" ? asset.sha256.toLowerCase() : "";
   if (!version || !/^[0-9a-f]{64}$/.test(sha256)) return null;
   return { version, sha256 };
 }
 
 function normalizedManifest(manifest) {
+  const asset = manifestAssetForCurrentPlatform(manifest);
   const cacheManifest = normalizedCacheManifest(manifest);
   if (!cacheManifest) return null;
-  if (typeof manifest.url !== "string" || Buffer.byteLength(manifest.url, "utf8") > 2048) return null;
+  if (typeof asset.url !== "string" || Buffer.byteLength(asset.url, "utf8") > 2048) return null;
   let url;
-  try { url = new URL(manifest.url); } catch { return null; }
+  try { url = new URL(asset.url); } catch { return null; }
   if (!/^https?:$/.test(url.protocol)) return null;
   let sizeBytes = null;
-  if (manifest.sizeBytes !== undefined && manifest.sizeBytes !== null) {
-    const candidate = Number(manifest.sizeBytes);
+  if (asset.sizeBytes !== undefined && asset.sizeBytes !== null) {
+    const candidate = Number(asset.sizeBytes);
     if (!Number.isSafeInteger(candidate) || candidate <= 0 || candidate > MAX_ARCHIVE_BYTES) return null;
     sizeBytes = candidate;
   }

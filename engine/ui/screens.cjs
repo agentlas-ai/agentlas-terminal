@@ -83,11 +83,10 @@ function dashboard(ui, db, en) {
   const builtin = count(db, "SELECT COUNT(*) n FROM installed_agents WHERE COALESCE(builtin,0)=1");
   const firms = count(db, "SELECT COUNT(*) n FROM firms");
   const marks = count(db, "SELECT COUNT(*) n FROM hub_agent_bookmarks");
-  const borrowed = count(db, "SELECT COUNT(*) n FROM borrowed_agent_careers");
 
   ui.ensureNl();
   ui.line(ui.c.bold(en ? "Dashboard" : "대시보드"));
-  ui.line(`  ${chip(ui.c.inverse, `${en ? "agents" : "에이전트"} ${local}`)} ${chip(ui.c.dim, `builtin ${builtin}`)} ${chip(ui.c.inverse, `${en ? "firms" : "회사"} ${firms}`)} ${chip(ui.c.dim, `${en ? "bookmarks" : "북마크"} ${marks}`)} ${chip(ui.c.dim, `${en ? "borrowed" : "대여"} ${borrowed}`)}`);
+  ui.line(`  ${chip(ui.c.inverse, `${en ? "agents" : "에이전트"} ${local}`)} ${chip(ui.c.dim, `builtin ${builtin}`)} ${chip(ui.c.inverse, `${en ? "firms" : "회사"} ${firms}`)} ${chip(ui.c.dim, `${en ? "bookmarks" : "북마크"} ${marks}`)}`);
 
   // ── 확인 필요 (D1 숨은 계약 2: 없으면 실행이 조용히 멈춘 채 정상처럼 보인다) ──
   const pending = count(db, `SELECT COUNT(*) n FROM automation_runs r WHERE ${ATTENTION_RUN_WHERE}`);
@@ -154,8 +153,8 @@ function dashboard(ui, db, en) {
 
   ui.line("");
   ui.line(ui.c.dim(en
-    ? "more: /library · /marketplace · /automation list · /usage · /sessions"
-    : "더 보기: /library · /marketplace · /automation list · /usage · /sessions"));
+    ? "more: /library · /hub · /automation list · /usage · /sessions"
+    : "더 보기: /library · /hub · /automation list · /usage · /sessions"));
 }
 
 /* ── /library — 데스크탑 library/agents + env + mcps 를 한 화면으로 ── */
@@ -188,10 +187,10 @@ function library(ui, db, en, ctx) {
   void ctx;
 }
 
-/* ── /marketplace · /bookmarks — Hub 북마크(로컬)와 검색 안내 ── */
+/* ── /hub · /bookmarks — 공개 Hub 북마크와 최근 사용 기록 ── */
 function marketplace(ui, db, en) {
   ui.ensureNl();
-  ui.line(ui.c.bold(en ? "Hub" : "Hub 마켓플레이스"));
+  ui.line(ui.c.bold(en ? "Agent Hub" : "에이전트 허브"));
   const marks = rows(db,
     "SELECT slug, entity_kind, bookmarked_at, sync_state FROM hub_agent_bookmarks ORDER BY COALESCE(bookmarked_at,'') DESC LIMIT 10");
   const borrowed = rows(db,
@@ -208,7 +207,7 @@ function marketplace(ui, db, en) {
 
   if (borrowed.length) {
     ui.line("");
-    ui.line(ui.c.bold(en ? "Borrowed (Hub careers)" : "빌려 쓴 에이전트"));
+    ui.line(ui.c.bold(en ? "Recently used Hub agents" : "최근 사용한 Hub 에이전트"));
     table(ui, [[en ? "slug" : "슬러그", en ? "name" : "이름", en ? "runs" : "실행", en ? "last" : "마지막"],
       ...borrowed.map((b) => [b.slug, b.nm || "", String(b.use_count || 0), shortTs(b.last_used_at)])],
       { cap: [26, 22, 6, 16] });
@@ -216,8 +215,8 @@ function marketplace(ui, db, en) {
 
   ui.line("");
   ui.line(ui.c.dim(en
-    ? 'search: /search "<what you need>"  ·  install: /install <slug>  ·  credits: /billing'
-    : '검색: /search "<필요한 것>"  ·  설치: /install <slug>  ·  크레딧: /billing'));
+    ? 'search: /search "<what you need>"  ·  install: /install <slug>'
+    : '검색: /search "<필요한 것>"  ·  설치: /install <slug>'));
 }
 
 /* ── /settings — 데스크탑 settings 의 터미널 관측 (변경은 기존 명령으로) ── */

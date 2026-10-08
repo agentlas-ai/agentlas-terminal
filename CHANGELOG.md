@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.71 — 2026-10-08
+
+- Update the on-demand Desktop Core runtime to v19 for Desktop 1.2.82, with Science rendering and protein validation dependencies. Fresh databases use schema 128; Desktop remains the migration owner for existing databases.
+- Require Node 22.13.0 or newer and include the supported platform native dependencies for image and canvas operations.
+- Inspect shared-store schemas read-only when the native SQLite driver is unavailable. Existing-store writes and the compiled Desktop Core require a compatible better-sqlite3 driver; file-open errors remain distinct from driver availability failures.
+- Allow the verified universal Core package within a bounded 256 MiB download limit, preserving exact size, checksum and safe archive validation.
+- Use Agentlas OS 1.2.58 for shared runtime commands.
+
+## 1.0.70 — 2026-09-25 (unpublished)
+
+- Terminal help and commands describe public Hub publishing, installation, and agent calls as free. The caller supplies its own model and API access. `agentlas billing` displays separate hosted AI subscription usage and read-only historical creator earnings.
+- Keep the published desktop-core v18 asset and schema 119 manifest until new platform assets have been uploaded and verified. The package publish hook now checks the committed manifest and release order without rebuilding the core from a mutable Desktop checkout.
+
 ## 1.0.69 — 2026-09-13
 
 - 데스크탑 v1.2.1 코어(desktop-core v18, 저장소 스키마 119)를 벤더링합니다. Antigravity(agy)에 사용자가 직접 등록한 같은 이름의 MCP 항목이 있어도 실행을 거절하지 않고 그 항목만 빼고 돌며, One 이 등록한 자동화의 예약 실행이 저장된 모델 선택 때문에 멈추지 않습니다.

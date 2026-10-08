@@ -967,7 +967,7 @@ function commitLocalBundleRecord(userDataDir, validation, options = {}) {
 }
 
 function saveLocalBundle(userDataDir, validation, options = {}) {
-  return commitLocalBundleRecord(userDataDir, validation, options);
+  throw new Error("experience_chips_retired: legacy evidence is read-only; use agentlas evolve.");
 }
 
 function readStoredBundle(userDataDir, bundleId) {
@@ -1213,25 +1213,7 @@ function remoteProjection(receipt, baseResolution = null, previousRemote = null)
 }
 
 function commitServerAcceptedBundle(userDataDir, validation, receipt, baseResolution, options = {}) {
-  const bundle = validation.bundle;
-  try {
-    const state = loadExchangeState(userDataDir);
-    const previous = state.bundles.find((row) => row.bundleId === bundle.bundleId);
-    return commitLocalBundleRecord(userDataDir, validation, {
-      cwd: options.cwd,
-      remote: remoteProjection(receipt, baseResolution, previous?.remote || null),
-    });
-  } catch (error) {
-    const stateError = new Error(
-      `Experience was accepted by the server as ${receipt.uploadId}, but Terminal could not atomically commit the canonical bundle and authoritative receipt. ` +
-      "The prior local bundle/state were restored; rerun the same command and Idempotency-Key to reconcile the same receipt.",
-    );
-    stateError.code = "AGENTLAS_EXPERIENCE_LOCAL_STATE_COMMIT_FAILED";
-    stateError.receipt = receipt;
-    stateError.bundleId = bundle.bundleId;
-    stateError.cause = error;
-    throw stateError;
-  }
+  throw new Error("experience_chips_retired: legacy evidence is read-only; use agentlas evolve.");
 }
 
 function persistRemoteReceipt(userDataDir, bundle, receipt, baseResolution = null) {
@@ -1281,53 +1263,7 @@ async function recoverLostUpload(bundle, idempotencyKey, options, auth, original
 }
 
 async function publishBundle(validation, options = {}) {
-  const originalBundle = validation.bundle;
-  const requestedVisibility = options.operation === "save"
-    ? "private"
-    : String(options.requestedVisibility || originalBundle.requestedVisibility);
-  if (options.operation === "publish" && !["unlisted", "public"].includes(requestedVisibility)) {
-    throw new Error("experience publish requires requested visibility unlisted or public; use experience save for a private draft");
-  }
-  const bundle = normalizeExperienceBundle({ ...originalBundle, requestedVisibility });
-  const normalizedValidation = validateExperienceBundle(bundle);
-  const dryRun = options.dryRun === true;
-  const operation = options.operation === "publish" ? "publish" : "save";
-  const key = idempotencyKeyForBundle(bundle, options.idempotencyKey, operation);
-  if (dryRun) {
-    return { dryRun: true, networkUsed: false, bundleId: bundle.bundleId, bundleHash: bundle.bundleHash, requestedVisibility: bundle.requestedVisibility, publicActivation: false, evaluatorAuthority: false };
-  }
-  const auth = await authenticatedContext(options, false);
-  const existingState = loadExchangeState(options.userDataDir);
-  const existingRow = findStateRecord(existingState, bundle.bundleId);
-  const exactBaseDescriptor = normalizeBaseDescriptor(options, existingRow?.remote?.baseResolution);
-  // Preflight and server acceptance happen before the canonical local envelope
-  // is changed. A failed promotion must leave the prior private file/state
-  // byte-identical instead of pairing a public envelope with an old receipt.
-  const baseRelease = await resolveBaseRelease(bundle, { ...options, baseDescriptor: exactBaseDescriptor }, auth, existingRow?.remote?.baseResolution);
-  let response;
-  try {
-    response = await options.fetchHub(`${auth.base}/uploads`, {
-      method: "POST",
-      headers: { "content-type": "application/json", cookie: auth.cookie, origin: auth.origin, "Idempotency-Key": key, "If-None-Match": "*" },
-      body: JSON.stringify({ bundle }),
-    });
-  } catch (error) {
-    const recovered = await recoverLostUpload(bundle, key, options, auth, error);
-    commitServerAcceptedBundle(options.userDataDir, normalizedValidation, recovered.receipt, baseRelease, { cwd: options.cwd });
-    return { ...recovered, dryRun: false, networkUsed: true, baseRelease, publicActivation: false, evaluatorAuthority: false };
-  }
-  if (!response.ok) throw responseError(response, "Experience draft upload");
-  const body = parseResponseJson(response, "Experience draft upload");
-  if (typeof body.replayed !== "boolean" || (response.status === 201 && body.replayed !== false) || (response.status === 200 && body.replayed !== true)) {
-    throw new Error("Experience upload returned an invalid replay marker");
-  }
-  const receipt = validateUploadReceipt(body.receipt, bundle);
-  const expectedStatus = operation === "publish" ? "verification-requested" : "draft-saved";
-  if (receipt.status !== expectedStatus) throw new Error(`Experience ${operation} receipt must be ${expectedStatus}, never ${receipt.status}`);
-  const etag = response.headers && typeof response.headers.get === "function" ? response.headers.get("etag") : null;
-  if (etag !== `"${receipt.revision}"`) throw new Error("Experience upload ETag does not match the exact receipt revision");
-  commitServerAcceptedBundle(options.userDataDir, normalizedValidation, receipt, baseRelease, { cwd: options.cwd });
-  return { receipt, replayed: body.replayed, recovered: false, dryRun: false, networkUsed: true, baseRelease, publicActivation: false, evaluatorAuthority: false };
+  throw new Error("experience_chips_retired: legacy evidence is read-only; use agentlas evolve.");
 }
 
 function findStateRecord(state, ref) {
@@ -1547,43 +1483,7 @@ async function fetchUploadExport(ref, options = {}) {
 }
 
 async function withdrawUpload(ref, options = {}) {
-  const { row, validation } = resolveScopedStoredRecord(options.userDataDir, ref, options.cwd);
-  const uploadId = row.remote?.uploadId;
-  if (!uploadId) throw new Error("unpublish requires an exact locally observed server upload receipt");
-  if (!row?.remote?.revision) throw new Error("withdraw requires the exact locally observed server revision; run experience status first");
-  if (row.remote.status === "withdrawn") throw new Error("Experience upload is already withdrawn");
-  const auth = await authenticatedContext(options, false);
-  const response = await options.fetchHub(`${auth.base}/uploads/${encodeURIComponent(uploadId)}`, {
-    method: "DELETE",
-    headers: { accept: "application/json", cookie: auth.cookie, origin: auth.origin, "If-Match": `"${row.remote.revision}"` },
-  });
-  if (!response.ok) {
-    if (response.status === 412) {
-      const body = parseResponseJson(response, "Experience withdrawal conflict");
-      const current = body.current?.receipt || body.current || body.receipt;
-      if (current) {
-        const bundle = validation.bundle;
-        const receipt = validateUploadReceipt(current, bundle);
-        persistRemoteReceipt(options.userDataDir, bundle, receipt);
-        const error = new Error("Experience withdrawal revision is stale; current server receipt was reconciled locally. Review status and retry.");
-        error.code = "experience_revision_conflict";
-        error.status = 412;
-        error.current = receipt;
-        throw error;
-      }
-    }
-    throw responseError(response, "Experience withdrawal (server support may be unavailable)");
-  }
-  const body = parseResponseJson(response, "Experience withdrawal");
-  const bundle = validation.bundle;
-  const receipt = validateUploadReceipt(body.receipt || body, bundle);
-  if (receipt.uploadId !== uploadId || receipt.status !== "withdrawn") throw new Error("withdrawal did not return the exact withdrawn server receipt");
-  const etag = response.headers && typeof response.headers.get === "function" ? response.headers.get("etag") : null;
-  if (etag !== `"${receipt.revision}"`) throw new Error("withdrawal ETag does not match the new server revision");
-  if (row) {
-    persistRemoteReceipt(options.userDataDir, bundle, receipt);
-  }
-  return { receipt, authoritative: "server", publicActivation: false };
+  throw new Error("experience_chips_retired: legacy evidence is read-only.");
 }
 
 function normalizedTaxonomyAtom(value) {
@@ -1779,147 +1679,7 @@ function exactTaskSignatureInPrompt(signature, prompt, options = {}) {
  * never attachment consent.
  */
 function resolveRuntimeExperienceForAgent(options = {}) {
-  const requested = options.requested || {};
-  if (requested.disabled === true) {
-    return { disabled: true, observableReason: "disabled-by-user", resolution: "skipped" };
-  }
-  const environmentTags = defaultEnvironmentTags(options);
-  if (environmentTags.some((tag) => tag.endsWith("/unknown"))) {
-    return { disabled: true, observableReason: "runtime-environment-unknown", resolution: "skipped" };
-  }
-  if (Array.isArray(requested.environmentTags) && requested.environmentTags.length) {
-    const declaredEnvironment = [...new Set(requested.environmentTags.map(String).filter(Boolean))];
-    const exactDefault = declaredEnvironment.length === environmentTags.length && declaredEnvironment.every((tag) => environmentTags.includes(tag));
-    if (!declaredEnvironment.every(isCanonicalEnvironmentTag)) {
-      return { disabled: true, observableReason: "legacy-environment-constraint-not-runtime-activatable", resolution: "skipped" };
-    }
-    if (!exactDefault) {
-      return { disabled: true, observableReason: "declared-environment-does-not-match-runtime", resolution: "skipped" };
-    }
-  }
-  const explicitBase = String(requested.baseAgentReleaseId || "");
-  const explicitSignatures = [...new Set((requested.taskSignatures || []).map(String).filter(Boolean))];
-  const explicitPackReleases = [...new Set((requested.experiencePackReleaseIds || []).map(String).filter(Boolean))];
-  if (explicitBase || explicitSignatures.length || requested.agentDefinitionId || explicitPackReleases.length) {
-    if (!ID_RE.test(explicitBase) || !explicitSignatures.length || explicitPackReleases.length !== 1 || !ID_RE.test(explicitPackReleases[0])) {
-      return { disabled: true, observableReason: "incomplete-explicit-experience-binding", resolution: "skipped" };
-    }
-    if (explicitSignatures.some((item) => !isCanonicalTaskId(item))) {
-      return { disabled: true, observableReason: "legacy-task-signature-not-runtime-activatable", resolution: "skipped" };
-    }
-    return {
-      disabled: false,
-      baseAgentReleaseId: explicitBase,
-      ...(requested.agentDefinitionId && ID_RE.test(String(requested.agentDefinitionId)) ? { agentDefinitionId: String(requested.agentDefinitionId) } : {}),
-      experiencePackReleaseIds: explicitPackReleases,
-      taskSignatures: explicitSignatures,
-      environmentTags,
-      resolution: "explicit-exact",
-    };
-  }
-  const agent = options.agent;
-  if (!agent || agent.builtin || !agent.slug) {
-    return { disabled: true, observableReason: agent?.builtin ? "builtin-agent-has-no-owned-experience-base" : "no-exact-agent-base", resolution: "skipped" };
-  }
-  const local = readExactLocalBaseMarker(options.agentRoot, agent.slug);
-  if (!local.marker) return { disabled: true, observableReason: local.reason, resolution: "skipped" };
-  const attachedPackReleases = [...new Set(
-    (requested.attachedExperiencePackReleaseIds || []).map(String).filter(Boolean),
-  )];
-  if (attachedPackReleases.length !== 1 || !ID_RE.test(attachedPackReleases[0])) {
-    return { disabled: true, observableReason: "explicit-experience-attachment-required", resolution: "skipped" };
-  }
-  let state;
-  try { state = loadExchangeState(options.userDataDir); }
-  catch { return { disabled: true, observableReason: "local-experience-state-invalid", resolution: "skipped" }; }
-  const scopeHash = projectScopeHash(options.cwd);
-  const matchingRows = state.bundles.filter((row) => {
-    const base = row.remote?.baseResolution;
-    return attachedPackReleases.includes(row.experiencePackReleaseId) &&
-      row.projectScopeHash === scopeHash && base &&
-      base.slug === local.marker.slug &&
-      (!local.marker.cloudId || base.cloudId === local.marker.cloudId) &&
-      base.packageHash === local.marker.packageHash &&
-      base.packageHashVersion === local.marker.packageHashVersion &&
-      base.agentDefinitionId === row.agentDefinitionId &&
-      row.compatibleBaseReleaseIds.includes(base.agentReleaseId);
-  });
-  if (!matchingRows.length) {
-    return { disabled: true, observableReason: "exact-local-base-release-unavailable", resolution: "skipped" };
-  }
-  const baseKeys = new Set(matchingRows.map((row) => {
-    const base = row.remote.baseResolution;
-    return `${base.agentDefinitionId}\0${base.agentReleaseId}\0${base.packageHash}`;
-  }));
-  if (baseKeys.size !== 1) {
-    return { disabled: true, observableReason: "ambiguous-exact-base-release", resolution: "skipped" };
-  }
-  const base = matchingRows[0].remote.baseResolution;
-  const taskClassResolution = deriveCanonicalTaskClasses(options.prompt, {
-    declaredTaskClasses: requested.declaredTaskClasses ?? options.declaredTaskClasses ?? options.declaredTaskClass,
-  });
-  if (taskClassResolution.invalidDeclaredCount) {
-    return { disabled: true, observableReason: "invalid-declared-task-class", resolution: "skipped" };
-  }
-  if (!taskClassResolution.taskIds.length) {
-    return { disabled: true, observableReason: "canonical-task-class-unresolved", resolution: "skipped" };
-  }
-  const environment = new Set(environmentTags);
-  const classifiedTasks = new Set(taskClassResolution.taskIds);
-  const taskSignatures = new Set();
-  let sawPromotedItem = false;
-  let sawCanonicalSignature = false;
-  let sawMatchingCanonicalTask = false;
-  let sawLegacyEnvironmentForMatch = false;
-  let sawCanonicalEnvironmentMismatch = false;
-  for (const row of matchingRows) {
-    let bundle;
-    try { bundle = readStoredBundle(options.userDataDir, row.bundleId).bundle; }
-    catch { continue; }
-    for (const item of bundle.items) {
-      if (item.status !== "promoted") continue;
-      sawPromotedItem = true;
-      const canonicalSignatures = item.taskSignatures.filter(isCanonicalTaskId);
-      if (canonicalSignatures.length) sawCanonicalSignature = true;
-      const matchedSignatures = canonicalSignatures.filter((signature) => classifiedTasks.has(signature));
-      if (!matchedSignatures.length) continue;
-      sawMatchingCanonicalTask = true;
-      if (!item.environmentConstraints.every(isCanonicalEnvironmentTag)) {
-        sawLegacyEnvironmentForMatch = true;
-        continue;
-      }
-      if (!item.environmentConstraints.every((constraint) => environment.has(constraint))) {
-        sawCanonicalEnvironmentMismatch = true;
-        continue;
-      }
-      for (const signature of matchedSignatures) taskSignatures.add(signature);
-    }
-  }
-  if (!taskSignatures.size) {
-    const observableReason = sawPromotedItem && !sawCanonicalSignature
-      ? "legacy-task-signature-not-auto-activatable"
-      : sawMatchingCanonicalTask && sawLegacyEnvironmentForMatch
-        ? "legacy-environment-constraint-not-auto-activatable"
-        : sawMatchingCanonicalTask && sawCanonicalEnvironmentMismatch
-          ? "canonical-environment-constraint-mismatch"
-          : "canonical-task-signature-unavailable";
-    return {
-      disabled: true,
-      observableReason,
-      resolution: "skipped",
-      taskClassResolution,
-    };
-  }
-  return {
-    disabled: false,
-    baseAgentReleaseId: base.agentReleaseId,
-    agentDefinitionId: base.agentDefinitionId,
-    experiencePackReleaseIds: attachedPackReleases,
-    taskSignatures: [...taskSignatures].sort(compareCodePoints),
-    environmentTags,
-    resolution: "automatic-exact",
-    taskClassResolution,
-  };
+  return { disabled: true, observableReason: "experience_chips_retired", resolution: "retired" };
 }
 
 function estimateTokens(text) {
@@ -1927,56 +1687,7 @@ function estimateTokens(text) {
 }
 
 function buildLocalExperienceAdvisory(options = {}) {
-  const empty = { text: "", itemIds: [], estimatedTokens: 0, authority: "local-advisory", serverRentalResolutionReceiptPresent: false };
-  if (!options.userDataDir || !options.cwd || !ID_RE.test(String(options.baseAgentReleaseId || ""))) return empty;
-  const experiencePackReleaseIds = new Set(
-    (options.experiencePackReleaseIds || []).map(String).filter((value) => ID_RE.test(value)),
-  );
-  if (experiencePackReleaseIds.size !== 1) return empty;
-  const taskSignatures = new Set((options.taskSignatures || []).map(String).filter(isCanonicalTaskId));
-  if (!taskSignatures.size) return empty;
-  const resolvedEnvironmentTags = (options.environmentTags || defaultEnvironmentTags(options)).map(String).filter(isCanonicalEnvironmentTag);
-  if (resolvedEnvironmentTags.some((tag) => tag.endsWith("/unknown"))) return empty;
-  const environmentTags = new Set(resolvedEnvironmentTags);
-  const state = loadExchangeState(options.userDataDir);
-  const projectHash = projectScopeHash(options.cwd);
-  const candidates = [];
-  for (const row of state.bundles) {
-    if (
-      !experiencePackReleaseIds.has(row.experiencePackReleaseId) ||
-      row.projectScopeHash !== projectHash ||
-      !row.compatibleBaseReleaseIds.includes(options.baseAgentReleaseId)
-    ) continue;
-    if (options.agentDefinitionId && row.agentDefinitionId !== options.agentDefinitionId) continue;
-    let validation;
-    try { validation = readStoredBundle(options.userDataDir, row.bundleId); } catch { continue; }
-    for (const item of validation.bundle.items) {
-      if (item.status !== "promoted") continue;
-      if (!item.taskSignatures.some((signature) => taskSignatures.has(signature))) continue;
-      if (!item.environmentConstraints.every(isCanonicalEnvironmentTag)) continue;
-      if (!item.environmentConstraints.every((constraint) => environmentTags.has(constraint))) continue;
-      candidates.push(item);
-    }
-  }
-  candidates.sort((a, b) => Number(b.confidence) - Number(a.confidence) || compareCodePoints(a.experienceItemId, b.experienceItemId));
-  const header = "[AGENTLAS_LOCAL_EXPERIENCE_ADVISORY v1] NO SERVER RENTAL-RESOLUTION RECEIPT. Local user-attested procedures only; not evaluator-verified and not reputation evidence.";
-  const reservedTokens = Number.isInteger(options.reservedTokens)
-    ? Math.max(0, Math.min(EXPERIENCE_RETRIEVAL_MAX_TOKENS, options.reservedTokens))
-    : 0;
-  const dynamicTokenBudget = Math.max(0, EXPERIENCE_RETRIEVAL_MAX_TOKENS - reservedTokens);
-  if (estimateTokens(header) > dynamicTokenBudget) return empty;
-  let text = header;
-  const itemIds = [];
-  for (const item of candidates) {
-    if (itemIds.length >= EXPERIENCE_RETRIEVAL_MAX_ITEMS || itemIds.includes(item.experienceItemId)) continue;
-    const line = `\n- [${item.experienceItemId}] ${item.summary}\n  Steps: ${item.instructions.join(" | ")}`;
-    const next = `${text}${line}`;
-    if (estimateTokens(next) > dynamicTokenBudget) continue;
-    text = next;
-    itemIds.push(item.experienceItemId);
-  }
-  if (!itemIds.length) return empty;
-  return { text, itemIds, estimatedTokens: estimateTokens(text), authority: "local-advisory", serverRentalResolutionReceiptPresent: false };
+  return { text: "", itemIds: [], estimatedTokens: 0, authority: "retired", serverRentalResolutionReceiptPresent: false };
 }
 
 function augmentRuntimeSystemWithLocalExperience(systemPrompt, options = {}) {
@@ -2050,153 +1761,7 @@ function baseDescriptorFromFlags(flags) {
 }
 
 async function cmdExperienceExchange(options = {}) {
-  const args = options.args || [];
-  const sub = args[0] || "list";
-  const emit = options.out || console.log;
-  if (!options.userDataDir) throw new Error("Terminal userData path is required");
-
-  if (sub === "help" || sub === "--help" || sub === "-h") {
-    const help = [
-      "agentlas experience list",
-      "agentlas experience inspect <exact-release-id|bundle-id|upload-id>",
-      "agentlas experience validate <bundle.agentlas-experience.json>",
-      "agentlas experience save <bundle> --base-cloud-id <id>|--base-slug <slug> --base-package-hash sha256:<hash>",
-      "agentlas experience publish <bundle> --visibility unlisted|public --base-cloud-id <id>|--base-slug <slug> --base-package-hash sha256:<hash>",
-      "agentlas experience status <bundle-id|upload-id>",
-      "agentlas experience unpublish <exact-release-id|bundle-id|upload-id> [--dry-run]",
-      "agentlas experience withdraw <bundle-id|upload-id>",
-      "agentlas experience export <bundle-id|upload-id> [--out file] [--overwrite]",
-      "Options: --dry-run (zero network/write), --idempotency-key <safe-key>, save --local-only",
-      "Legacy pack-only local intents: legacy-list|legacy-inspect|legacy-publish|legacy-unpublish",
-      "publish requests verification only; Terminal never claims evaluator verification or public activation.",
-    ].join("\n");
-    emit(help);
-    return { help: true };
-  }
-
-  if (["legacy-list", "legacy-inspect", "legacy-publish", "legacy-unpublish"].includes(sub)) {
-    if (typeof options.legacyCommand !== "function") throw new Error("legacy local-intent Experience handler is unavailable");
-    const mapped = sub.slice("legacy-".length);
-    return options.legacyCommand({ ...options, args: [mapped, ...args.slice(1)] });
-  }
-  const canonicalSub = sub === "ls" ? "list"
-    : sub === "show" ? "inspect"
-      : sub === "withdraw" ? "unpublish"
-        : sub;
-  const schema = EXPERIENCE_COMMAND_FLAG_SCHEMA[canonicalSub];
-  if (!schema) {
-    throw new Error("unknown experience subcommand (list|inspect|validate|save|publish|status|export|unpublish|withdraw; legacy: legacy-list|legacy-inspect|legacy-publish|legacy-unpublish)");
-  }
-  const flags = parseFlags(args.slice(1), schema);
-  if (sub === "list" || sub === "ls") {
-    if (flags._.length) throw new Error("usage: agentlas experience list [--json]");
-    const bundles = listStoredExperienceBundles(options.userDataDir, options.cwd);
-    const result = {
-      schemaVersion: "agentlas.terminal-experience-local-list.v1",
-      currentProjectOnly: true,
-      networkUsed: false,
-      bundles,
-    };
-    const lines = bundles.length
-      ? ["LOCAL PORTABLE EXPERIENCE BUNDLES · current project only · no network", ...bundles.map((bundle) =>
-          `- ${bundle.experiencePackId}@${bundle.experiencePackReleaseId} · ${bundle.itemCount} item(s) · ${bundle.reviewState} · Hub: ${bundle.remote ? `${bundle.remote.status} (${bundle.remote.uploadId})` : "not submitted"}`)]
-      : ["No Portable Experience Bundles are stored for this project.", "Hub was not contacted."];
-    emit(flags.json ? JSON.stringify(result, null, 2) : lines.join("\n"));
-    return result;
-  }
-  if (sub === "inspect" || sub === "show") {
-    const ref = flags._[0];
-    if (!ref || flags._.length !== 1) throw new Error("usage: agentlas experience inspect <exact-release-id|bundle-id|upload-id>");
-    const bundle = inspectStoredExperienceBundle(options.userDataDir, ref, options.cwd);
-    const result = { ...bundle, networkUsed: false };
-    emit(flags.json ? JSON.stringify(result, null, 2) : [
-      `${bundle.experiencePackId}@${bundle.experiencePackReleaseId}`,
-      `bundle: ${bundle.bundleId} · ${bundle.itemCount} item(s) · local integrity: verified`,
-      `review state: ${bundle.reviewState} · candidates ${bundle.itemStatusCounts.candidate} · promoted ${bundle.itemStatusCounts.promoted}`,
-      `compatible base releases: ${bundle.compatibleBaseReleaseIds.join(", ")}`,
-      bundle.remote
-        ? `Hub receipt: ${bundle.remote.status} · ${bundle.remote.uploadId} · exact revision ${bundle.remote.revision}`
-        : "Hub receipt: none · not submitted",
-      "Owner/account, local path, raw content, prompt, transcript, and credentials are intentionally omitted.",
-      "Public activation/evaluator authority: not claimed.",
-    ].join("\n"));
-    return result;
-  }
-  if (sub === "validate") {
-    if (flags._.length !== 1) throw new Error("usage: agentlas experience validate <bundle.agentlas-experience.json> [--json]");
-    const validation = readBundleFile(flags._[0], options.cwd);
-    const result = { valid: true, bundleId: validation.bundle.bundleId, bundleHash: validation.bundle.bundleHash, packContentHash: validation.bundle.pack.contentHash, items: validation.bundle.items.length, canonicalBytes: validation.canonicalBytes, networkUsed: false, authority: "local-validation" };
-    emit(flags.json ? JSON.stringify(result, null, 2) : renderValidation(validation));
-    return result;
-  }
-  if (sub === "save") {
-    if (flags._.length !== 1) throw new Error("usage: agentlas experience save <bundle> [options]");
-    const validation = readBundleFile(flags._[0], options.cwd);
-    if (flags["local-only"] === true) {
-      if (flags["dry-run"] === true) {
-        const result = { dryRun: true, saved: false, networkUsed: false, bundleId: validation.bundle.bundleId };
-        emit(flags.json ? JSON.stringify(result, null, 2) : `DRY RUN · ${validation.bundle.bundleId} validated · no file saved · network used: no`);
-        return result;
-      }
-      const row = saveLocalBundle(options.userDataDir, validation, { cwd: options.cwd });
-      const result = { saved: true, localOnly: true, networkUsed: false, bundleId: row.bundleId, projectScopeHash: row.projectScopeHash, serverReceiptPresent: false };
-      emit(flags.json ? JSON.stringify(result, null, 2) : `Local 0600 Experience bundle saved: ${row.bundleId}\nHub: not contacted · server receipt: none · public activation: none`);
-      return result;
-    }
-    const result = await publishBundle(validation, {
-      ...options,
-      operation: "save",
-      dryRun: flags["dry-run"] === true,
-      idempotencyKey: flags["idempotency-key"] || null,
-      baseDescriptor: baseDescriptorFromFlags(flags),
-    });
-    emit(flags.json ? JSON.stringify(publicCommandExchangeResult(result), null, 2) : renderPublish(result));
-    return result;
-  }
-  if (sub === "publish") {
-    if (flags._.length !== 1) throw new Error("usage: agentlas experience publish <bundle> [options]");
-    const source = flags._[0];
-    const validation = resolveBundleInput(options.userDataDir, source, options.cwd);
-    const result = await publishBundle(validation, {
-      ...options,
-      operation: "publish",
-      requestedVisibility: flags.visibility || validation.bundle.requestedVisibility,
-      dryRun: flags["dry-run"] === true,
-      idempotencyKey: flags["idempotency-key"] || null,
-      baseDescriptor: baseDescriptorFromFlags(flags),
-    });
-    emit(flags.json ? JSON.stringify(publicCommandExchangeResult(result), null, 2) : renderPublish(result));
-    return result;
-  }
-  if (sub === "status") {
-    if (flags._.length !== 1) throw new Error("usage: agentlas experience status <bundle-id|upload-id> [--json]");
-    const result = await fetchUploadStatus(flags._[0], options);
-    emit(flags.json ? JSON.stringify(publicCommandExchangeResult(result), null, 2) : `Server-authoritative status: ${result.receipt.status} · ${result.receipt.uploadId}\nrequested visibility: ${result.receipt.requestedVisibility} · Terminal did not assert public activation/evaluator reputation`);
-    return result;
-  }
-  if (sub === "export") {
-    if (flags._.length !== 1) throw new Error("usage: agentlas experience export <bundle-id|upload-id> [--out file] [--overwrite] [--json]");
-    const result = await fetchUploadExport(flags._[0], {
-      ...options,
-      outputPath: typeof flags.out === "string" ? flags.out : null,
-      overwrite: flags.overwrite === true,
-    });
-    // Intentionally omit owner/account fields and bundle content from stdout.
-    emit(flags.json ? JSON.stringify(result, null, 2) : `Experience exported: ${result.outputPath}\nbundle hash: ${result.bundleHash}`);
-    return result;
-  }
-  if (sub === "withdraw" || sub === "unpublish") {
-    if (!flags._[0] || flags._.length !== 1) throw new Error("usage: agentlas experience unpublish <exact-release-id|bundle-id|upload-id> [--dry-run]");
-    if (flags["dry-run"] === true) {
-      const result = previewWithdrawUpload(flags._[0], options);
-      emit(flags.json ? JSON.stringify(result, null, 2) : `DRY RUN · exact upload ${result.uploadId} at ${result.ifMatchRevision}\nnetwork/write used: no · server state unchanged · no new receipt`);
-      return result;
-    }
-    const result = await withdrawUpload(flags._[0], options);
-    emit(flags.json ? JSON.stringify(publicCommandExchangeResult(result), null, 2) : `Server-authoritative unpublication: ${result.receipt.uploadId} · withdrawn\nExisting receipts/history remain; no public activation claim.`);
-    return result;
-  }
-  throw new Error("unknown experience subcommand (list|inspect|validate|save|publish|status|export|unpublish|withdraw; legacy: legacy-list|legacy-inspect|legacy-publish|legacy-unpublish)");
+  throw new Error("experience_chips_retired: legacy evidence is read-only; use agentlas evolve.");
 }
 
 module.exports = {

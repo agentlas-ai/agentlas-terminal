@@ -52,7 +52,7 @@ function reportTeam(ctx, result, ko) {
     : "Now run here directly: agentlas run \"<task>\"  or just type a sentence in the REPL."));
 }
 
-function run(ctx, args) {
+async function run(ctx, args) {
   const action = String(args[0] || "status").toLowerCase();
   const cwd = projectCwd();
   const ko = ctx.lang === "ko";
@@ -93,7 +93,7 @@ function run(ctx, args) {
     const tokens = args.slice(1);
     if (!tokens.length || tokens.some((token) => !token || String(token).startsWith("-")) || (action === "use" && tokens.length !== 1)) return invalid();
     try {
-      const result = connectProjectTeam(ctx.db(), cwd, tokens, {});
+      const result = await connectProjectTeam(ctx.db(), cwd, tokens, {});
       reportTeam(ctx, result, ko);
       return 0;
     } catch (e) {

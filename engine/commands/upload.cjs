@@ -1,8 +1,9 @@
 "use strict";
 /*
- * upload — `agentlas upload <path> [--visibility marketplace]`.
+ * upload — `agentlas upload <path> [--visibility hub-public]`.
  * 기본은 owner-private `cloud save`다. 공개 Hub 발행은 오직 명시적
- * `--visibility marketplace` 로만 일어난다 (조용한 공개 승격 금지).
+ * `--visibility hub-public` 로만 일어난다 (조용한 공개 승격 금지).
+ * 옛 `marketplace` 값은 설치된 스크립트 호환용으로만 수용한다.
  */
 const { runUpload } = require("../cloud-assets/commands.cjs");
 const {

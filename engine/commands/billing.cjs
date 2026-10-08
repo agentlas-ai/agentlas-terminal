@@ -1,13 +1,10 @@
 "use strict";
 /*
- * billing — 크레딧 잔액 조회: agentlas billing
+ * billing — active usage and historical earnings: agentlas billing
  *
- * 데스크탑 electron/billing.ts 와 같은 엔드포인트를 읽는다:
- *   GET {web}/api/billing/credits — 두 계좌 정책:
- *   · 구독 계좌(A): remainingCredits — 월 초기화 + 톱업 + 전송받은 렌트수익. 사용 가능.
- *   · 렌트수익 계좌(B): earningsCredits — 내 업로드를 남이 빌려 쓸 때만 쌓임.
- *   · 전송은 B → A 한 방향뿐이며 터미널에는 전송 명령이 없다(데스크탑 전용) —
- *     조용히 숨기지 않고 help/출력에 명시한다.
+ * GET /api/billing/credits is the active hosted usage balance. Historical
+ * creator earnings must be read from GET /api/billing/earnings, never inferred
+ * from the spendable balance. New settlement and ledger transfers are closed.
  *
  * 인증: cloud/hub-client.cjs 의 세션 쿠키. 미로그인/세션 만료는 정직 exit 1 —
  * 빈 잔액(0)으로 위장 출력하지 않는다(조용한 기본값 안티패턴 금지).
@@ -23,14 +20,14 @@ function usage(ko) {
   return [
     ko ? "사용법: agentlas billing" : "Usage: agentlas billing",
     ko
-      ? "  구독 계좌(A)와 렌트수익 계좌(B) 잔액을 표시합니다."
-      : "  Shows the subscription account (A) and rental-earnings account (B) balances.",
+      ? "  현재 월 제공량을 표시합니다."
+      : "  Shows the current monthly allowance.",
     ko
-      ? "  크레딧은 Hub 에이전트 호출에 작업당 쓰입니다(기본 공개 에이전트 3·팀 10, 크리에이터 가격이 있으면 그 가격). 활성 장기대여 중에는 0."
-      : "  Credits pay per work order for Hub agent calls (base: public agent 3 · team 10; creator-priced agents charge their price). 0 while a day-lease is active.",
+      ? "  과거 구매 잔액이 있으면 표시합니다."
+      : "  Shows any remaining past purchases.",
     ko
-      ? "  참고: 렌트수익(B) → 구독(A) 전송은 Agentlas Desktop 에서만 가능합니다 (터미널 전송 명령 없음)."
-      : "  Note: earnings (B) → subscription (A) transfer is Desktop-only (no transfer command in the terminal).",
+      ? "  과거 창작자 수익을 별도로 표시합니다."
+      : "  Shows historical creator earnings separately.",
   ].join("\n");
 }
 
@@ -90,14 +87,45 @@ async function run(ctx, args) {
   const a = ctx.ui.accent;
   const dim = ctx.ui.dim;
   if (balance.plan) ctx.out(`${ko ? "플랜" : "Plan"}: ${balance.plan}`);
-  ctx.out(`${a(ko ? "구독 계좌 (A)" : "Subscription account (A)")}: ${fmtCredits(balance.remainingCredits)} ${ko ? "크레딧" : "credits"}`);
-  if (balance.limitCredits != null || balance.usedCredits != null) {
-    ctx.out(dim(`  ${ko ? "사용" : "used"}: ${fmtCredits(balance.usedCredits)} / ${ko ? "한도" : "limit"}: ${fmtCredits(balance.limitCredits != null ? balance.limitCredits : balance.planCreditLimit)}${balance.topUpCredits ? `  (+${ko ? "톱업" : "top-up"} ${fmtCredits(balance.topUpCredits)})` : ""}`));
+  if (balance.monthlyRemainingCredits != null && balance.planCreditLimit != null) {
+    ctx.out(`${a(ko ? "월 제공량" : "Monthly allowance")}: ${fmtCredits(balance.monthlyRemainingCredits)} / ${fmtCredits(balance.planCreditLimit)} ${ko ? "크레딧" : "credits"}`);
+    if (Number(balance.additionalUsageCredits) > 0) {
+      ctx.out(`${a(ko ? "과거 구매 잔액" : "Legacy purchased usage")}: ${fmtCredits(balance.additionalUsageCredits)} ${ko ? "크레딧" : "credits"}`);
+    }
+    ctx.out(dim(`${ko ? "사용 가능" : "Available"}: ${fmtCredits(balance.remainingCredits)} ${ko ? "크레딧" : "credits"}`));
+  } else {
+    // Older server responses expose only the combined balance.
+    ctx.out(`${a(ko ? "사용 가능" : "Available")}: ${fmtCredits(balance.remainingCredits)} ${ko ? "크레딧" : "credits"}`);
   }
-  ctx.out(`${a(ko ? "렌트수익 계좌 (B)" : "Rental earnings account (B)")}: ${fmtCredits(balance.earningsCredits)} ${ko ? "크레딧" : "credits"}`);
-  ctx.out(dim(ko
-    ? "B → A 전송은 Agentlas Desktop 에서만 가능합니다 (터미널 전송 명령 없음)."
-    : "B → A transfer is Desktop-only (no transfer command in the terminal)."));
+
+  // Historical earnings are read-only and do not contribute to "Available".
+  let earningsResponse;
+  try {
+    earningsResponse = await fetchHub(`${webBaseUrl()}/api/billing/earnings`, { headers: { cookie } });
+  } catch (error) {
+    ctx.err((ko ? "과거 수익 조회 실패: " : "Failed to fetch historical earnings: ") + ((error && error.message) || error));
+    return 1;
+  }
+  if (earningsResponse.status === 401) {
+    ctx.err(ko ? "세션이 만료되었습니다. `agentlas login` 으로 다시 로그인하세요." : "Session expired. Sign in again with `agentlas login`.");
+    return 1;
+  }
+  if (!earningsResponse.ok) {
+    ctx.err((ko ? "과거 수익 조회 실패: " : "Failed to fetch historical earnings: ") + `HTTP ${earningsResponse.status}`);
+    return 1;
+  }
+  let earnings;
+  try {
+    earnings = parseHubJson(earningsResponse, "billing/earnings");
+  } catch (error) {
+    ctx.err(String((error && error.message) || error));
+    return 1;
+  }
+  if (!earnings || earnings.authenticated === false || earnings.earningsCredits == null || !Number.isFinite(Number(earnings.earningsCredits))) {
+    ctx.err(ko ? "과거 수익 응답을 확인할 수 없습니다." : "Historical earnings response is unavailable.");
+    return 1;
+  }
+  ctx.out(`${a(ko ? "과거 창작자 수익" : "Historical creator earnings")}: ${fmtCredits(earnings.earningsCredits)} ${ko ? "크레딧" : "credits"}`);
   return 0;
 }
 

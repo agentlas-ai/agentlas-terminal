@@ -315,109 +315,15 @@ function findIntent(state, ref) {
 }
 
 function publishExperienceIntent(userDataDir, sourcePath, cwd) {
-  if (!sourcePath) throw new Error("usage: agentlas experience publish <experience-pack.json>");
-  const source = path.resolve(cwd || process.cwd(), sourcePath);
-  const { absolute, value } = readJsonFile(source, "experience pack");
-  const pack = validateExperiencePack(value);
-  const now = new Date().toISOString();
-  const intentId = `experience-intent:${crypto.createHash("sha256").update(`${pack.releaseId}\0${pack.contentHash}`).digest("hex").slice(0, 32)}`;
-  const intent = {
-    schemaVersion: EXPERIENCE_INTENT_SCHEMA,
-    intentId,
-    experiencePackId: pack.experiencePackId,
-    releaseId: pack.releaseId,
-    ownerRef: pack.ownerRef,
-    version: pack.version,
-    contentHash: pack.contentHash,
-    compatibleBaseReleaseIds: [...pack.baseCompatibility.compatibleBaseReleaseIds],
-    mcpRequirementIds: pack.mcpRequirements.map((requirement) => requirement.requirementId),
-    sourcePath: absolute,
-    desiredAction: "publish",
-    localState: "publish-requested",
-    hubReceipt: null,
-    contractValidatedAt: now,
-    contentVerified: false,
-    updatedAt: now,
-  };
-  withExperienceStateLock(userDataDir, () => {
-    const state = loadExperienceState(userDataDir);
-    const existing = state.intents.findIndex((row) => row.intentId === intentId);
-    if (existing >= 0) state.intents[existing] = intent;
-    else state.intents.push(intent);
-    saveExperienceState(userDataDir, state);
-  });
-  return publicExperienceIntent(intent);
+  throw new Error("experience_chips_retired: legacy evidence is read-only; use agentlas evolve.");
 }
 
 function unpublishExperienceIntent(userDataDir, ref) {
-  if (!ref) throw new Error("usage: agentlas experience unpublish <pack-id|release-id|intent-id>");
-  let intent;
-  withExperienceStateLock(userDataDir, () => {
-    const state = loadExperienceState(userDataDir);
-    intent = findIntent(state, ref);
-    if (!intent) throw new Error(`local Experience Pack intent not found: ${ref}`);
-    intent.desiredAction = "unpublish";
-    intent.localState = "unpublish-requested";
-    intent.hubReceipt = null;
-    intent.updatedAt = new Date().toISOString();
-    saveExperienceState(userDataDir, state);
-  });
-  return publicExperienceIntent(intent);
+  throw new Error("experience_chips_retired: legacy evidence is read-only; use agentlas evolve.");
 }
 
-/**
- * cmdExperience — 레거시 pack-only 로컬 의도 표면.
- * v2에서는 `agentlas experience legacy-*` 로만 도달한다(모던 명령은
- * agentlas-experience-exchange.cjs의 cmdExperienceExchange가 처리).
- */
 function cmdExperience(options) {
-  const args = options.args || [];
-  const sub = args[0] || "list";
-  const flags = parseSimpleFlags(args.slice(1));
-  const emit = options.out || console.log;
-  const userData = options.userDataDir;
-  if (!userData) throw new Error("Terminal userData path is required");
-  if (sub === "list" || sub === "ls") {
-    if (flags._.length) throw new Error("usage: agentlas experience legacy-list [--json]");
-    const list = loadExperienceState(userData).intents.map(publicExperienceIntent);
-    emit(flags.json ? JSON.stringify({ localOnly: true, hubPublicationAttempted: false, intents: list }, null, 2) : renderExperienceList(list));
-    return list;
-  }
-  if (sub === "inspect" || sub === "show") {
-    const ref = flags._[0];
-    if (!ref || flags._.length !== 1) throw new Error("usage: agentlas experience legacy-inspect <pack-id|release-id|intent-id> [--json]");
-    const intent = findIntent(loadExperienceState(userData), ref);
-    if (!intent) throw new Error(`local Experience Pack intent not found: ${ref}`);
-    const projected = publicExperienceIntent(intent);
-    emit(flags.json ? JSON.stringify(projected, null, 2) : [
-      `${projected.experiencePackId}@${projected.version}`,
-      `release: ${projected.releaseId}`,
-      `local intent: ${projected.desiredAction} (${projected.localState})`,
-      "Hub publication: not submitted · server receipt: none",
-      "base package: referenced only (not copied)",
-    ].join("\n"));
-    return projected;
-  }
-  if (sub === "publish") {
-    if (flags._.length !== 1) throw new Error("usage: agentlas experience legacy-publish <experience-pack.json> [--json]");
-    const intent = publishExperienceIntent(userData, flags._[0], options.cwd);
-    emit(flags.json ? JSON.stringify(intent, null, 2) : [
-      `Local publish intent saved: ${intent.experiencePackId}@${intent.version}`,
-      "Hub publication: NOT performed · server receipt: none",
-      "Use the Hub API/UI later; this command does not claim remote publication.",
-    ].join("\n"));
-    return intent;
-  }
-  if (sub === "unpublish") {
-    if (flags._.length !== 1) throw new Error("usage: agentlas experience legacy-unpublish <pack-id|release-id|intent-id> [--json]");
-    const intent = unpublishExperienceIntent(userData, flags._[0]);
-    emit(flags.json ? JSON.stringify(intent, null, 2) : [
-      `Local unpublish intent saved: ${intent.experiencePackId}@${intent.version}`,
-      "Hub state: unchanged · no server request or receipt was created.",
-    ].join("\n"));
-    return intent;
-  }
-  throw new Error(`unknown experience subcommand: ${sub} (list|inspect|publish|unpublish)`);
+  throw new Error("experience_chips_retired: legacy evidence is read-only; use agentlas evolve.");
 }
 
 module.exports = {

@@ -24,6 +24,16 @@ const fs = require("node:fs");
 const { runWriteTransaction } = require("../agentlas-sqlite-policy.cjs");
 const { findAgent } = require("../agents/registry.cjs");
 const { userDataDir } = require("../core/paths.cjs");
+const { parseAgentPool } = require("./controller.cjs");
+const { freshProjectAgentLimit, assertFreshProjectAgentLimit } = require("./entitlements.cjs");
+
+const PROJECT_AGENT_POOL_MAX = 32;
+
+function projectPoolAddsMembers(previousJson, next) {
+  const before = new Set(parseAgentPool(previousJson).map((member) =>
+    `${member.source}:${member.entityKind}:${member.targetId}:${member.releaseId || ""}`));
+  return next.some((member) => !before.has(`local:agent:${member.agentId}:`));
+}
 
 function canonical(p) {
   const resolved = path.resolve(String(p || ""));
@@ -79,7 +89,7 @@ function resolveTeam(db, tokens) {
  *   opts.name / opts.systemPrompt (선택)
  * → { id, name, folderPath, team: [{agentId, nameSnapshot}], created }
  */
-function connectProjectTeam(db, folder, tokens, opts = {}) {
+async function connectProjectTeam(db, folder, tokens, opts = {}) {
   if (!Array.isArray(tokens) || tokens.length === 0) {
     throw Object.assign(new Error("a project team needs at least one agent (the first is the controller)"), { code: "team_empty", honestStop: true });
   }
@@ -97,11 +107,27 @@ function connectProjectTeam(db, folder, tokens, opts = {}) {
   // agent_pool_json[0]다(default_agent_id는 데스크탑 호환용 보조 필드).
   const hasDefaultCol = columns.has("default_agent_id");
 
+  const findExisting = () => db.prepare(
+    "SELECT id, name, agent_pool_json FROM projects WHERE folder_path IS NOT NULL AND folder_path = ?",
+  ).get(root) || null;
+  const initial = findExisting();
+  // Existing teams can be reordered or reduced without a network connection.
+  // A newly introduced identity needs the server's current signed-in plan.
+  const initialAddsMembers = projectPoolAddsMembers(initial?.agent_pool_json || "[]", team);
+  if (initialAddsMembers && team.length > PROJECT_AGENT_POOL_MAX) {
+    throw Object.assign(new Error(`A project supports at most ${PROJECT_AGENT_POOL_MAX} agents and teams.`), { code: "project-agent-safety-limit", honestStop: true });
+  }
+  const grant = initialAddsMembers ? await freshProjectAgentLimit() : null;
+
   return runWriteTransaction(db, () => {
     // 같은 폴더의 기존 프로젝트를 찾는다(데스크탑이 만든 것 포함, 정확 경로만).
-    const existing = db.prepare(
-      "SELECT id, name FROM projects WHERE folder_path IS NOT NULL AND folder_path = ?",
-    ).get(root) || null;
+    const existing = findExisting();
+    if (projectPoolAddsMembers(existing?.agent_pool_json || "[]", team)) {
+      if (team.length > PROJECT_AGENT_POOL_MAX) {
+        throw Object.assign(new Error(`A project supports at most ${PROJECT_AGENT_POOL_MAX} agents and teams.`), { code: "project-agent-safety-limit", honestStop: true });
+      }
+      assertFreshProjectAgentLimit(grant, team.length);
+    }
     if (existing) {
       const sets = ["agent_pool_json=?", "updated_at=?"];
       const vals = [poolJson, now];

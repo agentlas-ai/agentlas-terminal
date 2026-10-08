@@ -54,6 +54,7 @@ function parseRunExperienceArgs(args) {
   for (let index = 0; index < args.length; index += 1) {
     const token = String(args[index]);
     if (passthrough) { prompt.push(token); continue; }
+    if (token.startsWith("--experience-")) throw new Error("experience_chips_retired: run an approved agent revision instead.");
     if (token === "--") { passthrough = true; continue; }
     const take = () => index + 1 < args.length ? String(args[++index]) : "";
     if (token === "--experience-base-release") experience.baseAgentReleaseId = take();

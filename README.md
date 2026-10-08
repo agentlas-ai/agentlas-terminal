@@ -17,11 +17,10 @@ Use this existing independent Terminal as the command-line runtime: inspect owne
 
 Agent Trust is our product principle: agent packages are treated as portable, owner-scoped, inspectable, and restorable assets. (It does not imply regulated financial or fiduciary services.) Agent Cloud stores package assets in your private cloud account, while Agentlas Terminal verifies and executes local runtime copies on your host machine.
 
-Current release: 1.0.67. It hardens local Cloud and credential storage against
-path races, keeps ACP notifications protocol-correct, aligns CLI machine output
-and typed errors, binds Workforce selections to exact ontology versions,
-rejects duplicate Experience requirements, and makes MCP consent and Hub
-installs race-safe.
+Current release: 1.0.71. It uses on-demand Desktop Core 19 for Desktop 1.2.82,
+bootstraps schema 128, and requires Node 22.13.0 or newer. Shared-store schema
+inspection is read-only; shared-store writes and the compiled Desktop Core
+require a compatible better-sqlite3 native driver.
 
 ---
 
@@ -29,7 +28,7 @@ installs race-safe.
 
 | Category | Requirement |
 | --- | --- |
-| **Node.js** | **Node 22+ recommended.** `package.json` specifies `engines: ">=20"`, but if native optional dependency `better-sqlite3` build fails, the launcher falls back strictly to `node:sqlite` in Node 22+. Node 20 works when `better-sqlite3` native build succeeds. |
+| **Node.js** | **Node 22.13.0 or newer is required.** A compatible `better-sqlite3` native module is required for shared-store writes and the compiled Desktop Core. `node:sqlite` supports launcher bootstrap and read-only schema inspection when that module is unavailable. |
 | **Agent CLI** | Requires at least one supported runtime CLI: `agy` (Antigravity, preferred), `claude`, `codex`, or legacy `gemini` in your `PATH`. Halts honestly with `no_runtime` if none are found (no fake model responses). |
 | **OS** | macOS is verified by the current local release gate. Linux is covered by the public adapter/CI contract. A Windows launcher is provided, but this release does not claim independent end-to-end Windows verification. |
 
@@ -89,14 +88,12 @@ agentlas plugin add <slug>       # Add Hub plugin (MCP server)
 agentlas plugin list             # List active plugins
 agentlas build "<prompt>"        # Build, repair, and package agents or multi-agent teams
 agentlas upload <path>           # Upload package to private Agent Cloud (default)
-agentlas upload <path> --visibility marketplace   # Explicitly publish to public Agentlas Hub
+agentlas upload <path> --visibility hub-public   # Explicitly publish to the free public Agentlas Hub
 agentlas connect <sub>           # Connect external platforms (e.g. Telegram)
 agentlas import <folder>         # Import local agent or firm directory
 agentlas native prepare <agent>  # Generate native CLI context files
 agentlas agents                  # List installed agents/firms and active runtimes (alias: list)
 agentlas uninstall <agent> [--yes] # Remove an installed agent (fails if chat history exists unless --yes)
-agentlas experience <sub>        # Manage agent experience (list|inspect|validate|save|publish|status|export|unpublish|withdraw)
-agentlas variant resolve --base-release <id> # Preview local variant compatibility
 agentlas roles [set <role> <runtime>] # Inspect or set the orchestrator/worker model roles
 ```
 
@@ -120,7 +117,12 @@ agentlas research <sub>          # Research loadout (status|gather|search|read|p
 ### KNOWLEDGE
 ```sh
 agentlas memory import <path> --agent <id> [--apply]
-agentlas evolve [list|apply <id>|revert <id>]
+agentlas evolve workspace <agent>
+agentlas evolve from-memory <agent> <memory-id> # Semantic review and real file proposal
+agentlas evolve prepare <agent> <changes.json>
+agentlas evolve diff <proposal>
+agentlas evolve apply <proposal> --reviewed-hash <hash> --receipt <owner-approval-receipt>
+agentlas evolve history <agent>
 agentlas ontology <sub>          # Manage project ontology (status|list|add)
 # Derived career-graph indexing is owned by the installed Hephaestus runtime;
 # use `agentlas ontology` for source registration.
@@ -138,7 +140,7 @@ Only in projects explicitly initialized with `agentlas project init` do single r
 agentlas login                    # Agentlas Cloud authentication (loopback browser flow)
 agentlas logout                   # Clear the saved CLI session
 agentlas whoami                   # Show the signed-in account
-agentlas billing                  # Check account credit balance
+agentlas billing                  # Check subscription usage and closed Hub-settlement history
 agentlas cloud <sub>              # Manage private Agent Cloud packages (save|publish|package|list|restore|delete|search|install|security scan|runtime bundle|field-test)
 agentlas automation <sub>         # Scheduled automations (list|add|on|off|remove|run <id>|runs|daemon)
 agentlas creds save --provider <n> --key <ENV> --value <v>
@@ -245,11 +247,11 @@ The launcher (`bin/agentlas.cjs`) runs system Node against `engine/`. The defaul
 | Windows | `%APPDATA%\Agentlas` |
 | Linux | `$XDG_CONFIG_HOME/Agentlas` (default `~/.config/Agentlas`) |
 
-The SQLite database file is `agentlas.sqlite` (`user_version=106`). When launched for the first time without an existing database, it bootstraps schemas using `engine/bootstrap-schema.sql`. Consequently, **projects, installed agents, task history, automation sessions, and MCP registrations are shared across Desktop and Terminal**. The first ordered project agent remains the controller; additional agents are task-scoped and are stored only as execution ledgers, never as global conversations or durable owners.
+The SQLite database file is `agentlas.sqlite` (`user_version=128`). When launched for the first time without an existing database, it bootstraps schemas using `engine/bootstrap-schema.sql`. Consequently, **projects, installed agents, task history, automation sessions, and MCP registrations are shared across Desktop and Terminal**. The first ordered project agent remains the controller; additional agents are task-scoped and are stored only as execution ledgers, never as global conversations or durable owners.
 
 **Single migration authority.** The Desktop app owns the schema migration ladder; the CLI never migrates the shared database. `engine/bootstrap-schema.sql` is generated by running that ladder to completion against an empty database, so a CLI-created store already sits at the ladder head and has nothing left for Desktop to upgrade. If the CLI opens a store older than the version it knows, it refuses with an actionable message instead of migrating or silently proceeding — a second migrator on this lock-free file is what corrupted the store once before. On a machine with no Desktop app, an operator can set `AGENTLAS_STORE_MIGRATION_ROLE=owner` for a single deliberate upgrade run with every other Agentlas process closed.
 
-SQLite driver priority: `better-sqlite3` (optional dependency native build), then Node 22+ `node:sqlite` when the first driver is unavailable.
+SQLite driver priority: compatible `better-sqlite3` for shared-store reads/writes and the compiled Desktop Core. Although npm declares it as an optional dependency, those features require it to install successfully for the Node version running the CLI. Node 22.13+ `node:sqlite` supports launcher bootstrap and read-only schema inspection; it does not replace the native driver for shared-store writes or the compiled Core.
 
 ### Hub Installation & Safety Policy
 
@@ -261,7 +263,8 @@ Local installation of Hub agents is gated by `assertHubInstallAllowed` (`engine/
 - **Web-only Agents**: Blocked on terminal surface.
 - **Withdrawn Catalog Items**: Fails with `Hub agent not found`.
 
-Package uploads (`upload`) default to private owner-scoped Agent Cloud storage; public Hub publishing requires explicit `--visibility marketplace`.
+Package uploads (`upload`) default to private owner-scoped Agent Cloud storage; public Hub publishing requires explicit `--visibility hub-public`. The old `marketplace` value remains an input alias for existing scripts.
+Public Hub publishing and agent calls are free. The caller supplies its own model and API access; `agentlas billing` concerns separate subscription usage.
 
 ## Desktop-Only Surface Scope
 
@@ -272,7 +275,7 @@ The following GUI-specific features are reserved for Agentlas Desktop and are no
 - Custom MCP server addition GUI (Terminal supports listing & `mcp probe`)
 - Site Studio, T-rex slide studio, Prompt Store GUI
 - Mobile pairing QR sheets & Quests
-- Provider quota dashboards & visual marketplace browsing
+- Provider quota dashboards & visual Agent Hub browsing
 
 ## Environment Variables
 
@@ -297,7 +300,7 @@ agentlas --where     # Outputs JSON diagnostic of launcher, engine, DB paths, dr
 
 - **`no_runtime: no agent CLI found`**: Connect Antigravity and put `agy` on `PATH` first, or install `claude`/`codex`; `gemini` remains available as a legacy CLI. Kimi, Grok, and Cursor use the shared ACP driver when their local CLIs are available.
 - **`runtime '<kind>' has no v2 streaming driver yet`**: Specified `--runtime` is not supported for active execution. Supported values: `claude-code`, `codex`, `agy` (Antigravity), `gemini` (legacy).
-- **`Node vX — Node 22+ (node:sqlite) is required when better-sqlite3 is unavailable`**: `better-sqlite3` native build failed on Node 20/21. Upgrade to Node 22+ or install build tools for native compilation.
+- **`Node vX — Node 22+ (node:sqlite) is required when better-sqlite3 is unavailable`**: `better-sqlite3` is unavailable on this Node version. Upgrade to Node 22.13+ for launcher bootstrap and read-only schema inspection. Shared-store writes and the compiled Desktop Core still require a compatible native driver; install Terminal with optional dependencies enabled under the same Node version, using build tools if no compatible prebuild is available.
 - **`storm`/`context`/`hep` halting due to missing runtime**: Agentlas OS core runtime is missing. Install Agentlas OS or set `HEPHAESTUS_BIN=<path>`.
 - **`'xxx' is not an agentlas command`**: Typo guard intercepted an unrecognized command. Use `agentlas run -p "xxx"` to run it as a prompt.
 

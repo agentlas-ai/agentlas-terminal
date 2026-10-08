@@ -45,7 +45,9 @@ function runtimeSessionFingerprint(runtime, agent, permission) {
     .update("\0agent\0")
     .update(String((agent && agent.id) || ""))
     .update("\0prompt\0")
-    .update(String((agent && agent.systemPrompt) || ""));
+    .update(String((agent && agent.systemPrompt) || ""))
+    .update("\0revision\0")
+    .update(String((agent && agent.revisionId) || ""));
   // ACP chooses its session mode at session/new. Unlike native Codex/Claude
   // flags, a later turn cannot safely retrofit that mode onto an old id.
   if (ACP_RUNTIME_KINDS.has(runtime && runtime.kind)) {
@@ -217,6 +219,48 @@ class Session extends EventEmitter {
   }
 
   async _runTurn(prompt) {
+    // External CLI adapters may lazily read skill/tool files. Until every read
+    // uses an immutable snapshot, a shared lease blocks activation for the
+    // entire invocation (including children). Never expire a crashed lease by
+    // wall clock: recovery must reconcile the owning process/run explicitly.
+    if (this.agent.builtin) return this._executeTurn(prompt);
+    let revisions;
+    const runId = `terminal-${this.chatId}-${crypto.randomUUID()}`;
+    this.status = "running";
+    let acquired = false;
+    let revisionReceipt = null;
+    try {
+      revisions = require("../agent-workspace.cjs").workspaceService();
+      const lease = await revisions.acquireAgentWorkspaceRunLease(this.agent.id, runId);
+      acquired = true;
+      const workspace = await revisions.getAgentWorkspace(this.agent.id);
+      if (workspace.treeDigest !== lease.treeDigest || !workspace.canonicalEntry) throw new Error("agent_revision_changed: refresh the agent before execution");
+      const entry = await revisions.readAgentWorkspaceFile(this.agent.id, workspace.canonicalEntry);
+      const expected = workspace.files.find((file) => file.path === workspace.canonicalEntry);
+      if (!expected || entry.binary || entry.blobHash !== expected.blobHash) throw new Error("agent_revision_changed: canonical instructions no longer match the pinned revision");
+      this.agent = { ...this.agent, systemPrompt: entry.content, revisionId: lease.revisionId };
+      this.fingerprint = runtimeSessionFingerprint(this.runtime, this.agent, this.permission);
+      this.runtimeSession = store.loadRuntimeSession(this.db, this.chatId, this.runtime.kind, this.fingerprint, this.agent.id);
+      if (this.status === "killed") return { text: "", error: "session killed" };
+      revisionReceipt = { agentId: this.agent.id, runId, revisionId: lease.revisionId, treeDigest: lease.treeDigest };
+      require("../agent-workspace.cjs").recordRevisionRun(this.db, { ...revisionReceipt, status: "started" });
+      this._record({ type: "agent-revision-pinned", runId, revisionId: lease.revisionId, treeDigest: lease.treeDigest, at: Date.now() });
+      return await this._executeTurn(prompt);
+    } catch (error) {
+      if (this.status !== "killed") this.status = "failed";
+      throw error;
+    } finally {
+      try {
+        if (revisionReceipt) require("../agent-workspace.cjs").recordRevisionRun(this.db, {
+          ...revisionReceipt, status: this.status === "killed" ? "killed" : this.status === "failed" ? "failed" : "succeeded",
+        });
+      } finally {
+        if (acquired) await revisions.releaseAgentWorkspaceRunLease(this.agent.id, runId);
+      }
+    }
+  }
+
+  async _executeTurn(prompt) {
     const runtimeSessionAtTurnStart = {
       kind: this.runtime.kind,
       id: this.runtimeSession && this.runtimeSession.id ? String(this.runtimeSession.id) : "",
@@ -471,7 +515,7 @@ class Session extends EventEmitter {
     // Experience intake is downstream of the governed episode receipt. It
     // records the successful exact-agent run even when the curator correctly
     // retains zero durable memories; promotion remains a separate policy.
-    if (governedResult && !(res && res.error) && this.status !== "killed") {
+    if (!this.agent.revisionId && governedResult && !(res && res.error) && this.status !== "killed") {
       try {
         const memoryContext = require("../project/memory-context.cjs");
         const installedAgent = this.db.prepare("SELECT * FROM installed_agents WHERE id=?").get(this.agent.id);

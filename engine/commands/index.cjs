@@ -50,10 +50,8 @@ const COMMANDS = {
   "hep-cloud": () => require("./hep-cloud.cjs"),
   "hep-hub": () => require("./hep-hub.cjs"),
   oberon: () => require("./oberon.cjs"),
-  experience: () => require("./experience.cjs"),
   memory: () => require("./memory.cjs"),
   evolve: () => require("./evolve.cjs"),
-  variant: () => require("./variant.cjs"),
   roles: () => require("./roles.cjs"),
   hep: () => require("./hep.cjs"),
   build: () => require("./build.cjs"),
@@ -95,12 +93,13 @@ const DESKTOP_ONLY_SURFACES = {
   slides: "T-rex slide studio is Desktop-only.",
   prompts: "Prompt Store is Desktop-only.",
   dashboard: "Dashboard: run `AGENTLAS_TUI=1 agentlas` then /dashboard — or: agentlas doctor · usage · list",
-  marketplace: "Hub view: run `AGENTLAS_TUI=1 agentlas` then /marketplace — or: agentlas search \"<what you need>\"",
+  hub: "Hub view: run `AGENTLAS_TUI=1 agentlas` then /hub — or: agentlas search \"<what you need>\"",
+  marketplace: "Hub view: run `AGENTLAS_TUI=1 agentlas` then /hub — or: agentlas search \"<what you need>\"",
   library: "Library: run `AGENTLAS_TUI=1 agentlas` then /library — or: agentlas list · env · mcp",
   settings: "Settings: run `AGENTLAS_TUI=1 agentlas` then /settings — change with: agentlas setup · env · creds · multimodal",
   apps: "Apps surface is Desktop-only.",
   quests: "Quests are Desktop-only.",
-  bookmarks: "Hub bookmarks: run `AGENTLAS_TUI=1 agentlas` then /marketplace.",
+  bookmarks: "Hub bookmarks: run `AGENTLAS_TUI=1 agentlas` then /hub.",
 };
 
 /*
@@ -151,6 +150,8 @@ const COMMAND_ALIASES = {
  * (아래 marketplace 사고 주석과 같은 계열). 착지 안내를 두고 arity 무관하게 잡는다.
  */
 const REMOVED_COMMANDS = {
+  experience: { en: "Experience chips are retired. Use agentlas evolve for reviewed file changes.", ko: "경험 칩은 종료됐습니다. agentlas evolve에서 파일 변경안을 검토하세요." },
+  variant: { en: "Experience variants are retired. Run an approved agent revision.", ko: "경험 변형은 종료됐습니다. 승인된 에이전트 버전을 실행하세요." },
   journal: {
     en: "`journal` was removed — it reported \"ok\" for runs that do not exist and read the wrong folder.\nExperts: agentlas hep stormbreaker journal --run-id <id> --journal <path>",
     ko: "`journal` 은 제거됐습니다 — 없는 실행에도 \"ok\" 를 답했고 다른 폴더를 봤습니다.\n전문가용: agentlas hep stormbreaker journal --run-id <id> --journal <path>",

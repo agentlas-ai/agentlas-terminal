@@ -1,15 +1,6 @@
 "use strict";
 
-/**
- * Successful-run -> private Operational Experience candidate bridge.
- *
- * Storage boundary:
- * - Run/evidence and value-free intake decisions use the existing shared
- *   `run_events` ledger.
- * - Candidates use the existing Portable Experience exchange store.
- * - Preferences never enter Operational Experience; they remain local Taste
- *   observations referencing curated Memory, with no copied preference text.
- */
+/** Historical RunReceipt compatibility. New chip generation is retired. */
 const crypto = require("node:crypto");
 const exchange = require("./agentlas-experience-exchange.cjs");
 
@@ -469,96 +460,9 @@ function candidateType(memoryKind) {
   return memoryKind === "risk" ? "warning" : "procedure";
 }
 
-function buildCandidateBundle(input) {
-  const summary = codePointSlice(input.memory.content, 320);
-  const scopeHash = exchange.projectScopeHash(input.cwd);
-  const packKey = digestHex(INTAKE_POLICY_VERSION, input.agentId, input.exactBase.agentDefinitionId, input.exactBase.agentReleaseId, scopeHash, ...input.environment.constraints);
-  const candidateKey = digestHex(packKey, input.memory.id, summary, ...input.taskSignatures);
-  const experiencePackId = `exp:${packKey.slice(0, 32)}`;
-  const releaseId = `experience-release:${candidateKey.slice(0, 32)}`;
-  const itemId = `experience-item:${candidateKey.slice(0, 32)}`;
-  const createdAt = input.receipt.createdAt;
-  const item = {
-    schemaVersion: "agentlas.experience-item.v1",
-    kind: "agentlas-experience-item",
-    experienceItemId: itemId,
-    experiencePackId,
-    experiencePackReleaseId: releaseId,
-    type: candidateType(input.memory.kind),
-    summary,
-    instructions: [summary],
-    taskSignatures: [...new Set(input.taskSignatures)].sort(),
-    environmentConstraints: [...input.environment.constraints],
-    evidenceReceiptIds: [input.receipt.receiptId],
-    supersedesItemIds: [],
-    confidence: input.memory.confidence === "high" ? 0.85 : input.memory.confidence === "low" ? 0.4 : 0.65,
-    status: "candidate",
-    privacyScope: "private",
-    createdAt,
-  };
-  const bundle = {
-    schemaVersion: exchange.BUNDLE_SCHEMA,
-    kind: "agentlas-experience-bundle",
-    bundleId: "exb_" + "0".repeat(48),
-    bundleHash: `sha256:${"0".repeat(64)}`,
-    requestedVisibility: "private",
-    pack: {
-      schemaVersion: "agentlas.experience-pack.v1",
-      kind: "agentlas-experience-pack",
-      experiencePackId,
-      releaseId,
-      ownerRef: "owner:local-terminal",
-      version: "0.0.1",
-      baseCompatibility: {
-        agentDefinitionId: input.exactBase.agentDefinitionId,
-        compatibleBaseReleaseIds: [input.exactBase.agentReleaseId],
-      },
-      itemIds: [itemId],
-      evidenceReceiptIds: [input.receipt.receiptId],
-      mcpRequirements: [],
-      containsBasePackageMaterial: false,
-      contentHash: `sha256:${"0".repeat(64)}`,
-      visibility: "private",
-      status: "draft",
-      createdAt,
-    },
-    items: [item],
-    sourceAttestations: [],
-    privacy: {
-      basePackageMaterialIncluded: false,
-      rawPromptIncluded: false,
-      rawTranscriptIncluded: false,
-      rawLocalPathsIncluded: false,
-      credentialValuesIncluded: false,
-    },
-  };
-  bundle.pack.contentHash = exchange.experiencePackContentHash(bundle);
-  bundle.bundleHash = exchange.experienceBundleHash(bundle);
-  bundle.bundleId = exchange.experienceBundleId(bundle);
-  return { validation: exchange.validateExperienceBundle(bundle), itemId };
-}
 
 function captureOperationalCandidate(input) {
-  const issues = exchange.portableExperienceSafetyIssues(input.memory.content);
-  const sensitivity = String(input.memory.sensitivity || "internal").trim().toLowerCase();
-  if (!["internal", "public"].includes(sensitivity)) issues.push("sensitive-memory");
-  if (input.memory.scope === "user_identity") issues.push("user-specific-memory-scope");
-  if (issues.length) return { status: "blocked", reasonCodes: [...new Set(issues)].sort() };
-  const tasks = exchange.deriveCanonicalTaskClasses(input.taskHint, {
-    declaredTaskClasses: input.taskSignatures,
-  }).taskIds;
-  if (!tasks.length) return { status: "skipped", reasonCodes: ["task-taxonomy-unavailable"] };
-  const { validation, itemId } = buildCandidateBundle({ ...input, taskSignatures: tasks });
-  const existing = existingCandidate(input.userDataDir, itemId);
-  if (existing) return {
-    status: "existing",
-    reasonCodes: ["idempotent-existing-candidate"],
-    candidateId: itemId,
-    bundleId: existing.row.bundleId,
-    row: existing.row,
-  };
-  const row = exchange.saveLocalBundle(input.userDataDir, validation, { cwd: input.cwd });
-  return { status: "candidate-created", reasonCodes: [], candidateId: itemId, bundleId: row.bundleId, row };
+  return { status: "retired", reasonCodes: ["experience_chips_retired"] };
 }
 
 function finalizeAgentExecution(input) {
@@ -597,60 +501,8 @@ function finalizeAgentExecution(input) {
   result.receipt = receipt;
   if (receipt.outcome.status !== "succeeded") return result;
 
-  const memories = Array.isArray(input.curatedMemories) ? input.curatedMemories : [];
-  for (const memory of memories) {
-    if (!memory?.id || !memory.kind) continue;
-    if (memory.kind === "preference") {
-      recordIntakeDecision(input.db, {
-        runId: receipt.runId,
-        ts: now,
-        kind: "taste-draft-observation",
-        agentId: input.agent.id,
-        memoryId: memory.id,
-        exactBase: input.exactBase,
-        environmentKey: environment.fingerprintHash,
-        status: "local-observation",
-        reasonCodes: ["preference-private-taste-only", "pairwise-evidence-required"],
-      });
-      result.tasteObservations += 1;
-      continue;
-    }
-    if (!OPERATIONAL_KINDS.has(memory.kind)) {
-      recordIntakeDecision(input.db, {
-        runId: receipt.runId, ts: now, agentId: input.agent.id, memoryId: memory.id,
-        exactBase: input.exactBase, environmentKey: environment.fingerprintHash,
-        status: "skipped", reasonCodes: ["non-operational-memory-kind"],
-      });
-      result.skipped += 1;
-      continue;
-    }
-    const captured = captureOperationalCandidate({
-      userDataDir: input.userDataDir,
-      cwd: input.cwd,
-      agentId: input.agent.id,
-      exactBase: input.exactBase,
-      environment,
-      memory,
-      receipt,
-      taskHint: input.taskHint,
-      taskSignatures: taskResolution.taskIds,
-    });
-    recordIntakeDecision(input.db, {
-      runId: receipt.runId,
-      ts: now,
-      agentId: input.agent.id,
-      memoryId: memory.id,
-      exactBase: input.exactBase,
-      environmentKey: environment.fingerprintHash,
-      status: captured.status,
-      reasonCodes: captured.reasonCodes,
-      candidateId: captured.candidateId,
-      bundleId: captured.bundleId,
-    });
-    if (captured.status === "blocked") result.blocked += 1;
-    else if (captured.status === "skipped") result.skipped += 1;
-    else result.candidates.push(captured);
-  }
+  // Governed memories remain in their owning store; no chip/pack is produced.
+
   return result;
 }
 

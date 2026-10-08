@@ -107,18 +107,7 @@ function assertNativeFolder(folder) {
 }
 
 function ensureNativeFiles(agent, folder) {
-  folder = assertNativeFolder(folder);
-  const sys = agentSystemPrompt(agent);
-  const created = [];
-  if (writeIfMissing(path.join(folder, "system-prompt.md"), sys)) created.push("system-prompt.md");
-  const name = String(agent.name || agent.slug || "Agentlas agent").replace(/[\u0000\r\n]/g, " ").slice(0, 500);
-  const tagline = String(agent.tagline || "").replace(/[\u0000\r]/g, " ").slice(0, 2_000);
-  const header = `# ${name}\n\n${tagline}\n\n${sys}\n`;
-  // 네이티브 CLI가 프로젝트 지시로 자동 인식하는 파일들
-  if (writeIfMissing(path.join(folder, "CLAUDE.md"), header)) created.push("CLAUDE.md");
-  if (writeIfMissing(path.join(folder, "AGENTS.md"), header)) created.push("AGENTS.md");
-  if (writeIfMissing(path.join(folder, "GEMINI.md"), header)) created.push("GEMINI.md");
-  return created;
+  throw Object.assign(new Error("agent_revision_approval_required: use agentlas native prepare to review an exact file proposal"), { code: "agent_revision_approval_required" });
 }
 
 module.exports = {

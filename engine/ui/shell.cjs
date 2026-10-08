@@ -196,7 +196,7 @@ class ShellUi extends Ui {
 const SHELL_SCREENS = [
   { name: "dashboard", ko: "관제 대시보드 — 확인 필요·실행 활동·자동화", en: "Dashboard — attention, run activity, automations" },
   { name: "library", ko: "라이브러리 — 에이전트·MCP", en: "Library — agents, MCP" },
-  { name: "marketplace", ko: "Hub — 북마크·대여 현황", en: "Hub — bookmarks and borrows" },
+  { name: "hub", ko: "Hub — 북마크·최근 사용", en: "Hub — bookmarks and recent use" },
   { name: "settings", ko: "설정 현황", en: "Settings overview" },
   { name: "projects", ko: "프로젝트 목록 — 채팅·작업 수", en: "Projects — chats and tasks" },
   { name: "automations", ko: "자동화 목록·상세 [이름]", en: "Automations list/detail [name]" },
@@ -527,6 +527,7 @@ async function startShell(ctx, opts = {}) {
       const SCREEN = {
         dashboard: screens.dashboard,
         library: screens.library,
+        hub: screens.marketplace,
         marketplace: screens.marketplace,
         bookmarks: screens.marketplace,
         settings: screens.settings,

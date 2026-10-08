@@ -1,4 +1,4 @@
--- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-09-13T06:12:07Z)
+-- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-10-08T07:02:40Z)
 --
 -- ★생성물이다. 손으로 고치지 말고 재생성하라:
 --     node scripts/gen-bootstrap-schema.cjs
@@ -6,11 +6,11 @@
 -- 정본은 Desktop 의 마이그레이션 사다리(agentlas_desktop/electron/store/db.ts, SCHEMA_VERSION).
 -- 이 파일은 그 사다리를 **빈 DB** 에 끝까지 돌린 결과의 덤프이므로, 터미널이 만든 DB 는
 -- 처음부터 사다리 머리에 있다 — 데스크탑이 나중에 승급할 것이 남지 않는다.
-PRAGMA user_version=119;
+PRAGMA user_version=128;
 CREATE TABLE active_runtime (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         kind TEXT NOT NULL
-      , backend TEXT, source TEXT, model TEXT, long_context INTEGER NOT NULL DEFAULT 0);
+      , backend TEXT, source TEXT, model TEXT, long_context INTEGER NOT NULL DEFAULT 0, acp_agent_id TEXT, runtime_label TEXT);
 CREATE TABLE agent_app_operations (
         id TEXT PRIMARY KEY,
         app_id TEXT NOT NULL,
@@ -354,6 +354,50 @@ CREATE TABLE automation_sessions (
         updated_at TEXT NOT NULL,
         UNIQUE(automation_id, target_kind, target_id)
       );
+CREATE TABLE automation_strategy_proposals (
+          id                    TEXT PRIMARY KEY,
+          automation_id         TEXT NOT NULL,
+          source_run_id         TEXT NOT NULL,
+          request_id            TEXT NOT NULL UNIQUE,
+          actor                 TEXT NOT NULL CHECK(actor = 'main'),
+          input_digest          TEXT NOT NULL,
+          intent                TEXT NOT NULL CHECK(intent IN ('keep','change','schedule-change')),
+          rationale             TEXT NOT NULL,
+          conflict              TEXT NOT NULL CHECK(conflict IN ('within_scope','needs_user_approval','uncertain')),
+          state                  TEXT NOT NULL CHECK(state IN ('pending','approved','rejected','applied')),
+          source_graph_digest   TEXT NOT NULL,
+          current_graph_digest  TEXT NOT NULL,
+          expected_graph_digest TEXT NOT NULL,
+          current_definition_digest  TEXT NOT NULL,
+          expected_definition_digest TEXT NOT NULL,
+          goal_bound            INTEGER NOT NULL CHECK(goal_bound IN (0,1)),
+          expected_revision     INTEGER NOT NULL CHECK(expected_revision >= 0),
+          strategy_json         TEXT,
+          graph_patch_json       TEXT,
+          receipt_json           TEXT NOT NULL,
+          created_at             TEXT NOT NULL,
+          updated_at             TEXT NOT NULL
+        );
+CREATE TABLE automation_strategy_revision_events (
+      id                    TEXT PRIMARY KEY,
+      automation_id         TEXT NOT NULL,
+      revision              INTEGER NOT NULL CHECK(revision >= 1),
+      previous_revision     INTEGER NOT NULL CHECK(previous_revision >= 0),
+      request_id            TEXT NOT NULL,
+      source_run_id         TEXT NOT NULL,
+      base_graph_digest     TEXT NOT NULL,
+      graph_digest          TEXT NOT NULL,
+      base_definition_digest TEXT NOT NULL,
+      definition_digest     TEXT NOT NULL,
+      strategy_digest       TEXT NOT NULL,
+      strategy_json         TEXT NOT NULL,
+      graph_patch_json      TEXT,
+      input_digest          TEXT NOT NULL,
+      receipt_json          TEXT NOT NULL,
+      created_at            TEXT NOT NULL,
+      UNIQUE(automation_id, revision),
+      UNIQUE(request_id)
+    );
 CREATE TABLE automation_trigger_events (
         id TEXT PRIMARY KEY,
         automation_id TEXT NOT NULL,
@@ -556,7 +600,7 @@ CREATE TABLE chat_messages (
         chat_id TEXT NOT NULL,
         role TEXT NOT NULL CHECK(role IN ('user','assistant','system')),
         text TEXT NOT NULL,
-        created_at TEXT NOT NULL, host_notice_json TEXT,
+        created_at TEXT NOT NULL, host_notice_json TEXT, speaker_agent_id TEXT,
         FOREIGN KEY(chat_id) REFERENCES chats(id) ON DELETE CASCADE
       );
 CREATE TABLE "chat_runtime_sessions" (
@@ -897,6 +941,25 @@ CREATE TABLE installed_agents (
         installed_at TEXT NOT NULL,
         tone TEXT NOT NULL
       , env_requirements_json TEXT NOT NULL DEFAULT '[]', name_en TEXT NOT NULL DEFAULT '', tagline_en TEXT NOT NULL DEFAULT '', builtin INTEGER NOT NULL DEFAULT 0, role TEXT, visibility TEXT NOT NULL DEFAULT 'visible' CHECK(visibility IN ('visible','background','private')), entity_kind TEXT, local_display_name TEXT, bookmarked_at TEXT NULL, parent_team_id TEXT NULL);
+CREATE TABLE invocation_admissions (
+          run_id TEXT PRIMARY KEY,
+          chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+          input_digest TEXT NOT NULL
+            CHECK(length(input_digest) = 64 AND input_digest NOT GLOB '*[^0-9a-f]*'),
+          digest_version TEXT NOT NULL CHECK(digest_version = 'main-canonical-json-v1'),
+          owner_process_epoch TEXT NOT NULL CHECK(length(owner_process_epoch) BETWEEN 1 AND 128),
+          status TEXT NOT NULL CHECK(status IN ('pending','admitted','rejected')),
+          pending_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          admitted_at TEXT,
+          rejected_at TEXT,
+          rejection_reason_code TEXT,
+          CHECK(
+            (status = 'pending' AND admitted_at IS NULL AND rejected_at IS NULL AND rejection_reason_code IS NULL)
+            OR (status = 'admitted' AND admitted_at IS NOT NULL AND rejected_at IS NULL AND rejection_reason_code IS NULL)
+            OR (status = 'rejected' AND admitted_at IS NULL AND rejected_at IS NOT NULL AND rejection_reason_code IS NOT NULL)
+          )
+        );
 CREATE TABLE invocation_steers (
       id TEXT PRIMARY KEY,
       chat_id TEXT NOT NULL,
@@ -908,6 +971,8 @@ CREATE TABLE invocation_steers (
       execution_context_json TEXT,
       status TEXT NOT NULL CHECK(status IN ('queued','draining','started','cancelled','failed')),
       drained_run_id TEXT,
+      recovery_state TEXT NOT NULL DEFAULT 'ready' CHECK(recovery_state IN ('ready','held')),
+      recovery_reason TEXT,
       queued_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -1094,7 +1159,8 @@ CREATE TABLE long_runs (
         updated_at TEXT NOT NULL,
         started_at TEXT,
         paused_at TEXT,
-        completed_at TEXT,
+        completed_at TEXT, host_owner_kind TEXT NOT NULL DEFAULT 'desktop'
+          CHECK(host_owner_kind IN ('desktop','daemon','hosted')),
         FOREIGN KEY(root_chat_id) REFERENCES chats(id) ON DELETE SET NULL,
         FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL
       );
@@ -1328,7 +1394,7 @@ CREATE TABLE model_role_members (
         model TEXT,
         effort TEXT,
         long_context INTEGER NOT NULL DEFAULT 0 CHECK(long_context IN (0,1)),
-        updated_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL, acp_agent_id TEXT, runtime_label TEXT,
         PRIMARY KEY(role, position)
       );
 CREATE TABLE model_roles (
@@ -1340,7 +1406,7 @@ CREATE TABLE model_roles (
         effort TEXT,
         long_context INTEGER NOT NULL DEFAULT 0 CHECK(long_context IN (0,1)),
         inherit INTEGER NOT NULL DEFAULT 0 CHECK(inherit IN (0,1)),
-        updated_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL, acp_agent_id TEXT, runtime_label TEXT,
         CHECK(role = 'worker' OR inherit = 0)
       );
 CREATE TABLE office_task_context (
@@ -1408,6 +1474,37 @@ CREATE TABLE one_org_members (
       handover_note TEXT,
       revision INTEGER NOT NULL DEFAULT 1
     );
+CREATE TABLE one_preflight_steers (
+          steer_id TEXT PRIMARY KEY,
+          submission_id TEXT NOT NULL REFERENCES one_preflight_submissions(submission_id) ON DELETE CASCADE,
+          chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+          prompt_text TEXT NOT NULL,
+          prompt_digest TEXT NOT NULL CHECK(length(prompt_digest) = 64),
+          status TEXT NOT NULL CHECK(status IN ('queued','claimed','attached','held','cancelled')),
+          parent_run_id TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL, request_json TEXT,
+          CHECK((status = 'queued' AND parent_run_id IS NULL)
+            OR (status IN ('claimed','attached') AND parent_run_id IS NOT NULL)
+            OR status IN ('held','cancelled'))
+        );
+CREATE TABLE one_preflight_submissions (
+          submission_id TEXT PRIMARY KEY,
+          chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+          prompt_digest TEXT NOT NULL CHECK(length(prompt_digest) = 64),
+          runtime_digest TEXT NOT NULL CHECK(length(runtime_digest) = 64),
+          runtime_selection_json TEXT,
+          owner_process_epoch TEXT NOT NULL,
+          state TEXT NOT NULL CHECK(state IN ('open','reserved','bound','held','cancelled')),
+          parent_run_id TEXT UNIQUE,
+          steer_template_json TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          CHECK((state = 'open' AND parent_run_id IS NULL AND steer_template_json IS NULL)
+            OR (state = 'reserved' AND parent_run_id IS NOT NULL AND steer_template_json IS NOT NULL)
+            OR (state = 'bound' AND parent_run_id IS NOT NULL AND steer_template_json IS NOT NULL)
+            OR state IN ('held','cancelled'))
+        );
 CREATE TABLE one_seat_occupants (
         seat_id      TEXT NOT NULL REFERENCES one_seats(id) ON DELETE CASCADE,
         slot         INTEGER NOT NULL DEFAULT 0,
@@ -1699,6 +1796,11 @@ CREATE INDEX idx_automation_runs_occurrence
       ON automation_runs(automation_id, occurrence_id, started_at);
 CREATE INDEX idx_automation_sessions_owner
         ON automation_sessions(automation_id, updated_at DESC);
+CREATE INDEX idx_automation_strategy_proposals_automation
+          ON automation_strategy_proposals(automation_id, created_at DESC);
+CREATE INDEX idx_automation_strategy_proposals_source
+          ON automation_strategy_proposals(source_run_id);
+CREATE INDEX idx_automation_strategy_revision_events_latest ON automation_strategy_revision_events(automation_id, revision DESC);
 CREATE INDEX idx_automation_trigger_events_automation
           ON automation_trigger_events(automation_id, status, created_at);
 CREATE INDEX idx_automation_trigger_events_due
@@ -1799,10 +1901,16 @@ CREATE INDEX idx_installed_agent_hub_binding_exact
         ON installed_agent_hub_bindings(agent_definition_id, agent_release_id);
 CREATE INDEX idx_installed_agents_parent_team ON installed_agents(parent_team_id) WHERE parent_team_id IS NOT NULL;
 CREATE INDEX idx_installed_agents_visibility ON installed_agents(visibility, installed_at DESC);
+CREATE INDEX idx_invocation_admissions_chat_time
+          ON invocation_admissions(chat_id, pending_at DESC);
+CREATE UNIQUE INDEX idx_invocation_admissions_pending_chat
+          ON invocation_admissions(chat_id) WHERE status = 'pending';
 CREATE INDEX idx_invocation_steers_chat
       ON invocation_steers(chat_id, queued_at, id);
 CREATE INDEX idx_invocation_steers_queue
       ON invocation_steers(status, queued_at, id);
+CREATE INDEX idx_invocation_steers_recovery
+        ON invocation_steers(chat_id, recovery_state, queued_at, id);
 CREATE INDEX idx_judgment_verdicts_recency ON judgment_verdicts(last_hit_at);
 CREATE INDEX idx_long_run_attempts_invocation
         ON long_run_worker_attempts(invocation_run_id, worker_id, attempt)
@@ -1883,10 +1991,40 @@ CREATE INDEX idx_one_artifact_binding_chat
       ON one_artifact_bindings(chat_id, created_at);
 CREATE INDEX idx_one_artifact_binding_exact
       ON one_artifact_bindings(task_id, chat_id, run_id, manifest_id, artifact_ref);
+CREATE INDEX idx_one_domain_event_entity_version
+      ON run_events(run_id, CAST(json_extract(CASE WHEN json_valid(payload_json)
+  THEN CASE WHEN json_type(payload_json, '$.oneDomainEventJson') = 'text'
+    THEN CASE WHEN json_valid(json_extract(payload_json, '$.oneDomainEventJson'))
+      THEN CASE WHEN json_type(json_extract(payload_json, '$.oneDomainEventJson')) = 'object'
+        THEN json_extract(payload_json, '$.oneDomainEventJson') END END END END, '$.version') AS INTEGER) DESC) WHERE kind = 'one_domain_event';
+CREATE INDEX idx_one_domain_event_id
+      ON run_events(json_extract(CASE WHEN json_valid(payload_json)
+  THEN CASE WHEN json_type(payload_json, '$.oneDomainEventJson') = 'text'
+    THEN CASE WHEN json_valid(json_extract(payload_json, '$.oneDomainEventJson'))
+      THEN CASE WHEN json_type(json_extract(payload_json, '$.oneDomainEventJson')) = 'object'
+        THEN json_extract(payload_json, '$.oneDomainEventJson') END END END END, '$.eventId')) WHERE kind = 'one_domain_event';
+CREATE INDEX idx_one_domain_event_type_time
+      ON run_events(json_extract(CASE WHEN json_valid(payload_json)
+  THEN CASE WHEN json_type(payload_json, '$.oneDomainEventJson') = 'text'
+    THEN CASE WHEN json_valid(json_extract(payload_json, '$.oneDomainEventJson'))
+      THEN CASE WHEN json_type(json_extract(payload_json, '$.oneDomainEventJson')) = 'object'
+        THEN json_extract(payload_json, '$.oneDomainEventJson') END END END END, '$.eventType'), julianday(json_extract(CASE WHEN json_valid(payload_json)
+  THEN CASE WHEN json_type(payload_json, '$.oneDomainEventJson') = 'text'
+    THEN CASE WHEN json_valid(json_extract(payload_json, '$.oneDomainEventJson'))
+      THEN CASE WHEN json_type(json_extract(payload_json, '$.oneDomainEventJson')) = 'object'
+        THEN json_extract(payload_json, '$.oneDomainEventJson') END END END END, '$.occurredAt'))) WHERE kind = 'one_domain_event';
 CREATE INDEX idx_one_org_members_agent
       ON one_org_members(installed_agent_id);
 CREATE INDEX idx_one_org_members_order
       ON one_org_members(archived_at, sort_order, added_at);
+CREATE INDEX idx_one_preflight_steers_chat_status
+          ON one_preflight_steers(chat_id, status, created_at);
+CREATE INDEX idx_one_preflight_steers_submission
+          ON one_preflight_steers(submission_id, created_at, steer_id);
+CREATE INDEX idx_one_preflight_submission_chat
+          ON one_preflight_submissions(chat_id, created_at DESC);
+CREATE UNIQUE INDEX idx_one_preflight_submission_open_chat
+          ON one_preflight_submissions(chat_id) WHERE state = 'open';
 CREATE INDEX idx_one_seats_updated ON one_seats(updated_at DESC);
 CREATE INDEX idx_one_taskforces_updated
       ON one_taskforces(updated_at DESC);
@@ -1903,8 +2041,8 @@ CREATE INDEX idx_run_events_automation
         ON run_events(automation_id, ts DESC);
 CREATE INDEX idx_run_events_chat_kind_ts
           ON run_events(chat_id, kind, ts DESC);
-CREATE INDEX idx_run_events_run_seq
-        ON run_events(run_id, seq);
+CREATE INDEX idx_run_events_kind_ts
+          ON run_events(kind, ts DESC);
 CREATE INDEX idx_run_events_ts
         ON run_events(ts DESC);
 CREATE INDEX idx_run_history_automation ON run_history(automation_id);

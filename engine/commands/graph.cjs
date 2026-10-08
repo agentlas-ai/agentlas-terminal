@@ -1187,7 +1187,7 @@ function inspectPackage(ctx, filePath) {
     ctx.out(en ? "Before it can run, fill in:" : "실행하려면 먼저 채워야 합니다:");
     for (const item of checklist) {
       if (item.kind === "vault-key") ctx.out(`  · ${en ? "key" : "키"} ${item.key}`);
-      else if (item.kind === "agent") ctx.out(`  · ${en ? "agent" : "에이전트"} ${item.slug}${item.source === "hub" ? ctx.ui.dim(en ? " (borrowed from the network)" : " (네트워크에서 빌림)") : ""}`);
+      else if (item.kind === "agent") ctx.out(`  · ${en ? "agent" : "에이전트"} ${item.slug}${item.source === "hub" ? ctx.ui.dim(en ? " (from the public Hub — free)" : " (공개 Hub 제공 · 무료)") : ""}`);
       else ctx.out(`  · MCP ${item.serverSlug}`);
     }
   }
@@ -1305,7 +1305,7 @@ function installPackage(ctx, filePath, flags = {}) {
     ctx.out(en ? "Missing on this computer — add these in the desktop app, then switch it on:" : "이 컴퓨터에 없는 것 — 데스크탑 앱에서 아래를 채운 뒤 켜세요:");
     for (const item of missing) {
       if (item.kind === "vault-key") ctx.out(`  · ${en ? "key" : "키"} ${item.key}`);
-      else if (item.kind === "agent") ctx.out(`  · ${en ? "agent" : "에이전트"} ${item.slug}${item.source === "hub" ? ctx.ui.dim(en ? " (borrowed from the network — costs credits)" : " (네트워크에서 빌림 — 크레딧 소모)") : ""}`);
+      else if (item.kind === "agent") ctx.out(`  · ${en ? "agent" : "에이전트"} ${item.slug}${item.source === "hub" ? ctx.ui.dim(en ? " (from the public Hub — free)" : " (공개 Hub 제공 · 무료)") : ""}`);
       else ctx.out(`  · MCP ${item.serverSlug}`);
     }
   } else if (checklist.length) {

@@ -82,10 +82,10 @@ const CATALOG = [
   // ── 7 account ─────────────────────────────────────────────────────────────
   { name: "whoami", group: "account", tier: "more", surfaces: BOTH, args: "", ko: "로그인 계정 확인", en: "Show the signed-in account" },
   { name: "logout", group: "account", tier: "more", surfaces: BOTH, args: "", ko: "로그아웃", en: "Sign out" },
-  { name: "billing", group: "account", tier: "more", surfaces: BOTH, args: "", ko: "크레딧 잔액 (구독·대여 수익)", en: "Credit balances (subscription and rental earnings)" },
+  { name: "billing", group: "account", tier: "more", surfaces: BOTH, args: "", ko: "호스팅 AI 사용량과 종료된 Hub 정산 내역", en: "Hosted AI usage and closed Hub-settlement history" },
   { name: "usage", group: "account", tier: "more", surfaces: BOTH, args: "", ko: "이 설치의 사용 현황", en: "Local usage on this install" },
   { name: "cloud", group: "account", tier: "more", surfaces: BOTH, args: "<save|publish|list|...>", ko: "Agent Cloud 자산", en: "Agent Cloud assets" },
-  { name: "upload", group: "account", tier: "more", surfaces: BOTH, aliases: ["hep-upload"], args: "<path> [--visibility ...]", argsKo: "<경로> [--visibility ...]", ko: "기본은 비공개 저장, --visibility marketplace 로 공개 발행", en: "Owner-private by default; --visibility marketplace publishes" },
+  { name: "upload", group: "account", tier: "more", surfaces: BOTH, aliases: ["hep-upload"], args: "<path> [--visibility ...]", argsKo: "<경로> [--visibility ...]", ko: "기본은 비공개 저장, --visibility hub-public로 무료 Hub 공개 발행", en: "Owner-private by default; --visibility hub-public publishes to the free Hub" },
   { name: "uninstall", group: "account", tier: "more", surfaces: BOTH, args: "<slug> [--yes]", ko: "에이전트 삭제 (대화 기록도 함께 지워짐)", en: "Delete an agent (its chats are deleted too)" },
   { name: "update", group: "account", tier: "more", surfaces: BOTH, args: "[--json]", ko: "npm 업데이트 확인", en: "Check for an npm update" },
   { name: "version", group: "account", tier: "more", surfaces: BOTH, args: "", ko: "버전", en: "Version" },
@@ -94,8 +94,7 @@ const CATALOG = [
   { name: "ontology", group: "knowledge", tier: "more", surfaces: BOTH, args: "[status|list|add <path>]", argsKo: "[status|list|add <경로>]", ko: "이 프로젝트가 읽을 지식 소스 등록", en: "Register the knowledge sources this project may read" },
   { name: "context", group: "knowledge", tier: "more", surfaces: BOTH, args: "<locate|slice|impact|...>", ko: "코드 의존성 맵 (Agentlas OS Core 필요)", en: "Code dependency map (requires Agentlas OS Core)" },
   { name: "memory", group: "knowledge", tier: "more", surfaces: BOTH, args: "<sub>", ko: "메모리", en: "Memory" },
-  { name: "experience", group: "knowledge", tier: "more", surfaces: BOTH, args: "<list|inspect|save|...>", ko: "이식 가능한 Experience", en: "Portable Experience" },
-  { name: "evolve", group: "knowledge", tier: "more", surfaces: BOTH, args: "", ko: "프롬프트 진화 제안", en: "Prompt-evolution proposals" },
+  { name: "evolve", group: "knowledge", tier: "more", surfaces: BOTH, args: "<command>", ko: "파일 변경안과 버전 검토", en: "Review agent file changes and revisions" },
 
   // ── 9 advanced ────────────────────────────────────────────────────────────
   { name: "route", group: "advanced", tier: "more", surfaces: BOTH, args: '"<request>"', argsKo: '"<요청>"', ko: "이 요청에 맞는 에이전트로 라우팅", en: "Route this request to the right agent" },
@@ -121,7 +120,6 @@ const CATALOG = [
   { name: "research", group: "advanced", tier: "more", surfaces: BOTH, args: "<subcommand> [args]", argsKo: "<하위-명령> [인자]", ko: "Research Engine (전체 목록: research --help)", en: "Research Engine (full list: research --help)" },
   { name: "document", group: "advanced", tier: "more", surfaces: BOTH, args: "pdf <html|url>", ko: "문서 PDF 내보내기", en: "Export a document to PDF" },
   { name: "oberon", group: "advanced", tier: "more", surfaces: BOTH, aliases: ["film"], args: "<scaffold|render|list|open>", ko: "AI 필름 렌더", en: "AI film render" },
-  { name: "variant", group: "advanced", tier: "more", surfaces: BOTH, args: "resolve --base-release", ko: "로컬 변형 선택", en: "Local variant selection" },
   { name: "netadmin", group: "advanced", tier: "more", surfaces: BOTH, args: "<init|status|reindex|...>", ko: "로컬 에이전트 네트워크 관리", en: "Local agent network administration" },
   { name: "hep", group: "advanced", tier: "more", surfaces: BOTH, aliases: ["hep-storm"], args: "<sub...>", ko: "Hephaestus 패스스루 (전문가용)", en: "Hephaestus passthrough (expert)" },
 ];

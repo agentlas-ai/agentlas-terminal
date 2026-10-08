@@ -72,6 +72,7 @@ function parseBuildArgs(args) {
   };
   for (let index = 0; index < buildArgs.length; index += 1) {
     const token = String(buildArgs[index]);
+    if (token.startsWith("--experience-")) throw new Error("experience_chips_retired: use reviewed agent file revisions.");
     const take = () => (index + 1 < buildArgs.length ? String(buildArgs[++index]) : "");
     if (token === "--mcp-plan-only") options.planOnly = true;
     else if (token === "--mcp-json") options.json = true;

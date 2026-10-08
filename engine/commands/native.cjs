@@ -1,9 +1,8 @@
 "use strict";
 /* native — 네이티브 CLI 문맥 파일 명시 생성: agentlas native prepare <agent> */
 const { findAgent } = require("../agents/registry.cjs");
-const { agentFolder, ensureNativeFiles } = require("../agents/files.cjs");
 
-function run(ctx, args) {
+async function run(ctx, args) {
   const ko = ctx.lang === "ko";
   const sub = String(args[0] || "help");
   const query = args[1];
@@ -18,18 +17,18 @@ function run(ctx, args) {
       ? [
         "agentlas native — 네이티브 CLI 문맥 파일 관리",
         "  native prepare <에이전트>   에이전트 폴더에 CLAUDE.md·AGENTS.md 등",
-        "                             네이티브 CLI 문맥 파일을 명시적으로 생성",
+        "                             네이티브 CLI 문맥 파일 변경안을 준비",
         "",
-        "  보통은 실행 시 자동 준비됩니다. 파일을 직접 확인·수정하고 싶을 때 쓰세요.",
+        "  변경안만 준비합니다. 실제 파일 적용에는 검토와 승인이 필요합니다.",
         "  에이전트 이름은 agentlas list 에서 확인합니다.",
       ].join("\n")
       : [
         "agentlas native — native CLI context files",
-        "  native prepare <agent>     explicitly create the native CLI context files",
+        "  native prepare <agent>     prepare changes to native CLI context files",
         "                             (CLAUDE.md, AGENTS.md, …) in the agent folder",
         "",
-        "  Normally these are prepared automatically on run. Use this when you want",
-        "  to inspect or edit the files directly. Find agent names via: agentlas list",
+        "  This prepares a file-change proposal for review. Owner approval is required",
+        "  before applying it. Find agent names via: agentlas list",
       ].join("\n"));
     return 0;
   }
@@ -42,12 +41,23 @@ function run(ctx, args) {
     ctx.err(ko ? `에이전트를 찾지 못했습니다: ${query}` : `Agent not found: ${query}`);
     return 1;
   }
-  const folder = agentFolder(agent);
-  const created = ensureNativeFiles(agent, folder);
-  ctx.out(`${ko ? "네이티브 CLI 문맥" : "Native CLI context"}: ${folder}`);
-  ctx.out(created.length
-    ? `${ko ? "생성됨" : "Created"}: ${created.join(", ")}`
-    : (ko ? "변경 없음: 필요한 파일이 이미 있습니다." : "No changes: the context files already exist."));
+  const service = require("../agent-workspace.cjs").workspaceService();
+  const workspace = await service.getAgentWorkspace(agent.id);
+  if (!workspace.canonicalEntry) throw new Error("agent_instruction_entry_required");
+  const entry = await service.readAgentWorkspaceFile(agent.id, workspace.canonicalEntry);
+  const expected = workspace.files.find((file) => file.path === workspace.canonicalEntry);
+  if (!expected || entry.binary || entry.blobHash !== expected.blobHash) throw new Error("agent_revision_changed: refresh the file proposal");
+  const sys = entry.content;
+  const changes = ["system-prompt.md", "CLAUDE.md", "AGENTS.md", "GEMINI.md"]
+    .filter((name) => !workspace.files.some((file) => file.path === name))
+    .map((name) => ({ path: name, afterContent: sys.endsWith("\n") ? sys : sys + "\n" }));
+  if (!changes.length) { ctx.out(ko ? "변경 없음" : "No changes"); return 0; }
+  const result = await service.prepareAgentWorkspaceProposal({
+    agentId: agent.id, changes, expectedBaseTreeDigest: workspace.treeDigest, summary: "Prepare native instruction files",
+  });
+  ctx.out(JSON.stringify(result, null, 2));
+  ctx.out(ko ? "실제 파일 변경안을 Agent Workspace에서 검토하고 승인하세요." : "Review and approve the actual file diff in Agent Workspace.");
+
   return 0;
 }
 

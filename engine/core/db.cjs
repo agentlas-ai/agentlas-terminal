@@ -2,8 +2,9 @@
 /*
  * core/db — 공유 SQLite(데스크탑과 동일 DB) 열기 + 드라이버 사다리 + 빌트인 시드.
  *
- * 드라이버: better-sqlite3(네이티브, optionalDependency) → node:sqlite(Node 22.5+).
- * 두 드라이버 모두 prepare().get/all/run 표면이 같으므로 얇은 어댑터만 둔다.
+ * 기존 저장소 RW와 Desktop Core 실행에는 호환되는 better-sqlite3 네이티브 드라이버가 필요하다.
+ * Node 22.13+의 플래그 없는 node:sqlite fallback은 읽기 전용 스키마 검사에만 사용한다.
+ * 첫 부트스트랩의 파일 생성은 런처의 별도 소유권 계약이다.
  * 스키마 소유권: 정본 스키마는 데스크탑 앱. 터미널은 bootstrap-schema.sql로
  * 첫 부트스트랩만 하고(런처가 수행), 이후 마이그레이션은 앱이 한다.
  * 터미널은 "있으면 쓰는" 방어적 열 확인(columnExists)으로만 전진 호환한다.
@@ -14,7 +15,6 @@
  * 정직하게 거절한다(승급은 여전히 데스크탑의 일이다).
  */
 const fs = require("node:fs");
-const { pathToFileURL } = require("node:url");
 const { configureSqliteConnection } = require("../agentlas-sqlite-policy.cjs");
 const { parseSemVer, compareSemVer } = require("../semver.cjs");
 const { dbPath } = require("./paths.cjs");
@@ -36,22 +36,48 @@ function loadNodeSqliteQuietly() {
   }
 }
 
-function openRaw(file) {
+function openRaw(file, { readOnly = false } = {}) {
+  let Database = null;
+  let nativeDriverError = null;
   try {
-    const Database = require("better-sqlite3");
-    const db = new Database(file, { fileMustExist: true });
-    configureSqliteConnection(db);
-    db.__driver = "better-sqlite3";
-    return db;
-  } catch { /* optional dep 미설치/ABI 불일치 → node:sqlite */ }
+    const Candidate = require("better-sqlite3");
+    // Loading the JS wrapper does not prove native ABI compatibility. Probe
+    // availability without opening the caller's store or taking writer authority.
+    const probe = new Candidate(":memory:");
+    probe.close();
+    Database = Candidate;
+  } catch (error) { nativeDriverError = error; }
+  if (Database) {
+    // Real file and connection-policy failures are not driver absence. Preserve
+    // their machine codes, and close a connection if configuration fails.
+    const db = new Database(file, { fileMustExist: true, readonly: readOnly });
+    try {
+      configureSqliteConnection(db);
+      db.__driver = "better-sqlite3";
+      return db;
+    } catch (error) {
+      try { db.close(); } catch { /* preserve configuration failure */ }
+      throw error;
+    }
+  }
+  // Node 22.13 has no atomic read/write-existing-only open flag. Its readOnly
+  // option refuses missing files; ordinary read/write opens may create them.
+  if (!readOnly) {
+    const error = new Error("A compatible better-sqlite3 driver is required for read/write access to an existing Agentlas store. Run 'agentlas --where' to inspect this Node/driver or 'agentlas doctor' for runtime health, then reinstall with 'npm i -g agentlas' to let npm install a matching native driver. node:sqlite is available for read-only schema inspection.");
+    error.code = "AGENTLAS_SQLITE_RW_DRIVER_UNAVAILABLE";
+    error.cause = nativeDriverError;
+    throw error;
+  }
   const { DatabaseSync } = loadNodeSqliteQuietly();
-  // DatabaseSync does not expose better-sqlite3's `fileMustExist` option. A
-  // SQLite URI with mode=rw opens an existing file read/write but refuses to
-  // create it when an existsSync check races with deletion.
-  const db = new DatabaseSync(`${pathToFileURL(file).href}?mode=rw`);
-  configureSqliteConnection(db);
-  db.__driver = "node:sqlite";
-  return db;
+  const db = new DatabaseSync(file, { readOnly: true });
+  try {
+    configureSqliteConnection(db);
+    db.__driver = "node:sqlite";
+    return db;
+  } catch (error) {
+    try { db.close(); } catch { /* preserve configuration failure */ }
+    throw error;
+  }
 }
 
 /**

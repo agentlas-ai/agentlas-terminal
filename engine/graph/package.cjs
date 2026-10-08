@@ -212,7 +212,8 @@ function buildPackage(input) {
     // 받는 사람이 설치 전에 알아야 하는 것 — 무엇이 바깥으로 나가는가.
     permissionsSummary: {
       mutationNodes,
-      leasedAgents: dependencies.agents.filter((d) => d.source === "hub").map((d) => d.slug),
+      // Public Hub dependencies are free releases, not paid rentals.
+      hubAgents: dependencies.agents.filter((d) => d.source === "hub").map((d) => d.slug),
     },
     scrubReport: { rulesVersion: "scrub/1.0", scrubbedAt: new Date().toISOString(), findings },
   };

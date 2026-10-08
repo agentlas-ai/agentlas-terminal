@@ -328,8 +328,11 @@ function positiveIntegerFlag(value, fallback, name, max) {
 
 function cloudVisibilityFlag(value) {
   if (value == null) return null;
+  // `marketplace` is the legacy server wire value. Keep accepting it for old
+  // scripts, but offer `hub-public` for the free public Hub product.
+  if (value === "hub-public") return "marketplace";
   if (value === "private-link" || value === "marketplace") return value;
-  throw cloudArgumentError("--visibility must be private-link or marketplace");
+  throw cloudArgumentError("--visibility must be private-link or hub-public");
 }
 
 function cloudVisibilityForAction(sub, flags) {
@@ -351,12 +354,12 @@ function cloudVisibilityForAction(sub, flags) {
   return "private-link";
 }
 
-/** 최상위 `upload`의 실제 동작 결정: 기본 save, 명시적 marketplace만 publish. */
+/** 최상위 `upload`: 기본 private save, 명시적 hub-public만 공개 발행. */
 function cloudActionForTopLevelUpload(args) {
   const flags = requireCloudPositionals(parseCloudFlags(args, {
     values: ["purpose", "slug", "visibility"],
     booleans: ["dry-run", "json", "llm-review", "overwrite"],
-  }), 1, 1, "usage: agentlas upload <path> [--visibility marketplace]");
+  }), 1, 1, "usage: agentlas upload <path> [--visibility hub-public]");
   return cloudVisibilityFlag(flags.visibility) === "marketplace" ? "publish" : "save";
 }
 
@@ -368,7 +371,7 @@ function printCloudPackageResult(ctx, result) {
   ctx.out(`  files:   ${result.manifest.includedFileCount}/${result.manifest.fileCount}`);
   ctx.out(`  hash:    ${result.manifest.packageHash}`);
   ctx.out(`  bundle:  ${result.bundlePath}`);
-  ctx.out(`  review:  ${result.review.mode} · cost=${result.review.costOwner}${result.review.runtimeLabel ? " · " + result.review.runtimeLabel : ""}`);
+  ctx.out("  review:  complete");
   const findings = result.review.findings || [];
   if (findings.length) {
     ctx.out("  findings:");
@@ -395,7 +398,7 @@ const CLOUD_HELP = [
   "  publish <path> [--dry-run] [--slug name]",
   "                                      explicitly publish to the public Agentlas Hub",
   "  --purpose \"ordinary explanation\"     repair a missing purpose through your connected model",
-  "  package <path> [--json] [--visibility private-link|marketplace]",
+  "  package <path> [--json] [--visibility private-link|hub-public]",
   "  --overwrite                         서버에 더 새 버전이 있어도 지금 폴더 내용으로 덮어쓰기",
   "                                      package only; defaults to private-save checks",
   "  list [--json]                       list packages in your private Agent Cloud",
@@ -434,7 +437,7 @@ async function runCloudInternal(ctx, args) {
     try {
       result = await callHubTool("marketplace.search_agents", { q: query, limit });
     } catch (e) {
-      ctx.err(e instanceof HubError ? e.message : `Marketplace connection failed: ${(e && e.message) || e}`);
+      ctx.err(e instanceof HubError ? e.message : `Agent Hub connection failed: ${(e && e.message) || e}`);
       return 1;
     }
     if (flags.json) { ctx.out(JSON.stringify(result, null, 2)); return 0; }
@@ -671,10 +674,10 @@ async function runCloud(ctx, args) {
 
 async function runUpload(ctx, args) {
   if (!args.length) {
-    ctx.err("usage: agentlas upload <path> [--visibility marketplace]");
+    ctx.err("usage: agentlas upload <path> [--visibility hub-public]");
     return 1;
   }
-  // 기본 = owner-private save. marketplace는 오직 명시적 플래그로만 publish가 된다.
+  // 기본 = owner-private save. hub-public은 오직 명시적 플래그로만 publish가 된다.
   // --visibility 인자는 그대로 넘긴다 — cloudVisibilityForAction이 재검증한다.
   const action = cloudActionForTopLevelUpload(args);
   // Top-level upload already owns its structured adapter. Keep the cloud
