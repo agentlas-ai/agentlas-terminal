@@ -1,4 +1,4 @@
--- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-10-08T13:12:48Z)
+-- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-10-08T14:32:09Z)
 --
 -- ★생성물이다. 손으로 고치지 말고 재생성하라:
 --     node scripts/gen-bootstrap-schema.cjs
@@ -6,7 +6,7 @@
 -- 정본은 Desktop 의 마이그레이션 사다리(agentlas_desktop/electron/store/db.ts, SCHEMA_VERSION).
 -- 이 파일은 그 사다리를 **빈 DB** 에 끝까지 돌린 결과의 덤프이므로, 터미널이 만든 DB 는
 -- 처음부터 사다리 머리에 있다 — 데스크탑이 나중에 승급할 것이 남지 않는다.
-PRAGMA user_version=128;
+PRAGMA user_version=129;
 CREATE TABLE active_runtime (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         kind TEXT NOT NULL
@@ -973,6 +973,16 @@ CREATE TABLE invocation_current_turn_steers (
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+CREATE TABLE invocation_run_owners (
+      run_id TEXT PRIMARY KEY,
+      chat_id TEXT NOT NULL,
+      owner_id TEXT NOT NULL,
+      owner_kind TEXT NOT NULL CHECK(owner_kind IN ('desktop','daemon','terminal')),
+      lease_id TEXT NOT NULL UNIQUE,
+      state TEXT NOT NULL CHECK(state IN ('active','settling','released')),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
 CREATE TABLE invocation_steers (
       id TEXT PRIMARY KEY,
       chat_id TEXT NOT NULL,
@@ -1916,6 +1926,8 @@ CREATE INDEX idx_installed_agent_hub_binding_exact
         ON installed_agent_hub_bindings(agent_definition_id, agent_release_id);
 CREATE INDEX idx_installed_agents_parent_team ON installed_agents(parent_team_id) WHERE parent_team_id IS NOT NULL;
 CREATE INDEX idx_installed_agents_visibility ON installed_agents(visibility, installed_at DESC);
+CREATE UNIQUE INDEX idx_invocation_active_owner_chat
+      ON invocation_run_owners(chat_id) WHERE state IN ('active','settling');
 CREATE INDEX idx_invocation_admissions_chat_time
           ON invocation_admissions(chat_id, pending_at DESC);
 CREATE UNIQUE INDEX idx_invocation_admissions_pending_chat

@@ -517,8 +517,19 @@ async function startRepl(ctx, opts = {}) {
       }
 
       if (session.isBusy()) {
-        // 실행 중 타이핑 = 스티어링(다음 턴 큐)
-        session.send(input);
+        // Each intake settles independently of the running brain and other inputs.
+        void (async () => {
+          try {
+            await session.send(input);
+          } catch (e) {
+            if (e && (e.code || e.honestStop)) ui.error(e);
+            else ui.error();
+            if (!rl.line) rl.write(line);
+            else ui.line(ui.c.dim(en
+              ? "The submitted input remains in history (↑); your current draft is unchanged."
+              : "보낸 입력은 히스토리(↑)에 남아 있습니다. 현재 초안은 유지됩니다."));
+          }
+        })();
         return;
       }
       try {

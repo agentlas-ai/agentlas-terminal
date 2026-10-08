@@ -594,7 +594,22 @@ async function startShell(ctx, opts = {}) {
         if (verdict === "quit") shutdown(0);
         return;
       }
-      if (busy) { orch.active()?.send(input).catch(() => {}); return; } // 스티어링 큐
+      if (busy) {
+        try {
+          const active = orch.active();
+          if (!active) throw Object.assign(new Error("No active turn owns this input."), { code: "session_not_active" });
+          await active.send(input);
+        } catch (e) {
+          if (e && (e.code || e.honestStop)) ui.error(e);
+          else ui.error();
+          if (!editor.getText()) editor.setText(String(text || ""));
+          else ui.line(ui.c.dim(en
+            ? "The submitted input remains in history (↑); your current draft is unchanged."
+            : "보낸 입력은 히스토리(↑)에 남아 있습니다. 현재 초안은 유지됩니다."));
+          tui.requestRender();
+        }
+        return;
+      }
       busy = true;
       try {
         const session = ensureMainSession();

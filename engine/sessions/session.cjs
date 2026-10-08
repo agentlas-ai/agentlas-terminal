@@ -5,9 +5,9 @@
  * 세션 = 에이전트 + 챗(영속) + 런타임 resume 상태 + 이벤트 링버퍼.
  * 포그라운드/서브에이전트 구분 없이 실행 경로는 이것 하나다(제2 경로 금지).
  *
- * 스티어링: 네이티브 러너는 stdin이 닫힌 헤드리스 실행이므로 "실행 중 주입"이
- * 아니라 "다음 턴 큐잉"이다 — steer()로 넣은 메시지는 현재 턴이 끝나는 즉시
- * resume 세션으로 이어 실행된다. (조용히 버리지 않고 큐에 쌓였음을 이벤트로 알린다.)
+ * Interactive owner directions use the canonical durable inbox and common
+ * brain-boundary pump inside one invocation. Child/automation sessions retain
+ * their own scoped custody and never inherit this interactive control inbox.
  */
 const crypto = require("node:crypto");
 const { EventEmitter } = require("node:events");
@@ -89,6 +89,12 @@ class Session extends EventEmitter {
     this._apiTurnImpl = opts.apiTurnImpl || null;
     this._timeoutConfig = opts.timeoutConfig || null;
     this._apiAbort = null;
+    this._activeRunId = null;
+    this._runInFlight = false;
+    this._ownerControl = null;
+    this._ownerControlOptions = opts.ownerControlOptions || {};
+    this._initialHistory = null;
+    this._nativeChildren = new Set();
 
     this.chatId = opts.chatId || store.createChat(this.db, {
       agentId: this.agent.id,
@@ -148,27 +154,63 @@ class Session extends EventEmitter {
     return this.status === "running";
   }
 
-  /** 실행 중이면 큐잉, 아니면 즉시 실행. 반환: 최종 상태로 settle되는 Promise. */
-  send(prompt) {
+  currentTurn() {
+    return this.isBusy() && this._ownerControl
+      ? { runId: this._activeRunId, runtime: this.runtime.kind } : null;
+  }
+
+  steerCurrentTurn(input) {
+    if (!this._ownerControl) throw new Error("invocation_current_turn_steer_no_active_run");
+    return this._ownerControl.accept(input);
+  }
+
+  currentTurnSteerReceipt({ intentId }) {
+    return this._ownerControl?.store.getCurrentTurnSteer(this.chatId, intentId) ?? null;
+  }
+
+  /** Busy interactive input settles at durable intake, independently of the brain. */
+  send(prompt, options = {}) {
     const text = String(prompt || "").trim();
     if (!text) return Promise.resolve(null);
     if (this.isBusy()) {
-      this.queue.push(text);
-      this._record({ type: "queued", at: Date.now(), text });
-      return this._turnPromise;
+      if (!this._ownerControl) return Promise.reject(new Error("session_scoped_control_not_interactive"));
+      try {
+        return Promise.resolve(this.steerCurrentTurn({ chatId: this.chatId,
+          expectedRunId: this._activeRunId, intentId: options.intentId || crypto.randomUUID(), text }));
+      } catch (error) { return Promise.reject(error); }
     }
-    this._turnPromise = this._runLoop(text);
+    if (this._runInFlight) return Promise.reject(new Error("session_invocation_still_closing"));
+    this._activeRunId = `terminal-${this.chatId}-${crypto.randomUUID()}`;
+    this._apiAbort = new AbortController();
+    this.status = "running";
+    this._runInFlight = true;
+    try {
+      this._ownerControl = !this.parent && this.chatKind === "user"
+        ? require("./owner-control.cjs").createSessionOwnerControl(this, this._activeRunId, this._ownerControlOptions) : null;
+      this._initialHistory = store.chatHistory(this.db, this.chatId).map(row => ({ role: row.role, text: row.text }));
+      store.appendMessage(this.db, this.chatId, "user", text);
+    } catch (error) {
+      this.status = "failed";
+      try { this._ownerControl?.release(); } catch { /* retain unavailable custody */ }
+      this._runInFlight = false;
+      this._apiAbort = null;
+      this._activeRunId = null;
+      return Promise.reject(error);
+    }
+    this._turnPromise = this._runTurn(text).catch(error => {
+      if (this.status !== "killed") this.status = "failed";
+      this.lastError = error?.message || String(error);
+      throw error;
+    }).finally(async () => {
+      await this._waitForNativeDrain();
+      try { this._ownerControl?.finish(this.status === "killed" ? "owner_control_cancelled"
+        : "owner_control_invocation_closed"); }
+      finally {
+        try { this._ownerControl?.release(); }
+        finally { this._runInFlight = false; this._apiAbort = null; this._activeRunId = null; this._initialHistory = null; }
+      }
+    });
     return this._turnPromise;
-  }
-
-  async _runLoop(firstPrompt) {
-    let prompt = firstPrompt;
-    let result = null;
-    while (prompt != null) {
-      result = await this._runTurn(prompt);
-      prompt = this.queue.length ? this.queue.shift() : null;
-    }
-    return result;
   }
 
   /**
@@ -225,7 +267,7 @@ class Session extends EventEmitter {
     // wall clock: recovery must reconcile the owning process/run explicitly.
     if (this.agent.builtin) return this._executeTurn(prompt);
     let revisions;
-    const runId = `terminal-${this.chatId}-${crypto.randomUUID()}`;
+    const runId = this._activeRunId;
     this.status = "running";
     let acquired = false;
     let revisionReceipt = null;
@@ -273,11 +315,7 @@ class Session extends EventEmitter {
     // ACP agents that cannot load a provider-side session need prior conversation
     // reattached on a fresh session. Capture it before appending this turn so the
     // current user prompt is not duplicated in both history and userPrompt.
-    const priorHistory = store.chatHistory(this.db, this.chatId).map((row) => ({
-      role: row.role,
-      text: row.text,
-    }));
-    store.appendMessage(this.db, this.chatId, "user", prompt);
+    const priorHistory = this._initialHistory || [];
     let governedTurn = null;
     try {
       governedTurn = memoryTurn.beginSessionMemoryTurn(this, prompt);
@@ -317,139 +355,88 @@ class Session extends EventEmitter {
       }, true, prompt);
     } catch { /* 프롬프트 증강 실패는 턴을 막지 않는다 — 원 프롬프트로 진행 */ }
 
-    let res;
+    const signal = this._apiAbort.signal;
+    let ollamaChoice;
     if (this.runtime.kind === "ollama") {
-      const ctrl = new AbortController();
-      this._apiAbort = ctrl;
-      const apiTurn = this._apiTurnImpl || require("../agentlas-api-agent.cjs").runApiTurn;
-      /*
-       * ★모델 이름을 지어내지 않는다(2026-09-07 실측). `--runtime ollama` 는 모델 없이
-       * 도달하는데, 예전에는 여기서 `|| "llama3.1"` 로 이름을 지어내 그 모델이 없는
-       * 기계에서는 실행이 통째로 404 로 죽었다 — 정작 다른 모델은 받아져 있었다.
-       * 이제 서버가 가진 목록에서만 고르고, 못 고르면 푸는 길과 함께 정직하게 멈춘다.
-       */
       const { resolveOllamaModel } = require("../runtimes/ollama.cjs");
-      const ollamaChoice = await resolveOllamaModel(this.runtime.model, { env: process.env });
-      try {
-        const history = store.chatHistory(this.db, this.chatId).map((row) => ({
-          role: row.role,
-          content: row.text,
-        }));
-        res = await apiTurn({
-          backend: "ollama",
-          model: ollamaChoice.model,
-          system: systemPrompt,
-          messages: history,
-          ctx: {
-            cwd: this.cwd,
-            permission: this.permission,
-            env: process.env,
-            /*
-             * 공유 능력 규칙(capability_grants)을 도구 관문이 읽을 수 있게 한다 —
-             * 데스크탑에서 "항상 허용"/"영구 거부"한 행동이 여기서도 그대로 적용된다
-             * (agentlas-tools.runTool). 이 세 칸이 없으면 관문은 등급만 보고 판단한다.
-             */
-            db: this.db,
-            chatId: this.chatId,
-            agentId: this.agent && this.agent.id,
+      ollamaChoice = await resolveOllamaModel(this.runtime.model, { env: process.env,
+        fetch: (url, options = {}) => fetch(url, { ...options,
+          signal: options.signal ? AbortSignal.any([signal, options.signal]) : signal }) });
+    }
+    const episodeResults = [];
+    const runOnce = async (controlRequest) => {
+      this._ownerControl?.assertOwned();
+      if (signal.aborted) throw new Error("session killed");
+      let result;
+      if (this.runtime.kind === "ollama") {
+        const apiTurn = this._apiTurnImpl || require("../agentlas-api-agent.cjs").runApiTurn;
+        result = await apiTurn({ backend: "ollama", model: ollamaChoice.model, system: systemPrompt,
+          messages: [...controlRequest.history.map(row => ({ role: row.role, content: row.text })),
+            { role: "user", content: controlRequest.userPrompt }],
+          ctx: { cwd: this.cwd, permission: this.permission, env: process.env, signal,
+            db: this.db, chatId: this.chatId, agentId: this.agent.id }, ui: this._sink, signal });
+      } else {
+        const req = { kind: this.runtime.kind, bin: this.runtime.bin, ui: this._sink, cwd: this.cwd,
+          prompt: controlRequest.userPrompt, systemPrompt, permission: this.permission,
+          session: { ...this.runtimeSession, ...(controlRequest.runtimeSessionId ? { id: controlRequest.runtimeSessionId } : {}) },
+          history: controlRequest.history, chatId: this.chatId, agentId: this.agent.id, locale: this.lang,
+          sessionFingerprintSeed: this.fingerprint, model: this.runtime.model, effort: this.runtime.effort,
+          mcpServers: this._consentedMcpServers(), signal, onSpawn: child => {
+            this._child = child;
+            this._nativeChildren.add(child);
+            child.once("close", () => {
+              this._nativeChildren.delete(child);
+              if (this._child === child) this._child = null;
+            });
           },
-          ui: this._sink,
-          signal: ctrl.signal,
-        });
-      } catch (e) {
-        res = { text: "", error: (e && e.message) || String(e) };
-      } finally {
-        this._apiAbort = null;
-      }
-    } else {
-      const isAcpRuntime = require("../runtimes/acp-driver.cjs").ACP_KINDS.has(this.runtime.kind);
-      const turnAbort = isAcpRuntime ? new AbortController() : null;
-      if (turnAbort) this._apiAbort = turnAbort;
-      const req = {
-        kind: this.runtime.kind,
-        bin: this.runtime.bin,
-        ui: this._sink,
-        cwd: this.cwd,
-        prompt,
-        systemPrompt,
-        permission: this.permission,
-        session: { ...this.runtimeSession },
-        history: priorHistory,
-        chatId: this.chatId,
-        agentId: this.agent.id,
-        locale: this.lang,
-        sessionFingerprintSeed: this.fingerprint,
-        model: this.runtime.model,
-        effort: this.runtime.effort,
-        // 사용자가 이미 동의한 MCP 서버를 턴에 싣는다.
-        //
-        // 여기가 비어 있어서 챗 경로의 MCP 가 통째로 죽어 있었다(2026-07-28 확인:
-        // `mcpServers` 를 넘기는 호출자가 0곳). native-host 는 `full` 권한에서만
-        // 주입하도록 이미 게이팅돼 있었는데, 그 분기에 도달할 데이터를 아무도
-        // 채우지 않았다 — `agentlas mcp probe` 가 connected 를 찍어도 실제 턴에서는
-        // 그 서버를 쓸 수 없었다.
-        //
-        // 여기서 새로 묻지 않는다. `readConsentedSystemMcpServers` 는 이미 받아 둔
-        // 동의 영수증과 지문이 **지금도 일치하는** 서버만 돌려준다. 동의가 없으면
-        // 빈 배열이고, native-host 가 명시적 빈 격리로 간다. 턴 도중에 동의를 묻는
-        // 것은 사용자가 답할 수 없는 자리에서 묻는 것이라 하지 않는다.
-        mcpServers: this._consentedMcpServers(),
-        onSpawn: (child) => { this._child = child; },
-      };
-      if (turnAbort) req.signal = turnAbort.signal;
-      if (this._spawnImpl) req.spawn = this._spawnImpl;
-      if (this._timeoutConfig) req.timeoutConfig = this._timeoutConfig;
-      let recoveryAbort = null;
-      try {
-        res = await nativeHost.runNativeTurn(req);
-        /*
-         * ★복구 게이트는 **표식**으로 연다 — `!res.text`를 조건에 끼우면 안 된다.
-         * 실측(2026-08-06): claude 한도 거절은 error와 함께 거절문이 text에도 실려 온다.
-         * 그래서 `!res.text`가 영원히 거짓이 되어, 예비 런타임이 등록돼 있는데도
-         * 복구가 한 번도 발화하지 않았다. 실패는 error가 말하고, text는 표시용이다.
-         */
-        // A user kill is terminal. The killed child normally unwinds with an
-        // error marker; treating that marker as provider failure would launch
-        // the next priority model after the user explicitly pressed stop.
-        if (res && res.error && this.status !== "killed") {
+          ...(this._spawnImpl ? { spawn: this._spawnImpl } : {}),
+          ...(this._timeoutConfig ? { timeoutConfig: this._timeoutConfig } : {}) };
+        result = await nativeHost.runNativeTurn(req);
+        // Non-interactive recovery retains its original scoped authority. The
+        // common interactive invocation never replays a failed provider effect.
+        if (!this._ownerControl && result?.error && this.status !== "killed") {
           const nextRuntime = this._nextRecoveryRuntime();
           if (nextRuntime) {
-            const privateEvidence = [...this._privateRecoveryEvidence, String(res.error)]
-              .filter(Boolean).join("\n").slice(0, 12000);
             this.runtime = nextRuntime;
             this.runtimeSession = {};
             this.fingerprint = runtimeSessionFingerprint(nextRuntime, this.agent, this.permission);
-            if (ACP_RUNTIME_KINDS.has(nextRuntime.kind)) {
-              recoveryAbort = new AbortController();
-              this._apiAbort = recoveryAbort;
-            }
-            res = await nativeHost.runNativeTurn({
-              ...req,
-              kind: nextRuntime.kind,
-              bin: nextRuntime.bin,
-              model: nextRuntime.model,
-              effort: nextRuntime.effort,
-              session: {},
-              sessionFingerprintSeed: this.fingerprint,
-              ...(recoveryAbort ? { signal: recoveryAbort.signal } : {}),
-              prompt: [
-                prompt,
-                "",
+            result = await nativeHost.runNativeTurn({ ...req, kind: nextRuntime.kind, bin: nextRuntime.bin,
+              model: nextRuntime.model, effort: nextRuntime.effort, session: {},
+              sessionFingerprintSeed: this.fingerprint, prompt: [prompt, "",
                 "Private recovery evidence follows. Never repeat it to the user.",
-                privateEvidence,
-                "Inspect the complete situation, apply safe reversible recovery within the granted authority, verify it, and finish the original request. Ask one concise question only if user identity or an irreversible choice is required.",
-              ].join("\n"),
-            });
+                [...this._privateRecoveryEvidence, String(result.error)].filter(Boolean).join("\n").slice(0, 12000),
+                "Inspect the complete situation, apply safe reversible recovery within the granted authority, verify it, and finish the original request. Ask one concise question only if user identity or an irreversible choice is required."].join("\n") });
           }
         }
-      } catch (e) {
-        res = { text: "", session: req.session, error: (e && e.message) || String(e) };
-      } finally {
-        if (recoveryAbort && this._apiAbort === recoveryAbort) this._apiAbort = null;
-        if (turnAbort && this._apiAbort === turnAbort) this._apiAbort = null;
       }
+      await this._waitForNativeDrain();
+      episodeResults.push(result);
+      const observedUsage = result?.usage && Number.isSafeInteger(result.usage.input_tokens)
+        && Number.isSafeInteger(result.usage.output_tokens)
+        ? { inputTokens: result.usage.input_tokens, outputTokens: result.usage.output_tokens } : undefined;
+      return { ...result, text: result?.finalText || result?.text || "", sessionId: result?.session?.id,
+        ownerControlTerminal: result?.ownerControlTerminal === "completed" ? "completed" : "uncertain",
+        ...(observedUsage ? { observedUsage } : {}),
+        ...(result?.error ? { failure: { kind: result.errorKind || "exit", message: String(result.error),
+          runtime: this.runtime.kind, source: result.errorSource || "marker" } } : {}) };
+    };
+    let res;
+    try {
+      const controlRequest = { userPrompt: prompt, history: priorHistory,
+        runtimeSessionId: this.runtimeSession.id, signal,
+        ...(this._ownerControl ? { ownerControlInbox: this._ownerControl.inbox } : {}) };
+      res = this._ownerControl
+        ? await this._ownerControl.runWithOwnerControl(controlRequest, runOnce) : await runOnce(controlRequest);
+      if (episodeResults.length > 1) {
+        res.usage = res.observedUsage ? { input_tokens: res.observedUsage.inputTokens,
+          output_tokens: res.observedUsage.outputTokens } : undefined;
+      }
+      if (this._ownerControl && res.ownerControlTerminal !== "completed" && !res.error) {
+        res.error = "owner_control_brain_terminal_unverified";
+      }
+    } catch (error) {
+      res = { text: "", error: error?.message || String(error), ownerControlTerminal: "uncertain" };
     }
-    this._child = null;
 
     const finalText = (res && (res.finalText || res.text)) || "";
     /*
@@ -590,21 +577,24 @@ class Session extends EventEmitter {
     return res;
   }
 
-  /** 실행 중 턴을 중단한다. 큐는 비운다. */
+  async _waitForNativeDrain() {
+    await Promise.all([...this._nativeChildren].map(child =>
+      new Promise(resolve => child.once("close", resolve))));
+  }
+
+  /** Stop always aborts the shared brain signal and independently kills the child tree. */
   kill() {
     this.queue.length = 0;
-    if (this._apiAbort) {
-      this.status = "killed";
-      try { this._apiAbort.abort(new Error("session killed")); } catch { /* already aborted */ }
-      return;
-    }
+    try { this._ownerControl?.markSettling(); } catch { /* cancellation cannot depend on custody storage */ }
+    if (this.status === "running" || this._runInFlight) this.status = "killed";
+    try { this._apiAbort?.abort(new Error("session killed")); } catch { /* already aborted */ }
     if (this._child) {
-      this.status = "killed";
       try { nativeHost.terminateNativeChild(this._child); } catch { /* already dead */ }
-    } else if (this.status === "running") {
-      this.status = "killed";
     }
+    try { this._ownerControl?.finish("owner_control_cancelled"); }
+    catch (error) { this._privateRecoveryEvidence.push(`control settlement failed: ${error?.message || error}`.slice(0, 4000)); }
   }
+
 }
 
 module.exports = { Session, runtimeSessionFingerprint };

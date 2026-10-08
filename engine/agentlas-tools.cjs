@@ -10,7 +10,7 @@
 const path = require("node:path");
 const fs = require("node:fs");
 const crypto = require("node:crypto");
-const { spawnSync } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 
 const PERM_RANK = { read: 0, write: 1, full: 2 };
 const MAX_TEXT_FILE_BYTES = 8 * 1024 * 1024;
@@ -357,7 +357,7 @@ function toolAskFor(tool, args) {
 }
 
 // 툴 1개 실행 → { ok, content }. 권한 부족/에러는 ok:false 문자열로.
-function runTool(name, args, ctx) {
+function authorizeTool(name, args, ctx) {
   const tool = BY_NAME[name];
   if (!tool) return { ok: false, content: `unknown tool: ${name}` };
   const context = ctx && typeof ctx === "object" ? ctx : {};
@@ -393,11 +393,90 @@ function runTool(name, args, ctx) {
       content: `permission denied: '${name}' requires '${tool.minPerm}' but current is '${context.permission || "read"}'. Ask the user to run /permission ${tool.minPerm}.`,
     };
   }
+  return { tool, context };
+}
+
+function runTool(name, args, ctx) {
+  const authorized = authorizeTool(name, args, ctx);
+  if (!authorized.tool) return authorized;
   try {
-    return { ok: true, content: String(tool.run(args || {}, context)) };
+    return { ok: true, content: String(authorized.tool.run(args || {}, authorized.context)) };
   } catch (e) {
     return { ok: false, content: `${name} error: ${e && e.message ? e.message : String(e)}` };
   }
+}
+
+async function runToolAsync(name, args, ctx) {
+  const authorized = authorizeTool(name, args, ctx);
+  if (!authorized.tool) return authorized;
+  if (authorized.context.signal?.aborted) return { ok: false, content: `${name} cancelled before dispatch`, terminalUncertain: true };
+  if (name !== "bash") return runTool(name, args, ctx);
+  return runShellToolAsync(args || {}, authorized.context);
+}
+
+function runShellToolAsync(args, ctx) {
+  const value = Number(args.timeout_ms);
+  const timeout = Math.min(Math.max(Number.isFinite(value) && value > 0 ? value : 120000, 1000), 600000);
+  const limit = 8 * 1024 * 1024;
+  return new Promise(resolve => {
+    if (ctx.signal?.aborted) return resolve({ ok: false, content: "bash cancelled before dispatch", terminalUncertain: true });
+    const native = require("./agentlas-native-host.cjs");
+    let child;
+    try {
+      child = spawn("bash", ["-lc", args.command], { cwd: ctx.cwd, env: ctx.env || process.env,
+        detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    } catch (error) {
+      return resolve({ ok: false, content: `exit ? (spawn error: ${error.message})\n(no output)` });
+    }
+    child.__agentlasNativeChild = true;
+    child.__agentlasGroupedChild = process.platform !== "win32";
+    let reason = null, settled = false, code = null, exitSignal = null, closed = false;
+    let capturedPids = [], verifyTimer = null, forceTimer = null;
+    const output = { stdout: [], stderr: [] }, bytes = { stdout: 0, stderr: 0 };
+    const timer = setTimeout(() => stop("timeout"), timeout);
+    const finish = () => {
+      if (settled || !closed) return;
+      const active = capturedPids.length ? native.activeNativeProcessIds(capturedPids) : [];
+      if (!Array.isArray(active) || active.length) {
+        verifyTimer = setTimeout(finish, 25);
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);clearTimeout(forceTimer);clearTimeout(verifyTimer);
+      ctx.signal?.removeEventListener("abort", abort);
+      process.removeListener("exit", reap);
+      let head = `exit ${code == null ? "?" : code}`;
+      if (reason === "timeout") head += ` (timed out after ${timeout}ms)`;
+      else if (reason === "output") head += " (output exceeded 8MB, truncated)";
+      else if (reason === "abort") head += " (cancelled)";
+      else if (reason?.message) head += ` (spawn error: ${reason.message})`;
+      else if (exitSignal) head += ` (killed by ${exitSignal})`;
+      const body = truncate([Buffer.concat(output.stdout).toString("utf8"), Buffer.concat(output.stderr).toString("utf8")]
+        .filter(Boolean).join("\n").trim() || "(no output)", 12000);
+      resolve({ ok: true, content: `${head}\n${body}`,
+        ...(["timeout", "output", "abort"].includes(reason) ? { terminalUncertain: true } : {}) });
+    };
+    const stop = why => {
+      if (reason || settled) return;
+      reason = why;
+      capturedPids = native.forceStopNativeProcessTree(child);
+      native.terminateNativeChild(child, "SIGTERM");
+      forceTimer = setTimeout(() => native.terminateNativeChild(child, "SIGKILL"), 250);
+    };
+    const abort = () => stop("abort");
+    const reap = () => native.terminateNativeChild(child, "SIGKILL");
+    process.once("exit", reap);
+    ctx.signal?.addEventListener("abort", abort, { once: true });
+    if (ctx.signal?.aborted) abort();
+    for (const stream of ["stdout", "stderr"]) child[stream].on("data", chunk => {
+      const room = Math.max(0, limit - bytes[stream]);
+      if (room) output[stream].push(chunk.subarray(0, room));
+      bytes[stream] += chunk.length;
+      if (bytes[stream] > limit) stop("output");
+    });
+    child.on("error", error => { reason = reason || error; });
+    child.on("close", (status, signal) => { code = status; exitSignal = signal; closed = true; finish(); });
+  });
 }
 
 // ── provider별 tool 선언 포맷 ─────────────────────────────
@@ -420,6 +499,7 @@ module.exports = {
   BY_NAME,
   allowedTools,
   runTool,
+  runToolAsync,
   anthropicTools,
   openaiTools,
   PERM_RANK,

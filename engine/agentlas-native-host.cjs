@@ -690,6 +690,7 @@ function handleClaudeLine(line, st, ui) {
       return;
     }
     case "result":
+      st.ownerControlTerminal = obj.is_error ? "uncertain" : "completed";
       st.finalText = typeof obj.result === "string" ? obj.result : st.text;
       st.usage = {
         input_tokens: obj.usage && obj.usage.input_tokens,
@@ -781,6 +782,7 @@ function handleCodexLine(line, st, ui) {
       return;
     }
     case "turn.completed":
+      st.ownerControlTerminal = "completed";
       if (obj.usage) {
         st.usage = {
           input_tokens: obj.usage.input_tokens,
@@ -1061,6 +1063,7 @@ function handleAgyLine(line, st, ui) {
   let obj;
   try { obj = JSON.parse(line); } catch { return; }
   if (obj.event === "result") {
+    st.ownerControlTerminal = ["success", "completed", "done"].includes(String(obj.result?.status).toLowerCase()) ? "completed" : "uncertain";
     if (st.geminiStreaming) { ui.streamEnd(); st.geminiStreaming = false; }
     if (obj.result && typeof obj.result.response === "string") st.finalText = obj.result.response;
     if (obj.result?.status && !["success", "completed", "done"].includes(String(obj.result.status).toLowerCase())) {
@@ -1157,6 +1160,7 @@ function handleGeminiLine(line, st, ui) {
       return;
     }
     case "result": {
+      st.ownerControlTerminal = obj.status === "success" ? "completed" : "uncertain";
       if (st.geminiStreaming) {
         ui.streamEnd();
         st.geminiStreaming = false;
@@ -1448,6 +1452,7 @@ function runNativeTurn(req) {
       if (exitError && !st.errorKind) { st.errorKind = "exit"; st.errorSource = st.errorSource || "exit"; }
       finish({
         text, session: st.session, usage: st.usage, error: exitError,
+        ownerControlTerminal: !exitError && st.ownerControlTerminal === "completed" ? "completed" : "uncertain",
         ...(exitError ? { errorKind: st.errorKind, errorSource: st.errorSource } : {}),
       });
     });

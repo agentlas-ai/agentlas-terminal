@@ -161,7 +161,8 @@ async function runAcpTurn(req) {
     if (result.failure) {
       return { text: result.text || "", session, usage: null, error: result.failure.message, errorKind: result.failure.kind, errorSource: result.failure.source };
     }
-    return { text: result.text || "", session, usage: null, error: null };
+    return { text: result.text || "", session, usage: null, error: null,
+      ownerControlTerminal: result.ownerControlTerminal === "completed" ? "completed" : "uncertain" };
   } catch (e) {
     if (streaming) ui.streamEnd();
     const message = e && e.message ? e.message : String(e);

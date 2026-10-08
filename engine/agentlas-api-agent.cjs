@@ -93,6 +93,7 @@ async function streamAnthropic({ apiKey, model, system, messages, permission, ui
 
   const blocks = {}; // index → {type, text, name, id, inputJson}
   let stopReason = null;
+  let messageStopped = false;
   let usage = null;
   try {
     for await (const line of iterSse(resp, idle)) {
@@ -104,7 +105,9 @@ async function streamAnthropic({ apiKey, model, system, messages, permission, ui
       } catch {
         continue;
       }
-      if (ev.type === "content_block_start") {
+      if (ev.type === "message_stop") {
+        messageStopped = true;
+      } else if (ev.type === "content_block_start") {
         const cb = ev.content_block || {};
         blocks[ev.index] = { type: cb.type, text: "", name: cb.name, id: cb.id, inputJson: "" };
         if (cb.type === "tool_use") ui.tool(cb.name, "");
@@ -160,13 +163,15 @@ async function streamAnthropic({ apiKey, model, system, messages, permission, ui
       toolUses.push({ id: b.id, name: b.name, input });
     }
   }
-  return { text, assistantContent, toolUses, stopReason, usage };
+  return { text, assistantContent, toolUses, stopReason, usage,
+    terminal: messageStopped && ["end_turn", "max_tokens", "stop_sequence", "tool_use"].includes(stopReason) };
 }
 
 async function runAnthropicLoop(req) {
   const { ctx, ui } = req;
   const messages = req.messages.slice();
   let finalText = "";
+  let ownerControlTerminal = "uncertain";
   let inTok = 0, outTok = 0;
   for (let i = 0; i < MAX_ITERS; i++) {
     if (req.signal && req.signal.aborted) break;
@@ -181,18 +186,20 @@ async function runAnthropicLoop(req) {
     });
     finalText = r.text || finalText;
     if (r.usage) { inTok += r.usage.input_tokens || 0; outTok += r.usage.output_tokens || 0; }
-    if (!r.toolUses.length) break;
+    if (!r.terminal || (r.toolUses.length && r.stopReason !== "tool_use")) break;
+    if (!r.toolUses.length) { ownerControlTerminal = "completed"; break; }
     messages.push({ role: "assistant", content: r.assistantContent });
     const results = [];
     for (const tu of r.toolUses) {
-      const out = tools.runTool(tu.name, tu.input, ctx);
+      const out = await tools.runToolAsync(tu.name, tu.input, ctx);
       ui.toolResult(out.content, out.ok);
+      if (out.terminalUncertain) return { text: finalText, ownerControlTerminal: "uncertain" };
       results.push({ type: "tool_result", tool_use_id: tu.id, content: out.content, is_error: !out.ok });
     }
     messages.push({ role: "user", content: results });
   }
   if (inTok || outTok) ui.cost({ input_tokens: inTok, output_tokens: outTok });
-  return { text: finalText };
+  return { text: finalText, ownerControlTerminal };
 }
 
 // ── OpenAI ───────────────────────────────────────────────
@@ -278,6 +285,7 @@ async function runOpenAILoop(req) {
   // OpenAI는 system을 messages[0]로.
   if (!messages.length || messages[0].role !== "system") messages.unshift({ role: "system", content: req.system });
   let finalText = "";
+  let ownerControlTerminal = "uncertain";
   let inTok = 0, outTok = 0;
   for (let i = 0; i < MAX_ITERS; i++) {
     if (req.signal && req.signal.aborted) break;
@@ -292,7 +300,9 @@ async function runOpenAILoop(req) {
     });
     finalText = r.text || finalText;
     if (r.usage) { inTok += r.usage.input_tokens || 0; outTok += r.usage.output_tokens || 0; }
-    if (!r.toolCalls.length) break;
+    if (!["stop", "length", "tool_calls", "function_call"].includes(r.finish)
+      || (r.toolCalls.length && !["tool_calls", "function_call"].includes(r.finish))) break;
+    if (!r.toolCalls.length) { ownerControlTerminal = "completed"; break; }
     messages.push({
       role: "assistant",
       content: r.text || null,
@@ -307,13 +317,14 @@ async function runOpenAILoop(req) {
       }
       const arg = safeArgObj(args);
       if (arg) ui.info(ui.c.dim("  " + arg));
-      const out = tools.runTool(c.name, args, ctx);
+      const out = await tools.runToolAsync(c.name, args, ctx);
       ui.toolResult(out.content, out.ok);
+      if (out.terminalUncertain) return { text: finalText, ownerControlTerminal: "uncertain" };
       messages.push({ role: "tool", tool_call_id: c.id, content: out.content });
     }
   }
   if (inTok || outTok) ui.cost({ input_tokens: inTok, output_tokens: outTok });
-  return { text: finalText };
+  return { text: finalText, ownerControlTerminal };
 }
 
 // ── Ollama (openai 스타일 tools, /api/chat) ──────────────
@@ -324,6 +335,7 @@ async function runOllamaLoop(req) {
   if (!messages.length || messages[0].role !== "system") messages.unshift({ role: "system", content: req.system });
   const toolDefs = tools.openaiTools(ctx.permission);
   let finalText = "";
+  let ownerControlTerminal = "uncertain";
   for (let i = 0; i < MAX_ITERS; i++) {
     if (req.signal && req.signal.aborted) break;
     const idle = idleAbort(req.signal, IDLE_MS);
@@ -357,6 +369,7 @@ async function runOllamaLoop(req) {
     let text = "";
     let started = false;
     let toolCalls = [];
+    let done = false;
     try {
       for await (const line of iterSse(resp, idle)) {
         let ev;
@@ -365,6 +378,7 @@ async function runOllamaLoop(req) {
         } catch {
           continue;
         }
+        if (ev.done === true) done = true;
         const msg = ev.message || {};
         if (msg.content) {
           if (!started) {
@@ -381,19 +395,21 @@ async function runOllamaLoop(req) {
       idle.clear();
     }
     finalText = text || finalText;
-    if (!toolCalls.length) break;
+    if (!done) break;
+    if (!toolCalls.length) { ownerControlTerminal = "completed"; break; }
     messages.push({ role: "assistant", content: text, tool_calls: toolCalls });
     for (const c of toolCalls) {
       const fn = c.function || {};
       const args = typeof fn.arguments === "string" ? safeParse(fn.arguments) : fn.arguments || {};
       ui.tool(fn.name || "tool", safeArgObj(args));
-      const out = tools.runTool(fn.name, args, ctx);
+      const out = await tools.runToolAsync(fn.name, args, ctx);
       ui.toolResult(out.content, out.ok);
+      if (out.terminalUncertain) return { text: finalText, ownerControlTerminal: "uncertain" };
       // Ollama tool 결과는 tool_call_id가 없으므로 tool_name으로 상관관계를 보존 (병렬 호출 시 중요)
       messages.push({ role: "tool", tool_name: fn.name, content: out.content });
     }
   }
-  return { text: finalText };
+  return { text: finalText, ownerControlTerminal };
 }
 
 // ── Google (chat-only 스트리밍) ──────────────────────────
@@ -423,6 +439,7 @@ async function runGoogleChat(req) {
     throw new Error(`Google ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 300)}`);
   }
   let text = "";
+  let ownerControlTerminal = "uncertain";
   let started = false;
   try {
     for await (const line of iterSse(resp, idle)) {
@@ -434,6 +451,7 @@ async function runGoogleChat(req) {
       } catch {
         continue;
       }
+      if (["STOP", "MAX_TOKENS"].includes(ev.candidates?.[0]?.finishReason)) ownerControlTerminal = "completed";
       const t = ev.candidates && ev.candidates[0] && ev.candidates[0].content && ev.candidates[0].content.parts && ev.candidates[0].content.parts[0] && ev.candidates[0].content.parts[0].text;
       if (t) {
         if (!started) {
@@ -448,7 +466,7 @@ async function runGoogleChat(req) {
     if (started) ui.streamEnd();
     idle.clear();
   }
-  return { text };
+  return { text, ownerControlTerminal };
 }
 
 // ── 엔트리 ───────────────────────────────────────────────
