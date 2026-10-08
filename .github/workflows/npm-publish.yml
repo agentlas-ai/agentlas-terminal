@@ -14,6 +14,11 @@ on:
         description: "Package version when ref is the exact current main commit SHA"
         required: false
         type: string
+      verify_only:
+        description: "Check an existing publication without publishing or retrying it"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -154,7 +159,7 @@ jobs:
           fi
 
       - name: Publish with npm trusted publishing
-        if: steps.registry.outputs.already_published != 'true'
+        if: steps.registry.outputs.already_published != 'true' && inputs.verify_only != true
         run: npm publish --access public
 
       - name: Verify registry publication
@@ -162,7 +167,7 @@ jobs:
           RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
           set -euo pipefail
-          for _attempt in {1..12}; do
+          for _attempt in {1..120}; do
             published="$(npm view "agentlas@$RELEASE_VERSION" version --json 2>/dev/null | tr -d '"' || true)"
             if [ "$published" = "$RELEASE_VERSION" ]; then
               npm view "agentlas@$RELEASE_VERSION" dist.tarball dist.integrity --json
