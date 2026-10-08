@@ -75,12 +75,99 @@ function candidateRoots() {
   return roots;
 }
 
-/** 컴파일된 코어의 dist 루트를 찾는다(run-graph.js 존재로 판정). 없으면 null. */
+const OWNER_CORE_SCHEMA_VERSION = 129;
+const OWNER_CORE_EXPORTS = [
+  ["electron/store/current-turn-steer-core.js", "createCurrentTurnSteerStore"],
+  ["electron/store/invocation-owner-core.js", "createInvocationRunOwnerStore"],
+  ["electron/runtime/owner-control-pump.js", "runWithOwnerControl"],
+  ["electron/daemon/invocation-owner-client.js", "createInvocationOwnerClient"],
+];
+let _selectedCoreRoot = null;
+
+function incompatibleCore(root, reason) {
+  return Object.assign(new Error(`AGENTLAS_DESKTOP_CORE_INCOMPATIBLE: ${reason}; a complete owner-control core with schema ${OWNER_CORE_SCHEMA_VERSION} or newer is required (${root}).`), {
+    code: "AGENTLAS_DESKTOP_CORE_INCOMPATIBLE", reason, root,
+    requiredSchemaVersion: OWNER_CORE_SCHEMA_VERSION,
+  });
+}
+
+// Validate only the process-neutral owner modules. Never import store/db, open
+// SQLite, install Electron hooks or construct/connect a native client here.
+function assertOwnerCoreCompatible(root) {
+  try {
+    const realRoot = fs.realpathSync(root);
+    const inside = (file) => {
+      const relative = path.relative(realRoot, fs.realpathSync(file));
+      if (relative.startsWith(`..${path.sep}`) || relative === ".." || path.isAbsolute(relative)) {
+        throw incompatibleCore(root, "owner_module_outside_core");
+      }
+      return fs.realpathSync(file);
+    };
+    inside(path.join(root, "electron/workflow/run-graph.js"));
+    const schemaFile = inside(path.join(root, "electron/store/db.js"));
+    const schemaSource = fs.readFileSync(schemaFile, "utf8");
+    const schema = /\bconst\s+SCHEMA_VERSION\s*=\s*(\d+)\s*;/.exec(schemaSource);
+    if (!schema || Number(schema[1]) < OWNER_CORE_SCHEMA_VERSION
+      || !/exports\.STORE_SCHEMA_VERSION\s*=\s*SCHEMA_VERSION\s*;/.test(schemaSource)) {
+      throw incompatibleCore(root, "owner_schema_unavailable");
+    }
+    const builtins = new Set(require("node:module").builtinModules.map((name) => name.replace(/^node:/, "")));
+    const visited = new Set();
+    const pending = OWNER_CORE_EXPORTS.map(([relative]) => path.join(root, relative));
+    while (pending.length) {
+      const file = inside(pending.pop());
+      if (visited.has(file)) continue;
+      visited.add(file);
+      const source = fs.readFileSync(file, "utf8");
+      const literalRequire = /\brequire\(\s*(["'])([^"']+)\1\s*\)/g;
+      for (const match of source.matchAll(literalRequire)) {
+        const spec = match[2];
+        if (builtins.has(spec.replace(/^node:/, ""))) continue;
+        if (!spec.startsWith(".")) throw incompatibleCore(root, "owner_module_not_process_neutral");
+        const dependency = require.resolve(path.resolve(path.dirname(file), spec));
+        if (dependency === schemaFile) throw incompatibleCore(root, "owner_module_imports_store");
+        pending.push(dependency);
+      }
+      if (/\brequire\s*\(/.test(source.replace(literalRequire, ""))) {
+        throw incompatibleCore(root, "owner_module_dynamic_import");
+      }
+    }
+    for (const [relative, name] of OWNER_CORE_EXPORTS) {
+      if (typeof require(path.join(root, relative))[name] !== "function") {
+        throw incompatibleCore(root, "owner_module_export_unavailable");
+      }
+    }
+  } catch (error) {
+    if (error?.code === "AGENTLAS_DESKTOP_CORE_INCOMPATIBLE") throw error;
+    throw incompatibleCore(root, "owner_module_unavailable");
+  }
+}
+
+/** Select one compatible build for every loader and Session in this process. */
 function findCoreRoot() {
+  const explicit = String(process.env.AGENTLAS_DESKTOP_CORE || "").trim();
+  if (explicit) {
+    const root = path.resolve(explicit);
+    if (_selectedCoreRoot) {
+      let realRoot;
+      try { realRoot = fs.realpathSync(root); }
+      catch { throw incompatibleCore(root, "owner_module_unavailable"); }
+      if (realRoot !== fs.realpathSync(_selectedCoreRoot)) {
+        throw incompatibleCore(root, "core_already_bound");
+      }
+      return _selectedCoreRoot;
+    }
+    if (!_selectedCoreRoot) assertOwnerCoreCompatible(root);
+    _selectedCoreRoot = root;
+    return root;
+  }
+  if (_selectedCoreRoot) return _selectedCoreRoot;
   for (const root of candidateRoots()) {
     try {
-      if (fs.existsSync(path.join(root, "electron", "workflow", "run-graph.js"))) return root;
-    } catch { /* 다음 후보 */ }
+      assertOwnerCoreCompatible(root);
+      _selectedCoreRoot = root;
+      return root;
+    } catch { /* Skip incomplete/old defaults; never mix their modules. */ }
   }
   return null;
 }
@@ -206,8 +293,8 @@ function configureSharedCoreIdentity(root) {
  * 한 번 켠다 — 사고로 되는 일과 적어서 되는 일은 달라야 한다.
  */
 function loadDesktopCore(options = {}) {
-  if (_cache !== undefined) return _cache;
   const root = findCoreRoot();
+  if (_cache !== undefined) return _cache;
   if (!root) { _cache = null; return null; }
   installRetiredProjectProvisioningHook();
   installNativeModuleHook();
@@ -319,8 +406,8 @@ function loadDesktopCore(options = {}) {
  */
 let _acpCache = undefined;
 function loadCoreAcpRuntime() {
-  if (_acpCache !== undefined) return _acpCache;
   const root = findCoreRoot();
+  if (_acpCache !== undefined) return _acpCache;
   if (!root) { _acpCache = null; return null; }
   const file = path.join(root, "electron", "runtime", "acp.js");
   if (!fs.existsSync(file)) { _acpCache = { root, error: new Error("desktop core predates the ACP runner (no electron/runtime/acp.js)") }; return _acpCache; }
@@ -345,9 +432,9 @@ function loadCoreAcpRuntime() {
 const _sharedCache = new Map();
 function loadCoreShared(rel) {
   const key = String(rel || "").replace(/\.js$/, "");
+  const root = findCoreRoot();
   if (_sharedCache.has(key)) return _sharedCache.get(key);
   let result = null;
-  const root = findCoreRoot();
   if (root) {
     const file = path.join(root, "shared", key + ".js");
     if (!fs.existsSync(file)) {

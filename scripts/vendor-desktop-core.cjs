@@ -44,6 +44,8 @@ const ROOT_ENTRY = path.join(distRoot, "electron", "workflow", "run-graph.js");
 //   상태였다 — CLI 만 쓰는 사람은 그 자동화를 영원히 못 돌린다.
 //   내는 오류가 있으면 푸는 길도 같이 실어야 한다.
 const EXTRA_ENTRIES = [
+  // Terminal's owner client is loaded dynamically, outside the graph closure.
+  path.join(distRoot, "electron", "daemon", "invocation-owner-client.js"),
   path.join(distRoot, "electron", "store", "graph-reconciliation.js"),
   // 저장 전 확인 — 동적 req() 로만 닿아 정적 분석이 못 본다(재조정과 같은 자리).
   path.join(distRoot, "electron", "workflow", "verify-before-save.js"),
@@ -292,6 +294,10 @@ function main() {
     process.exit(1);
   }
   console.log(`Computing the static require-graph closure from ${path.relative(distRoot, ROOT_ENTRY)} …`);
+  const ownerClientEntry = path.join(distRoot, "electron", "daemon", "invocation-owner-client.js");
+  if (!fs.existsSync(ownerClientEntry)) {
+    throw new Error("Required Desktop owner-control client is missing. Rebuild the current Desktop core before vendoring.");
+  }
   const entries = [ROOT_ENTRY, ...EXTRA_ENTRIES.filter((p) => fs.existsSync(p))];
   const { internal, external, missing } = computeClosure(entries);
   if (missing.size) {
