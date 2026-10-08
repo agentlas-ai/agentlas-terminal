@@ -1,4 +1,4 @@
--- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-10-08T07:02:40Z)
+-- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-10-08T13:12:48Z)
 --
 -- ★생성물이다. 손으로 고치지 말고 재생성하라:
 --     node scripts/gen-bootstrap-schema.cjs
@@ -960,6 +960,19 @@ CREATE TABLE invocation_admissions (
             OR (status = 'rejected' AND admitted_at IS NULL AND rejected_at IS NOT NULL AND rejection_reason_code IS NOT NULL)
           )
         );
+CREATE TABLE invocation_current_turn_steers (
+      intent_id TEXT PRIMARY KEY,
+      chat_id TEXT NOT NULL,
+      run_id TEXT NOT NULL,
+      prompt_text TEXT NOT NULL,
+      prompt_hash TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      binding_json TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('queued','dispatching','applied','rejected','uncertain')),
+      code TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
 CREATE TABLE invocation_steers (
       id TEXT PRIMARY KEY,
       chat_id TEXT NOT NULL,
@@ -1837,6 +1850,8 @@ CREATE INDEX idx_chats_project_updated
 CREATE INDEX idx_chats_seat_updated ON chats(seat_id, updated_at DESC);
 CREATE INDEX idx_chats_updated ON chats(updated_at DESC);
 CREATE INDEX idx_chats_used_updated ON chats(used_at, updated_at DESC);
+CREATE INDEX idx_current_turn_steers_chat
+      ON invocation_current_turn_steers(chat_id, created_at, intent_id);
 CREATE INDEX idx_experience_auto_intake_agent_status
         ON experience_auto_intake_receipts(agent_id, status, created_at DESC);
 CREATE INDEX idx_experience_auto_intake_run
