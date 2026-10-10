@@ -1,4 +1,4 @@
--- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-10-08T14:32:09Z)
+-- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-10-10T13:57:54Z)
 --
 -- ★생성물이다. 손으로 고치지 말고 재생성하라:
 --     node scripts/gen-bootstrap-schema.cjs
@@ -6,7 +6,7 @@
 -- 정본은 Desktop 의 마이그레이션 사다리(agentlas_desktop/electron/store/db.ts, SCHEMA_VERSION).
 -- 이 파일은 그 사다리를 **빈 DB** 에 끝까지 돌린 결과의 덤프이므로, 터미널이 만든 DB 는
 -- 처음부터 사다리 머리에 있다 — 데스크탑이 나중에 승급할 것이 남지 않는다.
-PRAGMA user_version=129;
+PRAGMA user_version=131;
 CREATE TABLE active_runtime (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         kind TEXT NOT NULL
@@ -59,6 +59,36 @@ CREATE TABLE agent_asset_versions (
         updated_at TEXT NOT NULL,
         FOREIGN KEY(agent_id) REFERENCES installed_agents(id) ON DELETE CASCADE
       );
+CREATE TABLE agent_context_bindings (
+      context_key TEXT NOT NULL REFERENCES agent_context_heads(context_key) ON DELETE CASCADE,
+      binding_key TEXT NOT NULL, provider_json TEXT NOT NULL,
+      generation INTEGER NOT NULL DEFAULT 1, acknowledged_seq INTEGER NOT NULL DEFAULT 0,
+      native_handle TEXT, PRIMARY KEY(context_key, binding_key)
+    );
+CREATE TABLE agent_context_deliveries (
+      delivery_id TEXT PRIMARY KEY, context_key TEXT NOT NULL REFERENCES agent_context_heads(context_key) ON DELETE CASCADE,
+      turn_id TEXT NOT NULL, binding_key TEXT NOT NULL, generation INTEGER NOT NULL,
+      from_seq INTEGER NOT NULL, through_seq INTEGER NOT NULL,
+      mode TEXT NOT NULL, status TEXT NOT NULL, receipt_id TEXT,
+      UNIQUE(context_key, turn_id)
+    );
+CREATE TABLE agent_context_entries (
+      context_key TEXT NOT NULL REFERENCES agent_context_heads(context_key) ON DELETE CASCADE,
+      seq INTEGER NOT NULL, event_id TEXT NOT NULL, kind TEXT NOT NULL,
+      payload_json TEXT NOT NULL, digest TEXT NOT NULL, producer_binding TEXT,
+      PRIMARY KEY(context_key, seq), UNIQUE(context_key, event_id)
+    );
+CREATE TABLE agent_context_heads (
+      context_key TEXT PRIMARY KEY, identity_json TEXT NOT NULL,
+      revision INTEGER NOT NULL DEFAULT 0, through_seq INTEGER NOT NULL DEFAULT 0,
+      open_delivery_id TEXT, updated_at TEXT NOT NULL
+    );
+CREATE TABLE agent_context_stable_blocks (
+      context_key TEXT NOT NULL REFERENCES agent_context_heads(context_key) ON DELETE CASCADE,
+      binding_key TEXT NOT NULL, generation INTEGER NOT NULL,
+      block_hash TEXT NOT NULL, acknowledged_seq INTEGER NOT NULL,
+      PRIMARY KEY(context_key, binding_key, generation, block_hash)
+    );
 CREATE TABLE agent_evolution_proposals (
         id TEXT PRIMARY KEY,
         agent_id TEXT NOT NULL,
@@ -898,6 +928,50 @@ CREATE TABLE folder_activity (
         first_seen TEXT NOT NULL,
         last_seen TEXT NOT NULL
       );
+CREATE TABLE goal_kpi_samples (
+      id TEXT PRIMARY KEY,
+      goal_id TEXT NOT NULL,
+      kpi_id TEXT NOT NULL,
+      value REAL NOT NULL,
+      observed_at TEXT NOT NULL,
+      recorded_at TEXT NOT NULL,
+      trust TEXT NOT NULL CHECK(trust IN ('agent_observed','collector')),
+      evidence TEXT NOT NULL,
+      run_id TEXT,
+      UNIQUE(goal_id, kpi_id, observed_at)
+    );
+CREATE TABLE goal_kpi_state (
+      goal_id TEXT NOT NULL,
+      kpi_id TEXT NOT NULL,
+      state TEXT NOT NULL CHECK(state IN ('no_data','ahead','on_pace','behind','stalled','breakout','declining')),
+      since TEXT NOT NULL,
+      pending_state TEXT,
+      pending_count INTEGER NOT NULL DEFAULT 0,
+      last_sample_id TEXT,
+      last_fired_at TEXT,
+      last_fired_state TEXT,
+      trigger_id TEXT,
+      trigger_created_at TEXT,
+      PRIMARY KEY(goal_id, kpi_id)
+    );
+CREATE TABLE goal_kpis (
+      goal_id TEXT NOT NULL,
+      kpi_id TEXT NOT NULL,
+      revision INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      unit TEXT NOT NULL DEFAULT '',
+      direction TEXT NOT NULL DEFAULT 'up' CHECK(direction IN ('up','down')),
+      kr_id TEXT,
+      target REAL,
+      deadline_at TEXT,
+      baseline REAL,
+      source_kind TEXT NOT NULL CHECK(source_kind IN ('agent_observed','collector')),
+      source_ref TEXT,
+      cadence_hours INTEGER NOT NULL DEFAULT 24 CHECK(cadence_hours BETWEEN 1 AND 168),
+      min_samples INTEGER NOT NULL DEFAULT 3,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(goal_id, kpi_id)
+    );
 CREATE TABLE graph_run_journal (
       run_id   TEXT NOT NULL,
       seq      INTEGER NOT NULL,
@@ -1917,6 +1991,7 @@ CREATE INDEX idx_failure_events_run
 CREATE INDEX idx_failure_events_ts
         ON failure_events(ts DESC);
 CREATE INDEX idx_firms_installed ON firms(installed_at DESC);
+CREATE INDEX idx_goal_kpi_samples_series ON goal_kpi_samples(goal_id, kpi_id, observed_at);
 CREATE INDEX idx_graph_run_journal_run ON graph_run_journal(run_id, seq);
 CREATE INDEX idx_hub_agent_bookmarks_outbox
           ON hub_agent_bookmarks(workspace_id, sync_state, bookmarked_at ASC);
