@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "desktopCommit": "85010aeb1937946212900eea17395d2f6443eb3d",
-  "pinnedAt": "2026-10-22",
+  "desktopCommit": "4bbd45f424b27c7c6127640f0bad850a0fe54e70",
+  "pinnedAt": "2026-10-23",
   "reason": "Use the source-bound Desktop core with schema 134 and the current shared runtime contract."
 }

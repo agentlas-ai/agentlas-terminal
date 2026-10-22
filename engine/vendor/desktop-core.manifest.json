@@ -1,23 +1,23 @@
 {
-  "version": "20",
+  "version": "21",
   "platformAssets": {
     "darwin": {
-      "url": "https://github.com/agentlas-ai/agentlas-terminal/releases/download/desktop-core-v20/desktop-core-darwin.tar.gz",
-      "sha256": "661ff451dd079c412b5090c5ac398cfe88301e2a662d82265908df6291803dd2",
-      "sizeBytes": 110567119
+      "url": "https://github.com/agentlas-ai/agentlas-terminal/releases/download/desktop-core-v21/desktop-core-darwin.tar.gz",
+      "sha256": "82a5551a9175c1cdf05d42aa0a8388808b051f1f3455d174d5cdeda94eb42c3d",
+      "sizeBytes": 110567206
     },
     "win32-x64": {
-      "url": "https://github.com/agentlas-ai/agentlas-terminal/releases/download/desktop-core-v20/desktop-core-win32-x64.tar.gz",
-      "sha256": "810abbf7de7473110f9f3d6f59c0517da4a41b10744b70e53f4fa635135ffacf",
-      "sizeBytes": 91820060
+      "url": "https://github.com/agentlas-ai/agentlas-terminal/releases/download/desktop-core-v21/desktop-core-win32-x64.tar.gz",
+      "sha256": "8260b93f1059af5b9d72bf276d45545acf5e43c08908db2e36a6e187a2b7e64a",
+      "sizeBytes": 91820389
     },
     "linux-x64": {
-      "url": "https://github.com/agentlas-ai/agentlas-terminal/releases/download/desktop-core-v20/desktop-core-linux-x64.tar.gz",
-      "sha256": "45dfdf75485262c5eb890a977f7920bedfd5989a2bdfd38d959b911855250888",
-      "sizeBytes": 111026916
+      "url": "https://github.com/agentlas-ai/agentlas-terminal/releases/download/desktop-core-v21/desktop-core-linux-x64.tar.gz",
+      "sha256": "abf2b927bf91a36d47e86a39cbd8ec519871154b7a3732a6f6161a2624137c72",
+      "sizeBytes": 111026811
     }
   },
-  "desktopSourceCommit": "85010aeb1937946212900eea17395d2f6443eb3d",
-  "desktopCompatibleRelease": "v1.3.86",
+  "desktopSourceCommit": "4bbd45f424b27c7c6127640f0bad850a0fe54e70",
+  "desktopCompatibleRelease": "v1.3.87",
   "desktopCompatibleSchemaVersion": 134
 }

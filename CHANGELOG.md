@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.74 — 2026-10-23
+
+- Use Desktop Core v21 with corrected Anthropic partial-cache usage and explicit zero context handling. Preserve unknown input totals and independently measured output tokens.
+- Bind all three platform downloads and the schema 134 bootstrap to the exact Desktop source, while retaining compatibility with Desktop 1.3.87.
+
 ## 1.0.73 — 2026-10-23
 
 - Keep logical input usage unknown when Claude does not report both cache counters. Preserve reported zero cache usage and avoid adding cached tokens twice for other runtimes.
