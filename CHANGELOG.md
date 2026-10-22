@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.73 — 2026-10-23
+
+- Keep logical input usage unknown when Claude does not report both cache counters. Preserve reported zero cache usage and avoid adding cached tokens twice for other runtimes.
+
 ## 1.0.72 — 2026-10-23
 
 - Use Desktop Core v20 with separate verified downloads for macOS, Windows x64, and Linux x64. New databases use schema 134, already supported by Desktop 1.3.86.

@@ -359,12 +359,12 @@ function recordTerminalModelCall(db, input) {
     if (!db || !input || !input.chatId) return false;
     const u = input.usage || {};
     const raw = count(u.input_tokens), out = count(u.output_tokens);
-    const observed = raw !== null && out !== null;
-    const window = count(input.contextWindowTokens);
-    if (!observed && !window) return false;
     const cacheRead = count(u.cache_read_input_tokens), cacheWrite = count(u.cache_creation_input_tokens);
     const anthropic = input.runtimeKind === "claude-code";
-    const observedInput = observed ? (anthropic ? raw + (cacheRead || 0) + (cacheWrite || 0) : raw) : null;
+    const observed = raw !== null && out !== null && (!anthropic || (cacheRead !== null && cacheWrite !== null));
+    const window = count(input.contextWindowTokens);
+    if (!observed && !window) return false;
+    const observedInput = observed ? (anthropic ? raw + cacheRead + cacheWrite : raw) : null;
     const cached = anthropic ? cacheRead : count(u.cached_input_tokens);
     const crypto = require("node:crypto");
     const runId = String(input.runId || `terminal-${crypto.randomUUID()}`);
