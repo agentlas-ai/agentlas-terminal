@@ -7,17 +7,8 @@
  * cloud-installed, company, native-CLI, and BYOK agents all share one contract.
  */
 
-function detectResponseLanguage(prompt, fallback) {
-  const text = String(prompt || "");
-  if (/\b(answer|reply|respond|write)\s+in\s+(english|en)\b/i.test(text)) return "en";
-  if (/(영어로|영문으로|english로)/i.test(text)) return "en";
-  if (/(한국어로|한글로|한글\s*답|korean으로)/i.test(text)) return "ko";
-  const hangul = (text.match(/[가-힣]/g) || []).length;
-  const latin = (text.match(/[A-Za-z]/g) || []).length;
-  if (hangul >= 2 && hangul >= latin * 0.15) return "ko";
-  if (latin >= 2 && hangul === 0) return "en";
-  return fallback === "ko" ? "ko" : "en";
-}
+// No host-side reply-language detection (native-harness notyet NH25): the language directive comes from the
+// configured locale and says "unless this message asks for another language" — the model reads the request.
 
 function responseLanguageDirective(lang) {
   return lang === "ko"
@@ -92,7 +83,6 @@ function createStreamingSanitizer() {
 
 module.exports = {
   createStreamingSanitizer,
-  detectResponseLanguage,
   responseDirective,
   responseLanguageDirective,
   responseStyleDirective,

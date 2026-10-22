@@ -11,7 +11,7 @@
  * "연결됨"은 툴 호출 성공을 의미하지 않는다 — 프리플라이트일 뿐이다.
  */
 const { userDataDir } = require("../core/paths.cjs");
-const { materializeTrustedSystemMcpServer } = require("../mcp/inventory.cjs");
+const { materializeTrustedSystemMcpServer, systemMcpSelectColumns } = require("../mcp/inventory.cjs");
 const { probeSystemMcpServerConnection } = require("../mcp/probe.cjs");
 const {
   DEFAULT_OPTIONS,
@@ -135,8 +135,8 @@ async function probe(ctx, args) {
   // catalog_id는 데스크탑 스키마 열 — 오래된 DB에는 없을 수 있어 방어적으로 조회.
   const byCatalog = ctx.columnExists(db, "mcp_servers", "catalog_id");
   const row = byCatalog
-    ? db.prepare("SELECT id, catalog_id, name, name_en, transport, command, args_json, env_keys_json, enabled FROM mcp_servers WHERE id=? OR catalog_id=? LIMIT 1").get(ref, ref)
-    : db.prepare("SELECT id, NULL AS catalog_id, name, name_en, transport, command, args_json, env_keys_json, enabled FROM mcp_servers WHERE id=? LIMIT 1").get(ref);
+    ? db.prepare(`SELECT ${systemMcpSelectColumns(db)} FROM mcp_servers WHERE id=? OR catalog_id=? LIMIT 1`).get(ref, ref)
+    : db.prepare("SELECT id, NULL AS catalog_id, name, name_en, transport, command, args_json, env_keys_json, enabled, '{}' AS credential_refs_json FROM mcp_servers WHERE id=? LIMIT 1").get(ref);
   if (!row) {
     throw commandError(
       en ? `MCP server not found: ${ref}` : `MCP 서버를 찾을 수 없습니다: ${ref}`,

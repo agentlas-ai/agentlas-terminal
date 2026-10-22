@@ -30,7 +30,7 @@ const SWARM_SPAWN_PER_TURN = 12;
 // ── swarm 프로토콜 프롬프트 — 앱 swarm-run.ts 와 동일 구조 ──
 // "WORK ALREADY ASSIGNED TO PEERS" 블록은 형제 소유권 가시화 계약이다: 워커가
 // 이미 배정된 패킷을 중복 spawn 해 사용자의 돈을 낭비하는 사고를 막는다.
-function swarmProtocol(goal, tasks, task, liveRuntimeInventory) {
+function swarmProtocol(goal, tasks, task, liveRuntimeInventory, coreHarnessPrompt = "") {
   const doneList = tasks
     .filter((t) => t.status === "done")
     .slice(-8)
@@ -41,20 +41,11 @@ function swarmProtocol(goal, tasks, task, liveRuntimeInventory) {
     .slice(0, 24)
     .map((t) => `- [${t.status}] ${t.title}${t.brief ? ` — ${t.brief}` : ""}`)
     .join("\n");
-  return [
+  // Composition order: fixed → variable (docs/PROMPT-COMPOSITION-POLICY.md, ledger terminal.swarm.worker.system).
+  const fixed = [
     "You are one worker in an EMERGENT AGENT SWARM collaborating on a shared goal.",
-    `SHARED GOAL: ${goal}`,
-    "",
-    "YOUR TASK RIGHT NOW:",
-    `- ${task.title}${task.role ? ` (role: ${task.role})` : ""}`,
-    task.brief ? `- Details: ${task.brief}` : "",
-    "",
-    doneList ? `Already completed by peers (recent):\n${doneList}` : "No peer results yet — you may be first.",
-    assignedList ? `WORK ALREADY ASSIGNED TO PEERS (never duplicate these packets):\n${assignedList}` : "",
-    "",
     "RULES:",
     "1. Do your task concretely with available tools/files in the current working folder.",
-    `LIVE_RUNTIME_INVENTORY=${JSON.stringify(liveRuntimeInventory || [])}`,
     "2. If the goal needs MORE work beyond your task — split into concrete next steps — end your",
     "   message with a `## Spawn` block. Every child MUST be one JSON object with a higher-level AI allocation. Choose runtimeId and exactModelId only from LIVE_RUNTIME_INVENTORY:",
     "   ## Spawn",
@@ -64,9 +55,21 @@ function swarmProtocol(goal, tasks, task, liveRuntimeInventory) {
     "   (role is optional. Do NOT spawn if the goal is already met or another pending/running/done packet already owns that work.)",
     "3. Do NOT restate the whole goal. Do NOT invent work that isn't needed — over-spawning wastes the user's money.",
     "4. Everything above the `## Spawn` block is your result and is shared with peers on the blackboard.",
+  ].join("\n");
+  const variable = [
+    `LIVE_RUNTIME_INVENTORY=${JSON.stringify(liveRuntimeInventory || [])}`,
+    `SHARED GOAL: ${goal}`,
+    "",
+    "YOUR TASK RIGHT NOW:",
+    `- ${task.title}${task.role ? ` (role: ${task.role})` : ""}`,
+    task.brief ? `- Details: ${task.brief}` : "",
+    "",
+    doneList ? `Already completed by peers (recent):\n${doneList}` : "No peer results yet — you may be first.",
+    assignedList ? `WORK ALREADY ASSIGNED TO PEERS (never duplicate these packets):\n${assignedList}` : "",
   ]
     .filter(Boolean)
     .join("\n");
+  return [fixed, String(coreHarnessPrompt || "").trim(), variable].filter(Boolean).join("\n\n");
 }
 
 // `## Spawn` 블록 파서 — 순수 함수 (test/swarm-protocol-contract.cjs 가 고정).
@@ -288,12 +291,12 @@ function create(deps) {
       try {
         const plannerText = await runBaseWorker(
           [
-            coreHarnessPrompt,
             workloadRouting.plannerSystemPrompt({
               language: ui.lang === "ko" ? "Korean" : "English",
               maxTasks: Math.min(SWARM_SPAWN_PER_TURN, SWARM_MAX_TASKS),
               mode: stormbreaker ? "stormbreaker-goal-ultracode" : "swarm",
               liveRuntimeInventory,
+              coreHarnessPrompt,
             }),
             attempt > 0
               ? "PREVIOUS ATTEMPT WAS NOT VALID PLAN JSON. Reply with ONLY the plan JSON object — no prose, no tool use."
@@ -345,7 +348,7 @@ function create(deps) {
           active++;
           ui.tool(`⚑ ${task.title}` + (task.role ? `  (${task.role})` : ""));
           runAllocatedWorker(
-            [coreHarnessPrompt, swarmProtocol(goal, tasks, task, liveRuntimeInventory)].filter(Boolean).join("\n\n"),
+            swarmProtocol(goal, tasks, task, liveRuntimeInventory, coreHarnessPrompt),
             task.brief || task.title,
             task,
             "worker",
@@ -403,13 +406,14 @@ function create(deps) {
         allocation: planned && planned.synthesis,
       };
       finalText = await runAllocatedWorker(
+        // Composition order: fixed → variable (docs/PROMPT-COMPOSITION-POLICY.md, ledger terminal.swarm.synthesis.system).
         [
-          coreHarnessPrompt,
           "You are the synthesizer of an agent swarm. Below are the results your peers produced for the shared goal.",
           "Integrate them into ONE coherent final answer for the user. Reconcile overlaps, note anything incomplete.",
           "Do not just concatenate. Do not include a `## Spawn` block.",
-          `SHARED GOAL: ${goal}`,
+          ...(coreHarnessPrompt ? ["", coreHarnessPrompt, ""] : []),
           `Answer in the user's language (${ui.lang === "ko" ? "Korean" : "English"}).`,
+          `SHARED GOAL: ${goal}`,
         ].join("\n"),
         pieces,
         synthesisTask,

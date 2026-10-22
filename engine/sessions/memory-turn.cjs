@@ -15,6 +15,7 @@ const path = require("node:path");
 
 const governance = require("../agentlas-memory-governance.cjs");
 const { loadArch } = require("../core/db.cjs");
+const { runtimeMemoryDb } = require("../core/memory-db.cjs");
 const { userDataDir } = require("../core/paths.cjs");
 const capture = require("../workforce/capture.cjs");
 const experienceExchange = require("../agentlas-experience-exchange.cjs");
@@ -30,7 +31,8 @@ function initializedProjectPath(cwd) {
 function beginSessionMemoryTurn(session, prompt) {
   const projectPath = initializedProjectPath(session.cwd);
   const stableTurnId = `${session.chatId}:${crypto.randomUUID()}`;
-  const memoryTurn = governance.beginTurn(session.db, {
+  const memoryDb = runtimeMemoryDb(session.db);
+  const memoryTurn = governance.beginTurn(memoryDb, {
     prompt,
     projectPath,
     agentId: session.agent.id,
@@ -39,7 +41,8 @@ function beginSessionMemoryTurn(session, prompt) {
     conversationRef: session.chatId,
     stableTurnId,
   });
-  return { projectPath, memoryTurn };
+  return { projectPath, memoryTurn, memoryDb, runtimeSelection: { ...session.runtime },
+    agentId: session.agent.id, chatId: session.chatId, permission: session.permission };
 }
 
 function curatorRuntimeDir() {
@@ -64,8 +67,8 @@ function curatorRuntimeEnv() {
   return env;
 }
 
-const OLLAMA_CURATOR_TIMEOUT_MS = 120_000;
-const OLLAMA_JUDGMENT_TIMEOUT_MS = 60_000;
+const { connectedModelTimeoutMs } = require("../agentlas-judgment.cjs");
+const OLLAMA_JUDGMENT_TIMEOUT_MS = 300_000;
 
 /**
  * API-backed memory decisions run after the main Session turn, so Session's
@@ -74,9 +77,7 @@ const OLLAMA_JUDGMENT_TIMEOUT_MS = 60_000;
  * while the signal lets a real fetch stop immediately on timeout.
  */
 async function runBoundedOllama(session, system, prompt, operation, timeoutMs) {
-  const limit = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
-    ? Number(timeoutMs)
-    : OLLAMA_JUDGMENT_TIMEOUT_MS;
+  const limit = connectedModelTimeoutMs(timeoutMs);
   const controller = new AbortController();
   let timer = null;
   let timedOut = false;
@@ -138,7 +139,10 @@ async function invokeCurator(session, payload, systemPrompt) {
   if (!Array.isArray(payload.candidates) || payload.candidates.length === 0) {
     return JSON.stringify({ schema_version: "agentlas.memory-curator.v1", decisions: [] });
   }
-  const serialized = JSON.stringify(payload);
+  return invokeMemoryModel(session, JSON.stringify(payload), systemPrompt, 120_000);
+}
+
+async function invokeMemoryModel(session, serialized, systemPrompt, timeoutMs) {
   if (
     governance.hasSecret(serialized) ||
     governance.hasAbsolutePath(serialized) ||
@@ -147,19 +151,136 @@ async function invokeCurator(session, payload, systemPrompt) {
     throw new Error("Memory Curator payload failed the pre-invocation privacy gate");
   }
   if (session.runtime.kind === "ollama") {
-    return runBoundedOllama(session, systemPrompt, serialized, "memory curator", OLLAMA_CURATOR_TIMEOUT_MS);
+    return runBoundedOllama(session, systemPrompt, serialized, "memory curator", timeoutMs);
   }
   return capture.captureRuntime(session.runtime.kind, systemPrompt, serialized, {
     cwd: curatorRuntimeDir(),
     env: curatorRuntimeEnv(),
+    binOverride: session.runtime.bin || undefined,
     permission: "read",
     model: session.runtime.model || null,
-    effort: "low",
+    effort: session.runtime.effort || "low",
     authorityMode: "no-authority",
     noToolsPolicyPath: session.runtime.kind === "gemini" ? ensureGeminiNoToolsPolicy() : null,
     outputLimitBytes: 64 * 1024,
-    timeoutConfig: { idleMs: 60_000, totalMs: 120_000, killGraceMs: 2_000 },
+    timeoutConfig: { idleMs: connectedModelTimeoutMs(timeoutMs), totalMs: connectedModelTimeoutMs(timeoutMs), killGraceMs: 2_000 },
   });
+}
+
+function canonicalReport(result) {
+  const decisions = result.decisionBatch?.decisions || [];
+  return {
+    written: decisions.filter(d => d.finalDisposition === "retain" && !d.reasonCodes.includes("deduplicated")).length,
+    deduped: decisions.filter(d => d.finalDisposition === "retain" && d.reasonCodes.includes("deduplicated")).length,
+    redacted: 0,
+    sessionOnly: decisions.filter(d => ["session", "review", "receipt_only"].includes(d.finalDisposition)).length,
+    discarded: decisions.filter(d => d.finalDisposition === "discard").length,
+  };
+}
+
+function recordCanonicalTurn(session, state, input, preview, result) {
+  const product = session.db;
+  if (!product?.name || product.name === ":memory:") return { status: "deferred", reason: "product_store_unbound" };
+  try {
+    const core = require("../core/desktop-core.cjs").loadDesktopCore();
+    if (!core || core.error || typeof core.recordAutomaticMemoryTurn !== "function") {
+      return { status: "deferred", reason: "automatic_memory_bridge_unavailable" };
+    }
+    // Validate the bound facade before resolving the host's current owner.
+    state.memoryDb.prepare("SELECT 1").get();
+    if (path.resolve(core.getDb().name) !== path.resolve(product.name) || core.getMemoryDb() !== state.memoryDb) {
+      return { status: "deferred", reason: "memory_product_store_binding_mismatch" };
+    }
+    const chosen = { ...session, runtime: state.runtimeSelection || session.runtime };
+    const clock = state.memoryDb.prepare("SELECT epoch FROM memory_forget_clock WHERE id=1").get();
+    const actorChanged = (state.agentId !== undefined && state.agentId !== session.agent.id)
+      || (state.chatId !== undefined && state.chatId !== session.chatId);
+    const sourceRevoked = actorChanged || !clock || clock.epoch !== state.memoryTurn.ownerPolicy?.memoryIntakeEpoch;
+    const cleanedSource = result.cleaned || "";
+    const unsafeExtract = governance.hasSecret(cleanedSource) || governance.hasAbsolutePath(cleanedSource) || governance.hasTranscriptBody(cleanedSource);
+    const sourceText = sourceRevoked || unsafeExtract ? "" : cleanedSource;
+    const context = {
+      turnId: state.memoryTurn.turnId, projectPath: state.projectPath,
+      projectId: state.memoryTurn.projectKey || null, agentId: state.agentId ?? session.agent.id,
+      chatId: state.chatId ?? session.chatId, cwdAtRequest: state.projectPath,
+    };
+    let runtimeKey;
+    if (!sourceRevoked && typeof core.registerAutomaticMemoryRuntime === "function") {
+      runtimeKey = core.registerAutomaticMemoryRuntime(sourceText, {
+        locale: "en",
+        context,
+        judge: request => {
+          if (request.requireNoTools !== true) throw new Error("memory_no_tools_contract_required");
+          return invokeMemoryModel(chosen, request.input, request.systemPrompt, connectedModelTimeoutMs(request.timeoutMs));
+        },
+      });
+    }
+    const readOnly = require("../agentlas-permissions.cjs").normalize(state.permission ?? session.permission, "read") === "read";
+    const captureTurn = state.memoryDb.transaction(() => {
+    const captured = core.recordAutomaticMemoryTurn({
+      context,
+      turnSummary: sourceRevoked ? null : preview.observation?.summary || null,
+      replyText: sourceText,
+      runtimeKey,
+      allowDurable: !readOnly,
+      // Rich candidate decisions have already crossed semantic admission.
+      // Invalid/legacy/failure sources must never be re-admitted from prose.
+      alreadyCurated: sourceRevoked || preview.candidates.length > 0 || preview.parseStatus !== "ok" || ["failed", "cancelled"].includes(input.outcome),
+      report: sourceRevoked ? { written: 0, deduped: 0, redacted: 0, sessionOnly: 0, discarded: 0 } : canonicalReport(result),
+    });
+    const decisions = result.decisionBatch?.decisions || [];
+    for (const decision of sourceRevoked ? [] : decisions) {
+      const candidate = preview.candidates.find(c => c.id === decision.candidateId);
+      if (!candidate) continue;
+      const retained = decision.finalDisposition === "retain";
+      const target = retained ? state.memoryDb.prepare("SELECT m.id FROM terminal_memory_scope_timeline t JOIN memory_entries m ON m.id=t.memory_id WHERE t.turn_id=? AND m.kind=? AND lower(trim(m.content))=? LIMIT 1")
+        .get(state.memoryTurn.turnId, candidate.kind, candidate.content.toLowerCase()) : null;
+      if (retained && !target) throw new Error("canonical_memory_source_missing");
+      const scope = { user_global: "user_identity", team: "team_memory", agent: "agent_repo", project: "project" }[decision.finalScope] || "session";
+      const action = retained ? decision.reasonCodes.includes("deduplicated") ? "deduped" : "written"
+        : decision.finalDisposition === "discard" ? "discarded" : decision.finalDisposition === "review" ? "deferred" : "session";
+      const normalized = candidate.content.normalize("NFKC").replace(/\s+/g, " ").trim().toLowerCase();
+      const mode = readOnly ? "read_only" : decision.semanticDisposition ? "semantic" : "policy_fallback";
+      state.memoryDb.prepare("INSERT OR IGNORE INTO memory_decisions(decision_id,ticket_id,candidate_index,content_hash,memory_kind,proposed_scope,resolved_scope,action,reason_code,target_memory_id,confidence,sensitivity,curator_mode,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,'internal',?,?)")
+        .run(`terminal-canonical:${crypto.createHash("sha256").update(`${state.memoryTurn.turnId}:${candidate.id}`).digest("hex")}`, captured.ticketId,
+          candidate.index, crypto.createHash("sha256").update(normalized).digest("hex"), candidate.kind, candidate.suggestedScope, scope, action,
+          decision.reasonCodes[0] || "governed_terminal_decision", target?.id || null, candidate.confidence, mode, new Date().toISOString());
+      if (target) {
+        const binding = state.memoryDb.prepare("SELECT owner_namespace,origin_refs_json FROM memory_identity_bindings WHERE memory_id=?").get(target.id);
+        if (binding) {
+          const refs = [...new Set([...JSON.parse(binding.origin_refs_json), `ticket:${captured.ticketId}`])];
+          state.memoryDb.prepare("UPDATE memory_identity_bindings SET origin_refs_json=? WHERE memory_id=?").run(JSON.stringify(refs), target.id);
+          state.memoryDb.prepare("INSERT OR IGNORE INTO memory_origin_links(memory_id,source_kind,source_id) VALUES(?,'memory-ticket',?),(?,'terminal-turn',?)")
+            .run(target.id, captured.ticketId, target.id, state.memoryTurn.turnId);
+          const authority = state.memoryDb.prepare("SELECT value FROM memory_store_meta WHERE key='revision'").get();
+          if (!authority || !Number.isSafeInteger(Number(authority.value))) throw new Error("memory_revision_unavailable");
+          const now = new Date().toISOString();
+          state.memoryDb.prepare("INSERT OR IGNORE INTO memory_projection_outbox(outbox_id,memory_id,authority_revision,state,payload_json,created_at,updated_at) VALUES(?,?,?,'queued',?,?,?)")
+            .run(`terminal-projection:${crypto.createHash("sha256").update(`${state.memoryTurn.turnId}:${candidate.id}`).digest("hex")}`, target.id,
+              Number(authority.value), JSON.stringify({ owner_namespace: binding.owner_namespace, memory_ref: target.id, ticket_ref: captured.ticketId, source_ref: `terminal-turn:${state.memoryTurn.turnId}` }), now, now);
+        }
+      }
+    }
+    if (sourceRevoked) {
+      state.memoryDb.prepare("UPDATE memory_tickets SET state='failed',failure_code='memory_intake_revoked',curation_outcome='curator_failed' WHERE ticket_id=?").run(captured.ticketId);
+      state.memoryDb.prepare("UPDATE memory_episodes SET summary=NULL,summary_hash=NULL,embedding_json=NULL,embedding_content_hash=NULL WHERE ticket_id=?").run(captured.ticketId);
+    } else if (!readOnly) {
+      const emitter = preview.parseStatus === "ok" ? preview.candidates.length ? "valid" : "empty" : preview.parseStatus === "missing" ? "missing" : "malformed";
+      const mode = decisions.some(d => d.semanticDisposition) ? "semantic" : decisions.length ? "policy_fallback" : "policy";
+      const outcome = preview.parseStatus !== "ok" ? "malformed_output" : result.curatorStatus === "error" ? "curator_failed" : decisions.length ? "decided" : "no_candidates";
+      state.memoryDb.prepare("UPDATE memory_tickets SET candidate_count=?,emitter_status=?,curator_mode=?,curation_outcome=? WHERE ticket_id=?")
+        .run(decisions.length, emitter, mode, outcome, captured.ticketId);
+    }
+    return captured;
+    });
+    const captured = captureTurn.immediate();
+    const worker = captured.queued && !readOnly && !sourceRevoked
+      ? require("./memory-worker.cjs").wakeSelectedMemoryWorker(core, chosen.runtime, captured, context.agentId)
+      : undefined;
+    return { status: "captured", ...captured, ...(worker ? { worker } : {}), ...(sourceRevoked ? { reason: actorChanged ? "memory_actor_binding_changed" : "memory_intake_revoked" } : {}) };
+  } catch {
+    return { status: "deferred", reason: "automatic_memory_bridge_failed" };
+  }
 }
 
 function extractJsonObject(text) {
@@ -209,7 +330,7 @@ async function resolveSessionTaskSignatures(session, prompt) {
       authorityMode: "no-authority",
       noToolsPolicyPath: session.runtime.kind === "gemini" ? ensureGeminiNoToolsPolicy() : null,
       outputLimitBytes: 32 * 1024,
-      timeoutConfig: { idleMs: 30_000, totalMs: 60_000, killGraceMs: 2_000 },
+      timeoutConfig: { idleMs: OLLAMA_JUDGMENT_TIMEOUT_MS, totalMs: OLLAMA_JUDGMENT_TIMEOUT_MS, killGraceMs: 2_000 },
     });
   }
   const parsed = extractJsonObject(raw);
@@ -252,7 +373,7 @@ async function judgeGlobalMemoryAuthorization(session, promptText) {
       authorityMode: "no-authority",
       noToolsPolicyPath: session.runtime.kind === "gemini" ? ensureGeminiNoToolsPolicy() : null,
       outputLimitBytes: 16 * 1024,
-      timeoutConfig: { idleMs: 30_000, totalMs: 60_000, killGraceMs: 2_000 },
+      timeoutConfig: { idleMs: OLLAMA_JUDGMENT_TIMEOUT_MS, totalMs: OLLAMA_JUDGMENT_TIMEOUT_MS, killGraceMs: 2_000 },
     });
   }
   const parsed = extractJsonObject(raw);
@@ -270,11 +391,12 @@ async function completeSessionMemoryTurn(session, state, input) {
     state.memoryTurn.turnId,
     arch.eventsHeading,
   );
-  // Legacy array envelopes remain supported by apply-fences' old deterministic
-  // curate gate, but they are intentionally unbound in the v1 governance
-  // protocol. Do not spend a semantic model call on an ineligible envelope.
+  // Legacy arrays remain decodable but cannot bypass this governed intake.
+  // Their unbound candidates receive a review receipt and never reach a second
+  // deterministic writer in apply-fences.
   const shouldInvokeCurator = input.invokeCurator !== false && preview.parseStatus !== "legacy_array";
-  return governance.completeTurn(session.db, {
+  const chosen = { ...session, runtime: state.runtimeSelection || session.runtime };
+  const result = await governance.completeTurn(state.memoryDb || runtimeMemoryDb(session.db), {
     turnId: state.memoryTurn.turnId,
     mainOutput: input.text,
     requestText: input.prompt,
@@ -289,16 +411,21 @@ async function completeSessionMemoryTurn(session, state, input) {
     },
     ...(!shouldInvokeCurator
       ? {}
-      : { invokeCurator: (payload, systemPrompt) => invokeCurator(session, payload, systemPrompt) }),
+      : { invokeCurator: (payload, systemPrompt) => invokeCurator(chosen, payload, systemPrompt) }),
     // 전역 스코프 후보가 실제로 나왔을 때만 거버넌스가 1회 호출한다(fail-closed).
-    judgeGlobalAuthorization: (promptText) => judgeGlobalMemoryAuthorization(session, promptText),
+    judgeGlobalAuthorization: (promptText) => judgeGlobalMemoryAuthorization(chosen, promptText),
   });
+  result.canonicalIntake = recordCanonicalTurn(session, state, input, preview, result);
+  return result;
 }
 
 module.exports = {
   initializedProjectPath,
   beginSessionMemoryTurn,
   completeSessionMemoryTurn,
+  invokeMemoryModel,
+  curatorRuntimeEnv,
+  curatorRuntimeDir,
   resolveSessionTaskSignatures,
   runBoundedOllama,
 };

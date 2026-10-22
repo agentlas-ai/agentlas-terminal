@@ -18,7 +18,6 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const memoryCurate = require("../memory-cli/curate.cjs");
 const automationStore = require("../automation/store.cjs");
 const permissions = require("../agentlas-permissions.cjs");
 const schedule = require("../automation/schedule.cjs");
@@ -223,60 +222,96 @@ function oneQuarantineLock(lockPath, label) {
   return true;
 }
 
-/** Acquire a directory lock; stale takeover proves the recorded owner is gone. */
+/** Pid recorded in a Python-format lock file; 0 when it holds none (legacy, mid-create). */
+function oneFileLockPid(lockPath) {
+  let raw;
+  try { raw = readOneFile(lockPath, 64, { allowMissing: true }); } catch { return 0; }
+  const text = raw == null ? "" : raw.trim();
+  return /^[0-9]{1,10}$/.test(text) ? Number(text) : 0;
+}
+
+function oneUnlinkIfSame(lockPath, observed) {
+  let current;
+  try { current = fs.lstatSync(lockPath); } catch (error) { return Boolean(error && error.code === "ENOENT"); }
+  if (!current.isFile() || current.isSymbolicLink() || current.dev !== observed.dev || current.ino !== observed.ino) return false;
+  try {
+    fs.unlinkSync(lockPath);
+  } catch (error) {
+    return Boolean(error && error.code === "ENOENT");
+  }
+  return true;
+}
+
+/**
+ * Acquire the One ledger lock in the cross-surface format Python's
+ * one_workspace._LedgerLock uses: an O_EXCL regular file holding the pid.
+ * A stale file whose pid is gone (or which holds no pid, as Python reads it) is
+ * taken over. A legacy Terminal directory lock (owner.json) is still reclaimed
+ * for one release so a crash under the old format cannot block either side.
+ */
 function acquireOneLedgerLock(lockPath) {
   for (let attempt = 0; attempt < ONE_LOCK_ATTEMPTS; attempt += 1) {
-    let created = false;
+    let fd;
     try {
-      fs.mkdirSync(lockPath, { mode: 0o700 });
-      created = true;
-      const nonce = crypto.randomBytes(16).toString("hex");
-      fs.writeFileSync(path.join(lockPath, "owner.json"), JSON.stringify({
-        pid: process.pid,
-        nonce,
-        createdAt: new Date().toISOString(),
-      }) + "\n", { encoding: "utf8", mode: 0o600, flag: "wx" });
-      return { lockPath, pid: process.pid, nonce };
+      fd = fs.openSync(lockPath, "wx", 0o600);
     } catch (error) {
-      if (created) {
-        try { oneQuarantineLock(lockPath, "abandoned"); } catch { /* best effort */ }
-        return null;
-      }
-      if (!error || (error.code !== "EEXIST" && error.code !== "ENOENT")) return null;
+      // Windows can report an existing directory lock as EPERM/EACCES rather than EEXIST.
+      if (!error || !["EEXIST", "EPERM", "EACCES", "EISDIR"].includes(error.code)) return null;
       let stat;
       try { stat = fs.lstatSync(lockPath); } catch (statError) {
         if (statError && statError.code === "ENOENT") continue;
         return null;
       }
-      if (!stat.isDirectory() || stat.isSymbolicLink()) return null;
-      const owner = oneLockOwner(lockPath);
-      if (
-        Number.isFinite(stat.mtimeMs) && Date.now() - stat.mtimeMs > ONE_LOCK_STALE_MS &&
-        owner && !oneProcessIsAlive(owner.pid)
-      ) {
-        try {
-          oneQuarantineLock(lockPath, "stale");
-          continue;
-        } catch {
+      if (stat.isSymbolicLink()) return null;
+      const stale = Number.isFinite(stat.mtimeMs) && Date.now() - stat.mtimeMs > ONE_LOCK_STALE_MS;
+      if (stat.isDirectory()) {
+        const owner = oneLockOwner(lockPath);
+        if (stale && owner && !oneProcessIsAlive(owner.pid)) {
+          try {
+            oneQuarantineLock(lockPath, "stale");
+            continue;
+          } catch {
+            return null;
+          }
+        }
+      } else if (stat.isFile()) {
+        if (error.code !== "EEXIST") return null;
+        const pid = oneFileLockPid(lockPath);
+        if (stale && (pid === 0 || !oneProcessIsAlive(pid))) {
+          if (oneUnlinkIfSame(lockPath, stat)) continue;
           return null;
         }
+      } else {
+        return null;
       }
       oneWaitSync(ONE_LOCK_RETRY_MS);
+      continue;
+    }
+    try {
+      const opened = fs.fstatSync(fd);
+      fs.writeSync(fd, String(process.pid));
+      return { lockPath, pid: process.pid, dev: opened.dev, ino: opened.ino };
+    } catch {
+      try { fs.closeSync(fd); } catch { /* best effort */ }
+      fd = undefined;
+      try { fs.unlinkSync(lockPath); } catch { /* best effort */ }
+      return null;
+    } finally {
+      if (fd !== undefined) {
+        try { fs.closeSync(fd); } catch { /* best effort */ }
+      }
     }
   }
   return null;
 }
 
-/** Release only this holder's lock; a successor's path is never recursively removed. */
+/** Release only this holder's lock file; a successor's lock is never removed. */
 function releaseOneLedgerLock(lock) {
   let stat;
   try { stat = fs.lstatSync(lock.lockPath); } catch { return; }
-  if (!stat.isDirectory() || stat.isSymbolicLink()) return;
-  const owner = oneLockOwner(lock.lockPath);
-  if (!owner || owner.pid !== lock.pid || owner.nonce !== lock.nonce) return;
-  try {
-    if (oneQuarantineLock(lock.lockPath, "done")) return;
-  } catch { /* retain the lock for stale recovery; never delete an unknown owner */ }
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.dev !== lock.dev || stat.ino !== lock.ino) return;
+  if (oneFileLockPid(lock.lockPath) !== lock.pid) return;
+  try { fs.unlinkSync(lock.lockPath); } catch { /* retain the lock for stale recovery */ }
 }
 
 function withOneLedgerLock(lockPath, action) {
@@ -428,7 +463,7 @@ function forwardToOne(events, permission = "read") {
 /**
  * @param {import('./session.cjs').Session} session 방금 턴을 끝낸 세션
  * @param {object} parsed parseReplyFences 결과
- * @param {{orch?: object}} opts orch 미지정 시 session.orchestrator 사용
+ * @param {{orch?: object, governedMemory?: object|null}} opts
  * @returns 적용 영수증 { asks, memory, automations, delegates, refused }
  */
 function applyReplyFences(session, parsed, opts = {}) {
@@ -449,40 +484,18 @@ function applyReplyFences(session, parsed, opts = {}) {
     receipts.asks += 1;
   }
 
-  /* ── memoryEvents → curate 게이트 (제안 ≠ 승인) ─────────────────────── */
+  // Fences decode memory but never write it. The Session's governed completion
+  // is the sole admission path; semantic discard/review/session cannot be
+  // undone by reconstructing the original candidates for the legacy writer.
   if (Array.isArray(parsed.memoryEvents) && parsed.memoryEvents.length) {
-    const memoryEvents = boundMemoryEvents(parsed.memoryEvents);
-    // 프로젝트 경계: 명시 초기화된(.agentlas 존재) 폴더만 project 스코프 대상 —
-    // 임의 cwd 에 .agentlas 스캐폴딩을 만들지 않는다(session.cjs 프롬프트 증강과 동일 기준).
-    let projectPath = null;
-    try {
-      const fs = require("node:fs");
-      const path = require("node:path");
-      projectPath = fs.existsSync(path.join(session.cwd, ".agentlas")) ? session.cwd : null;
-    } catch { projectPath = null; }
-    const ctx = {
-      permission,
-      projectPath,
-      agentId: session.agent.id,
-      curatedMemories: [],
-    };
-    // 게이트 로직을 복제하지 않기 위해 이벤트를 정확한 wire 블록으로 재구성해
-    // curateCliReply 에 그대로 통과시킨다(시크릿/스코프/중복/권한 게이트 전부 재사용).
-    const heading = memoryCurate.loadArch().eventsHeading;
-    const block = `${heading}\n\`\`\`json\n${JSON.stringify(memoryEvents)}\n\`\`\``;
-    try {
-      memoryCurate.curateCliReply(session.db, block, ctx);
-    } catch { /* 게이트 실패가 턴 자체를 죽이면 안 된다 */ }
+    const governed = opts.governedMemory;
     receipts.memory = {
       candidates: parsed.memoryEvents.length,
-      written: ctx.curatedMemories.length,
+      written: Array.isArray(governed?.curatedMemories) ? governed.curatedMemories.length : 0,
       permission,
+      status: governed?.receipt ? "governed" : "deferred",
+      reason: governed?.receipt ? "governed_completion_owns_memory" : "governed_completion_required",
     };
-    // Agentlas One 이 켜져 있으면 에이전트 스코프 후보를 One 서랍에도 티켓으로 넘긴다.
-    // 프로젝트 스코프는 여기 남기고 옮기지 않는다 — One 은 프로젝트를 넘나드는 정체성이라
-    // agent_repo/user_identity 만 One 의 것이다(기획 2.2 스코프 경계).
-    receipts.memory.one = forwardToOne(ctx.curatedMemories, permission);
-    // read 권한 턴 = durable 쓰기 0 — 영수증 이벤트만 남는다.
     record({ type: "memory-curated", ...receipts.memory });
   }
 
@@ -568,6 +581,22 @@ function applyReplyFences(session, parsed, opts = {}) {
       receipts.refused.push(refusal);
       continue;
     }
+    // G38: 한 부모 아래 같은 target(좌석)은 동시에 하나만 돈다. 전역 상한과 같은 정책으로
+    // 대기열이 아니라 타입드 거부 — 이미 도는 형제 위임이 끝난 뒤 다시 위임하면 된다.
+    const busySibling = (session.children || [])
+      .map((childKey) => orch.sessions && orch.sessions.get(childKey))
+      .find((sib) => sib && sib.delegateTarget === d.target && sib.isBusy());
+    if (busySibling) {
+      const refusal = {
+        type: "delegate-refused",
+        target: d.target,
+        code: "delegate_target_busy",
+        reason: `delegate_target_busy: ${d.target} already has a running delegation under this parent (${busySibling.key})`,
+      };
+      record(refusal);
+      receipts.refused.push(refusal);
+      continue;
+    }
     // 부모의 런타임/권한/작업폴더를 물려받는 division 자식. spawnImpl/timeoutConfig
     // 전달은 계약 테스트(오프라인 fake spawn)를 위해 필요하고 프로덕션에선 null 이다.
     const child = orch.spawn({
@@ -581,6 +610,7 @@ function applyReplyFences(session, parsed, opts = {}) {
       spawnImpl: session._spawnImpl,
       timeoutConfig: session._timeoutConfig,
     });
+    child.delegateTarget = d.target;
     try {
       const promise = orch.sendTo(child.key, brief);
       const receipt = { type: "delegate-spawned", key: child.key, target: d.target, allocation: d.allocation || null };

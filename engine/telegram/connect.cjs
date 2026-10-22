@@ -59,6 +59,9 @@ async function telegramApi(token, method, payload, { fetchImpl } = {}) {
       const message = String(raw).replaceAll(safeToken, "[redacted]").replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 1000);
       const error = new Error(message || `Telegram ${safeMethod} failed`);
       error.telegramStatus = Number(res.status) || null;
+      // 429 의 기계 필드(parameters.retry_after, 초) — 문장에서 숫자를 읽지 않는다.
+      const retryAfter = Number(json && json.parameters && json.parameters.retry_after);
+      if (Number.isFinite(retryAfter) && retryAfter > 0) error.telegramRetryAfterSeconds = retryAfter;
       throw error;
     }
     return json.result;
@@ -232,6 +235,21 @@ async function startConnection(db, targetKind, targetId, token, opts) {
   return { id, botUsername: me.username || null };
 }
 
+const TELEGRAM_PAIR_BACKOFF_MAX_MS = 30_000;
+
+/** 기다려도 풀리지 않는 getUpdates 거절 → 이름 붙은 오류(그 밖은 null: 백오프 후 재시도). */
+function telegramPairingStop(error) {
+  const status = error && error.telegramStatus;
+  if (status !== 401 && status !== 409) return null;
+  const code = status === 409 ? "telegram_conflict" : "telegram_token_invalid";
+  const stop = new Error(status === 409
+    ? "telegram_conflict: another program is already reading this bot's updates (for example Agentlas Desktop). Stop it or pair from there, then retry."
+    : "telegram_token_invalid: Telegram rejected this bot token. Create a new token with @BotFather and connect again.");
+  stop.code = code;
+  stop.telegramStatus = status;
+  return stop;
+}
+
 /**
  * getUpdates 폴링으로 `/start <bindingId>`를 보낸 private chat을 이 바인딩에 귀속한다.
  * 보안: 봇 이름을 발견한 제3자의 첫 메시지가 로컬 에이전트를 탈취하지 못하도록 정확한
@@ -248,6 +266,7 @@ async function pairByPolling(db, id, { timeoutMs = 120_000, opts, onWait } = {})
     ? Number(initialRow.last_update_id)
     : 0;
   let lastApiError = null;
+  let consecutiveFailures = 0;
   while (Date.now() < deadline) {
     if (typeof onWait === "function") onWait();
     let updates;
@@ -255,9 +274,21 @@ async function pairByPolling(db, id, { timeoutMs = 120_000, opts, onWait } = {})
       updates = await telegramApi(token, "getUpdates", { offset: offset + 1, timeout: 25, allowed_updates: ["message"] }, opts);
       if (!Array.isArray(updates)) throw new Error("Telegram getUpdates returned an invalid result");
       lastApiError = null;
+      consecutiveFailures = 0;
     } catch (error) {
+      // 409(다른 폴러, 예: Desktop)·401(토큰 폐기)은 기다려도 안 풀린다 — 바로 멈춘다.
+      const stop = telegramPairingStop(error);
+      if (stop) throw stop;
+      // 그 밖의 실패는 즉시 재시도하지 않는다: 1초부터 두 배씩 최대 30초, 429 는 retry_after, 마감은 넘기지 않는다.
+      // (재시도 폭주는 봇을 429 로 막아 Desktop 의 정상 봇까지 깨뜨린다.)
       lastApiError = error;
-      updates = [];
+      consecutiveFailures += 1;
+      const waitMs = error && error.telegramRetryAfterSeconds
+        ? error.telegramRetryAfterSeconds * 1000
+        : Math.min(TELEGRAM_PAIR_BACKOFF_MAX_MS, 1000 * 2 ** (consecutiveFailures - 1));
+      const remaining = deadline - Date.now();
+      if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, Math.min(waitMs, remaining)));
+      continue;
     }
     for (const update of updates || []) {
       if (typeof update.update_id === "number") offset = Math.max(offset, update.update_id);

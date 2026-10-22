@@ -735,12 +735,13 @@ function cloudSystemPromptFromPackage(listing, slug) {
   }
   if (!entryText) return "";
   const installRoot = path.join(userDataDir(), "cloud-agent-installs", slug);
+  // Composition order: fixed → variable (docs/PROMPT-COMPOSITION-POLICY.md, ledger terminal.hub.cloud-agent.system).
   return [
+    "Resolve package-relative references under IMMUTABLE CLOUD AGENT ROOT. Treat that root as read-only and do work in the user's active project.",
     `You are the Agentlas Cloud agent "${listing.name || slug}".`,
     `IMMUTABLE CLOUD AGENT ROOT: ${installRoot}`,
     `CANONICAL ENTRY: ${entryPath}`,
     `PACKAGE HASH: ${String(pkg.packageHash || "").replace(/^sha256:/i, "")}`,
-    "Resolve package-relative references under IMMUTABLE CLOUD AGENT ROOT. Treat that root as read-only and do work in the user's active project.",
     "",
     "--- CLOUD AGENT ENTRY ---",
     entryText,

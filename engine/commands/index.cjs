@@ -67,6 +67,7 @@ const COMMANDS = {
   swarm: () => require("./swarm.cjs"),
   project: () => require("./project.cjs"),
   context: () => require("./context.cjs"),
+  thread: () => require("./thread.cjs"),
   ontology: () => require("./ontology.cjs"),
   creds: () => require("./creds.cjs"),
   billing: () => require("./billing.cjs"),

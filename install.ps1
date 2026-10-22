@@ -3,6 +3,11 @@
 #   powershell -ExecutionPolicy Bypass -File install.ps1
 #
 # %LOCALAPPDATA%\Agentlas\bin\agentlas.cmd 를 만들고 PATH 안내를 출력한다.
+# This installer has no supported command-line parameters. Reject an unknown
+# recovery request before resolving tools, creating directories or writing files.
+if ($args.Count -ne 0) {
+  throw "INVALID_ARGUMENT: usage: powershell -File install.ps1 (no arguments supported)"
+}
 $ErrorActionPreference = "Stop"
 
 $pkgRoot = Split-Path -Parent $MyInvocation.MyCommand.Path

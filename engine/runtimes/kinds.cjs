@@ -25,6 +25,12 @@ const RUNTIME_KIND_SPECS = [
   { kind: "kimi", bin: "kimi", driver: "acp" },
   { kind: "grok", bin: "grok", driver: "acp" },
   { kind: "cursor", bin: "cursor-agent", driver: "acp" },
+  // GitHub Copilot CLI — the seventh subscription CLI, an ACP agent of the shared runner (Desktop acp.ts ACP_AGENTS
+  // "github-copilot-cli", spawned as `npx -y @github/copilot@<pin> --acp`). Its launcher is npx, so npx on PATH is
+  // what detection can see (Desktop acp-agents.ts counts npx specs the same way); a launcher is never picked as the
+  // automatic "detected" fallback (resolve.cjs) — only by an explicit choice. Desktop stores it as kind "acp" +
+  // acp_agent_id "github-copilot-cli" (storedRuntimeKind / canonicalRuntimeKind translate).
+  { kind: "github-copilot-cli", bin: "npx", driver: "acp", launcher: "npx", acpAgentId: "github-copilot-cli" },
 ];
 
 /** kind → 실행 파일 이름. CLI 런타임 전체(네이티브 + ACP). */
@@ -47,11 +53,20 @@ const RUNTIME_BIN = Object.fromEntries(RUNTIME_KIND_SPECS.map((s) => [s.kind, s.
  */
 const STORED_KIND_ALIASES = { antigravity: "agy" };
 
-/** 저장소에서 읽은 kind 를 이 저장소의 정본 이름으로. 모르는 값은 그대로 돌려준다. */
-function canonicalRuntimeKind(kind) {
+/** Built-in ACP agents Desktop stores as kind "acp" + acp_agent_id (shared/runtime-kinds.ts: one "acp" seat kind). */
+const ACP_SEAT_KINDS = Object.freeze(Object.fromEntries(
+  RUNTIME_KIND_SPECS.filter((s) => s.acpAgentId).map((s) => [s.acpAgentId, s.kind]),
+));
+/** Names a person types for a kind (never written to the shared store). */
+const USER_KIND_ALIASES = { copilot: "github-copilot-cli" };
+
+/** 저장소에서 읽은 kind 를 이 저장소의 정본 이름으로. 모르는 값은 그대로 돌려준다.
+ *  `acpAgentId` is the row's acp_agent_id: a Desktop "acp" seat of a built-in agent reads as that agent's kind. */
+function canonicalRuntimeKind(kind, acpAgentId) {
   const text = typeof kind === "string" ? kind.trim() : "";
   if (!text) return text;
-  return STORED_KIND_ALIASES[text] ?? text;
+  if (text === "acp" && typeof acpAgentId === "string" && ACP_SEAT_KINDS[acpAgentId.trim()]) return ACP_SEAT_KINDS[acpAgentId.trim()];
+  return STORED_KIND_ALIASES[text] ?? USER_KIND_ALIASES[text] ?? text;
 }
 
 /** 역방향 — 공유 DB 에 적을 이름. 어긋남은 **양쪽으로** 난다:
@@ -64,7 +79,14 @@ const CANONICAL_TO_STORED = Object.fromEntries(
 function storedRuntimeKind(kind) {
   const text = typeof kind === "string" ? kind.trim() : "";
   if (!text) return text;
+  if (RUNTIME_KIND_SPECS.some((s) => s.kind === text && s.acpAgentId)) return "acp";
   return CANONICAL_TO_STORED[text] ?? text;
+}
+
+/** acp_agent_id to store beside storedRuntimeKind(kind); null for every kind that is not a built-in ACP seat. */
+function storedAcpAgentId(kind) {
+  const spec = RUNTIME_KIND_SPECS.find((s) => s.kind === canonicalRuntimeKind(kind));
+  return spec && spec.acpAgentId ? spec.acpAgentId : null;
 }
 
 /** CLI 런타임 kind 전체(탐지 순서). */
@@ -73,7 +95,7 @@ const CLI_KINDS = RUNTIME_KIND_SPECS.map((s) => s.kind);
 /** native-host 드라이버(스폰 러너)를 갖춘 CLI 4종. */
 const NATIVE_CLI_KINDS = RUNTIME_KIND_SPECS.filter((s) => s.driver === "native").map((s) => s.kind);
 
-/** 벤더 코어의 공용 ACP 러너로 도는 3종. */
+/** 벤더 코어의 공용 ACP 러너로 도는 종류(kimi·grok·cursor·github-copilot-cli). */
 const ACP_CLI_KINDS = RUNTIME_KIND_SPECS.filter((s) => s.driver === "acp").map((s) => s.kind);
 
 /** 캡처(no-authority headless) 드라이버가 검증된 kind — buildArgs/텍스트 추출 계약 보유. */
@@ -119,6 +141,8 @@ module.exports = {
   STORED_KIND_ALIASES,
   canonicalRuntimeKind,
   storedRuntimeKind,
+  storedAcpAgentId,
+  ACP_SEAT_KINDS,
   CLI_KINDS,
   NATIVE_CLI_KINDS,
   ACP_CLI_KINDS,

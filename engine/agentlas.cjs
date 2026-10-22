@@ -60,6 +60,7 @@ const { loadPrefs } = require("./agentlas-config.cjs");
 const { Ui } = require("./agentlas-ui.cjs");
 const { parseOutputFlags, render, renderError, isRichUi } = require("./cli-output.cjs");
 const commands = require("./commands/index.cjs");
+const { assertLifecycleInvocation } = require("./lifecycle-args.cjs");
 
 const SUPPORTED_LANGS = new Set(["ko", "en"]);
 
@@ -160,6 +161,15 @@ function nearestCommands(token, names) {
 function main() {
   const argv = process.argv.slice(2);
   const helpRequested = argv.some((arg) => arg === "--help" || arg === "-h");
+  let lifecycleOutput;
+  try {
+    lifecycleOutput = parseOutputFlags(argv);
+    assertLifecycleInvocation(lifecycleOutput.rest, { helpRequested });
+  } catch (error) {
+    process.stderr.write(renderError(error, lifecycleOutput?.options || { format: "table", noColor: true }) + "\n");
+    process.exitCode = 1;
+    return;
+  }
   const helpCommand = argv.find((arg) => arg !== "--help" && arg !== "-h" && !arg.startsWith("-"));
   if (helpRequested && helpCommand) {
     const ctx = buildCtx();

@@ -26,44 +26,67 @@ function keychainTimeoutMs() {
   return DEFAULT_TIMEOUT_MS;
 }
 
-/**
- * 키체인 값 하나를 상한 안에서 읽는다. 못 읽으면 `null` — 호출부는 "키 없음" 갈래를 이미 갖고
- * 있고, 멈춰 서는 것보다 그 갈래가 낫다. 값은 stdout(파이프)으로만 오고 argv 에는 안 실린다.
- */
-function readKeychainPassword(service, account) {
+// Reading one rejected account must not queue prompts for every other key in
+// the same OS service. Preserve callers' null contract without retrying native
+// access automatically. Values live only in an in-flight promise, never a cache.
+const inFlight = new Map();
+const failedServices = new Set();
+let nativeQueue = Promise.resolve();
+const nativeDisabledForTest = () => process.env.AGENTLAS_E2E === "1" && process.env.AGENTLAS_E2E_KEYCHAIN !== "1";
+
+function readInChild(service, account) {
   return new Promise((resolve) => {
     let keytarPath;
-    try {
-      keytarPath = require.resolve("keytar");
-    } catch {
-      resolve(null);
-      return;
-    }
+    try { keytarPath = require.resolve("keytar"); }
+    catch { resolve(null); return; }
+    const failed = () => { failedServices.add(service); resolve(null); };
     const script = `
 const [modPath, service, account] = process.argv.slice(1);
 const keytar = require(modPath);
+const done = (result) => process.stdout.write(JSON.stringify(result), () => process.exit(0));
 keytar.getPassword(service, account)
-  .then((v) => { process.stdout.write(JSON.stringify({ value: v ?? null })); process.exit(0); })
-  .catch(() => { process.stdout.write(JSON.stringify({ value: null })); process.exit(0); });
+  .then((value) => done({ value: value ?? null }))
+  .catch(() => done({ error: "native_keychain_read_failed" }));
 `;
-    execFile(
-      process.execPath,
-      ["-e", script, keytarPath, String(service), String(account)],
-      { timeout: keychainTimeoutMs(), killSignal: "SIGKILL", maxBuffer: 1024 * 1024 },
-      (error, stdout) => {
-        if (error) {
-          resolve(null);
-          return;
-        }
-        try {
-          const parsed = JSON.parse(String(stdout || "{}"));
-          resolve(typeof parsed.value === "string" ? parsed.value : null);
-        } catch {
-          resolve(null);
-        }
-      },
-    );
+    try {
+      execFile(
+        process.execPath,
+        ["-e", script, keytarPath, service, account],
+        {
+          timeout: keychainTimeoutMs(), killSignal: "SIGKILL", maxBuffer: 1024 * 1024,
+          env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+        },
+        (error, stdout) => {
+          if (error) { failed(); return; }
+          try {
+            const parsed = JSON.parse(String(stdout || "{}"));
+            if (!parsed || parsed.error || !Object.prototype.hasOwnProperty.call(parsed, "value")
+              || !(parsed.value === null || typeof parsed.value === "string")) { failed(); return; }
+            resolve(parsed.value);
+          } catch { failed(); }
+        },
+      );
+    } catch { failed(); }
   });
+}
+
+/** A missing/unavailable key remains null for legacy callers. Native rejection
+ * pauses the service for this process; restarting the command is an explicit
+ * new attempt. Queued work rechecks the pause before resolving or loading keytar. */
+function readKeychainPassword(service, account) {
+  const serviceName = String(service), accountName = String(account);
+  if (nativeDisabledForTest() || failedServices.has(serviceName)) return Promise.resolve(null);
+  const key = JSON.stringify([serviceName, accountName]);
+  const pending = inFlight.get(key);
+  if (pending) return pending;
+  const read = nativeQueue.then(() => {
+    if (nativeDisabledForTest() || failedServices.has(serviceName)) return null;
+    return readInChild(serviceName, accountName);
+  });
+  nativeQueue = read.then(() => undefined, () => undefined);
+  inFlight.set(key, read);
+  void read.then(() => { if (inFlight.get(key) === read) inFlight.delete(key); });
+  return read;
 }
 
 module.exports = { readKeychainPassword, keychainTimeoutMs };

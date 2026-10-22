@@ -147,7 +147,15 @@ function parseMemoryEventsCli(text) {
   if (fence && fence.index != null) cut = idx + heading.length + fence.index + fence[0].length;
   const before = text.slice(0, idx).replace(/<!--\s*$/u, "");
   const remainder = text.slice(cut).replace(/^\s*-->/u, "");
-  return { events, cleaned: (before + remainder).trim() };
+  // Every block leaves the visible text (a reply can carry two — Terminal envelope + Agentlas One ticket); the events
+  // stay those of the last block, as before.
+  let cleaned = (before + remainder).trim();
+  while (cleaned.includes(heading)) {
+    const inner = parseMemoryEventsCli(cleaned);
+    if (inner.cleaned === cleaned) break;
+    cleaned = inner.cleaned;
+  }
+  return { events, cleaned };
 }
 
 function curateCliReply(db, text, ctx) {

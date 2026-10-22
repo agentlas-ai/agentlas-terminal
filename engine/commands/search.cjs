@@ -48,8 +48,9 @@ async function run(ctx, args) {
 
   let result;
   try {
-    // Hub 파라미터 이름은 `q` — 데스크탑 mcp-source.ts와 동일하게 q만 전송.
-    result = await callHubTool("marketplace.search_agents", { q: query, limit });
+    // Hub 파라미터 이름은 `q`. verbose 가 없으면 Hub 는 라우팅용 짧은 모양(slug·이름·종류)만
+    // 돌려줘서 아래 설명 칸이 늘 비었다 — 데스크탑 mcp-source.ts 처럼 verbose 를 같이 보낸다.
+    result = await callHubTool("marketplace.search_agents", { q: query, limit, verbose: true });
   } catch (e) {
     ctx.err(e instanceof HubError ? e.message : `Agent Hub connection failed: ${(e && e.message) || e}`);
     return 1;

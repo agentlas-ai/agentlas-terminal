@@ -40,6 +40,33 @@ function domainTarget() { return `gui/${os.userInfo().uid}`; }
 /** launchd 가 poke 할 CLI 진입점(절대경로). 전역 설치본이든 체크아웃이든 이 파일 기준으로 해석. */
 function cliEntry() { return path.resolve(__dirname, "..", "..", "bin", "agentlas.cjs"); }
 
+// 버전별 런타임 폴더(Homebrew Cellar/<ver>, nvm·volta·asdf·fnm) — 업그레이드·전환·정리 때 사라진다.
+const VERSIONED_RUNTIME_RE = /\/Cellar\/[^/]+\/[^/]+\/|\/\.nvm\/versions\/|\/\.volta\/tools\/image\/|\/\.asdf\/installs\/|\/fnm\/node-versions\//;
+
+/**
+ * launchd 가 실행할 node — 설치(enable) 시점에 정한다. process.execPath 가 버전 폴더
+ * (/opt/homebrew/Cellar/node/25.3.0/bin/node 등)면 `brew upgrade node` 뒤 cleanup 이 지우고, launchd 는
+ * 매 인터벌 조용히 exec 에 실패한다(리뷰 2026-10-16 engine-06). 같은 런타임으로 실경로가 풀리는 버전 무관
+ * 경로(PATH 의 node, /opt/homebrew/bin/node, /usr/local/bin/node)가 있으면 그것을 쓴다. 없으면(nvm 등)
+ * 지금 경로를 그대로 쓰고, 그 경로가 사라지면 launchdStatus 가 stale_program 으로 알린다.
+ */
+function launchNodeProgram(execPath = process.execPath, env = process.env) {
+  const current = String(execPath || "");
+  if (!VERSIONED_RUNTIME_RE.test(current)) return current;
+  let real;
+  try { real = fs.realpathSync(current); } catch { return current; }
+  const candidates = [
+    ...String((env && env.PATH) || "").split(path.delimiter).filter(Boolean).map((dir) => path.join(dir, "node")),
+    "/opt/homebrew/bin/node",
+    "/usr/local/bin/node",
+  ];
+  for (const candidate of candidates) {
+    if (!path.isAbsolute(candidate) || VERSIONED_RUNTIME_RE.test(candidate)) continue;
+    try { if (fs.realpathSync(candidate) === real) return candidate; } catch { /* absent alias */ }
+  }
+  return current;
+}
+
 function samePath(left, right) {
   const a = path.normalize(String(left || ""));
   const b = path.normalize(String(right || ""));
@@ -197,8 +224,9 @@ function normalizeIntervalSec(value, fallback = 300) {
   return Math.max(MIN_INTERVAL_SEC, Math.min(MAX_INTERVAL_SEC, Math.trunc(number)));
 }
 
-function plistXml(intervalSec = 300) {
-  const node = process.execPath;
+/** program: 실행할 node(enableLaunchd 는 launchNodeProgram() 을 넘긴다). */
+function plistXml(intervalSec = 300, program = process.execPath) {
+  const node = program;
   const entry = cliEntry();
   const log = logPath();
   const esc = (s) => String(s)
@@ -450,21 +478,36 @@ function removePlistSafely(location) {
   removeKnownFile(quarantine, moved, location.launchAgents);
 }
 
+/** 설치된 plist 의 ProgramArguments(우리가 쓴 XML 모양만 읽는다). 읽을 수 없으면 null. */
+function installedProgramArguments(location, target) {
+  if (!target || target.size > MAX_PLIST_BYTES) return null;
+  const xml = fs.readFileSync(location.target, "utf8");
+  const array = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(xml);
+  if (!array) return null;
+  const unescape = (s) => s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, "\"").replace(/&apos;/g, "'").replace(/&amp;/g, "&");
+  return [...array[1].matchAll(/<string>([^<]*)<\/string>/g)].map((match) => unescape(match[1]));
+}
+
 function launchdStatus() {
   const supported = isSupported();
   let installed = false;
+  let staleProgram = false;
   if (supported) {
     try {
       const location = launchAgentsLocation({ create: false });
       const target = inspectPlistTarget(location.target, { allowMissing: true });
       assertDirectory(location.launchAgents, "LaunchAgents directory");
       installed = !!target;
+      // 설치돼 있어도 실행 파일이 사라졌으면 launchd 는 매번 조용히 실패한다 — "정상"으로 보이면 안 된다.
+      const args = installed ? installedProgramArguments(location, target) : null;
+      if (args) staleProgram = !args[0] || !fs.existsSync(args[0]) || (path.isAbsolute(args[1] || "") && !fs.existsSync(args[1]));
     } catch { /* unsafe/missing path is not an installed LaunchAgent */ }
   }
   return {
     supported,
     installed: supported && installed,
     loaded: supported && isLoaded(),
+    stale_program: supported && installed && staleProgram,
     plistPath: plistPath(),
     label: LABEL,
     entry: cliEntry(),
@@ -477,7 +520,7 @@ function enableLaunchd({ intervalSec = 300 } = {}) {
   let location;
   try {
     location = launchAgentsLocation({ create: true });
-    writePlistAtomic(location, plistXml(intervalSec));
+    writePlistAtomic(location, plistXml(intervalSec, launchNodeProgram()));
   } catch (err) {
     return { ...launchdStatus(), error: `failed to write plist: ${String(err)}` };
   }
@@ -505,6 +548,6 @@ function disableLaunchd() {
 }
 
 module.exports = {
-  LABEL, plistPath, plistXml, cliEntry, isSupported,
+  LABEL, plistPath, plistXml, cliEntry, isSupported, launchNodeProgram,
   launchdStatus, enableLaunchd, disableLaunchd,
 };

@@ -23,26 +23,79 @@ const { userDataDir } = require("./paths.cjs");
 
 const DAEMON_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 
-/** 데몬 소켓 주소 — control-socket.ts 의 defaultControlSocketPath 와 같은 규칙. */
+/**
+ * The desktop daemon names its sockets from the canonical userData (desktop daemon/service-identity.ts
+ * canonicalDaemonPath: realpath, resolving existing ancestors for a path not created yet). A userData reached
+ * through a symlink or a Windows junction must resolve the same way here, or the hashed long-path name and the
+ * Windows pipe name point somewhere the daemon never listens. A path with no link in it keeps its bytes.
+ */
+function canonicalUserDataDir(value) {
+  const absolute = path.resolve(value);
+  try { return fs.realpathSync(absolute); }
+  catch (error) {
+    if (!error || error.code !== "ENOENT") return absolute;
+    const parent = path.dirname(absolute);
+    if (parent === absolute) return absolute;
+    return path.join(canonicalUserDataDir(parent), path.basename(absolute));
+  }
+}
+
+/** 데몬 소켓 주소 — control-socket.ts 의 defaultControlSocketPath 와 같은 규칙(정규 경로 기준). */
 function daemonSocketPath() {
-  const dir = userDataDir();
+  const dir = canonicalUserDataDir(userDataDir());
   if (process.platform === "win32") {
-    const tag = Buffer.from(dir).toString("base64url").slice(-16);
+    // Same rule as the desktop (control-socket.ts): sha256 of the whole canonical userData. Pipe names are
+    // machine-global, so the old base64url(dir).slice(-16) ("…ing\Agentlas") was one name for every user.
+    const tag = crypto.createHash("sha256").update(dir).digest("hex").slice(0, 24);
     return `\\\\.\\pipe\\agentlas-daemon-${tag}`;
   }
   // ★유닉스 소켓 경로 ~104바이트 한계(sockaddr_un). 실측: 128바이트에서 bind 는
   // 조용히 지나가고 connect 만 EINVAL — 데몬 쪽(control-socket.ts)과 같은 폴백 규칙.
   const preferred = path.join(dir, "daemon.sock");
-  if (Buffer.byteLength(preferred, "utf8") <= 100) return preferred;
   const tag = crypto.createHash("sha256").update(dir).digest("hex").slice(0, 16);
-  return path.join(require("node:os").tmpdir(), `agentlas-daemon-${tag}.sock`);
+  const name = `agentlas-daemon-${tag}.sock`;
+  // Match Desktop publication and its private .d-XXXXXX/s staging address.
+  const fits = address => Buffer.byteLength(address, "utf8") <= 100
+    && Buffer.byteLength(path.join(path.dirname(address), ".d-XXXXXX", "s"), "utf8") <= 100;
+  for (const address of [preferred, path.join(require("node:os").tmpdir(), name)]) {
+    if (fits(address)) return address;
+  }
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  if (!Number.isSafeInteger(uid) || uid < 0) throw new Error("daemon_socket_owner_unavailable");
+  const directory = path.join("/tmp", `agentlas-${uid}`);
+  const address = path.join(directory, name);
+  if (!fits(address)) throw new Error("daemon_socket_path_limit");
+  try { fs.mkdirSync(directory, { mode: 0o700 }); }
+  catch (error) { if (error.code !== "EEXIST") throw error; }
+  const owner = fs.lstatSync(directory);
+  if (owner.isSymbolicLink() || !owner.isDirectory() || owner.uid !== uid || (owner.mode & 0o7777) !== 0o700) {
+    throw new Error("daemon_socket_directory_unsafe");
+  }
+  return address;
+}
+
+/** The pipe name a desktop daemon from before the full-path hash listens on (Windows only; kept one release). */
+function legacyDaemonPipePath() {
+  if (process.platform !== "win32") return null;
+  const tag = Buffer.from(canonicalUserDataDir(userDataDir())).toString("base64url").slice(-16);
+  return `\\\\.\\pipe\\agentlas-daemon-${tag}`;
 }
 
 /** JSON-RPC 한 번. 데몬이 에러를 주면 그 문장 그대로 throw 한다. */
 function callDaemon(method, params, timeoutMs) {
+  const primary = daemonSocketPath();
+  const legacy = legacyDaemonPipePath();
+  // ENOENT means nothing listens there, so nothing was sent: trying the old name once cannot run work twice.
+  return callDaemonAt(primary, method, params, timeoutMs).catch((error) => {
+    if (!legacy || legacy === primary || !error || error.code !== "ENOENT") throw error;
+    return callDaemonAt(legacy, method, params, timeoutMs);
+  });
+}
+
+function callDaemonAt(address, method, params, timeoutMs) {
   const limit = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 120000;
   return new Promise((resolve, reject) => {
-    const socket = net.connect(daemonSocketPath());
+    const socket = net.connect(address);
     const id = crypto.randomUUID();
     let buffer = Buffer.alloc(0);
     let responseBytes = 0;

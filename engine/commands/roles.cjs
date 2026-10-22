@@ -17,7 +17,7 @@
  */
 const { RUNTIME_BIN, whichSync } = require("../runtimes/detect.cjs");
 const { runtimeAuthEvidence } = require("../runtimes/auth-evidence.cjs");
-const { canonicalRuntimeKind, storedRuntimeKind } = require("../runtimes/kinds.cjs");
+const { canonicalRuntimeKind, storedRuntimeKind, storedAcpAgentId } = require("../runtimes/kinds.cjs");
 const { MODEL_ROLE_TABLE, MODEL_ROLE_MEMBER_TABLE, VALID_ROLES, resolvedModelRole, roleMembers } = require("../runtimes/roles.cjs");
 const { runWriteTransaction } = require("../agentlas-sqlite-policy.cjs");
 const { EFFORTS } = require("../agentlas-workload-routing.cjs");
@@ -170,7 +170,7 @@ function set(ctx, args) {
   const now = new Date().toISOString();
   runWriteTransaction(db, () => {
     const existing = db.prepare("SELECT * FROM model_roles WHERE role=?").get(role);
-    const sameKind = existing && canonicalRuntimeKind(existing.kind) === kind;
+    const sameKind = existing && canonicalRuntimeKind(existing.kind, existing.acp_agent_id) === kind;
     const storedKind = storedRuntimeKind(kind);
     // kind가 바뀌면 이전 모델/백엔드/출처는 새 런타임의 좌표가 아니다
     // (예: kimi에 opus, codex에 google backend). 명시하지 않은 값은 지운다.
@@ -212,6 +212,11 @@ function set(ctx, args) {
          VALUES (?,?,?,?,?,?,?,?,?)`,
       ).run(role, storedKind, savedBackend, savedSource, savedModel, savedEffort, savedLongContext, inherit, now);
     }
+    // Desktop's "acp" seat names its agent in acp_agent_id (github-copilot-cli); every other kind clears it.
+    if (ctx.columnExists ? ctx.columnExists(db, "model_roles", "acp_agent_id")
+      : db.prepare("PRAGMA table_info(model_roles)").all().some((column) => column.name === "acp_agent_id")) {
+      db.prepare("UPDATE model_roles SET acp_agent_id=? WHERE role=?").run(storedAcpAgentId(kind), role);
+    }
 
     // Desktop v80과 같은 단일 설정 계약: model_roles만 바꿔 실제 실행이
     // 계속 옛 pool 1순위를 고르는 split-brain을 만들지 않는다.
@@ -228,6 +233,9 @@ function set(ctx, args) {
            SET kind=?, backend=?, source=?, model=?, effort=?, long_context=?, updated_at=?
            WHERE role=? AND position=1`,
         ).run(storedKind, savedBackend, savedSource, savedModel, savedEffort, savedLongContext, now, role);
+        if (db.prepare("PRAGMA table_info(model_role_members)").all().some((column) => column.name === "acp_agent_id")) {
+          db.prepare("UPDATE model_role_members SET acp_agent_id=? WHERE role=? AND position=1").run(storedAcpAgentId(kind), role);
+        }
       }
     }
   });

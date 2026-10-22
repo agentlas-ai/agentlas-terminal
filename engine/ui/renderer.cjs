@@ -4,6 +4,12 @@
  * 활성 세션 하나에만 attach된다. 백그라운드 세션 이벤트는 orchestrator의
  * notice로만 표면화된다(오르카 규칙: 화면은 한 세션, 나머지는 상태로).
  */
+const i18n = require("../agentlas-i18n.cjs");
+
+function runtimeLabel(runtime, lang = "en") {
+  if (!runtime || !runtime.kind) return "—";
+  return `${runtime.kind} · ${runtime.model || (lang === "ko" ? "기본 모델" : "default model")}`;
+}
 
 class Renderer {
   constructor(ui) {
@@ -15,6 +21,7 @@ class Renderer {
   attach(session, { replay = true } = {}) {
     this.detach();
     this.session = session;
+    this._runtimeLabel = runtimeLabel(session.runtime, session.lang);
     if (replay) this._replayTail(session);
     this._listener = (ev) => this._render(ev);
     session.on("event", this._listener);
@@ -31,7 +38,7 @@ class Renderer {
   _beginChrome() {
     this.ui.beginTurn({
       permissionLabel: this.session ? this.session.permission : "",
-      status: this.session ? this.session.agent.slug : "",
+      status: this.session ? `${this.session.agent.slug} · ${runtimeLabel(this.session.runtime, this.session.lang)}` : "",
     });
   }
 
@@ -39,7 +46,7 @@ class Renderer {
     const tail = session.eventsTail(120);
     if (!tail.length) return;
     this.ui.ensureNl();
-    this.ui.rule(`${session.key || ""} ${session.agent.slug} · ${session.status}`);
+    this.ui.rule(`${session.key || ""} ${session.agent.slug} · ${runtimeLabel(session.runtime, session.lang)} · ${session.status}`);
     // 마지막 턴의 스트림 텍스트만 복원한다(도구 소음 제외) — 전환 시 맥락 파악용.
     let text = "";
     for (const ev of tail) {
@@ -52,13 +59,26 @@ class Renderer {
 
   _render(ev) {
     const ui = this.ui;
+    const current = runtimeLabel(this.session?.runtime, this.session?.lang);
+    if (this._runtimeLabel && current !== this._runtimeLabel) ui.line(ui.c.dim(current));
+    this._runtimeLabel = current;
     switch (ev.type) {
       case "turn-start": this._beginChrome(); return;
       case "turn-end":
         ui.endTurn();
+        if (ev.ok === false && ev.killed !== true && this.session && !this.session.lastErrorAnnounced) {
+          // A returned failure is terminal even when it never threw. Keep the
+          // provider's raw reason private and do not repeat an earlier failure line.
+          ui.warn(i18n.t(this.session.lang || ui.lang || "en", "runtime.replyFailed"));
+          this.session.lastErrorAnnounced = true;
+        }
         return;
       case "status": ui.status(ev.text); return;
-      case "warn": ui.warn(ev.text); return;
+      case "warn":
+        ui.warn(ev.text);
+        // The reason a turn failed, drawn here: a surface that also prints session.lastError must not say it twice.
+        if (ev.failure === true && this.session) this.session.lastErrorAnnounced = true;
+        return;
       case "error":
         // 사용자가 의도적으로 중단(kill)한 턴의 종료 에러(SIGTERM exit 등)는 소음 —
         // 실사용 테스트에서 확인된 UX 결함. 중단 안내는 REPL이 이미 출력했다.
@@ -116,4 +136,4 @@ class Renderer {
   }
 }
 
-module.exports = { Renderer };
+module.exports = { Renderer, runtimeLabel };

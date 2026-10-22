@@ -1,12 +1,5 @@
--- Agentlas 첫 실행 부트스트랩 스키마 (생성: 2026-10-10T13:57:54Z)
---
--- ★생성물이다. 손으로 고치지 말고 재생성하라:
---     node scripts/gen-bootstrap-schema.cjs
---
--- 정본은 Desktop 의 마이그레이션 사다리(agentlas_desktop/electron/store/db.ts, SCHEMA_VERSION).
--- 이 파일은 그 사다리를 **빈 DB** 에 끝까지 돌린 결과의 덤프이므로, 터미널이 만든 DB 는
--- 처음부터 사다리 머리에 있다 — 데스크탑이 나중에 승급할 것이 남지 않는다.
-PRAGMA user_version=131;
+-- Generated from immutable Desktop 85010aeb1937946212900eea17395d2f6443eb3d; schema 134.
+PRAGMA user_version=134;
 CREATE TABLE active_runtime (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         kind TEXT NOT NULL
@@ -588,6 +581,10 @@ CREATE TABLE capability_grants (
       resource_identity TEXT,
       permission_scope TEXT CHECK(permission_scope IS NULL OR permission_scope IN ('read','write','full')),
       tool_identity TEXT,
+      -- G04: optional expiry (ISO, NULL = never) and the consent revision the grant was given under.
+      -- Also declared in REQUIRED_COLUMNS for installs that already have the table.
+      expires_at TEXT,
+      consent_revision INTEGER NOT NULL DEFAULT 0,
       UNIQUE(capability, pattern, scope)
     );
 CREATE TABLE chat_goal_contracts (
@@ -1072,7 +1069,7 @@ CREATE TABLE invocation_steers (
       recovery_reason TEXT,
       queued_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
-    );
+    , one_team_report_custody_json TEXT);
 CREATE TABLE judgment_verdicts (
       kind          TEXT NOT NULL,
       signature     TEXT NOT NULL,
@@ -1273,7 +1270,7 @@ CREATE TABLE mcp_servers (
         env_keys_json TEXT NOT NULL DEFAULT '[]',
         enabled INTEGER NOT NULL DEFAULT 1,
         installed_at TEXT NOT NULL
-      );
+      , credential_refs_json TEXT NOT NULL DEFAULT '{}', connection_epoch INTEGER NOT NULL DEFAULT 0 CHECK(connection_epoch >= 0));
 CREATE TABLE media_operation_events (
           operation_id TEXT NOT NULL,
           sequence INTEGER NOT NULL CHECK(sequence > 0),
@@ -1666,6 +1663,93 @@ CREATE TABLE prompt_chat_start_intents (
       prompt_digest TEXT NOT NULL,
       seed_only INTEGER NOT NULL CHECK(seed_only IN (0,1)),
       created_at TEXT NOT NULL
+    );
+CREATE TABLE room_discussion_settings (
+      chat_id TEXT PRIMARY KEY,
+      -- NULL = default (on when the room has at least two members), 0/1 = the owner's explicit choice.
+      enabled INTEGER CHECK(enabled IN (0,1)),
+      updated_at TEXT NOT NULL
+    );
+CREATE TABLE room_discussions (
+      id TEXT PRIMARY KEY,
+      chat_id TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('running','completed','stopped','interrupted','failed')),
+      stop_reason TEXT,
+      owner_message_id TEXT NOT NULL,
+      root_seq INTEGER NOT NULL,
+      round_no INTEGER NOT NULL DEFAULT 0,
+      max_rounds INTEGER NOT NULL,
+      budget_units INTEGER NOT NULL,
+      spent_units INTEGER NOT NULL DEFAULT 0,
+      stop_requested INTEGER NOT NULL DEFAULT 0,
+      -- The process that runs the loop. Recovery closes only rows whose host is gone (another live process keeps its own).
+      host_id TEXT NOT NULL DEFAULT '',
+      host_pid INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+CREATE TABLE room_member_cursors (
+      chat_id TEXT NOT NULL,
+      member_agent_id TEXT NOT NULL,
+      last_seen_seq INTEGER NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(chat_id, member_agent_id)
+    );
+CREATE TABLE room_messages (
+      message_id TEXT PRIMARY KEY,
+      chat_id TEXT NOT NULL,
+      seq INTEGER NOT NULL,
+      kind TEXT NOT NULL CHECK(kind IN ('post','comment')),
+      author TEXT NOT NULL CHECK(author IN ('owner','member','system')),
+      speaker_agent_id TEXT,
+      reply_to TEXT,
+      discussion_id TEXT,
+      round_no INTEGER,
+      created_at TEXT NOT NULL,
+      UNIQUE(chat_id, seq)
+    );
+CREATE TABLE room_owner_inbox (
+      id TEXT PRIMARY KEY,
+      chat_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      interrupt INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL CHECK(status IN ('pending','consumed')),
+      created_at TEXT NOT NULL,
+      consumed_at TEXT
+    );
+CREATE TABLE room_round_turns (
+      id TEXT PRIMARY KEY,
+      round_id TEXT NOT NULL,
+      discussion_id TEXT NOT NULL,
+      chat_id TEXT NOT NULL,
+      member_agent_id TEXT NOT NULL,
+      member_name TEXT NOT NULL,
+      ordinal INTEGER NOT NULL,
+      mode TEXT NOT NULL CHECK(mode IN ('message','comment')),
+      reason TEXT NOT NULL,
+      reply_to TEXT,
+      status TEXT NOT NULL CHECK(status IN ('pending','running','completed','failed','cancelled','interrupted','refused')),
+      reason_code TEXT,
+      run_id TEXT,
+      child_chat_id TEXT,
+      -- The finished text is kept here until it is committed to the room log, so a restart between the two
+      -- publishes it instead of asking the model again.
+      result_text TEXT,
+      message_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+CREATE TABLE room_rounds (
+      id TEXT PRIMARY KEY,
+      discussion_id TEXT NOT NULL,
+      chat_id TEXT NOT NULL,
+      round_no INTEGER NOT NULL,
+      snapshot_seq INTEGER NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('running','completed','interrupted')),
+      close_reason TEXT,
+      created_at TEXT NOT NULL,
+      closed_at TEXT,
+      UNIQUE(discussion_id, round_no)
     );
 CREATE TABLE run_events (
         id TEXT PRIMARY KEY,
@@ -2136,6 +2220,11 @@ CREATE INDEX idx_plugin_builder_sessions_slug_phase
         ON plugin_builder_sessions(slug, phase);
 CREATE INDEX idx_prompt_chat_start_chat
       ON prompt_chat_start_intents(chat_id);
+CREATE INDEX idx_room_discussions_chat ON room_discussions(chat_id, status);
+CREATE INDEX idx_room_messages_reply ON room_messages(chat_id, reply_to);
+CREATE INDEX idx_room_owner_inbox_pending ON room_owner_inbox(chat_id, status, created_at);
+CREATE INDEX idx_room_round_turns_round ON room_round_turns(round_id, ordinal);
+CREATE INDEX idx_room_round_turns_running ON room_round_turns(status);
 CREATE INDEX idx_run_events_agent_kind_ts
           ON run_events(agent_id, kind, ts DESC);
 CREATE INDEX idx_run_events_agent_ts ON run_events(agent_id, ts DESC);
@@ -2203,4 +2292,4 @@ CREATE TRIGGER trg_science_runtime_event_outbox_identity_update
       SELECT CASE WHEN NOT (NEW.status = OLD.status OR (OLD.status = 'pending' AND NEW.status = 'delivered'))
         THEN RAISE(ABORT, 'science-runtime-outbox-state-invalid') END;
     END;
-INSERT OR IGNORE INTO memory_forget_clock (id, epoch) VALUES (1, 0);
+INSERT OR IGNORE INTO memory_forget_clock (id,epoch) VALUES (1,0);

@@ -12,8 +12,9 @@
  *
  * 스키마는 실측으로 확인됨 (cli/agentlas.cjs 상단 주석 참고).
  */
-const { execFileSync, spawn } = require("node:child_process");
+const { execFileSync, spawn, spawnSync } = require("node:child_process");
 const { detectRuntimeRefusal } = require("./runtime-refusal.cjs");
+const { normalizeCliUsage } = require("./usage-normalizer.cjs");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -22,6 +23,8 @@ const permissions = require("./agentlas-permissions.cjs");
 const acpDriver = require("./runtimes/acp-driver.cjs");
 const i18n = require("./agentlas-i18n.cjs");
 const { wrapStdioServer } = require("./agentlas-mcp-env.cjs");
+const { withClaudeProductHome, withClaudeNativeCompaction } = require("./claude-product-home.cjs");
+const generation = require("./sessions/generation.cjs");
 
 function uiText(ui, key, ...args) {
   return ui && typeof ui.t === "function" ? ui.t(key, ...args) : i18n.t("en", key, ...args);
@@ -361,6 +364,31 @@ function writeManagedFile(file, content, location = null) {
   }
 }
 
+/*
+ * The person's Codex telemetry OPT-OUTS a Terminal Codex home keeps (owner decision 2026-10-17, every product home: a
+ * person who turned vendor telemetry off keeps it off in product runs; never an opt-in, never an [otel] exporter;
+ * otherwise the vendor default). Same rule as Desktop electron/runtime/codex-product-home.ts PRODUCT_CODEX_OPT_OUTS:
+ * `analytics.enabled = false` and `feedback.enabled = false`, as a `[table]` key, a dotted root key or an inline table.
+ * A line scan, not a TOML parser: a misread can only turn telemetry off, never on. They ride as `-c` overrides
+ * (codexArgs): the managed config.toml is write-once (writeManagedFile refuses different content), so its text stays.
+ */
+function codexTelemetryOptOuts(configText) {
+  const out = new Set();
+  let table = "";
+  for (const raw of String(configText || "").split(/\r?\n/)) {
+    const line = raw.replace(/\s+#.*$/, "").trim();
+    const header = /^\[\s*([A-Za-z0-9_.-]+)\s*\]$/.exec(line);
+    if (header) { table = header[1]; continue; }
+    if (/^\[\[/.test(line)) { table = "[[array]]"; continue; }
+    for (const name of ["analytics", "feedback"]) {
+      if ((table === name && /^enabled\s*=\s*false$/.test(line))
+        || (table === "" && new RegExp(`^${name}\\.enabled\\s*=\\s*false$`).test(line))
+        || (table === "" && new RegExp(`^${name}\\s*=\\s*\\{\\s*enabled\\s*=\\s*false\\s*\\}$`).test(line))) out.add(`${name}.enabled = false`);
+    }
+  }
+  return [...out];
+}
+
 function prepareCodexRuntimeEnv(env = process.env) {
   const base = { ...env };
   const sourceHome = path.resolve(base.CODEX_HOME || path.join(os.homedir(), ".codex"));
@@ -423,7 +451,21 @@ function prepareCodexRuntimeEnv(env = process.env) {
 function runtimeEnvForKind(kind, env = process.env, options = {}) {
   if (kind === "codex") return prepareCodexRuntimeEnv(env);
   if (kind === "gemini") return prepareGeminiRuntimeEnv(env, options);
+  if (kind === "claude-code" || kind === "claude") return prepareClaudeRuntimeEnv(env, options);
   return env;
+}
+
+// Product turns keep their Claude sessions in Agentlas's own config dir, never in the person's ~/.claude (owner
+// 2026-10-13: a Motiondirector run through this host wrote its session into ~/.claude/projects). Same rule as the desktop.
+function prepareClaudeRuntimeEnv(env = process.env, options = {}) {
+  let runEnv = env;
+  if (env.AGENTLAS_CLAUDE_KEEP_HOME !== "1") {
+    try {
+      runEnv = withClaudeProductHome({ ...env }, path.join(managedUserDataDirectory(env).realPath, "claude-product-home"));
+    } catch { /* keep the existing home when the mirror is unavailable */ }
+  }
+  const windowTokens = generation.contextWindowTokens("claude-code", options.model);
+  return withClaudeNativeCompaction(runEnv, { windowTokens, limitTokens: generation.nativeCompactionLimit(windowTokens) });
 }
 
 // MCP 서버 이름 → TOML/JSON 안전 키 (하이픈/공백 → _).
@@ -507,34 +549,40 @@ function summarizeToolInput(name, input) {
 }
 
 // child.stdout → 줄 단위 콜백. 종료 시 잔여 버퍼 flush. cleanup 반환.
+// The bound is one line, not the run: a long run whose tool results carry images can pass any total (owner
+// 2026-10-13 — a Motiondirector film was killed at 16 MiB of cumulative stdout mid-render). Memory stays bounded by
+// dropping a single line that grows past maxBytes before its newline; the run itself is never stopped for volume.
 function lineReader(stream, onLine, onActivity, options = {}) {
   let buf = "";
-  let totalBytes = 0;
-  let limited = false;
+  let dropping = false;
   const maxBytes = Number.isFinite(Number(options.maxBytes))
     ? Math.max(1, Math.trunc(Number(options.maxBytes)))
     : NATIVE_STDOUT_MAX_BYTES;
   stream.setEncoding("utf8");
   const onData = (chunk) => {
-    if (limited) return;
     if (onActivity) onActivity();
-    totalBytes += Buffer.byteLength(chunk, "utf8");
-    if (totalBytes > maxBytes) {
-      limited = true;
+    let rest = chunk;
+    while (rest.length) {
+      const nl = rest.indexOf("\n");
+      const piece = nl >= 0 ? rest.slice(0, nl) : rest;
+      rest = nl >= 0 ? rest.slice(nl + 1) : "";
+      if (!dropping) {
+        buf += piece;
+        if (Buffer.byteLength(buf, "utf8") > maxBytes) {
+          buf = "";
+          dropping = true;
+          if (typeof options.onLineDropped === "function") options.onLineDropped(maxBytes);
+        }
+      }
+      if (nl < 0) break;
+      const line = buf;
       buf = "";
-      if (typeof options.onLimit === "function") options.onLimit(maxBytes);
-      return;
-    }
-    buf += chunk;
-    let nl;
-    while ((nl = buf.indexOf("\n")) >= 0) {
-      const line = buf.slice(0, nl);
-      buf = buf.slice(nl + 1);
+      if (dropping) { dropping = false; continue; }
       if (line.trim()) onLine(line);
     }
   };
   const onEnd = () => {
-    if (!limited && buf.trim()) onLine(buf);
+    if (!dropping && buf.trim()) onLine(buf);
   };
   stream.on("data", onData);
   stream.on("end", onEnd);
@@ -559,6 +607,72 @@ function structuredToolResult(content, fallbackText) {
   try { return JSON.parse(fenced ? fenced[1] : text); } catch { return null; }
 }
 
+// ── effort ───────────────────────────────────────────────
+// Effort is a CLI flag wherever the runtime has one and never prompt words (native-harness audit 31, A2 C6.2): Desktop
+// passes claude `--effort`, codex `model_reasoning_effort` and agy `--effort` (agy 1.4.0). The installed CLI's own
+// `--help` list decides the levels (the same parse as Desktop claude-code.ts parseEffortChoices): a CLI without
+// `--effort` gets no flag instead of an unknown option, and an unlisted level clamps down, never up.
+const EFFORT_RANK = Object.freeze(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
+const EFFORT_FLAG_KINDS = new Set(["claude-code", "agy"]);
+const effortChoiceCache = new Map();
+
+/** Levels listed after `--effort` in a CLI's help: "(low, medium, high, xhigh, max)" or "(low|medium|high)". */
+function parseEffortChoices(help) {
+  const match = /--effort[\s\S]{0,240}?\(([a-z0-9, |]+)\)/i.exec(String(help || ""));
+  if (!match) return [];
+  return [...new Set(match[1].split(/[,|]/).map((value) => value.trim().toLowerCase()).filter(Boolean))];
+}
+
+/**
+ * The effort levels this executable accepts, read once per executable generation (path, size, mtime).
+ * null = the help could not be read (the explicit pin is passed through and the CLI judges it);
+ * [] = the CLI has no `--effort` (no flag is sent).
+ */
+function cliEffortChoices(bin, env = process.env) {
+  if (!bin) return null;
+  let key;
+  try {
+    const stat = fs.statSync(bin);
+    key = `${fs.realpathSync(bin)}:${stat.size}:${stat.mtimeMs}`;
+  } catch {
+    return null;
+  }
+  if (effortChoiceCache.has(key)) return effortChoiceCache.get(key);
+  let choices = null;
+  try {
+    // agy (Go flag) prints its usage on stderr with exit 0; claude prints on stdout. Read both.
+    const probe = spawnSync(bin, ["--help"], {
+      encoding: "utf8", env, timeout: 5_000, maxBuffer: 4 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
+    });
+    const help = `${probe.stdout || ""}\n${probe.stderr || ""}`;
+    choices = probe.error || probe.status !== 0 ? null : parseEffortChoices(help);
+  } catch {
+    choices = null;
+  }
+  effortChoiceCache.set(key, choices);
+  return choices;
+}
+
+/** The exact level to send as `--effort` for claude-code/agy, or null when no flag is sent. */
+function nativeEffortLevel(kind, effort, choices) {
+  if (!EFFORT_FLAG_KINDS.has(kind)) return null;
+  const requested = String(effort || "").trim().toLowerCase();
+  if (!requested || ["none", "off", "auto", "default"].includes(requested)) return null;
+  const wanted = requested === "minimal" ? "low" : requested;
+  if (!Array.isArray(choices)) return /^[a-z][a-z0-9-]{0,23}$/.test(wanted) ? wanted : null;
+  if (choices.includes(wanted)) return wanted;
+  const rank = EFFORT_RANK.indexOf(wanted);
+  if (rank < 0) return null;
+  return choices
+    .filter((choice) => EFFORT_RANK.indexOf(choice) >= 0 && EFFORT_RANK.indexOf(choice) <= rank)
+    .sort((left, right) => EFFORT_RANK.indexOf(right) - EFFORT_RANK.indexOf(left))[0] || null;
+}
+
+function effortArgs(kind, effort, choices) {
+  const level = nativeEffortLevel(kind, effort, choices);
+  return level ? ["--effort", level] : [];
+}
+
 // ── claude-code ──────────────────────────────────────────
 function claudePermissionArgs(permission) {
   const level = permissions.normalize(permission);
@@ -567,20 +681,30 @@ function claudePermissionArgs(permission) {
   return ["--permission-mode", "plan"];
 }
 
-function claudeArgs({ prompt, systemPrompt, permission, session, model, effort, mcpServers, mcpAllowlistMode, env }) {
+// Turn context in front of the user message (same frame as Desktop runtime/continuity.ts composeResumeTurnPrompt).
+function withTurnContext(prompt, turnContext, locale) {
+  const ctx = String(turnContext || "").trim();
+  if (!ctx) return prompt;
+  return ["── Turn context (host background; not the user's message; never quote) ──", ctx, "",
+    locale === "ko" ? "── 이번 요청 ──" : "── Current request ──", prompt].join("\n");
+}
+
+function claudeArgs({ prompt, systemPrompt, systemPromptStable, turnContext, locale, permission, session, model, effort, effortChoices, mcpServers, mcpAllowlistMode, env }) {
+  // A session-split prompt (sessions/prompt.cjs augmentSystemParts): the same stable bytes on every spawn — Claude's
+  // transcript keeps no system prompt, so a resume without it ran with no Agentlas instructions — and this turn's part
+  // (turn_id, recall) as turn context. Measured 2026-10-14: 3/3 resumed turns kept the right turn_id this way.
+  if (systemPromptStable) prompt = withTurnContext(prompt, turnContext, locale);
   const level = permissions.normalize(permission);
   const perm = claudePermissionArgs(level);
-  // /effort → Claude Code는 think 키워드로 reasoning 예산을 올린다(전용 CLI 플래그 없음).
-  const thinkKw =
-    effort === "max" ? "Ultrathink. " : effort === "high" ? "Think hard. " : effort === "medium" ? "Think. " : "";
   const args = [
     "-p",
-    thinkKw + prompt,
+    prompt,
     "--output-format",
     "stream-json",
     "--include-partial-messages",
     "--verbose",
     ...perm,
+    ...effortArgs("claude-code", effort, effortChoices),
   ];
   // MCP tools can mutate state outside the workspace sandbox. Until the desktop schema
   // carries a trustworthy readOnlyHint per tool, only explicit full access may inject them.
@@ -594,16 +718,119 @@ function claudeArgs({ prompt, systemPrompt, permission, session, model, effort, 
   if (model) args.push("--model", model); // alias (sonnet/opus) or full id — /model parity
   if (session && session.id) {
     args.push("--resume", session.id);
-  } else if (systemPrompt) {
-    args.push("--append-system-prompt", systemPrompt);
+    if (systemPromptStable) args.push("--append-system-prompt", systemPromptStable);
+  } else if (systemPromptStable || systemPrompt) {
+    args.push("--append-system-prompt", systemPromptStable || systemPrompt);
   }
   return args;
+}
+
+// ── typed failures ───────────────────────────────────────
+// The kinds are Desktop runner.ts RunnerFailureKind (quota | auth | refused | empty | exit | timeout | unavailable |
+// unsupported). errorCode is the provider's own bounded machine code (Desktop RunnerFailure.providerCode), never prose.
+// Before this, `terminal_reason: "api_error"` alone meant quota, so the measured "Not logged in" shape (claude 2.1.301:
+// assistant.error "authentication_failed", api_error_status null) was reported as a usage limit (audit 31, A2 C8.3).
+const CLAUDE_ASSISTANT_ERROR_KIND = Object.freeze({
+  authentication_failed: "auth", oauth_org_not_allowed: "auth", account_on_hold: "auth", cloud_credential_error: "auth",
+  rate_limit: "quota", billing_error: "quota",
+  overloaded: "unavailable", server_error: "unavailable",
+  model_not_found: "unsupported",
+  invalid_request: "exit", max_output_tokens: "exit", unknown: "exit",
+});
+const PROVIDER_CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/;
+
+function boundedProviderCode(value) {
+  if (typeof value !== "string" && typeof value !== "number") return undefined;
+  const code = String(value).trim();
+  return PROVIDER_CODE_RE.test(code) ? code : undefined;
+}
+
+/** HTTP status from a provider field → kind (Desktop runtimeHttpFailure: 401 auth, 403 refused, 429 quota). */
+function httpStatusFailureKind(status) {
+  if (!Number.isSafeInteger(status)) return null;
+  if (status === 401) return "auth";
+  if (status === 403) return "refused";
+  if (status === 429) return "quota";
+  if (status === 529 || (status >= 500 && status <= 599)) return "unavailable";
+  return null;
+}
+
+/** Record one typed failure on the stream state (the last writer wins; callers decide precedence). */
+function markFailure(st, failure) {
+  st.typedFailure = failure;
+  st.error = failure.message;
+  st.errorKind = failure.kind;
+  st.errorSource = failure.source || "marker";
+  st.errorCode = failure.code;
+  st.retryAfterHint = failure.retryAfterHint;
+}
+
+function claudeAssistantText(obj) {
+  const content = obj && obj.message && obj.message.content;
+  if (!Array.isArray(content)) return "";
+  return content.map((block) => (block && block.type === "text" && typeof block.text === "string" ? block.text : "")).join("").trim();
+}
+
+/** A claude error result's own words: `result`, else `errors[]` (error results carry no `result`; A2 C8.8). */
+function claudeResultMessage(obj) {
+  if (typeof obj.result === "string" && obj.result.trim()) return obj.result.trim().slice(0, 2000);
+  if (Array.isArray(obj.errors)) {
+    const joined = obj.errors.map((item) => (typeof item === "string" ? item : item && typeof item.message === "string" ? item.message : ""))
+      .filter(Boolean).join("; ").trim();
+    if (joined) return joined.slice(0, 2000);
+  }
+  return "";
+}
+
+function claudeResultFailure(obj, st) {
+  const message = claudeResultMessage(obj);
+  const prior = st.typedFailure;
+  // A resumed session that no longer exists: error_during_execution with no model turn (Desktop claude-code.ts
+  // resumedConversationMissing). No model work happened, so the session layer may start a fresh generation.
+  if (st.claudeResumeId && obj.subtype === "error_during_execution" && obj.num_turns === 0) {
+    st.sessionGoneBeforeEffects = true;
+    return { kind: "exit", code: "session_not_found", message: message || "claude could not resume the saved conversation", source: "marker" };
+  }
+  // An observed provider cause (assistant.error, a rejected usage window) is more specific than the result envelope.
+  if (prior && prior.source === "marker" && prior.kind !== "exit") {
+    return { ...prior, message: message || prior.message };
+  }
+  const httpKind = httpStatusFailureKind(obj.api_error_status);
+  if (httpKind) return { kind: httpKind, code: `http_${obj.api_error_status}`, message: message || `HTTP ${obj.api_error_status}`, source: "marker" };
+  if (prior) return { ...prior, message: message || prior.message };
+  if (/not logged in|please run \/login/i.test(message)) return { kind: "auth", message, source: "heuristic" };
+  const reason = obj.terminal_reason && obj.terminal_reason !== "completed" ? boundedProviderCode(obj.terminal_reason) : undefined;
+  return { kind: "exit", ...(reason ? { code: reason } : {}), message: message || "claude error", source: "marker" };
 }
 
 // ANSI 제거 (에러 stderr 정리용) — 외부 의존성 없이.
 function stripAnsi(s) {
   // eslint-disable-next-line no-control-regex
   return String(s).replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+/**
+ * A tool-ish event of a kind this driver draws no row for: the turn did use a tool, so a blank reply behind it is not the model
+ * producing nothing at all (sessions/turn-outcome.cjs blankReplyKind). "No tool seen" is not "no tool ran". The hook is optional:
+ * a plain UI object (a graph model call) has no tally and needs none.
+ */
+function noteToolActivity(ui) {
+  if (ui && typeof ui.noteToolActivity === "function") ui.noteToolActivity();
+}
+
+// Claude content-block types that are reply text or the model's thinking; every other type is tool use (tool_use, server_tool_use,
+// mcp_tool_use and their *_tool_result blocks) or one this host does not know - which counts as activity too, never as nothing.
+const CLAUDE_NON_TOOL_BLOCKS = new Set(["text", "thinking", "redacted_thinking"]);
+
+/** The blocks of a finished assistant message: a tool call the stream path did not draw (same id) is unclassified tool use. */
+function noteClaudeToolBlocks(content, st, ui) {
+  if (!Array.isArray(content)) return;
+  for (const block of content) {
+    const type = block && typeof block.type === "string" ? block.type : "";
+    if (!type || CLAUDE_NON_TOOL_BLOCKS.has(type)) continue;
+    if (type === "tool_use" && st.toolUseSeen && st.toolUseSeen.has(block.id)) continue;
+    noteToolActivity(ui);
+  }
 }
 
 function handleClaudeLine(line, st, ui) {
@@ -613,6 +840,8 @@ function handleClaudeLine(line, st, ui) {
   } catch {
     return;
   }
+  // An event type of the CLI's own that is about a tool (tool_progress, tool_use_summary) and has no handler below.
+  if (typeof obj.type === "string" && obj.type !== "stream_event" && /tool/i.test(obj.type)) noteToolActivity(ui);
   switch (obj.type) {
     case "system":
       if (obj.subtype === "init" && obj.session_id) st.session.id = obj.session_id;
@@ -626,12 +855,16 @@ function handleClaudeLine(line, st, ui) {
           const tool = { id: cb.id || String(ev.index), name: cb.name || "tool", input: "" };
           st.tools[ev.index] = tool;
           st.toolById[tool.id] = tool;
+          (st.toolUseSeen || (st.toolUseSeen = new Set())).add(tool.id);
           // 인자가 다 모이는 content_block_stop에서 한 줄로(⏺ Name(arg)) 출력 — Claude Code 스타일
         } else if (cb.type === "thinking") {
           st.think[ev.index] = "";
           ui.status(uiText(ui, "runtime.thinking"));
         } else if (cb.type === "text") {
           ui.streamStart();
+        } else if (typeof cb.type === "string" && cb.type && !CLAUDE_NON_TOOL_BLOCKS.has(cb.type)) {
+          // server_tool_use / mcp_tool_use / a server tool's result block: no row is drawn for it, but a tool ran.
+          noteToolActivity(ui);
         }
       } else if (ev.type === "content_block_delta") {
         const d = ev.delta || {};
@@ -665,6 +898,29 @@ function handleClaudeLine(line, st, ui) {
       }
       return;
     }
+    case "assistant": {
+      // Tool use in the finished message that the stream path drew no row for (server_tool_use, mcp_tool_use, a sub-agent's own calls).
+      noteClaudeToolBlocks(obj.message && obj.message.content, st, ui);
+      // The context the next request starts from = the turn's LAST top-level model request (input + cache read +
+      // cache creation); a subagent's request is not this conversation (Desktop claude-code.ts contextInputTokens).
+      if (obj.parent_tool_use_id == null && obj.isSidechain !== true) {
+        const u = obj.message && obj.message.usage;
+        const part = (v) => (typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : 0);
+        const total = u ? part(u.input_tokens) + part(u.cache_read_input_tokens) + part(u.cache_creation_input_tokens) : 0;
+        if (total > 0) st.contextInputTokens = total;
+      }
+      // SDKAssistantMessage.error is the CLI's typed cause (authentication_failed, rate_limit, model_not_found, ...).
+      // A cause already observed with a specific kind (a rejected usage window) is not replaced by a later echo.
+      if (typeof obj.error === "string" && obj.error) {
+        const code = boundedProviderCode(obj.error);
+        const prior = st.typedFailure;
+        if (code && !(prior && prior.source === "marker" && prior.kind !== "exit")) {
+          markFailure(st, { kind: CLAUDE_ASSISTANT_ERROR_KIND[code] || "exit", code,
+            message: claudeAssistantText(obj) || code, source: "marker" });
+        }
+      }
+      return;
+    }
     case "user": {
       // tool_result 들
       const content = obj.message && obj.message.content;
@@ -689,35 +945,34 @@ function handleClaudeLine(line, st, ui) {
       }
       return;
     }
-    case "result":
+    case "result": {
+      // One plain -p invocation owns one root CLI turn; sidechain and background results are separate work.
+      const origin = obj.origin && typeof obj.origin === "object" ? obj.origin.kind : undefined;
+      if (obj.parent_tool_use_id != null || obj.isSidechain === true
+        || ["task-notification", "observer", "observer-activity", "coordinator"].includes(origin)) return;
+      // The result event is this turn's receipt (Desktop RuntimeTurnDelivery "accepted").
+      st.turnAccepted = true;
       st.ownerControlTerminal = obj.is_error ? "uncertain" : "completed";
       st.finalText = typeof obj.result === "string" ? obj.result : st.text;
-      st.usage = {
-        input_tokens: obj.usage && obj.usage.input_tokens,
-        output_tokens: obj.usage && obj.usage.output_tokens,
-        cost_usd: obj.total_cost_usd,
-        duration_ms: obj.duration_ms,
-      };
-      if (obj.is_error) {
-        st.error = obj.result || "claude error";
-        // api_error_status:429·error:"rate_limit"이 실려 오는 실측 형태 — 한도는 quota.
-        st.errorKind = obj.api_error_status === 429 || obj.terminal_reason === "api_error"
-          ? "quota" : "exit";
-        st.errorSource = "marker";
-      }
+      // Unreported side stays unknown (input_unknown/output_unknown), never 0. Anthropic: input excludes cache.
+      st.usage = normalizeCliUsage("anthropic", obj.usage, { cost_usd: obj.total_cost_usd, duration_ms: obj.duration_ms });
+      if (obj.is_error) markFailure(st, claudeResultFailure(obj, st));
       return;
+    }
     case "rate_limit_event":
       /*
        * ★한도 거절은 **표식이다** — 경고만 찍고 버리면 안 된다.
        * 실측(2026-08-06): 이 이벤트가 왔는데도 error가 비어 있어, 뒤따르는 거절문
        * ("You've hit your weekly limit")이 정상 답으로 세어졌다. 살아 있는 다른
        * 런타임으로 폴백이 안 걸린 진범. status:rejected면 그 자체로 실패다.
+       * A rejected usage window (seven_day, five_hour ...) is the subscription limit: quota/usage_limit, with the
+       * reset time only from its machine field (Desktop claudeFailureFromEvent retryAfterHint).
        */
       if (obj.rate_limit_info && obj.rate_limit_info.status === "rejected") {
         ui.warn(uiText(ui, "runtime.rateLimit", "Claude"));
-        if (!st.error) st.error = "claude rate limit rejected";
-        st.errorKind = "quota";
-        st.errorSource = "marker";
+        const resetsAt = obj.rate_limit_info.resetsAt;
+        markFailure(st, { kind: "quota", code: "usage_limit", message: st.error || "claude rate limit rejected", source: "marker",
+          ...(Number.isFinite(resetsAt) && resetsAt > 0 ? { retryAfterHint: new Date(resetsAt * 1000).toISOString() } : {}) });
       }
       return;
     default:
@@ -741,7 +996,7 @@ function codexPermissionArgs(permission) {
   return ["--sandbox", level === "write" ? "workspace-write" : "read-only", "-c", 'approval_policy="never"'];
 }
 
-function codexArgs({ prompt, systemPrompt, permission, session, cwd, model, effort, mcpServers, mcpAllowlistMode, env }) {
+function codexArgs({ prompt, systemPrompt, systemPromptStable, turnContext, locale, permission, session, cwd, model, effort, mcpServers, mcpAllowlistMode, env, compactTokenLimit }) {
   const level = permissions.normalize(permission);
   const sandbox = codexPermissionArgs(level);
   const mcp = level === "full" ? codexMcpArgs(mcpServers, { exactAllowlist: mcpAllowlistMode === "exact", env }) : [];
@@ -749,10 +1004,24 @@ function codexArgs({ prompt, systemPrompt, permission, session, cwd, model, effo
   // Current Codex model inventory advertises max directly; preserve the user's
   // explicit pin instead of silently weakening it to high.
   const eff = effort ? ["-c", `model_reasoning_effort="${effort}"`] : [];
-  const full = systemPrompt && !(session && session.id) ? `[SYSTEM]\n${systemPrompt}\n\n${prompt}` : prompt;
+  // `codex exec` reports thread-cumulative usage, not the last request, so the 80%-of-W generation rule runs as the
+  // CLI's own compaction at that point (sessions/generation.cjs; Desktop codex exec passes the same key).
+  const compact = Number.isSafeInteger(compactTokenLimit) && compactTokenLimit > 0
+    ? ["-c", `model_auto_compact_token_limit=${compactTokenLimit}`] : [];
+  // A session-split prompt goes in as developer instructions when the thread starts (in the user message Codex ignored
+  // the memory output contract, 0/3) and the thread keeps them; each turn — fresh or resumed — carries this turn's part as
+  // turn context (an id inside developer instructions sticks to the first turn). Measured 2026-10-14: 3/3 resumed turns.
+  const split = Boolean(systemPromptStable);
+  const devInstructions = split && !(session && session.id) ? ["-c", `developer_instructions=${JSON.stringify(systemPromptStable)}`] : [];
+  const full = split ? withTurnContext(prompt, turnContext, locale)
+    : systemPrompt && !(session && session.id) ? `[SYSTEM]\n${systemPrompt}\n\n${prompt}` : prompt;
   // -C/--sandbox/--skip-git-repo-check 는 `codex exec` 옵션이라 `resume <id>` 토큰 *앞에* 와야 한다.
   // (codex-cli 0.133: resume 뒤에 두면 `unexpected argument` 로 거부 → 멀티턴 전부 실패. 실측 검증됨.)
-  const base = ["exec", "--json", "--skip-git-repo-check", "-C", cwd, ...mdl, ...eff, ...sandbox, ...mcp];
+  let personalConfig = "";
+  try { personalConfig = fs.readFileSync(path.join(path.resolve((env || process.env).CODEX_HOME || path.join(os.homedir(), ".codex")), "config.toml"), "utf8"); }
+  catch { /* none */ }
+  const optOuts = codexTelemetryOptOuts(personalConfig).flatMap((line) => ["-c", line.replace(/\s+/g, "")]);
+  const base = ["exec", "--json", "--skip-git-repo-check", "-C", cwd, ...mdl, ...eff, ...compact, ...devInstructions, ...optOuts, ...sandbox, ...mcp];
   if (session && session.id) {
     return [...base, "resume", session.id, full];
   }
@@ -766,11 +1035,15 @@ function handleCodexLine(line, st, ui) {
   } catch {
     return;
   }
+  // Any exec event (thread.started included) means the resume got past its refusal point (codexResumeGone).
+  if (obj && typeof obj.type === "string") st.codexEventSeen = true;
   switch (obj.type) {
     case "thread.started":
       if (obj.thread_id) st.session.id = obj.thread_id;
       return;
     case "turn.started":
+      // codex exec's own turn-started event acknowledges this turn (Desktop RuntimeTurnDelivery "accepted").
+      st.turnAccepted = true;
       ui.status(uiText(ui, "runtime.thinking"));
       return;
     case "item.started":
@@ -784,24 +1057,54 @@ function handleCodexLine(line, st, ui) {
     case "turn.completed":
       st.ownerControlTerminal = "completed";
       if (obj.usage) {
-        st.usage = {
-          input_tokens: obj.usage.input_tokens,
-          output_tokens: obj.usage.output_tokens,
-        };
+        st.usage = normalizeCliUsage("unknown", obj.usage);
       }
       st.finalText = st.text;
       return;
     case "turn.failed":
     case "error":
-      st.error = (obj.error && (obj.error.message || obj.error)) || "codex error";
+      // turn.failed carries {error:{message}}; the stream-level error event carries {message} (codex exec JSONL).
+      // exec has no typed cause, so the kind stays exit (Desktop codexFailureFromEvent); the words are kept.
+      st.error = (typeof obj.message === "string" && obj.message.trim())
+        || (obj.error && (obj.error.message || (typeof obj.error === "string" ? obj.error : ""))) || "codex error";
       st.errorKind = "exit";
       st.errorSource = "marker";
       ui.error(String(st.error));
       st.errorShown = true;
       return;
     default:
+      // An event of the CLI's own about a tool, command, patch, MCP server or search that has no handler above: tool use.
+      if (typeof obj.type === "string" && CODEX_TOOLISH_EVENT.test(obj.type)) noteToolActivity(ui);
       return;
   }
+}
+
+// Codex events that are about tool use but not a rendered item (older exec protocol: exec_command_begin, patch_apply_end, ...).
+const CODEX_TOOLISH_EVENT = /tool|exec|command|patch|mcp|search/i;
+// Codex item types that are reply text, the model's reasoning or a non-fatal error notice; every other item type is a tool-ish
+// item (a web_search, a collab tool call, the plan update) or one this host does not know - which counts as activity, never as nothing.
+const CODEX_NON_TOOL_ITEMS = new Set(["agent_message", "reasoning", "error"]);
+
+/**
+ * `codex exec resume <id>` of a thread whose rollout is gone exits 1 before any event with Codex's own thread/resume
+ * protocol phrase on stderr (codex-cli 0.163.0, measured by Desktop 2026-10-16; Desktop classifyCodexResumeFailure).
+ * Only that phrase proves the session gone. "already has an active writer" is transient (Desktop writer_busy) and an
+ * exec that emitted any event, text or a turn may already have acted, so neither qualifies.
+ */
+function codexResumeGone(st, code, text, stderr) {
+  return Boolean(st.codexResumeId) && code !== 0 && !st.codexEventSeen && !st.turnAccepted && !text
+    && /no rollout found for thread id/.test(stderr);
+}
+
+/** codex exec reports a tool item that did not work as `status` failed / declined or an `error` (Desktop codex.ts isError). */
+function codexItemFailed(item) {
+  return Boolean(item) && (item.error != null || item.status === "failed" || item.status === "declined");
+}
+
+function codexItemFailureText(item) {
+  const error = item.error;
+  const message = error && typeof error === "object" ? error.message : error;
+  return typeof message === "string" && message ? message : String(item.status || "failed");
 }
 
 function renderCodexItem(item, done, st, ui) {
@@ -837,9 +1140,10 @@ function renderCodexItem(item, done, st, ui) {
       }
       if (done) {
         const out = item.aggregated_output || item.stdout || item.output || "";
-        const ok = item.exit_code == null || item.exit_code === 0;
+        // The exit code is not the only failure fact: a declined or failed command carries a status (and none an exit code).
+        const ok = !codexItemFailed(item) && (item.exit_code == null || item.exit_code === 0);
         if (out) ui.toolResult(out, ok);
-        else ui.toolResult(ok ? "done" : `exit ${item.exit_code}`, ok);
+        else ui.toolResult(ok ? "done" : item.exit_code != null ? `exit ${item.exit_code}` : String(item.status || "failed"), ok);
       }
       return;
     }
@@ -852,7 +1156,10 @@ function renderCodexItem(item, done, st, ui) {
         ui.tool("Edit", files);
         st.itemSeen[item.id] = true;
       }
-      if (done && item.diff) ui.toolResult(item.diff, true);
+      if (done) {
+        if (codexItemFailed(item)) ui.toolResult(codexItemFailureText(item), false);
+        else if (item.diff) ui.toolResult(item.diff, true);
+      }
       return;
     }
     case "mcp_tool_call":
@@ -861,16 +1168,23 @@ function renderCodexItem(item, done, st, ui) {
         ui.tool(item.name || item.tool || "tool", argSummary(item));
         st.itemSeen[item.id] = true;
       }
-      if (done && (item.result || item.output)) ui.toolResult(item.result || item.output, true);
+      if (done) {
+        if (codexItemFailed(item)) ui.toolResult(codexItemFailureText(item), false);
+        else if (item.result || item.output) ui.toolResult(item.result || item.output, true);
+      }
       return;
     }
     case "todo_list": {
       // Codex 0.144 JSONL exposes actual plan state as a todo_list item. Keep this
       // separate from ordinary Bash/Edit activity so Ctrl-T never invents tasks.
       ui.replaceTasks?.(item, "codex");
+      // The plan update is the model's update_plan tool call, drawn as a task list rather than a tool row.
+      noteToolActivity(ui);
       return;
     }
     default:
+      // A tool-ish item this host draws no row for (web_search, a collab tool call, a kind not known yet): a tool ran.
+      if (type && !CODEX_NON_TOOL_ITEMS.has(type)) noteToolActivity(ui);
       // 알 수 없는 item — 우아하게 한 줄.
       if (done && (item.text || item.summary)) {
         ui.info((type || "item") + ": " + truncateLines(item.text || item.summary, 1));
@@ -963,7 +1277,10 @@ function geminiPermissionArgs(permission) {
   return ["--approval-mode", approvalMode];
 }
 
-function geminiArgs({ prompt, systemPrompt, permission, model, mcpServers, mcpAllowlistMode, env }) {
+// gemini cannot resume: the session replays the journal into every turn (sessions/generation.cjs HOST_REPLAY_KINDS); it
+// rides the same turn-context frame in front of the request.
+function geminiArgs({ prompt: request, systemPrompt, permission, model, mcpServers, mcpAllowlistMode, env, historySeed, locale }) {
+  const prompt = withTurnContext(request, historySeed, locale);
   const level = permissions.normalize(permission);
   // Gemini CLI 0.50 exposes three matching modes: plan, auto_edit, and yolo.
   const approval = geminiPermissionArgs(level);
@@ -993,14 +1310,34 @@ function agyPermissionArgs(permission) {
   ];
 }
 
-function agyArgs({ prompt, systemPrompt, permission, model, addDirectories = [] }) {
-  const body = systemPrompt ? `${systemPrompt}\n\n---\n\n${prompt}` : prompt;
+/**
+ * The agy request body. A session-split prompt (sessions/prompt.cjs) starts a conversation with the stable system text,
+ * which the conversation keeps; every turn, fresh or resumed (`--conversation`), carries this turn's part (and on a
+ * fresh generation the journal seed) as turn context — the same split as codex. Unsplit callers (workforce capture,
+ * graph builder) send one self-contained request.
+ */
+function agyRequestBody(request) {
+  const resumed = Boolean(request.session && request.session.id);
+  if (request.systemPromptStable) {
+    const turn = withTurnContext(request.prompt, request.turnContext, request.locale);
+    return resumed ? turn : `${request.systemPromptStable}\n\n---\n\n${turn}`;
+  }
+  const prompt = withTurnContext(request.prompt, request.historySeed, request.locale);
+  return request.systemPrompt && !resumed ? `${request.systemPrompt}\n\n---\n\n${prompt}` : prompt;
+}
+
+function agyArgs(request) {
+  const { permission, model, addDirectories = [], session, effort, effortChoices } = request;
+  const body = typeof request._body === "string" ? request._body : agyRequestBody(request);
   return [
     ...(model ? ["--model", model] : []),
     ...[...new Set(addDirectories.filter(Boolean))].flatMap((dir) => ["--add-dir", dir]),
     ...agyPermissionArgs(permission),
+    ...effortArgs("agy", effort, effortChoices),
     "--output-format", "stream-json",
     "--print-timeout", "30m",
+    // agy keeps the conversation (measured on Desktop, agy 1.1.14: a `--conversation` turn remembered the codeword).
+    ...(session && session.id ? ["--conversation", String(session.id)] : []),
     "--prompt", body,
   ];
 }
@@ -1017,16 +1354,15 @@ function agyPromptBootstrap(promptFile) {
  * keep argv limited to a short bootstrap. The caller owns cleanup and must run
  * it on every process terminal path (close, spawn error, timeout, and abort).
  */
-function prepareAgyLaunch(request, options = {}) {
-  const body = request.systemPrompt
-    ? `${request.systemPrompt}\n\n---\n\n${request.prompt}`
-    : request.prompt;
+function prepareAgyLaunch(launchRequest, options = {}) {
+  // The journal seed / turn context is part of the request body (a Windows request file must carry it, never argv).
+  const body = agyRequestBody(launchRequest);
   const platform = options.platform || process.platform;
   const promptLimit = Number.isFinite(options.promptLimit)
     ? Math.max(1, Math.trunc(options.promptLimit))
     : AGY_WINDOWS_ARGV_PROMPT_LIMIT;
   if (platform !== "win32" || body.length <= promptLimit) {
-    return { args: agyArgs(request), promptFile: null, cleanup: () => {} };
+    return { args: agyArgs({ ...launchRequest, _body: body }), promptFile: null, cleanup: () => {} };
   }
 
   let directory = null;
@@ -1039,10 +1375,9 @@ function prepareAgyLaunch(request, options = {}) {
     let cleaned = false;
     return {
       args: agyArgs({
-        ...request,
-        systemPrompt: "",
-        prompt: agyPromptBootstrap(promptFile),
-        addDirectories: [directory, ...(request.addDirectories || [])],
+        ...launchRequest,
+        _body: agyPromptBootstrap(promptFile),
+        addDirectories: [directory, ...(launchRequest.addDirectories || [])],
       }),
       promptFile,
       cleanup: () => {
@@ -1059,32 +1394,149 @@ function prepareAgyLaunch(request, options = {}) {
   }
 }
 
+// ── agy typed failures ──────────────────────────────────
+// Kind only from a provider machine code (the Desktop antigravity contract): result.error is the owner-readable reason
+// and is never parsed for a kind; an error with no code is `refused`, an ERROR status with no reason is `exit`.
+const AGY_MACHINE_CODE_RE = /^(?:[A-Z][A-Z0-9_.:-]{0,63}|[1-9][0-9]{2})$/;
+const AGY_CODE_KIND = Object.freeze({
+  500: "unavailable", 502: "unavailable", 503: "unavailable", 504: "unavailable", UNAVAILABLE: "unavailable", INTERNAL: "unavailable",
+  429: "quota", RESOURCE_EXHAUSTED: "quota", QUOTA_EXCEEDED: "quota", RATE_LIMITED: "quota", RATE_LIMIT_EXCEEDED: "quota",
+  401: "auth", UNAUTHENTICATED: "auth", AUTHENTICATION_REQUIRED: "auth", INVALID_CREDENTIALS: "auth",
+  408: "timeout", DEADLINE_EXCEEDED: "timeout", TIMEOUT: "timeout", TIMED_OUT: "timeout",
+  UNIMPLEMENTED: "unsupported", UNSUPPORTED_CLIENT: "unsupported",
+});
+
+function normalizeAgyCode(value) {
+  if (typeof value !== "string" && typeof value !== "number") return undefined;
+  const code = String(value).trim().toUpperCase();
+  return AGY_MACHINE_CODE_RE.test(code) ? code : undefined;
+}
+
+/** A retry hint only from its own provider field: seconds, a compact "25m37s", or an ISO time. */
+function normalizeAgyRetryAfter(value) {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value > 0 && value <= 86_400) return `in ${value}s`;
+  if (typeof value !== "string") return undefined;
+  const hint = value.trim();
+  if (!hint || hint.length > 80 || /[\r\n\u0000]/.test(hint)) return undefined;
+  if (/^(?:in\s+)?(?:\d{1,2}h)?(?:\d{1,3}m)?(?:\d{1,5}s)?$/i.test(hint) && /\d/.test(hint)) return hint.startsWith("in ") ? hint : `in ${hint}`;
+  const parsed = Date.parse(hint);
+  return Number.isFinite(parsed) && /T/.test(hint) ? new Date(parsed).toISOString() : undefined;
+}
+
+function agyFailureKind(code) {
+  return (code && AGY_CODE_KIND[code]) || "refused";
+}
+
+function agyConversationId(obj) {
+  const value = obj.conversation_id ?? (obj.result && obj.result.conversation_id) ?? (obj.step_update && obj.step_update.conversation_id);
+  return typeof value === "string" && value.trim() && value.length <= 256 ? value.trim() : null;
+}
+
+function noteAgyDenial(st, ui, tool, detail) {
+  const name = String(tool || "").trim();
+  if (!name) return;
+  const denied = st.agyDenied || (st.agyDenied = new Map());
+  if (denied.has(name)) return;
+  denied.set(name, String(detail || ""));
+  ui.warn(`Antigravity auto-denied ${name}: headless mode has nobody to approve it.`);
+}
+
+/** One tool row per agy tool step (ACTIVE → DONE/ERROR share step_index); the result is shown on DONE/ERROR. */
+function handleAgyToolStep(step, st, ui) {
+  let name = step.tool_name || (step.tool_info && step.tool_info.name) || "";
+  if (!name) return false;
+  st.agyToolSeen = true;
+  if (st.geminiStreaming) { ui.streamEnd(); st.geminiStreaming = false; }
+  let params = step.tool_info && step.tool_info.parameters;
+  if (name === "call_mcp_tool") {
+    let envelope = params;
+    if (typeof envelope === "string") { try { envelope = JSON.parse(envelope); } catch { /* keep provider data */ } }
+    if (envelope && typeof envelope === "object" && /^[A-Za-z0-9_-]+$/.test(String(envelope.ServerName || ""))
+      && /^[A-Za-z0-9_-]+$/.test(String(envelope.ToolName || ""))) {
+      name = `mcp__${envelope.ServerName}__${envelope.ToolName}`;
+      params = envelope.Arguments;
+    }
+  }
+  const tools = st.agyTools || (st.agyTools = new Map());
+  const id = `${name}:${Number.isSafeInteger(step.step_index) ? step.step_index : tools.size}`;
+  let entry = tools.get(id);
+  if (!entry) { entry = { done: false }; tools.set(id, entry); ui.tool(prettyToolName(name), summarizeToolInput(name, params)); }
+  const state = String(step.state || "").toUpperCase();
+  if ((state === "DONE" || state === "ERROR") && !entry.done) {
+    entry.done = true;
+    const errorMessage = step.tool_info && step.tool_info.error && typeof step.tool_info.error.message === "string"
+      ? step.tool_info.error.message : "";
+    if (state === "ERROR" && /\bdenied permission\b|\bpermission denied\b|\brequires? approval\b/i.test(errorMessage)) {
+      noteAgyDenial(st, ui, name, errorMessage);
+    }
+    const output = step.tool_info && step.tool_info.output;
+    const text = typeof output === "string" ? output : output != null ? JSON.stringify(output) : state === "ERROR" ? (errorMessage || "error") : "";
+    ui.toolResult(text, state !== "ERROR" && !(step.tool_info && step.tool_info.error));
+  }
+  return true;
+}
+
 function handleAgyLine(line, st, ui) {
   let obj;
   try { obj = JSON.parse(line); } catch { return; }
-  if (obj.event === "result") {
-    st.ownerControlTerminal = ["success", "completed", "done"].includes(String(obj.result?.status).toLowerCase()) ? "completed" : "uncertain";
-    if (st.geminiStreaming) { ui.streamEnd(); st.geminiStreaming = false; }
-    if (obj.result && typeof obj.result.response === "string") st.finalText = obj.result.response;
-    if (obj.result?.status && !["success", "completed", "done"].includes(String(obj.result.status).toLowerCase())) {
-      st.error = `agy ${obj.result.status}`;
-      st.errorKind = "exit";
-      st.errorSource = "marker";
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
+  const conversationId = agyConversationId(obj);
+  if (conversationId && !st.agyConversationId) {
+    st.agyConversationId = conversationId;
+    if (st.agyResumeId && conversationId !== st.agyResumeId) {
+      // agy could not find the conversation and silently started a new one without the earlier context (audit 31, A3).
+      // Before any tool frame nothing happened, so the session layer may run the turn fresh from the journal.
+      st.agySessionGone = true;
+      st.sessionGoneBeforeEffects = !st.agyToolSeen;
+      markFailure(st, { kind: "exit", code: "session_not_found", source: "marker",
+        message: `Antigravity could not resume conversation ${st.agyResumeId}; it started a new conversation without the earlier context.` });
+      if (typeof st.onSessionGone === "function") st.onSessionGone();
+      return;
     }
+    // The id becomes this chat's binding only when the turn completes (sessions/session.cjs ACK).
+    if (st.session) st.session.id = conversationId;
+  }
+  // Nothing from a context-free replacement conversation is shown or kept.
+  if (st.agySessionGone) return;
+  if (obj.event === "result") {
+    st.turnAccepted = true;
+    const result = obj.result && typeof obj.result === "object" && !Array.isArray(obj.result) ? obj.result : {};
+    const status = String(result.status || "").toLowerCase();
+    const ok = ["success", "completed", "done"].includes(status);
+    if (st.geminiStreaming) { ui.streamEnd(); st.geminiStreaming = false; }
+    // The full answer arrives in result.response; deltas can split a UTF-8 character (measured on Desktop).
+    if (typeof result.response === "string") st.finalText = result.response;
+    for (const denied of Array.isArray(result.denied_actions) ? result.denied_actions : []) {
+      noteAgyDenial(st, ui, denied && (denied.display_name || denied.action), "result.denied_actions");
+    }
+    const structured = result.error && typeof result.error === "object" && !Array.isArray(result.error) ? result.error : null;
+    const message = typeof result.error === "string" ? result.error.trim()
+      : structured && typeof structured.message === "string" ? structured.message.trim() : "";
+    const code = normalizeAgyCode(result.error_code ?? result.errorCode
+      ?? (structured && (structured.code ?? structured.error_code ?? structured.errorCode)));
+    const retryAfterHint = normalizeAgyRetryAfter(result.retry_after ?? result.retryAfter
+      ?? (structured && (structured.retry_after ?? structured.retryAfter)));
+    if (message || code || (status && !ok)) {
+      markFailure(st, { kind: message || code ? agyFailureKind(code) : "exit", code, retryAfterHint, source: "marker",
+        message: (message || `Antigravity reported status ${result.status || "unknown"} without a reason.`).slice(0, 2000) });
+    }
+    st.ownerControlTerminal = ok && !st.error && (!st.agyResumeId || st.agyConversationId === st.agyResumeId) ? "completed" : "uncertain";
     return;
   }
   if (obj.event !== "step_update" || !obj.step_update) {
     if (obj.event) ui.status(`agy: ${obj.event}`);
     return;
   }
+  st.turnAccepted = true;
   const step = obj.step_update;
   if (step.usage) {
-    st.usage = {
-      input_tokens: step.usage.input_tokens,
-      output_tokens: step.usage.output_tokens,
-      ...(step.usage.duration_ms != null ? { duration_ms: step.usage.duration_ms } : {}),
-    };
+    st.usage = normalizeCliUsage("unknown", step.usage, { duration_ms: step.usage.duration_ms });
+    // The last agent_response step's input = the context the next request starts from (the common 80% rule).
+    if (step.step_type === "agent_response" && Number.isSafeInteger(step.usage.input_tokens) && step.usage.input_tokens > 0) {
+      st.contextInputTokens = step.usage.input_tokens;
+    }
   }
+  if (step.step_type === "tool" && handleAgyToolStep(step, st, ui)) return;
   if (step.step_type === "agent_response") {
     const delta = typeof step.text_delta === "string" ? step.text_delta : "";
     if (!delta) return;
@@ -1095,6 +1547,16 @@ function handleAgyLine(line, st, ui) {
   }
   if (st.geminiStreaming) { ui.streamEnd(); st.geminiStreaming = false; }
   ui.status(`agy: ${step.step_type || "step"}${step.state ? ` (${step.state})` : ""}`);
+}
+
+/** agy exit-0 with no answer: a denial is `refused`, nothing at all is `empty` (an empty SUCCESS is not a result). */
+function agyEmptyRunFailure(st) {
+  if (st.agyDenied && st.agyDenied.size) {
+    return { kind: "refused", code: "agy_tool_denied", source: "marker",
+      message: `Antigravity auto-denied ${[...st.agyDenied.keys()].join(", ")} and gave no answer: headless mode has nobody to approve it. Raise /permission or rerun with the needed access.` };
+  }
+  if (!st.agyToolSeen) return { kind: "empty", source: "exit", message: "Antigravity ended the run without producing any answer." };
+  return null;
 }
 
 // gemini 툴명 → 친숙한 표시명 (claude/codex 표기와 통일)
@@ -1160,17 +1622,14 @@ function handleGeminiLine(line, st, ui) {
       return;
     }
     case "result": {
+      st.turnAccepted = true;
       st.ownerControlTerminal = obj.status === "success" ? "completed" : "uncertain";
       if (st.geminiStreaming) {
         ui.streamEnd();
         st.geminiStreaming = false;
       }
       const s = obj.stats || {};
-      st.usage = {
-        input_tokens: s.input_tokens,
-        output_tokens: s.output_tokens,
-        duration_ms: s.duration_ms,
-      };
+      st.usage = normalizeCliUsage("unknown", s, { duration_ms: s.duration_ms });
       st.finalText = st.text;
       // error 이벤트가 이미 구체 사유를 남겼으면 뭉뚱그린 상태 문자열로 덮지 않는다.
       if (obj.status && obj.status !== "success" && !st.error) {
@@ -1191,8 +1650,26 @@ function handleGeminiLine(line, st, ui) {
       st.errorSource = "marker";
       return;
     default:
+      // An event of the CLI's own about a tool that has no handler above (tool_use / tool_result are drawn): tool use.
+      if (typeof obj.type === "string" && /tool/i.test(obj.type)) noteToolActivity(ui);
       return;
   }
+}
+
+/**
+ * A process that never started is RuntimeTurnDelivery "not-dispatched"; a missing executable is `unsupported`
+ * (Desktop: a CLI that is not installed is refused before dispatch as unsupported).
+ */
+function spawnFailure(error, child) {
+  const code = error && typeof error.code === "string" ? error.code : "";
+  const neverStarted = !child || !child.pid || ["ENOENT", "EACCES", "ENOTDIR", "EPERM"].includes(code);
+  if (code === "ENOENT") {
+    return { errorKind: "unsupported", errorSource: "marker", errorCode: "runtime_executable_missing", turnDelivery: "not-dispatched" };
+  }
+  if (code === "EACCES" || code === "EPERM") {
+    return { errorKind: "unsupported", errorSource: "marker", errorCode: "runtime_executable_not_runnable", turnDelivery: "not-dispatched" };
+  }
+  return { errorKind: "exit", errorSource: "exit", turnDelivery: neverStarted ? "not-dispatched" : "not-accepted" };
 }
 
 // ── 공통 실행기 ───────────────────────────────────────────
@@ -1228,6 +1705,17 @@ function runNativeTurn(req) {
     itemText: {},
     itemSeen: {},
   };
+  const resumeId = req.session && req.session.id ? String(req.session.id) : "";
+  if (kind === "claude-code" && resumeId) st.claudeResumeId = resumeId;
+  if (kind === "codex" && resumeId) st.codexResumeId = resumeId;
+  if (kind === "agy" && resumeId) st.agyResumeId = resumeId;
+  // The installed CLI's own level list (read once per executable generation) decides the effort flag.
+  const effortChoices = EFFORT_FLAG_KINDS.has(kind) && launchReq.effort && launchReq.effortChoices === undefined
+    ? cliEffortChoices(bin, launchReq.env || process.env) : launchReq.effortChoices;
+  const appliedEffort = kind === "codex"
+    ? (launchReq.effort ? String(launchReq.effort) : null)
+    : nativeEffortLevel(kind, launchReq.effort, effortChoices);
+  if (EFFORT_FLAG_KINDS.has(kind)) launchReq = { ...launchReq, effortChoices };
 
   let args;
   let lineHandler;
@@ -1249,12 +1737,14 @@ function runNativeTurn(req) {
       launchCleanup = prepared.cleanup;
       lineHandler = (l) => handleAgyLine(l, st, ui);
     } else {
-      return Promise.resolve({ text: "", session: st.session, error: `unknown runtime: ${kind}`, errorKind: "unsupported", errorSource: "marker" });
+      return Promise.resolve({ text: "", session: st.session, error: `unknown runtime: ${kind}`, errorKind: "unsupported",
+        errorSource: "marker", turnDelivery: "not-dispatched", appliedEffort: null });
     }
   } catch (error) {
     const message = error && error.message ? error.message : String(error);
     ui.error(uiText(ui, "runtime.failed", kind, message));
-    return Promise.resolve({ text: "", session: st.session, error: message });
+    return Promise.resolve({ text: "", session: st.session, error: message, errorKind: "exit", errorSource: "marker",
+      turnDelivery: "not-dispatched", appliedEffort: null });
   }
 
   const timeout = req.timeoutConfig ? directNativeTimeoutConfig(req.timeoutConfig) : nativeTimeoutConfig(req.env || process.env);
@@ -1284,7 +1774,7 @@ function runNativeTurn(req) {
     } catch (e) {
       launchCleanup();
       ui.error(uiText(ui, "runtime.failed", kind, e.message));
-      return resolve({ text: "", session: st.session, error: e.message });
+      return resolve({ text: "", session: st.session, error: e.message, ...spawnFailure(e), appliedEffort: null });
     }
 
     let settled = false;
@@ -1317,19 +1807,24 @@ function runNativeTurn(req) {
       cleanup();
       resolve(result);
     };
+    const delivery = () => (st.turnAccepted && !st.agySessionGone ? "accepted" : "not-accepted");
     const terminationResult = () => {
       ui.streamEnd();
       ui.stopSpinner();
-      const text = (st.finalText || st.text || "").trim();
+      const text = st.agySessionGone ? "" : (st.finalText || st.text || "").trim();
       if (st.usage) ui.cost(st.usage);
+      const sessionGone = termination?.reason === "session_gone";
       finish({
         text,
         session: st.session,
         usage: st.usage,
         error: termination ? termination.message : "native runtime stopped",
-        errorKind: termination?.reason === "output" ? "output_limit" : "timeout",
+        errorKind: sessionGone ? st.errorKind : termination?.reason === "output" ? "output_limit" : "timeout",
         errorSource: "marker",
+        ...(sessionGone ? { errorCode: st.errorCode, sessionGoneBeforeEffects: st.sessionGoneBeforeEffects === true } : {}),
         terminationVerified: Boolean(termination?.verified),
+        turnDelivery: delivery(),
+        appliedEffort,
       });
     };
     const verifyTermination = () => {
@@ -1352,13 +1847,16 @@ function runNativeTurn(req) {
       if (termination || settled) return;
       const message = reason === "abort"
         ? "aborted"
-        : reason === "output"
-          ? `native runtime stdout exceeded ${NATIVE_STDOUT_MAX_BYTES} bytes`
-          : nativeTimeoutMessage(reason, reason === "idle" ? timeout.idleMs : timeout.totalMs);
+        : reason === "session_gone"
+          ? st.error
+          : reason === "output"
+            ? `native runtime stdout exceeded ${NATIVE_STDOUT_MAX_BYTES} bytes`
+            : nativeTimeoutMessage(reason, reason === "idle" ? timeout.idleMs : timeout.totalMs);
       termination = { reason, message };
       st.error = message;
       st.errorShown = true;
-      if (reason !== "abort") ui.error(message);
+      if (reason === "session_gone") ui.status(message);
+      else if (reason !== "abort") ui.error(message);
       if (idleTimer) clearTimeout(idleTimer);
       if (totalTimer) clearTimeout(totalTimer);
       idleTimer = totalTimer = null;
@@ -1378,6 +1876,8 @@ function runNativeTurn(req) {
       }, timeout.killGraceMs);
     };
     const onAbort = () => requestStop("abort");
+    // A lost agy conversation seen before any tool frame stops the context-free run at once (handleAgyLine).
+    st.onSessionGone = () => { if (st.sessionGoneBeforeEffects) requestStop("session_gone"); };
     const armIdle = () => {
       if (settled || termination) return;
       if (idleTimer) clearTimeout(idleTimer);
@@ -1394,11 +1894,11 @@ function runNativeTurn(req) {
         }
         ui.streamDelta(l + "\n");
         st.text += l + "\n";
-      }, markActivity, { maxBytes: NATIVE_STDOUT_MAX_BYTES, onLimit: () => requestStop("output") });
+      }, markActivity, { maxBytes: NATIVE_STDOUT_MAX_BYTES, onLineDropped: (limit) => ui.error(`native runtime line over ${limit} bytes skipped`) });
     } else {
       removeLineReader = lineReader(child.stdout, lineHandler, markActivity, {
         maxBytes: NATIVE_STDOUT_MAX_BYTES,
-        onLimit: () => requestStop("output"),
+        onLineDropped: (limit) => ui.error(`native runtime line over ${limit} bytes skipped`),
       });
     }
 
@@ -1417,7 +1917,9 @@ function runNativeTurn(req) {
         return;
       }
       ui.stopSpinner();
-      finish({ text: "", session: st.session, error: err.message });
+      const failure = spawnFailure(err, child);
+      finish({ text: "", session: st.session, error: err.message, ...failure,
+        ...(failure.turnDelivery === "not-dispatched" ? {} : { turnDelivery: delivery() }), appliedEffort });
     });
     child.on("close", (code) => {
       if (settled) return;
@@ -1435,6 +1937,10 @@ function runNativeTurn(req) {
        * 이 한 자리에서만 텍스트 판별을 허용하고, 출처를 heuristic으로 남긴다
        * (판별 규칙은 runtime-refusal.cjs 한 곳 — 여기서 정규식을 다시 쓰지 않는다).
        */
+      if (kind === "agy" && code === 0 && !st.error && !text) {
+        const empty = agyEmptyRunFailure(st);
+        if (empty) markFailure(st, empty);
+      }
       if (code === 0 && !st.error) {
         const refusal = detectRuntimeRefusal(text);
         if (refusal) {
@@ -1442,6 +1948,12 @@ function runNativeTurn(req) {
           st.errorKind = refusal.kind;
           st.errorSource = "heuristic";
         }
+      }
+      // A gone Codex rollout refused the resume before anything ran: the session layer may start a fresh generation
+      // from the journal (sessions/session.cjs; Desktop unattended-session-turns.ts rule 4).
+      if (kind === "codex" && codexResumeGone(st, code, text, stripAnsi(stderrBuf))) {
+        st.sessionGoneBeforeEffects = true;
+        markFailure(st, { kind: "exit", code: "session_not_found", source: "marker", message: "codex could not resume the saved thread" });
       }
       const exitError = code === 0
         ? st.error
@@ -1451,9 +1963,17 @@ function runNativeTurn(req) {
           ].filter(Boolean).join("\n");
       if (exitError && !st.errorKind) { st.errorKind = "exit"; st.errorSource = st.errorSource || "exit"; }
       finish({
-        text, session: st.session, usage: st.usage, error: exitError,
+        text: st.agySessionGone ? "" : text, session: st.session, usage: st.usage, error: exitError,
+        ...(st.contextInputTokens ? { contextInputTokens: st.contextInputTokens } : {}),
         ownerControlTerminal: !exitError && st.ownerControlTerminal === "completed" ? "completed" : "uncertain",
-        ...(exitError ? { errorKind: st.errorKind, errorSource: st.errorSource } : {}),
+        ...(exitError ? {
+          errorKind: st.errorKind, errorSource: st.errorSource,
+          ...(st.errorCode ? { errorCode: st.errorCode } : {}),
+          ...(st.retryAfterHint ? { retryAfterHint: st.retryAfterHint } : {}),
+          ...(st.errorCode === "session_not_found" ? { sessionGoneBeforeEffects: st.sessionGoneBeforeEffects === true } : {}),
+        } : {}),
+        turnDelivery: delivery(),
+        appliedEffort,
       });
     });
 
@@ -1613,6 +2133,9 @@ function terminateNativeChild(child, signal = "SIGTERM") {
 module.exports = {
   runNativeTurn,
   summarizeToolInput,
+  parseEffortChoices,
+  cliEffortChoices,
+  nativeEffortLevel,
   claudeArgs,
   claudePermissionArgs,
   codexArgs,
@@ -1627,9 +2150,11 @@ module.exports = {
   claudeMcpIsolationArgs,
   geminiMcpIsolationArgs,
   prepareCodexRuntimeEnv,
+  codexTelemetryOptOuts,
   prepareGeminiRuntimeEnv,
   geminiMcpIsolationReadiness,
   runtimeEnvForKind,
+  prepareClaudeRuntimeEnv,
   cliMcpConfigPath,
   codexMcpArgs,
   nativeTimeoutConfig,
@@ -1639,4 +2164,5 @@ module.exports = {
   forceStopNativeProcessTree,
   terminateNativeChild,
   NATIVE_STDOUT_MAX_BYTES,
+  lineReader,
 };

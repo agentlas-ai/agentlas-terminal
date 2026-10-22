@@ -18,6 +18,7 @@
  *    프로젝트 .env가 보호 키(타임아웃/캡처 상한 포함)를 덮지 못한다
  */
 const fs = require("node:fs");
+const { composeDeclaredPrompt } = require("../prompt-order.cjs");
 const { detectRuntimeRefusal } = require("../runtime-refusal.cjs");
 const os = require("node:os");
 const path = require("node:path");
@@ -75,11 +76,35 @@ function directCaptureOutputLimit(value) {
 
 // ── 캡처 인자 빌드 (v1 buildArgs 포팅) ──────────────────────────────────
 // 보안 매핑은 native-host/permissions가 단일 정본이다. 여기서는 조립만 한다.
+/** Exact fallback contract for adapters without native schema support; never grants tools. */
+function schemaFallbackSystem(system, outputSchema, declaredSystemParts) {
+  if (!outputSchema) return system;
+  const contract = `[OUTPUT CONTRACT]\nReturn exactly one JSON document matching this schema; no prose/fence:\n${JSON.stringify(outputSchema.schema)}\n[/OUTPUT CONTRACT]`;
+  if (!declaredSystemParts) return `${system}\n${contract}`;
+  // A schema can contain a fresh plannerInvocationId; it is per-invocation data, never authority.
+  return composeDeclaredPrompt([
+    ...declaredSystemParts,
+    { id: "terminal.workforce.output-contract", revision: 1, stability: "turn-context", changeTriggers: ["task", "plan-revision", "checkpoint", "capability-inventory"], order: 10, text: contract },
+  ], "\n");
+}
+
 function buildArgs(kind, systemPrompt, prompt, permission, runtimeOptions = {}) {
   const native = require("../agentlas-native-host.cjs");
+  const schemaArgs = kind === "claude-code" && runtimeOptions.outputSchema ? ["--json-schema", JSON.stringify(runtimeOptions.outputSchema.schema)] : [];
+  if (kind !== "claude-code") systemPrompt = schemaFallbackSystem(systemPrompt, runtimeOptions.outputSchema, runtimeOptions.declaredSystemParts);
   const level = require("../agentlas-permissions.cjs").normalize(permission);
   const model = runtimeOptions.model ? String(runtimeOptions.model) : null;
   const effort = runtimeOptions.effort ? String(runtimeOptions.effort) : null;
+  // Effort is the CLI flag only, never prompt words (native-host nativeEffortLevel: minimal -> low, xhigh kept, the
+  // installed CLI's own --help list clamps); `effortChoices` lets a caller pass the list it already read.
+  const effortChoices = runtimeOptions.effortChoices !== undefined
+    ? runtimeOptions.effortChoices
+    : effort && (kind === "claude-code" || kind === "agy") && runtimeOptions.bin
+      ? native.cliEffortChoices(runtimeOptions.bin, runtimeOptions.env || process.env) : null;
+  const claudeEffortArgs = (() => {
+    const level = native.nativeEffortLevel("claude-code", effort, effortChoices);
+    return level ? ["--effort", level] : [];
+  })();
   const noAuthority = runtimeOptions.authorityMode === "no-authority";
   // read-only 권한: 워크포스가 tool:file-read 능력만 부여했을 때. plan 모드(쓰기 불가)에
   // 정확-도구 allowlist를 겹쳐 읽기 3종으로 고정한다. 이것이 "증명 가능한 경계"의 실체다 —
@@ -100,13 +125,12 @@ function buildArgs(kind, systemPrompt, prompt, permission, runtimeOptions = {}) 
   }
   if (kind === "claude-code") {
     if (readOnlyAuthority) {
-      const thinkingRo = effort === "max" || effort === "xhigh" ? "Ultrathink. " : effort === "high" ? "Think hard. " : effort === "medium" ? "Think. " : "";
-      const claudeEffortRo = effort === "minimal" ? "low" : effort === "xhigh" ? "max" : effort;
       return [
-        "-p", thinkingRo + prompt,
+        "-p", prompt,
         "--append-system-prompt", systemPrompt,
+        ...schemaArgs,
         ...(model ? ["--model", model] : []),
-        ...(claudeEffortRo && claudeEffortRo !== "none" ? ["--effort", claudeEffortRo] : []),
+        ...claudeEffortArgs,
         // 도구를 쓰는 워커는 최종 답까지 stdout에 한 글자도 내지 않는다 — 무도구
         // 워커에는 없던 문제다. 유휴 타이머는 그 침묵을 "죽었다"로 읽고 10분에
         // 처형한다(2026-07-27 라이브 실측 AGENTLAS_CAPTURE_IDLE_TIMEOUT). 이벤트
@@ -127,18 +151,16 @@ function buildArgs(kind, systemPrompt, prompt, permission, runtimeOptions = {}) 
     // 백그라운드/캡처 경로에는 검토된 MCP 서버 목록이 없다. full 권한은 툴 권한이지
     // MCP 동의가 아니므로 이 경로는 항상 정확-공백 MCP 격리를 유지한다.
     const mcp = native.claudeMcpIsolationArgs();
-    const thinking = effort === "max" || effort === "xhigh" ? "Ultrathink. " : effort === "high" ? "Think hard. " : effort === "medium" ? "Think. " : "";
-    const claudeEffort = effort === "minimal" ? "low" : effort === "xhigh" ? "max" : effort;
-    const effortArgs = claudeEffort && claudeEffort !== "none" ? ["--effort", claudeEffort] : [];
     return [
-      "-p", thinking + prompt,
+      "-p", prompt,
       "--append-system-prompt", systemPrompt,
+      ...schemaArgs,
       ...(model ? ["--model", model] : []),
-      ...effortArgs,
+      ...claudeEffortArgs,
       // 이 분기도 read-only 분기와 같은 이유로 이벤트 스트림이 필요하다. 위 주석은
       // 침묵 문제를 "도구를 쓰는 워커"의 것으로 한정했지만, 그건 도구 유무가 아니라
       // "최종 답 전에는 stdout에 아무것도 없다"는 성질이고 이 분기도 똑같다.
-      // effort가 높으면 "Ultrathink."가 앞에 붙어 사고만 10분을 넘길 수 있고,
+      // effort가 높으면 사고만 10분을 넘길 수 있고,
       // 유휴 타이머는 그 침묵을 죽음으로 읽는다 — 2026-07-28 라이브에서 무도구
       // 워커 3개가 전부 600초 유휴로 처형됐다. 진행 신호가 흐르는 채널로 재야
       // 유휴 판정이 실제 정지를 뜻한다. 최종 텍스트는
@@ -195,9 +217,11 @@ function buildArgs(kind, systemPrompt, prompt, permission, runtimeOptions = {}) 
       systemPrompt,
       permission: noAuthority ? "read" : level,
       model,
+      effort,
+      effortChoices,
     });
   }
-  return [prompt];
+  return [runtimeOptions.outputSchema ? `[SYSTEM]\n${systemPrompt}\n\n${prompt}` : prompt];
 }
 
 // codex --json 이벤트 스트림에서 최종 에이전트 텍스트만 추출.
@@ -378,6 +402,10 @@ function capturedRuntimeAgentText(kind, raw) {
       ["system", "stream_event", "result", "rate_limit_event"].includes(event?.type),
     );
     if (!isProtocol) return text.trim();
+    const structured = [...events].reverse().find(event => event?.type === "result" && event.structured_output && typeof event.structured_output === "object");
+    if (structured) return JSON.stringify(structured.structured_output);
+    const structuredTool = events.flatMap(event => event?.message?.content || []).filter(block => block?.type === "tool_use" && block.name === "StructuredOutput" && block.input && typeof block.input === "object").at(-1);
+    if (structuredTool) return JSON.stringify(structuredTool.input);
     const final = [...events].reverse().find(
       (event) => event?.type === "result" && typeof event.result === "string",
     );
@@ -448,6 +476,7 @@ function captureRuntime(kind, systemPrompt, prompt, opts) {
     try {
       const spawnImpl = opts.spawn || spawn;
       const env = nativeHost.runtimeEnvForKind(kind, opts.env || process.env, {
+        model: opts.model,
         permission: opts.permission,
         mcpServers: [],
         mcpAllowlistMode: kind === "gemini" ? "exact" : undefined,
@@ -456,17 +485,23 @@ function captureRuntime(kind, systemPrompt, prompt, opts) {
       const runtimeOptions = {
         model: opts.model,
         effort: opts.effort,
+        bin,
+        env: opts.env || process.env,
         authorityMode: opts.authorityMode,
         noToolsPolicyPath: opts.noToolsPolicyPath,
         allowedNativeTools: opts.allowedNativeTools,
+        outputSchema: opts.outputSchema,
+        declaredSystemParts: opts.declaredSystemParts,
       };
       let childArgs = buildArgs(kind, systemPrompt, prompt, opts.permission, runtimeOptions);
       if (kind === "agy") {
         const prepared = nativeHost.prepareAgyLaunch({
           prompt,
-          systemPrompt,
+          systemPrompt: schemaFallbackSystem(systemPrompt, opts.outputSchema, opts.declaredSystemParts),
           permission: opts.authorityMode === "no-authority" ? "read" : opts.permission,
           model: opts.model,
+          effort: opts.effort,
+          effortChoices: opts.effort ? nativeHost.cliEffortChoices(bin, opts.env || process.env) : null,
         }, {
           platform: opts.platform,
           promptLimit: opts.agyPromptLimit,
@@ -734,6 +769,7 @@ function readCustomApiBaseUrl() {
  */
 async function runApi(backend, model, system, prompt, options) {
   options = options || {};
+  if (backend !== "ollama") system = schemaFallbackSystem(system, options.outputSchema, options.declaredSystemParts);
   const finish = (text, usage) => options.envelope
     ? { text: String(text || ""), usage: usage || null }
     : String(text || "");
@@ -752,7 +788,7 @@ async function runApi(backend, model, system, prompt, options) {
     const resp = await request(`${ollama.ollamaHost()}/api/chat`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model, stream: false, messages: [{ role: "system", content: system }, { role: "user", content: prompt }] }),
+      body: JSON.stringify({ model, stream: false, ...(options.outputSchema ? { format: options.outputSchema.schema } : {}), messages: [{ role: "system", content: system }, { role: "user", content: prompt }] }),
     });
     if (!resp.ok) throw new Error(`Ollama ${resp.status} — run 'ollama serve' and check the model`);
     const j = await resp.json();
@@ -947,7 +983,12 @@ async function buildChildEnv(db, ctx) {
     ...readDotEnvFile(path.join(userDataDir(), "credentials.env")),
     ...readDotEnvFile(path.join(os.homedir(), ".agentlas", "credentials.env")),
   };
-  apply(globalCredentials, false, true); // 사용자 본인의 전역 자격 — 신뢰
+  // 프로젝트 범위 키(AGENTLAS_PROJECT_<P>_<KEY>)는 이번 프로젝트 것만, 원래 이름으로 넣는다. 파일의 접두 키를
+  // 통째로 넣으면 모든 자식이 모든 프로젝트의 비밀을 받는다(리뷰 2026-10-16 engine-11). 호스트 env 에서 물려받은
+  // AGENTLAS_PROJECT_* (BOOTSTRAP_AUTO 같은 설정)은 그대로 둔다.
+  const unscopedCredentials = Object.fromEntries(Object.entries(globalCredentials)
+    .filter(([key]) => !key.startsWith("AGENTLAS_PROJECT_")));
+  apply(unscopedCredentials, false, true); // 사용자 본인의 전역 자격 — 신뢰
   if (ctx && ctx.projectPath) apply(projectScopedEnvValues(globalCredentials, ctx.projectPath), true, true);
   if (ctx && ctx.cwd) apply(readDotEnvDir(ctx.cwd), true, false); // 프로젝트 dotenv — 비신뢰
   if (ctx && ctx.projectPath && ctx.projectPath !== ctx.cwd) apply(readDotEnvDir(ctx.projectPath), true, false);
@@ -966,6 +1007,7 @@ module.exports = {
   captureOutputLimit,
   directCaptureOutputLimit,
   captureRuntime,
+  schemaFallbackSystem,
   apiKey,
   normalizeCustomApiBaseUrl,
   readCustomApiBaseUrl,

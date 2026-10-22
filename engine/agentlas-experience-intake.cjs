@@ -445,26 +445,6 @@ function recordIntakeDecision(db, input) {
   });
 }
 
-function existingCandidate(userDataDir, itemId) {
-  const state = exchange.loadExchangeState(userDataDir);
-  for (const row of state.bundles) {
-    try {
-      const validation = exchange.readStoredBundle(userDataDir, row.bundleId);
-      if (validation.bundle.items.some((item) => item.experienceItemId === itemId)) return { row, validation };
-    } catch { /* corrupted unrelated rows are surfaced by list/inspect; intake continues fail-closed */ }
-  }
-  return null;
-}
-
-function candidateType(memoryKind) {
-  return memoryKind === "risk" ? "warning" : "procedure";
-}
-
-
-function captureOperationalCandidate(input) {
-  return { status: "retired", reasonCodes: ["experience_chips_retired"] };
-}
-
 function finalizeAgentExecution(input) {
   const now = input.createdAt || new Date().toISOString();
   const result = {
@@ -522,6 +502,5 @@ module.exports = {
   validateRunReceipt,
   persistRunReceipt,
   finalizeAgentExecution,
-  captureOperationalCandidate,
   listRunEvents,
 };

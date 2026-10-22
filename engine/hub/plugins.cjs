@@ -55,6 +55,28 @@ function pluginIsLikelyRemoteMcpEndpoint(rawUrl) {
   return true;
 }
 
+// 데스크탑 electron/mcp-tools/credential-refs.ts ENV_KEY / connectionVaultKey 동형(NH29 연결 소유 키).
+const PLUGIN_ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+
+/**
+ * 원격(http/sse) Hub 행이 선언한 키 → 이 연결만의 Vault 키. 참조가 없으면 데스크탑 credentialVaultKey 가
+ * 같은 이름의 **전역** 키를 읽어 그 매니페스트의 URL 로 헤더를 보낸다(리뷰 2026-10-16 engine-01).
+ * 행마다 토큰 하나(randomBytes(6) hex), 100자 넘는 키는 sha256 앞 32자 — 데스크탑 hub-plugin-bridge.ts
+ * hubConnectionCredentialRefs 와 같은 모양. 값은 오너가 이 연결에 넣을 때까지 비어 있다.
+ */
+function pluginConnectionCredentialRefs(envKeys) {
+  const token = crypto.randomBytes(6).toString("hex");
+  return Object.fromEntries(envKeys.map((key) => {
+    const suffix = key.length <= 100 ? key : crypto.createHash("sha256").update(key).digest("hex").slice(0, 32);
+    return [key, `AGENTLAS_CONN_${token}_${suffix}`];
+  }));
+}
+
+function mcpServersHoldCredentialRefs(db) {
+  try { return db.prepare("PRAGMA table_info(mcp_servers)").all().some((column) => column && column.name === "credential_refs_json"); }
+  catch { return false; }
+}
+
 /** Hub 플러그인 매니페스트 조회. 404 → null, 스키마 불일치/HTTP 오류 → throw. */
 async function fetchPluginManifest(slug, { fetch: fetchImpl } = {}) {
   const resp = await fetchHub(`${webBaseUrl()}/api/plugins/${encodeURIComponent(slug)}`, {
@@ -109,6 +131,11 @@ function pluginMcpRow(slug, entry, index) {
     },
   });
   const refuse = (reason) => ({ refused: { name, source: source || (typeof entry?.url === "string" ? entry.url : ""), reason } });
+  // 원격 행의 키는 이 연결 소유 키로만 묶인다(installPluginMcpRows). 그 이름을 만들 수 없는 키는 전역 키로
+  // 읽히지 않게 행 자체를 거절한다(데스크탑 connectionVaultKey 가 던지면 그 행을 등록하지 않는 것과 동형).
+  const remoteRow = (url) => (envKeys.some((key) => !PLUGIN_ENV_KEY_RE.test(key))
+    ? refuse("declared credential key is not an environment variable name, so it cannot be bound to this connection")
+    : makeRow({ transport: "http", command: null, argsJson: "[]", url }));
 
   if (transport === "stdio") {
     const command = typeof entry?.command === "string" ? entry.command.trim() : "";
@@ -127,7 +154,7 @@ function pluginMcpRow(slug, entry, index) {
     if (!pluginIsLikelyRemoteMcpEndpoint(url)) {
       return refuse("URL is not a usable remote MCP endpoint (https required; repo/package pages are docs)");
     }
-    return makeRow({ transport: "http", command: null, argsJson: "[]", url });
+    return remoteRow(url);
   }
   if (transport) return refuse(`unsupported transport "${transport}"`);
 
@@ -141,7 +168,7 @@ function pluginMcpRow(slug, entry, index) {
           : "URL does not look like an MCP endpoint (no /mcp, /sse, or mcp.* host, and no declared transport)",
       );
     }
-    return makeRow({ transport: "http", command: null, argsJson: "[]", url: source });
+    return remoteRow(source);
   }
   // 원격은 URL, stdio는 실행 커맨드다. 둘을 섞으면 codex config.toml 스키마 위반으로
   // 런타임이 통째로 죽는다(Runtime Doctor가 반복해서 잡던 사고 계열).
@@ -173,25 +200,35 @@ function planPluginMcpInstall(slug, manifest) {
  * 데스크탑과 공유되므로, 터미널이 enabled=1로 넣으면 데스크탑 런타임 구성이
  * 승인 게이트 없이 그 로컬 프로세스를 실행하게 된다. http/sse 원격 연결만
  * 자동 활성화한다(네트워크 연결일 뿐 로컬 실행이 없다).
+ *
+ * 키를 선언한 원격 행은 연결 소유 키 참조(credential_refs_json)와 함께 넣는다 — 오너의 전역 키는
+ * 절대 그 URL 로 가지 않는다(pluginConnectionCredentialRefs). 참조를 담을 열이 없는 구형 저장소에서는
+ * 그 행을 비활성으로 넣고 승인 필요로 표면화한다(참조 없이 켜면 전역 키를 읽는다).
  */
 function installPluginMcpRows(db, rows) {
   let installed = 0;
   let reused = 0;
   const needsApproval = [];
+  let refsColumn = null;
   for (const row of rows) {
     const stdioNeedsApproval = row.transport === "stdio";
     const existing = db.prepare("SELECT id FROM mcp_servers WHERE catalog_id = ? LIMIT 1").get(row.catalogId);
     if (existing) { reused += 1; continue; } // 멱등: 재설치가 중복 행을 만들지 않는다
+    const remoteKeys = stdioNeedsApproval ? [] : JSON.parse(row.envKeysJson || "[]");
+    if (remoteKeys.length && refsColumn === null) refsColumn = mcpServersHoldCredentialRefs(db);
+    const refs = remoteKeys.length && refsColumn ? JSON.stringify(pluginConnectionCredentialRefs(remoteKeys)) : null;
+    const needsApprovalNow = stdioNeedsApproval || (remoteKeys.length > 0 && !refs);
     db.prepare(
-      `INSERT INTO mcp_servers (id, catalog_id, name, name_en, transport, command, args_json, url, env_keys_json, enabled, installed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO mcp_servers (id, catalog_id, name, name_en, transport, command, args_json, url, env_keys_json, enabled, installed_at${refs ? ", credential_refs_json" : ""})
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${refs ? ", ?" : ""})`,
     ).run(
       row.id, row.catalogId, row.name, row.name, row.transport,
       row.command, row.argsJson, row.url, row.envKeysJson,
-      stdioNeedsApproval ? 0 : 1, new Date().toISOString(),
+      needsApprovalNow ? 0 : 1, new Date().toISOString(),
+      ...(refs ? [refs] : []),
     );
     installed += 1;
-    if (stdioNeedsApproval) needsApproval.push(row.name);
+    if (needsApprovalNow) needsApproval.push(row.name);
   }
   return { installed, reused, needsApproval };
 }

@@ -29,10 +29,16 @@ function hasJudgmentRunner() {
   return typeof runner === "function";
 }
 
-const DEFAULT_TIMEOUT_MS = 20000;
+const DEFAULT_TIMEOUT_MS = 300_000;
 const MAX_INPUT_CHARS = 8000;
 const CACHE_MAX = 500;
 const cache = new Map();
+
+function connectedModelTimeoutMs(value) {
+  const parsed = Number(value);
+  return process.env.AGENTLAS_TEST_JUDGMENT_TIMEOUTS === "1" && Number.isFinite(parsed) && parsed > 0
+    ? Math.min(DEFAULT_TIMEOUT_MS, parsed) : DEFAULT_TIMEOUT_MS;
+}
 
 function cacheGet(key) {
   if (!cache.has(key)) return undefined;
@@ -52,6 +58,37 @@ function cacheSet(key, value) {
 
 function clearJudgmentCache() {
   cache.clear();
+}
+
+/** A host deadline must settle even when an injected runner ignores cancellation. */
+async function runBoundedJudgment(system, prompt, timeoutMs, signal) {
+  const selectedRunner = runner;
+  const limit = connectedModelTimeoutMs(timeoutMs);
+  const controller = new AbortController();
+  let timer;
+  let onAbort;
+  const deadline = new Promise((_, reject) => {
+    const stop = (reason) => {
+      reject(reason);
+      controller.abort(reason);
+    };
+    onAbort = () => stop(signal?.reason || new Error("judgment aborted"));
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
+    timer = setTimeout(() => stop(new Error(`judgment timed out after ${limit}ms`)), limit);
+  });
+  const call = Promise.resolve().then(() => {
+    if (controller.signal.aborted) throw controller.signal.reason;
+    return selectedRunner({ system, prompt, signal: controller.signal });
+  });
+  // A late rejection is observed without invoking or replaying the model again.
+  void call.catch(() => {});
+  try {
+    return await Promise.race([call, deadline]);
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
+  }
 }
 
 function cacheLabelContext(labels) {
@@ -87,7 +124,7 @@ function judgmentCacheKey(spec, text, labels) {
     multi: spec.multi === false ? false : true,
     question: String(spec.question),
     guidance: spec.guidance ? String(spec.guidance) : "",
-    timeoutMs: String(spec.timeoutMs || DEFAULT_TIMEOUT_MS),
+    timeoutMs: String(connectedModelTimeoutMs(spec.timeoutMs)),
   });
 }
 
@@ -127,14 +164,8 @@ async function judgeLabels(spec) {
     .filter(Boolean)
     .join("\n");
 
-  const controller = typeof AbortController === "function" ? new AbortController() : null;
-  const timer = controller ? setTimeout(() => controller.abort(), spec.timeoutMs || DEFAULT_TIMEOUT_MS) : null;
-  const onAbort = () => controller && controller.abort();
-  if (spec.signal && typeof spec.signal.addEventListener === "function") {
-    spec.signal.addEventListener("abort", onAbort, { once: true });
-  }
   try {
-    const raw = await runner({ system, prompt: text, signal: controller ? controller.signal : undefined });
+    const raw = await runBoundedJudgment(system, text, spec.timeoutMs, spec.signal);
     const match = String(raw || "").match(/\{[\s\S]*\}/);
     if (!match) return unavailable;
     let parsed;
@@ -161,11 +192,6 @@ async function judgeLabels(spec) {
      */
     const message = error && error.message ? String(error.message).slice(0, 300) : "";
     return message ? { ...unavailable, reason: message } : unavailable;
-  } finally {
-    if (timer) clearTimeout(timer);
-    if (spec.signal && typeof spec.signal.removeEventListener === "function") {
-      spec.signal.removeEventListener("abort", onAbort);
-    }
   }
 }
 
@@ -176,16 +202,12 @@ async function judgeLabels(spec) {
  */
 async function runRaw(system, prompt, timeoutMs) {
   if (!hasJudgmentRunner()) return "";
-  const controller = typeof AbortController === "function" ? new AbortController() : null;
-  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs || DEFAULT_TIMEOUT_MS) : null;
   try {
-    const raw = await runner({ system: String(system || ""), prompt: String(prompt || ""), signal: controller ? controller.signal : undefined });
+    const raw = await runBoundedJudgment(String(system || ""), String(prompt || ""), timeoutMs);
     return String(raw || "");
   } catch {
     return "";
-  } finally {
-    if (timer) clearTimeout(timer);
   }
 }
 
-module.exports = { setJudgmentRunner, hasJudgmentRunner, judgeLabels, clearJudgmentCache, runRaw };
+module.exports = { setJudgmentRunner, hasJudgmentRunner, judgeLabels, clearJudgmentCache, runRaw, connectedModelTimeoutMs };

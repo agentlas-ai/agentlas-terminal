@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.72 — 2026-10-23
+
+- Use Desktop Core v20 with separate verified downloads for macOS, Windows x64, and Linux x64. New databases use schema 134, already supported by Desktop 1.3.86.
+- Preserve the session model and orchestration defaults in Terminal selection, and show returned run failures with their recovery actions.
+- Bind npm release verification to the exact Desktop source history and verify the source pin before publication.
+- Add context-window inspection and saved-thread navigation, and retain personal One conversation continuity.
+- Strengthen native session generations, child cleanup, resume recovery, project-scoped credentials, and provider profile and effort handling.
+- Bind memory tickets and delivery to their session and owner, redact tool-result secrets, and preserve unknown usage as unknown.
+- Improve MCP consent and inventory, automation scheduling, Hub operations, and graph owner occurrence handling. Retire the old Experience and Variant commands.
+
 ## 1.0.71 — 2026-10-08
 
 - Update the on-demand Desktop Core runtime to v19 for Desktop 1.2.82, with Science rendering and protein validation dependencies. Fresh databases use schema 128; Desktop remains the migration owner for existing databases.

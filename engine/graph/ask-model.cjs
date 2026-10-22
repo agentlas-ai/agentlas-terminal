@@ -1,4 +1,7 @@
 "use strict";
+const { composeDeclaredPrompt } = require("../prompt-order.cjs");
+const { typedInterviewPrompt } = require("./interview.cjs");
+const CONTRACT_SEPARATOR = "\n";
 /*
  * 인터뷰 한 턴을 모델에게 묻는 최소 경로.
  *
@@ -69,6 +72,16 @@ function consentedMcpServersFor(ctx) {
 
 async function askModel(ctx, prompt, opts = {}) {
   const db = ctx.db();
+  // This host has no native output-schema transport. Both provider paths receive the full contract.
+  // An interview prompt joins as its own declared parts (typed lookup, no parsing), so this one user channel stays in
+  // lifetime order: interview policy → locale → schema → request/catalog → answers. Other text stays one turn part.
+  const typed = typedInterviewPrompt(prompt);
+  const contractPrompt = composeDeclaredPrompt([
+    ...(opts.outputSchema ? [{ id: "terminal.graph.output-schema", revision: 3, stability: "task-context", changeTriggers: ["release", "task", "output-schema"],
+      text: "[OUTPUT CONTRACT]\nReturn exactly one JSON document matching this schema; no prose or fence.\n" + JSON.stringify(opts.outputSchema.schema) + "\n[/OUTPUT CONTRACT]" }] : []),
+    ...(typed && typed.separator === CONTRACT_SEPARATOR ? typed.parts
+      : [{ id: "terminal.graph.interview.request", revision: 2, stability: "turn-context", changeTriggers: ["locale", "owner-input", "checkpoint", "capability-inventory"], text: prompt }]),
+  ], CONTRACT_SEPARATOR);
   let primary = null;
   try {
     primary = resolveRuntimeForAgent({
@@ -122,7 +135,7 @@ async function askModel(ctx, prompt, opts = {}) {
           backend: "ollama",
           model: (await require("../runtimes/ollama.cjs").resolveOllamaModel(runtime.model, { env: process.env })).model,
           system: "",
-          messages: [{ role: "user", content: prompt }],
+          messages: [{ role: "user", content: contractPrompt }],
           ctx: { cwd, permission: "read", env: process.env, db },
           ui,
         })
@@ -131,7 +144,7 @@ async function askModel(ctx, prompt, opts = {}) {
           bin: runtime.bin,
           ui,
           cwd,
-          prompt,
+          prompt: contractPrompt,
         /*
          * 읽기 권한 — 만드는 동안 바깥을 바꾸지 않는다. 메일이 나가거나 글이 올라가면 안 된다.
          * ★런타임의 "read"는 **쓰기 금지가 아니라 도구 금지에 가깝다**(이 저장소 실측:

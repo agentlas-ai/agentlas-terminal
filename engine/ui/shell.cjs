@@ -20,7 +20,7 @@
 const { PassThrough } = require("node:stream");
 const { Ui } = require("../agentlas-ui.cjs");
 const { Orchestrator, maxParallel } = require("../sessions/orchestrator.cjs");
-const { Renderer } = require("./renderer.cjs");
+const { Renderer, runtimeLabel } = require("./renderer.cjs");
 const { resolveRuntimeForAgent } = require("../runtimes/overrides.cjs");
 const permissions = require("../agentlas-permissions.cjs");
 const palette = require("./palette.cjs");
@@ -249,10 +249,10 @@ async function startShell(ctx, opts = {}) {
   const renderer = new Renderer(ui);
   let permission = permissions.normalize(opts.permission || (ctx.prefs && ctx.prefs.permission) || "write");
 
-  const resolveRt = (agentId = null) => resolveRuntimeForAgent({
+  const resolveRt = (agentId = null, chatId = null) => resolveRuntimeForAgent({
     db, prefs: ctx.prefs, explicit: opts.runtime || null,
     model: opts.model || null, effort: opts.effort || null,
-    role: "orchestrator", agentId,
+    role: "orchestrator", agentId, chatId,
   });
   const pickController = () => {
     const resolved = resolveProjectController(db, process.cwd());
@@ -269,7 +269,7 @@ async function startShell(ctx, opts = {}) {
     const active = orch.active();
     if (active && active.agent.id === agent.id) return active;
     const session = orch.spawn({
-      agent, runtime: resolveRt(agent.id), permission,
+      agent, runtime: resolveRt(agent.id, opts.chatId || null), permission,
       cwd: process.cwd(), activate: true, chatId: opts.chatId || null,
     });
     renderer.attach(session, { replay: false });
@@ -278,6 +278,8 @@ async function startShell(ctx, opts = {}) {
 
   // ── 헤더 ──
   ui.line(`${ui.c.paw("▞▖")} ${ui.c.bold("AGENTLAS")} ${ui.c.dim(`${readVersion()} · parallel ≤${maxParallel()}`)}`);
+  try { ui.line(ui.c.dim(runtimeLabel(resolveRt(pickController()?.id, opts.chatId || null), ctx.lang))); }
+  catch { ui.line(ui.c.dim("—")); }
   ui.line(ui.c.dim(en
     ? "plain words run a task · / commands · Esc interrupts · Ctrl+C quits"
     : "문장을 치면 실행 · / 명령 · Esc 중단 · Ctrl+C 종료"));

@@ -57,9 +57,12 @@ function boundedAcpHistory(history) {
   return bounded;
 }
 
+// Contract tests replace the core loader (a fake runner module); production always loads the vendored core.
+let coreLoaderOverride = null;
+
 /** 이 머신에서 ACP 드라이버를 쓸 수 있는가. { ok, reason?, module? } */
 function acpDriverAvailability() {
-  const loaded = loadCoreAcpRuntime();
+  const loaded = coreLoaderOverride ? coreLoaderOverride() : loadCoreAcpRuntime();
   if (!loaded) return { ok: false, reason: "desktop core not available (run `agentlas doctor`)" };
   if (loaded.error) return { ok: false, reason: loaded.error.message };
   if (!loaded.module || typeof loaded.module.createAcpRunner !== "function") {
@@ -71,6 +74,109 @@ function acpDriverAvailability() {
 function acpSpecFor(kind, mod) {
   const spec = mod.ACP_AGENTS && mod.ACP_AGENTS[kind];
   return spec || null;
+}
+
+/*
+ * ── session/request_permission → the shared capability rules ────────────────────────────────────────────────
+ * Terminal registered no arbiter, so the core's default answered every ACP permission request and a stored deny rule
+ * was ignored on write runs (native-harness audit 31, A3 C4.4). The arbiter now answers from the same table and the
+ * same precedence as Terminal's own tool gate (agentlas-permissions.cjs decideCapability):
+ *   stored deny → deny · stored allow → allow · full → allow · non-mutating → allow · write → allow ·
+ *   read + mutating with no rule → deny (Terminal has no live approval card; Desktop asks or, unattended, denies).
+ * Every allow is "allow_once": a session-wide grant lets the agent skip the next request, so a deny rule written
+ * later would never be consulted. Plan-mode mutations are already denied by the core wrapper.
+ */
+const permissionContexts = new Map(); // chatId → { db, ui, refs }
+let lastPermissionContext = null;
+let installedArbiterModule = null;
+let coreRulesDbProvider = null; // the full core's own store handle (loadDesktopCore → getDb)
+let readOnlyRulesDb = null;
+
+/** Rule source when no Terminal turn context carries a DB (graph runs, core-driven tool loops). */
+function fallbackRulesDb() {
+  if (typeof coreRulesDbProvider === "function") {
+    try { const db = coreRulesDbProvider(); if (db) return db; } catch { /* fall through to the read-only store */ }
+  }
+  if (readOnlyRulesDb) return readOnlyRulesDb;
+  try {
+    const file = process.env.AGENTLAS_STORE_PATH || require("../core/paths.cjs").dbPath();
+    if (!require("node:fs").existsSync(file)) return null;
+    readOnlyRulesDb = require("../core/db.cjs").openRaw(file, { readOnly: true });
+    return readOnlyRulesDb;
+  } catch {
+    return null;
+  }
+}
+
+function terminalPermissionDecision(db, ask) {
+  const verdict = permissions.decideCapability(db || null, {
+    kind: ask && ask.kind,
+    tool: ask && ask.tool,
+    detail: ask && ask.detail,
+    agentId: ask && ask.agentId,
+    chatId: ask && ask.chatId,
+    mutating: !!(ask && ask.mutating),
+    permission: ask && ask.permission,
+  });
+  return verdict.decision === "allow" ? "allow_once" : "deny";
+}
+
+function permissionContextFor(chatId) {
+  return (chatId && permissionContexts.get(String(chatId))) || lastPermissionContext;
+}
+
+async function terminalPermissionArbiter(ask) {
+  const context = permissionContextFor(ask && ask.chatId);
+  let decision = "deny";
+  try { decision = terminalPermissionDecision((context && context.db) || fallbackRulesDb(), ask); }
+  catch { decision = "deny"; } // a rule read that fails never becomes an allow
+  if (decision === "deny" && context && context.ui && typeof context.ui.warn === "function") {
+    const tool = String((ask && (ask.tool || ask.kind)) || "tool").slice(0, 120);
+    const level = permissions.normalize(ask && ask.permission);
+    try {
+      context.ui.warn(`ACP permission denied: ${tool} (${level} run; a stored capability rule or the read boundary refused it — change it with /permission or the saved rule).`);
+    } catch { /* a display failure never changes the decision */ }
+  }
+  return decision;
+}
+
+function installTerminalPermissionArbiter(mod) {
+  if (installedArbiterModule === mod) return;
+  if (typeof mod.setAcpPermissionArbiter !== "function") return;
+  mod.setAcpPermissionArbiter(terminalPermissionArbiter);
+  installedArbiterModule = mod;
+}
+
+/**
+ * A fully loaded core (graph runs) asks the same registry for ACP and host-loop tool permissions; install the
+ * Terminal arbiter there too, with the core's own store as the rule source. Without a DB it answers exactly as the
+ * core default does (read + mutating → deny, otherwise allow once).
+ */
+function installTerminalPermissionArbiterInCore(core) {
+  try {
+    const approval = core && typeof core.require === "function" ? core.require("runtime/tool-approval") : null;
+    if (!approval || typeof approval.setRuntimeToolPermissionArbiter !== "function") return false;
+    if (typeof core.getDb === "function") coreRulesDbProvider = core.getDb;
+    approval.setRuntimeToolPermissionArbiter(terminalPermissionArbiter);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function enterPermissionContext(req) {
+  const key = req.approvalChatId || req.chatId ? String(req.approvalChatId || req.chatId) : "";
+  const context = { db: req.db || null, ui: req.ui || null, refs: 1 };
+  const previous = key ? permissionContexts.get(key) : null;
+  if (previous) { previous.refs += 1; previous.db = context.db || previous.db; previous.ui = context.ui || previous.ui; }
+  else if (key) permissionContexts.set(key, context);
+  const active = previous || context;
+  lastPermissionContext = active;
+  return () => {
+    active.refs -= 1;
+    if (key && active.refs <= 0 && permissionContexts.get(key) === active) permissionContexts.delete(key);
+    if (lastPermissionContext === active && active.refs <= 0) lastPermissionContext = null;
+  };
 }
 
 /**
@@ -89,6 +195,7 @@ async function runAcpTurn(req) {
   if (!spec) {
     return { text: "", session: req.session || {}, error: `runtime '${kind}' is not an ACP agent in this core`, errorKind: "unsupported", errorSource: "marker" };
   }
+  installTerminalPermissionArbiter(mod);
   const runner = mod.createAcpRunner(spec);
   const permission = permissions.normalize(req.permission);
   let mcpConfigPath;
@@ -114,6 +221,7 @@ async function runAcpTurn(req) {
     };
   }
   const locale = req.locale === "ko" ? "ko" : "en";
+  const leavePermissionContext = enterPermissionContext(req);
   let streaming = false;
   let lastText = "";
   const events = {
@@ -127,14 +235,19 @@ async function runAcpTurn(req) {
     onStatus: (status) => ui.status(status),
     onTool: (name, args, result, id, isError) => {
       ui.tool(name, args || "");
-      if (result) ui.toolResult(result, !isError);
+      // A failed call is always reported as a failure, even with no output text (the runner reports an empty `result`): the
+      // sink counts how every call came back (sessions/turn-outcome.cjs) and a failure is private evidence, never drawn.
+      if (result || isError) ui.toolResult(result || "", !isError);
     },
     onThinking: (phase) => { if (phase === "start") ui.status(locale === "ko" ? "생각 중..." : "thinking..."); },
     onNotice: (notice) => { if (notice && notice.message) ui.status(notice.message); },
   };
   try {
     const result = await runner({
-      systemPrompt: req.systemPrompt || "",
+      // Session-split prompt: the stable part is the session's system text, this turn's part (turn_id, recall) rides the
+      // runner's turn context, so a loaded ACP session still gets each turn's binding.
+      systemPrompt: req.systemPromptStable || req.systemPrompt || "",
+      ...(req.systemPromptStable && req.turnContext ? { turnContext: req.turnContext } : {}),
       history: boundedAcpHistory(req.history),
       userPrompt: req.prompt || "",
       backendLabel: spec.label,
@@ -152,22 +265,46 @@ async function runAcpTurn(req) {
       sessionFingerprintSeed: req.sessionFingerprintSeed,
       unattended: req.unattended === true,
       ...(req.model ? { model: req.model } : {}),
+      // Desktop RunnerRequest.effort: the shared runner owns the ACP effort channel (spawn flag / thought_level).
+      ...(req.effort ? { effort: req.effort } : {}),
     }, events);
     if (streaming) ui.streamEnd();
     const session = {
       ...(req.session || {}),
       ...(result.sessionId ? { id: result.sessionId, acpSessionId: result.sessionId } : {}),
     };
+    const delivery = result.turnDelivery === "not-dispatched" || result.turnDelivery === "not-accepted" || result.turnDelivery === "accepted"
+      ? { turnDelivery: result.turnDelivery } : {};
+    const appliedEffort = typeof result.appliedEffort === "string" ? result.appliedEffort : null;
     if (result.failure) {
-      return { text: result.text || "", session, usage: null, error: result.failure.message, errorKind: result.failure.kind, errorSource: result.failure.source };
+      // The core's typed code and retry hint are the cause the owner and the recovery logic act on; keep them.
+      return { text: result.text || "", session, usage: null, error: result.failure.message, errorKind: result.failure.kind,
+        errorSource: result.failure.source,
+        ...(typeof result.failure.providerCode === "string" ? { errorCode: result.failure.providerCode } : {}),
+        ...(typeof result.failure.retryAfterHint === "string" ? { retryAfterHint: result.failure.retryAfterHint } : {}),
+        ...delivery, appliedEffort };
     }
+    // The runner's context meter (ACP usage_update used/size) feeds the common 80% generation rule (generation.cjs).
+    const meter = (value) => (Number.isSafeInteger(value) && value > 0 ? value : undefined);
+    const contextInputTokens = meter(result.contextInputTokens), contextWindowTokens = meter(result.contextWindowTokens);
+    // The runner's own count of this turn's tool calls (started or finished) when it ended with no text: a session that finds
+    // fewer outcomes than calls never judges the turn (sessions/turn-outcome.cjs endedWithoutAnswerAfterUnusableTools).
+    const toolCalls = Number.isSafeInteger(result.toolCalls) && result.toolCalls > 0 ? result.toolCalls : undefined;
     return { text: result.text || "", session, usage: null, error: null,
-      ownerControlTerminal: result.ownerControlTerminal === "completed" ? "completed" : "uncertain" };
+      ...(contextInputTokens ? { contextInputTokens } : {}), ...(contextWindowTokens ? { contextWindowTokens } : {}),
+      ...(toolCalls ? { toolCalls } : {}),
+      ownerControlTerminal: result.ownerControlTerminal === "completed" ? "completed" : "uncertain", ...delivery, appliedEffort };
   } catch (e) {
     if (streaming) ui.streamEnd();
     const message = e && e.message ? e.message : String(e);
     const detail = process.env.AGENTLAS_DEBUG && e && e.stack ? e.stack : message;
-    return { text: "", session: req.session || {}, usage: null, error: detail, errorKind: /abort/i.test(message) ? "cancelled" : "exit", errorSource: "marker" };
+    // A typed pre-dispatch refusal thrown by the core (Desktop markRefusedBeforeDispatch) keeps its code and delivery.
+    const code = e && typeof e.code === "string" && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/.test(e.code) ? e.code : undefined;
+    return { text: "", session: req.session || {}, usage: null, error: detail, errorKind: /abort/i.test(message) ? "cancelled" : "exit", errorSource: "marker",
+      ...(code ? { errorCode: code } : {}),
+      ...(e && e.turnDelivery === "not-dispatched" ? { turnDelivery: "not-dispatched" } : {}), appliedEffort: null };
+  } finally {
+    leavePermissionContext();
   }
 }
 
@@ -180,4 +317,10 @@ module.exports = {
   acpDriverAvailability,
   acpSpecFor,
   runAcpTurn,
+  terminalPermissionDecision,
+  terminalPermissionArbiter,
+  installTerminalPermissionArbiterInCore,
+  _test: {
+    setCoreLoader(loader) { coreLoaderOverride = typeof loader === "function" ? loader : null; installedArbiterModule = null; },
+  },
 };

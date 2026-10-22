@@ -9,7 +9,11 @@
  * 작아서(몇 줄) git 에 커밋된다 — 무거운 tar.gz 는 커밋하지 않는다(코덱스 CLI 패턴).
  *
  * 사용: node scripts/write-desktop-core-manifest.cjs --version 1 --url <release-asset-url>
- *       [--desktop-release v1.1.1 --desktop-schema-version 107]
+ *       [--desktop-release v1.1.1 --desktop-schema-version 107] [--desktop-source-commit <40-hex>]
+ *
+ * `--desktop-source-commit` records the exact Desktop commit the tarball was built from (build-core-snapshot.cjs
+ * VENDORED.json desktopSourceCommit). scripts/verify-desktop-core-pin.cjs proves it descends from the pinned commit.
+ * Without the flag the previous value is kept only while the tarball is byte-identical; a new tarball drops it.
  *
  * ★릴리스 순서 선언(2026-09-06, scripts/verify-desktop-release-order.cjs 가 지키는 값).
  * `--desktop-release`/`--desktop-schema-version` 을 주지 않으면 기존 매니페스트의 값을
@@ -47,6 +51,13 @@ const manifestPath = path.resolve(__dirname, "..", "engine", "vendor", "desktop-
 let previous = {};
 try { previous = JSON.parse(fs.readFileSync(manifestPath, "utf8")); } catch { /* first write */ }
 
+const sourceCommitFlag = flag("desktop-source-commit");
+if (sourceCommitFlag !== null && !/^[0-9a-f]{40}$/.test(String(sourceCommitFlag))) {
+  console.error("✖ --desktop-source-commit must be the full 40-hex Desktop commit the tarball was built from.");
+  process.exit(1);
+}
+const desktopSourceCommit = sourceCommitFlag
+  || (previous.sha256 === sha256 && /^[0-9a-f]{40}$/.test(String(previous.desktopSourceCommit || "")) ? previous.desktopSourceCommit : null);
 const desktopReleaseFlag = flag("desktop-release");
 const desktopSchemaFlag = flag("desktop-schema-version");
 if (Boolean(desktopReleaseFlag) !== Boolean(desktopSchemaFlag)) {
@@ -61,6 +72,7 @@ const desktopCompatibleNote = desktopReleaseFlag
 
 const manifest = {
   version, url, sha256, sizeBytes, writtenAt: new Date().toISOString(),
+  ...(desktopSourceCommit ? { desktopSourceCommit } : {}),
   ...(desktopCompatibleRelease ? { desktopCompatibleRelease } : {}),
   ...(Number.isFinite(desktopCompatibleSchemaVersion) ? { desktopCompatibleSchemaVersion } : {}),
   ...(desktopCompatibleNote ? { desktopCompatibleNote } : {}),
@@ -68,6 +80,9 @@ const manifest = {
 fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
 console.log(`✓ wrote ${path.relative(process.cwd(), manifestPath)}`);
 console.log(`  version=${version} sha256=${sha256.slice(0, 16)}… size=${(sizeBytes / 1024 / 1024).toFixed(1)}MB`);
+console.log(desktopSourceCommit
+  ? `  desktopSourceCommit=${desktopSourceCommit}`
+  : "  ⚠ no desktopSourceCommit recorded — npm run verify:desktop-core-pin falls back to the declared release tag.");
 if (desktopCompatibleRelease) {
   console.log(`  desktopCompatibleRelease=${desktopCompatibleRelease} desktopCompatibleSchemaVersion=${desktopCompatibleSchemaVersion}`);
 } else {

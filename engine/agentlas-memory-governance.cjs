@@ -337,6 +337,11 @@ function beginTurn(db, input = {}) {
     }
 
     const turnId = explicitTurnId || `terminal-turn:${crypto.randomUUID()}`;
+    if (tableExists(db, "memory_forget_clock")) {
+      const clock = db.prepare("SELECT epoch FROM memory_forget_clock WHERE id=1").get();
+      if (!clock || !Number.isSafeInteger(clock.epoch)) throw new Error("memory_forget_epoch_unavailable");
+      policy.memoryIntakeEpoch = clock.epoch;
+    }
     db.prepare(
       "INSERT OR IGNORE INTO terminal_memory_turn_intents (turn_id,request_fingerprint,context_key,permission,project_key,owner_key,owner_policy_json,status,started_at) VALUES (?,?,?,?,?,?,?,'pending',?)",
     ).run(turnId, requestFingerprint, contextKey, permission, pKey, oKey, JSON.stringify(policy), now);
@@ -453,10 +458,35 @@ function blockUnboundCandidates(candidates, reason) {
   return candidates;
 }
 
+/**
+ * Every `## Memory Events` block of a reply. A reply can carry two (measured 2026-10-14: with Agentlas One on, the
+ * One directive's memory-ticket envelope followed the Terminal envelope): every block leaves the visible text, and the
+ * block bound to this turn's id is the receipt — else the last one, as before.
+ */
+function memoryEventBlocks(source, heading) {
+  const starts = [];
+  for (let at = source.indexOf(heading); at >= 0; at = source.indexOf(heading, at + heading.length)) starts.push(at);
+  const blocks = starts.map((start, i) => {
+    const next = i + 1 < starts.length ? starts[i + 1] : source.length;
+    const tail = source.slice(start + heading.length, next);
+    const fence = tail.match(/```(?:json)?\s*[\s\S]*?```/i);
+    // The last block takes the rest of the reply (single-block behaviour); an earlier one ends with its fence.
+    const end = i + 1 < starts.length && fence && fence.index != null ? start + heading.length + fence.index + fence[0].length : next;
+    return { start, end, tail };
+  });
+  let cleaned = "", cursor = 0;
+  for (const block of blocks) {
+    cleaned += source.slice(cursor, block.start).replace(/<!--\s*$/u, "");
+    cursor = block.end;
+  }
+  cleaned += source.slice(cursor).replace(/^\s*-->/u, "");
+  return { blocks, cleaned: cleaned.trim() };
+}
+
 function parseMainOutput(text, turnId, heading = DEFAULT_EVENTS_HEADING) {
   const source = String(text || "");
-  const index = source.lastIndexOf(heading);
-  if (index < 0) {
+  const { blocks, cleaned } = memoryEventBlocks(source, heading);
+  if (!blocks.length) {
     return {
       cleaned: source.trim(),
       parseStatus: "missing",
@@ -465,9 +495,10 @@ function parseMainOutput(text, turnId, heading = DEFAULT_EVENTS_HEADING) {
       declaredTurnId: null,
     };
   }
-  const cleaned = source.slice(0, index).trim();
-  const tail = source.slice(index + heading.length);
-  const parsed = extractJson(tail);
+  const decoded = blocks.map((block) => extractJson(block.tail));
+  const bound = decoded.find((value) => value && !Array.isArray(value) && typeof value === "object"
+    && validTurnId(value.turn_id || value.turnId) === turnId);
+  const parsed = bound || decoded[decoded.length - 1];
   if (!parsed) {
     return {
       cleaned,
@@ -498,9 +529,24 @@ function parseMainOutput(text, turnId, heading = DEFAULT_EVENTS_HEADING) {
       declaredTurnId: null,
     };
   }
-  const declaredTurnId = validTurnId(parsed.turn_id || parsed.turnId);
-  const hasObservation = parsed.observation && typeof parsed.observation === "object";
-  const hasCandidates = Array.isArray(parsed.candidates);
+  // Summary-only receipts originate in this host's completed invocation. They
+  // contain no writable candidates, so the host may bind their missing turn id
+  // without granting legacy or malformed candidate batches write authority.
+  const summaryOnly = parsed.schema_version === "agentlas.memory-ticket.v1"
+    && typeof parsed.turn_summary === "string"
+    && (parsed.candidates === undefined || (Array.isArray(parsed.candidates) && parsed.candidates.length === 0));
+  const declaredTurnId = validTurnId(parsed.turn_id || parsed.turnId)
+    || (summaryOnly && parsed.turn_id === undefined && parsed.turnId === undefined ? turnId : null);
+  // A memory-ticket envelope's turn_summary is the receipt sentence even when its candidates cannot be bound to this turn
+  // (they stay blocked below); only a missing observation leaves the receipt without one.
+  const observation = summaryOnly || (parsed.schema_version === "agentlas.memory-ticket.v1" && typeof parsed.turn_summary === "string"
+    && !(parsed.observation && typeof parsed.observation === "object"))
+    ? { outcome: "completed", summary: parsed.turn_summary }
+    : parsed.observation;
+  const hasObservation = observation && typeof observation === "object";
+  // Candidates are an optional explicit proposal (owner decisions 06 D11): an envelope without the key is an ordinary
+  // receipt with none; a present non-array value is still a malformed batch.
+  const hasCandidates = parsed.candidates === undefined || Array.isArray(parsed.candidates) || summaryOnly;
   let parseStatus = hasObservation && hasCandidates ? "ok" : "partial";
   if (!declaredTurnId) parseStatus = "turn_id_missing";
   else if (declaredTurnId !== turnId) parseStatus = "turn_id_mismatch";
@@ -509,7 +555,7 @@ function parseMainOutput(text, turnId, heading = DEFAULT_EVENTS_HEADING) {
   return {
     cleaned,
     parseStatus,
-    observation: normalizeObservation(parsed.observation),
+    observation: normalizeObservation(observation),
     candidates,
     declaredTurnId,
   };
@@ -1113,6 +1159,15 @@ async function completeTurn(db, input = {}) {
 
     for (const decision of decisions) {
       if (decision.finalDisposition !== "retain") continue;
+      if (tableExists(db, "memory_forget_clock")) {
+        const clock = db.prepare("SELECT epoch FROM memory_forget_clock WHERE id=1").get();
+        if (!clock || !Number.isSafeInteger(turn.ownerPolicy.memoryIntakeEpoch) || clock.epoch !== turn.ownerPolicy.memoryIntakeEpoch) {
+          decision.finalDisposition = "review";
+          decision.finalScope = "session";
+          decision.reasonCodes = [...new Set([...decision.reasonCodes, "memory_source_epoch_changed"])];
+          continue;
+        }
+      }
       const candidate = decision.candidate;
       const dbScope = storageScope(decision.finalScope);
       if (!dbScope) continue;
@@ -1132,10 +1187,25 @@ async function completeTurn(db, input = {}) {
        * (`agt_team_` 낙인이거나 신원이 없으면 개인 칸이 없다).
        */
       const scopedAgentId = decision.finalScope === "agent" ? boundAgentId : null;
+      if (tableExists(db, "memory_revocations")) {
+        const normalized = candidate.content.normalize("NFKC").replace(/\s+/g, " ").trim().toLowerCase();
+        let projectAuthority = scopedProjectPath ? path.resolve(scopedProjectPath) : null;
+        if (projectAuthority) { try { projectAuthority = fs.realpathSync.native(projectAuthority); } catch { /* Same canonical fallback as the owner. */ } }
+        const authority = dbScope === "project" ? projectAuthority ? `project-path:${sha256(projectAuthority)}` : `project-id:${scopedProjectId}`
+          : dbScope === "agent_repo" ? `agent:${scopedAgentId || "unbound"}` : "shared";
+        const revoked = db.prepare("SELECT 1 FROM memory_revocations WHERE owner_key=? AND memory_kind=? AND content_hash=?")
+          .get(sha256(`agentlas-memory-owner-v1\0${dbScope}\0${authority}`), candidate.kind, sha256(normalized));
+        if (revoked) {
+          decision.finalDisposition = "review";
+          decision.finalScope = "session";
+          decision.reasonCodes = [...new Set([...decision.reasonCodes, "memory_content_revoked"])];
+          continue;
+        }
+      }
       let memoryId = null;
       try {
         const duplicate = db.prepare(
-          "SELECT id FROM memory_entries WHERE scope=? AND kind=? AND lower(trim(content))=? AND superseded_at IS NULL AND (project_path IS ? OR project_path=?) AND (agent_id IS ? OR agent_id=?) LIMIT 1",
+          `SELECT id FROM memory_entries WHERE scope=? AND kind=? AND lower(trim(content))=? AND superseded_at IS NULL AND (project_path IS ? OR project_path=?) AND (agent_id IS ? OR agent_id=?) ${canonicalRecallFilter(db)} LIMIT 1`,
         ).get(dbScope, candidate.kind, candidate.content.toLowerCase(), scopedProjectPath, scopedProjectPath, scopedAgentId, scopedAgentId);
         memoryId = duplicate && duplicate.id;
         if (memoryId) decision.reasonCodes = [...new Set([...decision.reasonCodes, "deduplicated"])];
@@ -1167,6 +1237,25 @@ async function completeTurn(db, input = {}) {
           JSON.stringify(safeContext),
           timestamp,
         );
+      }
+      // New owner stores retain source and actor custody alongside the legacy
+      // retrieval shape. A dedup adds an origin without changing applicability.
+      if (tableExists(db, "memory_identity_bindings")) {
+        const owner = db.prepare("SELECT value FROM memory_store_meta WHERE key='owner_namespace'").get();
+        if (!owner || !owner.value) throw new Error("memory_owner_binding_required");
+        const priorBinding = db.prepare("SELECT owner_namespace,origin_refs_json FROM memory_identity_bindings WHERE memory_id=?").get(memoryId);
+        if (priorBinding && priorBinding.owner_namespace !== owner.value) throw new Error("memory_owner_binding_mismatch");
+        const origins = [...new Set([...safeJsonArray(priorBinding && priorBinding.origin_refs_json), `terminal-turn:${turnId}`, candidate.id])];
+        if (priorBinding) {
+          db.prepare("UPDATE memory_identity_bindings SET origin_refs_json=? WHERE memory_id=?").run(JSON.stringify(origins), memoryId);
+        } else {
+          db.prepare("INSERT INTO memory_identity_bindings(memory_id,owner_namespace,actor_id,origin_refs_json,applicability_json,curation_actor,policy_version) VALUES(?,?,?,?,?,'model_curated',?)")
+            .run(memoryId, owner.value, boundAgentId, JSON.stringify(origins), JSON.stringify({ scope: dbScope }), GOVERNANCE_SCHEMA_VERSION);
+        }
+        if (turn.projectKey && tableExists(db, "memory_project_links")) {
+          db.prepare("INSERT OR IGNORE INTO memory_project_links(memory_id,project_id,relation,source_ref) VALUES(?,?,'origin',?)")
+            .run(memoryId, turn.projectKey, `terminal-turn:${turnId}`);
+        }
       }
       const lane = decision.finalScope;
       const timelineId = `timeline:${sha256(`${turnId}:${candidate.id}:${memoryId}:${lane}`).slice(0, 32)}`;
@@ -1231,6 +1320,16 @@ async function completeTurn(db, input = {}) {
   };
 }
 
+// New canonical identity metadata is authority. Pre-cutover bundles without
+// the additive table retain their existing recall contract.
+function canonicalRecallFilter(db, alias = "memory_entries") {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(alias)) throw new Error("memory_alias_invalid");
+  if (!tableExists(db, "memory_identity_bindings")) return "";
+  return ` AND NOT EXISTS(SELECT 1 FROM memory_identity_bindings b WHERE b.memory_id=${alias}.id
+    AND (json_extract(b.applicability_json,'$.recallChannel')='legacy_one_overlay'
+      OR COALESCE(json_extract(b.applicability_json,'$.enabled'),1)=0))`;
+}
+
 function listScopedTimeline(db, input = {}) {
   ensureGovernanceSchema(db);
   if (!tableExists(db, "memory_entries")) return [];
@@ -1243,7 +1342,7 @@ function listScopedTimeline(db, input = {}) {
              t.lane,t.project_key,t.owner_key,t.created_at
       FROM terminal_memory_scope_timeline t
       JOIN memory_entries m ON m.id=t.memory_id
-      WHERE m.superseded_at IS NULL AND (
+      WHERE m.superseded_at IS NULL ${canonicalRecallFilter(db, "m")} AND (
         t.lane='user_global'
         OR (t.lane='project' AND t.project_key=?)
         OR (t.lane IN ('team','agent') AND t.owner_key=? AND (t.project_key IS NULL OR t.project_key=?))
@@ -1274,6 +1373,7 @@ module.exports = {
   parseCuratorOutput,
   completeTurn,
   listScopedTimeline,
+  canonicalRecallFilter,
   mirrorCoreLogs,
   hasSecret,
   hasAbsolutePath,

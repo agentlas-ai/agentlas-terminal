@@ -163,6 +163,11 @@ async function run(ctx, args) {
     const row = store.getAutomationByPrefix(db, idPrefix);
     if (!row) return fail(missingAutomation(idPrefix));
     const outcome = store.setEnabledChecked(db, row, sub === "on");
+    if (outcome.refused === store.GOAL_CONTINUATION_RETIRED_CODE) {
+      return fail(ko
+        ? `목표 이어가기 기록이라 다시 켤 수 없습니다(앱이 목표를 직접 이어갑니다): ${row.id}`
+        : `This is a retired Goal continuation record and cannot be turned on (the app continues the Goal itself): ${row.id}`);
+    }
     if (!outcome.changed) {
       return fail(ko
         ? `자동화가 변경되는 동안 사라졌습니다: ${row.id}`
@@ -259,6 +264,12 @@ async function run(ctx, args) {
       if (!st.supported) { ctx.out(ko ? "launchd 상주는 macOS 전용입니다. 다른 OS 는 `agentlas automation daemon` 을 켜 두세요." : "launchd persistence is macOS-only. On other systems keep `agentlas automation daemon` running."); return 0; }
       ctx.out(`${st.loaded ? ctx.ui.green("✓") : ctx.ui.dim("○")} ${ko ? "상주(launchd)" : "persistence (launchd)"}: ${st.loaded ? (ko ? "실행 중" : "loaded") : st.installed ? (ko ? "설치됨(미로드)" : "installed (not loaded)") : (ko ? "미설치" : "not installed")}`);
       ctx.out(ctx.ui.dim(`plist: ${st.plistPath}`));
+      // 설치·로드돼 보여도 plist 가 가리키는 node/agentlas 가 사라졌으면 launchd 는 매번 조용히 실패한다.
+      if (st.stale_program) {
+        ctx.err(`${ctx.ui.red("✖")} ${ko
+          ? "상주 plist 가 가리키는 node 또는 agentlas 가 없어 자동화가 돌지 않습니다. 다시 켜세요: agentlas automation install"
+          : "the LaunchAgent's node or agentlas program no longer exists, so automations are not running. Re-enable: agentlas automation install"}`);
+      }
       if (!st.loaded) ctx.out(ctx.ui.dim(ko ? "켜기: agentlas automation install" : "Enable: agentlas automation install"));
       return 0;
     }

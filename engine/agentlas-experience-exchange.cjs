@@ -966,10 +966,6 @@ function commitLocalBundleRecord(userDataDir, validation, options = {}) {
   });
 }
 
-function saveLocalBundle(userDataDir, validation, options = {}) {
-  throw new Error("experience_chips_retired: legacy evidence is read-only; use agentlas evolve.");
-}
-
 function readStoredBundle(userDataDir, bundleId) {
   const file = bundleStorePath(userDataDir, bundleId);
   recoverPrivateAtomicTarget(file);
@@ -1212,10 +1208,6 @@ function remoteProjection(receipt, baseResolution = null, previousRemote = null)
   };
 }
 
-function commitServerAcceptedBundle(userDataDir, validation, receipt, baseResolution, options = {}) {
-  throw new Error("experience_chips_retired: legacy evidence is read-only; use agentlas evolve.");
-}
-
 function persistRemoteReceipt(userDataDir, bundle, receipt, baseResolution = null) {
   try {
     return withExchangeStateLock(userDataDir, () => {
@@ -1260,10 +1252,6 @@ async function recoverLostUpload(bundle, idempotencyKey, options, auth, original
   const etag = response.headers && typeof response.headers.get === "function" ? response.headers.get("etag") : null;
   if (etag !== `"${receipt.revision}"`) throw new Error("lost upload recovery ETag does not match the receipt revision");
   return { receipt, replayed: true, recovered: true };
-}
-
-async function publishBundle(validation, options = {}) {
-  throw new Error("experience_chips_retired: legacy evidence is read-only; use agentlas evolve.");
 }
 
 function findStateRecord(state, ref) {
@@ -1482,10 +1470,6 @@ async function fetchUploadExport(ref, options = {}) {
   };
 }
 
-async function withdrawUpload(ref, options = {}) {
-  throw new Error("experience_chips_retired: legacy evidence is read-only.");
-}
-
 function normalizedTaxonomyAtom(value) {
   return typeof value === "string" ? value.normalize("NFKC").trim().toLowerCase() : "";
 }
@@ -1672,30 +1656,8 @@ function exactTaskSignatureInPrompt(signature, prompt, options = {}) {
   return deriveCanonicalTaskClasses(prompt, options).taskIds.includes(signature);
 }
 
-/**
- * Resolve normal Terminal runs without fuzzy identity or semantic guessing.
- * Automatic retrieval additionally needs one exact Experience release selected
- * by an authoritative loadout. Merely saving/uploading a compatible bundle is
- * never attachment consent.
- */
-function resolveRuntimeExperienceForAgent(options = {}) {
-  return { disabled: true, observableReason: "experience_chips_retired", resolution: "retired" };
-}
-
 function estimateTokens(text) {
   return Math.ceil(Buffer.byteLength(String(text || ""), "utf8") / 3);
-}
-
-function buildLocalExperienceAdvisory(options = {}) {
-  return { text: "", itemIds: [], estimatedTokens: 0, authority: "retired", serverRentalResolutionReceiptPresent: false };
-}
-
-function augmentRuntimeSystemWithLocalExperience(systemPrompt, options = {}) {
-  const context = buildLocalExperienceAdvisory(options);
-  return {
-    systemPrompt: context.text ? `${String(systemPrompt || "")}\n\n${context.text}` : String(systemPrompt || ""),
-    experienceContext: context,
-  };
 }
 
 function renderValidation(validation) {
@@ -1760,10 +1722,6 @@ function baseDescriptorFromFlags(flags) {
   };
 }
 
-async function cmdExperienceExchange(options = {}) {
-  throw new Error("experience_chips_retired: legacy evidence is read-only; use agentlas evolve.");
-}
-
 module.exports = {
   BUNDLE_SCHEMA,
   RECEIPT_SCHEMA,
@@ -1795,8 +1753,6 @@ module.exports = {
   bundleStorePath,
   loadExchangeState,
   withExchangeStateLock,
-  saveLocalBundle,
-  commitServerAcceptedBundle,
   readStoredBundle,
   verifyStoredBundleRow,
   scopedStateRows,
@@ -1811,10 +1767,8 @@ module.exports = {
   idempotencyKeyForBundle,
   idempotencyKeyHash,
   trustedExperienceOrigin,
-  publishBundle,
   fetchUploadStatus,
   fetchUploadExport,
-  withdrawUpload,
   defaultEnvironmentTags,
   loadExperienceTaxonomyContract,
   validateExperienceTaxonomyContract,
@@ -1829,10 +1783,6 @@ module.exports = {
   resolveCanonicalTaskClasses,
   readExactLocalBaseMarker,
   exactTaskSignatureInPrompt,
-  resolveRuntimeExperienceForAgent,
   estimateTokens,
-  buildLocalExperienceAdvisory,
-  augmentRuntimeSystemWithLocalExperience,
   portableExperienceSafetyIssues,
-  cmdExperienceExchange,
 };

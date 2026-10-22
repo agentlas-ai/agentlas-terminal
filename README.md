@@ -17,8 +17,8 @@ Use this existing independent Terminal as the command-line runtime: inspect owne
 
 Agent Trust is our product principle: agent packages are treated as portable, owner-scoped, inspectable, and restorable assets. (It does not imply regulated financial or fiduciary services.) Agent Cloud stores package assets in your private cloud account, while Agentlas Terminal verifies and executes local runtime copies on your host machine.
 
-Current release: 1.0.71. It uses on-demand Desktop Core 19 for Desktop 1.2.82,
-bootstraps schema 128, and requires Node 22.13.0 or newer. Shared-store schema
+Current release: 1.0.72. It uses on-demand Desktop Core 20 for Desktop 1.3.86,
+bootstraps schema 134, and requires Node 22.13.0 or newer. Shared-store schema
 inspection is read-only; shared-store writes and the compiled Desktop Core
 require a compatible better-sqlite3 native driver.
 
@@ -130,6 +130,7 @@ agentlas ontology <sub>          # Manage project ontology (status|list|add)
 # agentlas hep stormbreaker journal --run-id <id> --journal <path>
 agentlas project [status|init]   # Explicit entry point to initialize `.agentlas/` context
 agentlas context <sub>           # Context slice operations (refresh|locate|refs|slice|impact|verify)
+agentlas thread list|read|status # Conversations and runs from the shared database (same view as Desktop)
 agentlas graph [list|show|run <name>] # Saved automation graphs (built in Desktop's Graph editor)
 ```
 

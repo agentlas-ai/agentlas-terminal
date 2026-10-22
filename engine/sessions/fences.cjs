@@ -107,8 +107,10 @@ function parseDelegateBlock(text) {
             }
             // Desktop 계약: target 만 필수. allocation 은 정규화 실패 시 null 로 남고
             // (레거시 텍스트 위임과 동일) 실행 측이 현재 모델 폴백 영수증을 남긴다.
+            // Stage is the parent model's declaration (Desktop delegate.ts DelegationStage); default production.
+            const stage = ["production", "integration", "verification"].includes(d.stage) ? d.stage : "production";
             return target
-              ? { target, brief, allocation: workloadRouting.normalizeAllocation(d.allocation, "delegate") }
+              ? { target, brief, allocation: workloadRouting.normalizeAllocation(d.allocation, "delegate"), stage }
               : null;
           })
           .filter(Boolean);
@@ -330,6 +332,22 @@ function parseAutomationBlock(text) {
 
 /* ── <<agentlas-ask>> (renderer/lib/ask-question.ts extractQuestions 포팅) ── */
 
+/**
+ * Desktop shared/types.ts isUnfilledQuestionTemplate 포팅: 모델에게 보여 주는 질문 서식을 채우지 않고 그대로 낸 것은
+ * 질문이 아니다. 선택지가 몇 개든 화면에 올리지 않는다(답할 수 없는 것은 보여주지 않는다).
+ */
+function isUnfilledAskTemplate(question, header, options) {
+  const norm = (value) => String(value == null ? "" : value).trim().toLowerCase();
+  const q = norm(question);
+  const labels = options.map((option) => norm(option && option.label));
+  if (q === "question text ending with ?") return true;
+  const ellipsisOnly = (value) => /^(?:…|\.{3})\??$/.test(value);
+  if (ellipsisOnly(q)) return true;
+  const placeholderLabels = labels.filter((label) => /^option [a-d]$/.test(label) || ellipsisOnly(label));
+  if (labels.length > 0 && placeholderLabels.length === labels.length) return true;
+  return norm(header) === "short label" && q === "";
+}
+
 function tryParseAsk(body) {
   if (utf8Bytes(body) > MAX_ASK_BODY_BYTES) return null;
   // body 가 ```json 펜스로 감싸진 경우도 허용 (Desktop confirm/index.ts:77-80 동일)
@@ -359,16 +377,107 @@ function tryParseAsk(body) {
     });
     if (options.length >= 8) break; // Desktop confirm/index.ts:99 상한
   }
-  if (options.length < 2) return null; // Desktop 계약: 선택지 2개 미만은 유효 질문 아님
+  const header = typeof o.header === "string" ? o.header.trim().slice(0, 200) : "";
+  // 서식 그대로인 것만 거른다. 선택지가 2개 미만이어도 진짜 질문이면 사람에게 가야 한다 — 질문이 본문에서 지워지고
+  // 이벤트도 없으면 그 턴은 아무것도 묻지 않은 채 끝난다. 선택지가 모자라면 가진 선택지만 싣고(없으면 빈 목록),
+  // 렌더러가 답을 그대로 입력하라고 안내한다.
+  if (isUnfilledAskTemplate(question, header, options)) return null;
   return {
     question: question.slice(0, 4000),
-    ...(typeof o.header === "string" && o.header.trim() ? { header: o.header.trim().slice(0, 200) } : {}),
+    ...(header ? { header } : {}),
     multiSelect: o.multiSelect === true,
     options,
   };
 }
 
-function extractAsks(text) {
+/**
+ * Desktop shared/agent-control-blocks.ts repairAskOpenMarkers 포팅(구조 수리, 단어 규칙 아님): 열린 펜스 밖에서
+ * 만난 닫는 토큰 뒤에 JSON 객체가 오면 여는 토큰을 잘못 쓴 것이다(gpt-oss:20b 6회 중 2회, 2026-10-14).
+ */
+// 닫는 표식 오타 일반화(데스크탑 shared/agent-control-blocks.ts 와 같은 규칙): `<` 로 시작하고 이름 앞에 `/` 가 하나 이상 있으며 뒤에 `>` 가 0~3개.
+// 정상 여는 표식(`<<agentlas-ask>>`)은 `/` 가 없어 걸리지 않고, 여는 표식 앞의 `/`(`path/<<agentlas-ask>>`)도 잡지 않는다.
+const ASK_CLOSE_VARIANTS = /(?<!<)<(?=[<\/ ]*\/)[<\/ ]{0,6}agentlas-ask(?![\w-])>{0,3}/g;
+
+/** `start` 에서 열리는 JSON 객체를 닫는 `}` 의 위치(문자열·이스케이프 인식). 안 닫히면 -1. */
+function endOfJsonObject(text, start) {
+  let depth = 0;
+  let inString = false;
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (char === "\\") index += 1;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') inString = true;
+    else if (char === "{") depth += 1;
+    else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+/**
+ * 마지막 여는 표식 뒤에 닫는 표식이 아예 없거나 알아볼 수 없을 때: 그 뒤가 온전히 닫힌 JSON 객체 하나면 그 객체가 질문이고 닫는 표식만 빠진 것이다.
+ * 잘린 객체는 미완성 꼬리로 남는다.
+ */
+function closeCompleteAskObject(text) {
+  const open = text.lastIndexOf(ASK_OPEN);
+  if (open < 0) return text;
+  const afterOpen = text.slice(open + ASK_OPEN.length);
+  if (afterOpen.includes(ASK_CLOSE)) return text;
+  const start = afterOpen.indexOf("{");
+  if (start < 0 || afterOpen.slice(0, start).replace(/```(?:json)?/i, "").trim() !== "") return text;
+  const end = endOfJsonObject(afterOpen, start);
+  if (end < 0) return text;
+  try {
+    const value = JSON.parse(afterOpen.slice(start, end + 1));
+    if (!value || typeof value !== "object" || Array.isArray(value)) return text;
+  } catch {
+    return text;
+  }
+  // 객체 뒤의 깨진 닫는 표식(과 감싼 코드 펜스)은 버리고, 그 뒤 공백·본문은 그대로 둔다.
+  const rest = afterOpen.slice(end + 1);
+  const noise = (/^\s*(?:```\s*)?(?:[<\/\] ]*agentlas[ -]?asks?[>\]]*)?/i.exec(rest) || [""])[0];
+  const tail = rest.slice(/```|agentlas/i.test(noise) ? noise.length : 0);
+  return text.slice(0, open + ASK_OPEN.length) + afterOpen.slice(0, end + 1) + ASK_CLOSE + tail;
+}
+
+function repairAskOpenMarkers(input) {
+  // 닫는 표식 오타(`</<agentlas-ask>>` 등)도 닫는 표식이다(같은 모델, 같은 날 실측).
+  const text = input.includes("agentlas-ask") ? input.replace(ASK_CLOSE_VARIANTS, ASK_CLOSE) : input;
+  if (!text.includes(ASK_CLOSE)) return closeCompleteAskObject(text);
+  let out = "";
+  let rest = text;
+  let inFence = false;
+  for (let guard = 0; guard < 128; guard += 1) {
+    const open = inFence ? -1 : rest.indexOf(ASK_OPEN);
+    const close = rest.indexOf(ASK_CLOSE);
+    if (close < 0 && open < 0) break;
+    if (!inFence && open >= 0 && (close < 0 || open < close)) {
+      out += rest.slice(0, open + ASK_OPEN.length);
+      rest = rest.slice(open + ASK_OPEN.length);
+      inFence = true;
+      continue;
+    }
+    if (close < 0) break;
+    const after = rest.slice(close + ASK_CLOSE.length);
+    if (!inFence && /^\s*\{/.test(after)) {
+      out += rest.slice(0, close) + ASK_OPEN;
+      inFence = true;
+    } else {
+      out += rest.slice(0, close + ASK_CLOSE.length);
+      inFence = false;
+    }
+    rest = after;
+  }
+  return closeCompleteAskObject(out + rest);
+}
+
+function extractAsks(input) {
+  const text = repairAskOpenMarkers(input);
   if (!text.includes(ASK_OPEN)) return { text, asks: [] };
   const asks = [];
   let remaining = text;
@@ -446,6 +555,7 @@ module.exports = {
   AUTOMATION_HEADING,
   ASK_OPEN,
   ASK_CLOSE,
+  repairAskOpenMarkers,
   parseReplyFences,
   // 테스트/재사용용 개별 파서
   parseDelegateBlock,

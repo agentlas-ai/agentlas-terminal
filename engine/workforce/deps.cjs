@@ -84,7 +84,7 @@ function legacyWorkforceRuntime(db, override) {
   const active = ar
     ? runtimeFromSelection({
         role: "orchestrator",
-        kind: canonicalRuntimeKind(ar.kind),
+        kind: canonicalRuntimeKind(ar.kind, ar.acp_agent_id),
         backend: ar.backend,
         source: ar.source,
         model: ar.model,
@@ -590,6 +590,10 @@ function buildWorkforceDeps(ctx = {}) {
     resolveRuntime: resolveWorkforceRuntime,
     captureRuntime: capture.captureRuntime,
     runApi: capture.runApi,
+    // Only this native composition supplies a selected brain for authenticated
+    // Web memory packets. A local/injected callHubTool transport grants no authority.
+    captureRemoteMemoryRuntime: ({ selection, isCurrent }) =>
+      require("../project/remote-memory-curation.cjs").captureSelectedHost(selection, isCurrent),
     buildChildEnv: capture.buildChildEnv,
     receiptFile,
     appendReceipt,

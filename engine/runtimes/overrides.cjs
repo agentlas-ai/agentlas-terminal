@@ -7,7 +7,7 @@
  * 스키마 소유권은 데스크탑에 있으므로 여기서는 방어적으로만 읽는다(tableExists/
  * columnExists) — 구버전 DB에서 열이 없으면 "오버라이드 없음"으로 조용히 전진.
  *
- * 해석 사다리(오너 계약): 명시(--runtime) > 에이전트별 오버라이드 > 역할별
+ * 해석 사다리(오너 계약): 명시(--runtime) > 기존 대화 선택 > 에이전트별 오버라이드 > 역할별
  * Dashboard 후보 풀 > prefs > active_runtime > detected. 역할 풀은 사용자가
  * Orchestrator/Worker별로 정한 실행 우선순위이므로 전역 legacy prefs보다 앞선다.
  * resolve.cjs 는 건드리지 않는다 — 이 모듈이 앞의 두 층을 얹는다.
@@ -41,7 +41,7 @@ function rowToOverride(row) {
     label: cleanText(row.label),
     selection: {
       // 저장된 이름(데스크탑 표기) → 이 저장소의 이름. kinds.cjs 참고.
-      kind: canonicalRuntimeKind(String(row.kind)),
+      kind: canonicalRuntimeKind(String(row.kind), row.acp_agent_id),
       backend: cleanText(row.backend) || undefined,
       source: cleanText(row.source) || undefined,
       model: cleanText(row.model) || undefined,
@@ -75,6 +75,31 @@ function readAgentRuntimeOverride(db, agentId) {
   return readRuntimeOverride(db, "agent", agentId);
 }
 
+/** Existing Desktop/Mobile chat pin. Reading never changes the shared schema or selection. */
+function readChatRuntimeSelection(db, chatId) {
+  if (!db || !cleanText(chatId) || !columnExists(db, "chats", "runtime_selection_json")) return null;
+  const raw = db.prepare("SELECT runtime_selection_json FROM chats WHERE id=?").get(chatId)?.runtime_selection_json;
+  if (raw == null || raw === "") return null;
+  const invalid = () => Object.assign(new Error("This conversation has an invalid model selection. Choose its model again in Agentlas Desktop."), { code: "chat_runtime_selection_invalid" });
+  let selection;
+  try { selection = JSON.parse(raw); } catch { throw invalid(); }
+  if (!selection || typeof selection !== "object" || Array.isArray(selection) ||
+      typeof selection.kind !== "string" || !selection.kind.trim() ||
+      (selection.role !== undefined && selection.role !== "orchestrator") ||
+      (selection.inherit !== undefined && selection.inherit !== false) ||
+      (selection.longContext !== undefined && typeof selection.longContext !== "boolean")) throw invalid();
+  for (const [key, max] of Object.entries({ model: 512, effort: 80, source: 2048, label: 256, acpAgentId: 256, backend: 256 })) {
+    const value = selection[key];
+    if (value != null && (typeof value !== "string" || value.length > max)) throw invalid();
+  }
+  // Desktop's legacy gemini pin denotes Antigravity and deliberately drops its old model.
+  const legacyGemini = selection.kind === "gemini";
+  return { ...selection,
+    kind: canonicalRuntimeKind(legacyGemini ? "antigravity" : selection.kind, selection.acpAgentId),
+    ...(legacyGemini ? { model: undefined, source: undefined } : {}),
+  };
+}
+
 /** 데스크탑 findAgentRuntimeOverride 동형 — targets 우선순위(예: agent > division > firm). */
 function findRuntimeOverride(db, targets) {
   for (const target of Array.isArray(targets) ? targets : []) {
@@ -87,7 +112,7 @@ function findRuntimeOverride(db, targets) {
 
 /**
  * 오버라이드를 얹은 런타임 해석.
- * @param {object} p { db, prefs, explicit, model?, effort?, role?, agentId, targets?, deps? }
+ * @param {object} p { db, prefs, explicit, model?, effort?, role?, agentId, chatId?, targets?, deps? }
  *   targets: [{scope,targetId}] — 주면 agentId 대신 이 우선순위로 오버라이드를 찾는다
  *            (firm 경로: agent > division > firm).
  *   deps: 테스트 주입 { which, resolve } — 상용 호출자는 사용하지 않는다.
@@ -103,6 +128,7 @@ function resolveRuntimeForAgent({
   effort,
   role = "orchestrator",
   agentId,
+  chatId,
   targets,
   deps,
 } = {}) {
@@ -137,6 +163,13 @@ function resolveRuntimeForAgent({
   };
   // 명시(--runtime)가 항상 이긴다 — 오버라이드는 "사용자가 고르지 않았을 때"의 기본값이다.
   if (explicit) return withPins(resolveImpl({ db, prefs, explicit }));
+
+  const chatSelection = readChatRuntimeSelection(db, chatId);
+  if (chatSelection) {
+    const selected = selectedRuntime(chatSelection, "chat-selection");
+    if (!selected) throw Object.assign(new Error("This conversation's selected runtime is unavailable in this Terminal. Choose an available runtime explicitly."), { code: "chat_runtime_unavailable" });
+    return { ...selected, role };
+  }
 
   const override = targets && targets.length
     ? findRuntimeOverride(db, targets)
@@ -203,6 +236,7 @@ function unavailableRoleNote(runtime, lang) {
 
 module.exports = {
   readAgentRuntimeOverride,
+  readChatRuntimeSelection,
   readRuntimeOverride,
   findRuntimeOverride,
   resolveRuntimeForAgent,

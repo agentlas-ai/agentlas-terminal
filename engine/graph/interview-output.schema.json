@@ -1,0 +1,465 @@
+{
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "ask": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "question": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2000
+              },
+              "why": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2000
+              },
+              "choices": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 1000
+                },
+                "maxItems": 20,
+                "minItems": 0
+              }
+            },
+            "required": [
+              "id",
+              "question"
+            ],
+            "additionalProperties": false
+          },
+          "maxItems": 3,
+          "minItems": 1
+        }
+      },
+      "required": [
+        "ask"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "blueprint": {
+          "type": "object",
+          "properties": {
+            "schema": {
+              "const": "agentlas.graph-blueprint.v1"
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160
+            },
+            "goal": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4000
+            },
+            "trigger": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "cron",
+                    "input"
+                  ]
+                },
+                "schedule": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "label": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 160
+                },
+                "varName": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 80
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "additionalProperties": false
+            },
+            "steps": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "title": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 160
+                  },
+                  "instruction": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 16000
+                  },
+                  "effect": {
+                    "enum": [
+                      "read",
+                      "mutation"
+                    ]
+                  },
+                  "produces": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 80
+                  },
+                  "consumes": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 80
+                    },
+                    "maxItems": 32,
+                    "minItems": 0
+                  },
+                  "uses": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "capability": {
+                          "enum": [
+                            "calendar.events.create",
+                            "calendar.events.list",
+                            "chat.messages.list",
+                            "chat.messages.post",
+                            "code.issues.create",
+                            "code.issues.list",
+                            "code.repo.read",
+                            "docs.database.query",
+                            "docs.pages.create",
+                            "docs.pages.read",
+                            "files.read",
+                            "files.write",
+                            "mail.messages.list",
+                            "mail.messages.send",
+                            "sheets.rows.append",
+                            "sheets.rows.read",
+                            "tasks.issues.create",
+                            "tasks.issues.list",
+                            "web.search"
+                          ]
+                        },
+                        "provider": {
+                          "anyOf": [
+                            {
+                              "type": "null"
+                            },
+                            {
+                              "enum": [
+                                "google_calendar",
+                                "google_sheets",
+                                "gmail",
+                                "outlook_calendar",
+                                "outlook_mail",
+                                "apple_calendar",
+                                "slack",
+                                "notion",
+                                "github",
+                                "linear",
+                                "local_files",
+                                "web_search"
+                              ]
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "capability"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "maxItems": 32,
+                    "minItems": 0
+                  },
+                  "kind": {
+                    "enum": [
+                      "agent",
+                      "code",
+                      "runGraph",
+                      "mcp_call",
+                      "toolchain_call"
+                    ]
+                  },
+                  "graphRef": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128
+                  },
+                  "mcpCall": {
+                    "type": "object",
+                    "properties": {
+                      "catalogId": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128
+                      },
+                      "toolName": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200
+                      },
+                      "arguments": {
+                        "type": "object",
+                        "additionalProperties": true
+                      },
+                      "schemaDigest": {
+                        "type": "string",
+                        "pattern": "^[a-f0-9]{64}$"
+                      }
+                    },
+                    "required": [
+                      "catalogId",
+                      "toolName",
+                      "arguments"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "toolchainCall": {
+                    "type": "object",
+                    "properties": {
+                      "toolchainId": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128
+                      },
+                      "version": {
+                        "type": "integer",
+                        "minimum": 1
+                      },
+                      "args": {
+                        "type": "object",
+                        "additionalProperties": true
+                      }
+                    },
+                    "required": [
+                      "toolchainId",
+                      "version",
+                      "args"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "code": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 24000,
+                    "description": "Code step body. Earlier values arrive in `vars` (python dict: vars.get('text'); js object: vars.text) — list the names in consumes. Assign the output to `result`; it becomes this step's produces value. print/console output is a log only."
+                  },
+                  "codeLang": {
+                    "enum": [
+                      "python",
+                      "js"
+                    ]
+                  },
+                  "packages": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 120
+                    },
+                    "maxItems": 32,
+                    "minItems": 0
+                  },
+                  "role": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "roleEn": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  }
+                },
+                "required": [
+                  "title",
+                  "instruction",
+                  "effect"
+                ],
+                "additionalProperties": false
+              },
+              "maxItems": 20,
+              "minItems": 1
+            },
+            "branches": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "afterStep": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 63
+                  },
+                  "var": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 80
+                  },
+                  "op": {
+                    "enum": [
+                      "truthy",
+                      "falsy",
+                      "eq",
+                      "ne",
+                      "gt",
+                      "lt",
+                      "contains"
+                    ]
+                  },
+                  "value": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "maxLength": 8000
+                      },
+                      {
+                        "type": "number"
+                      }
+                    ]
+                  },
+                  "yesStep": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 63
+                  },
+                  "noStep": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 63
+                  },
+                  "repeatStep": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 63
+                  },
+                  "repeatOn": {
+                    "enum": [
+                      "yes",
+                      "no"
+                    ]
+                  },
+                  "maxRepeats": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20
+                  }
+                },
+                "required": [
+                  "afterStep",
+                  "var",
+                  "op"
+                ],
+                "additionalProperties": false
+              },
+              "maxItems": 32,
+              "minItems": 0
+            },
+            "checks": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "afterStep": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 63
+                  },
+                  "subject": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 80
+                  },
+                  "criteria": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4000
+                  },
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "text": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 2000
+                        },
+                        "kind": {
+                          "enum": [
+                            "must",
+                            "mustNot"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "text",
+                        "kind"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "maxItems": 32,
+                    "minItems": 0
+                  },
+                  "produces": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 80
+                  },
+                  "evidence": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 80
+                  }
+                },
+                "required": [
+                  "afterStep",
+                  "subject",
+                  "criteria"
+                ],
+                "additionalProperties": false
+              },
+              "maxItems": 32,
+              "minItems": 0
+            }
+          },
+          "required": [
+            "schema",
+            "name",
+            "goal",
+            "trigger",
+            "steps"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "blueprint"
+      ],
+      "additionalProperties": false
+    }
+  ]
+}

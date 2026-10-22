@@ -130,6 +130,8 @@ async function run(ctx, args) {
   if (flags.print && finalText) process.stdout.write(finalText.trimEnd() + "\n");
 
   if (session.status === "failed") {
+    // The renderer already drew the reason as its own line (session.lastErrorAnnounced): do not say it a second time.
+    if (session.lastErrorAnnounced) return 1;
     const error = session.lastError && typeof session.lastError === "object" && typeof session.lastError.message === "string"
       ? session.lastError
       : buildError(String(session.lastError || (ko ? "빌드 실행에 실패했습니다." : "The build session failed.")), "BUILD_FAILED");

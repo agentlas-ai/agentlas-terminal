@@ -36,6 +36,7 @@ jobs:
       AGENTLAS_CORE_COMMIT: 33c1e1fe1587aa2e5c9725745e312d5b88c26004
       HEPHAESTUS_RUNTIME_ROOT: ${{ github.workspace }}/Agentlas-OS
       HEPHAESTUS_PYTHON: python
+      AGENTLAS_DESKTOP_REPO: ${{ github.workspace }}/agentlas-desktop-source
     steps:
       - name: Resolve immutable release tag
         id: release
@@ -92,6 +93,41 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
+      - name: Resolve immutable Desktop core source
+        id: desktop
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const manifest = require('./engine/vendor/desktop-core.manifest.json');
+          const pin = require('./scripts/desktop-core-pin.json');
+          const bindings = { commit: manifest.desktopSourceCommit, pin: pin.desktopCommit };
+          for (const [name, value] of Object.entries(bindings)) {
+            if (typeof value !== 'string' || !/^[0-9a-f]{40}$/.test(value)) {
+              throw new Error(`Desktop ${name} must be an immutable full 40-hex commit`);
+            }
+          }
+          fs.appendFileSync(process.env.GITHUB_OUTPUT,
+            Object.entries(bindings).map(([name, value]) => `${name}=${value}\n`).join(''));
+          NODE
+
+      - name: Checkout immutable Desktop core source
+        uses: actions/checkout@v6
+        with:
+          repository: agentlas-ai/agentlas-desktop
+          ref: ${{ steps.desktop.outputs.commit }}
+          path: agentlas-desktop-source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify Desktop source checkout identity
+        env:
+          DESKTOP_SOURCE_COMMIT: ${{ steps.desktop.outputs.commit }}
+          DESKTOP_PIN_COMMIT: ${{ steps.desktop.outputs.pin }}
+        run: |
+          set -euo pipefail
+          test "$(git -C "$AGENTLAS_DESKTOP_REPO" rev-parse HEAD)" = "$DESKTOP_SOURCE_COMMIT"
+          git -C "$AGENTLAS_DESKTOP_REPO" cat-file -e "$DESKTOP_PIN_COMMIT^{commit}"
 
       - name: Pin npm trusted-publishing client
         run: |

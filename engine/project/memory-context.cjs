@@ -16,6 +16,7 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const { userDataDir } = require("../core/paths.cjs");
+const { runtimeMemoryDb } = require("../core/memory-db.cjs");
 const { loadArch, tableExists, columnExists } = require("../core/db.cjs");
 const { captureCoreJsonSync, resolveContextMapCoreRoot } = require("../agentlas-core-harness.cjs");
 const terminalMemoryGovernance = require("../agentlas-memory-governance.cjs");
@@ -140,6 +141,7 @@ function cliProjectContextSlice(projectPath, task) {
 }
 
 function cliMemoryContext(db, projectPath, agentId = null, task = "") {
+  db = runtimeMemoryDb(db);
   const sections = [];
   const arch = loadArch();
   ensureMemoryContextColumn(db);
@@ -173,7 +175,7 @@ function cliMemoryContext(db, projectPath, agentId = null, task = "") {
         ? db.prepare(`
             SELECT id,kind,content,confidence,context_json,created_at
             FROM memory_entries
-            WHERE superseded_at IS NULL AND (
+            WHERE superseded_at IS NULL ${terminalMemoryGovernance.canonicalRecallFilter(db)} AND (
               (scope='user_identity' AND project_path IS NULL)
               OR (scope='project' AND project_path=?)
               OR (scope IN ('team_memory','agent_team') AND (agent_id IS NULL OR agent_id=?) AND (project_path IS NULL OR project_path=?))
@@ -184,7 +186,7 @@ function cliMemoryContext(db, projectPath, agentId = null, task = "") {
         : db.prepare(`
             SELECT id,kind,content,confidence,context_json,created_at
             FROM memory_entries
-            WHERE superseded_at IS NULL AND (
+            WHERE superseded_at IS NULL ${terminalMemoryGovernance.canonicalRecallFilter(db)} AND (
               (scope='user_identity' AND project_path IS NULL)
               OR (scope IN ('team_memory','agent_team') AND (agent_id IS NULL OR agent_id=?) AND project_path IS NULL)
               OR (scope='agent_repo' AND agent_id=? AND project_path IS NULL)
@@ -293,22 +295,36 @@ function loadGlobalConnectionSkill() {
   }
 }
 
+// Composition order: fixed → variable (docs/PROMPT-COMPOSITION-POLICY.md, ledger terminal.project.memory-context.augment-legacy.system).
 function augmentSystem(db, baseSystem, ctx, withEmitter, request = "") {
   const arch = loadArch();
-  let sys = baseSystem || "";
-  // 언어/말투 지시를 맨 앞에 둔다. imported/cloud/company agents도 같은 전역 계약을 따른다.
+  // 말투(고정) → 연결 스킬 → 이미터 코어/상세 → 자격증명 리마인더 → 에이전트 지시문 → 언어(설정) → 메모리 컨텍스트 → 턴 바인딩.
   const lang = (ctx && ctx.lang) || prefsLangCli();
-  sys = langDirective(lang) + (sys ? "\n\n" + sys : "");
+  const style = require("../agentlas-style.cjs");
+  const parts = [style.responseStyleDirective()];
   const connectionSkill = loadGlobalConnectionSkill();
-  if (connectionSkill) sys += "\n\n" + connectionSkill;
-  const mem = cliMemoryContext(db, ctx && ctx.projectPath, ctx && ctx.agentId, request);
-  if (mem) sys += "\n\n" + mem;
+  if (connectionSkill) parts.push(connectionSkill);
+  let binding = "";
   if (withEmitter) {
-    sys += "\n\n" + memoryEmitterPromptFor(request, arch, ctx && ctx.turnId, ctx && ctx.permission);
+    // 이미터 프롬프트 = 코어 [+ 턴 바인딩 두 줄] [+ 상세]. 바인딩 줄만 떼어 맨 끝으로 보낸다.
+    // The output contract (format line + JSON template) closes the prompt with the turn binding (final-boundary),
+    // the same split as sessions/prompt.cjs (live A/B 2026-10-14: near the top, Claude dropped turn_id 3/3).
+    const full = memoryEmitterPromptFor(request, arch, ctx && ctx.turnId, ctx && ctx.permission);
+    const coreLines = TERMINAL_MEMORY_CORE.split("\n");
+    const contract = coreLines.slice(1, 3).join("\n");
+    const rest = full.slice(TERMINAL_MEMORY_CORE.length);
+    const m = /\nturn_id: [^\n]*\npermission: [^\n]*/.exec(rest);
+    binding = contract + (m ? `\n${m[0].slice(1)}` : "");
+    parts.push([coreLines[0], ...coreLines.slice(3)].join("\n") + (m ? rest.replace(m[0], "") : rest));
     const credentialReminder = credentialIndexReminderFor(request);
-    if (credentialReminder) sys += "\n\n" + credentialReminder;
+    if (credentialReminder) parts.push(credentialReminder);
   }
-  return sys;
+  if (baseSystem) parts.push(baseSystem);
+  parts.push(style.responseLanguageDirective(lang));
+  const mem = cliMemoryContext(db, ctx && ctx.projectPath, ctx && ctx.agentId, request);
+  if (mem) parts.push(mem);
+  if (binding) parts.push(binding);
+  return parts.join("\n\n");
 }
 
 function exactAgentBaseForExecution(db, agent, runtimeExperience = null) {

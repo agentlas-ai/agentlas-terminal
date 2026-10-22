@@ -47,6 +47,11 @@ const EXTRA_ENTRIES = [
   // Terminal's owner client is loaded dynamically, outside the graph closure.
   path.join(distRoot, "electron", "daemon", "invocation-owner-client.js"),
   path.join(distRoot, "electron", "store", "graph-reconciliation.js"),
+  // The feature connection catalog and the thread/turn service are host-neutral harness modules the Terminal reads
+  // (native-harness NH23: a vendored core without them cannot serve the common contract); nothing in the graph closure
+  // requires them, so they are roots of their own.
+  path.join(distRoot, "electron", "harness", "feature-registry.js"),
+  path.join(distRoot, "electron", "harness", "thread-service.js"),
   // 저장 전 확인 — 동적 req() 로만 닿아 정적 분석이 못 본다(재조정과 같은 자리).
   path.join(distRoot, "electron", "workflow", "verify-before-save.js"),
 ];

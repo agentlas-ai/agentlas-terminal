@@ -37,10 +37,36 @@ try {
 } catch {
   /* 아래 check 가 말한다 */
 }
+
+function hasDownloadAsset(asset) {
+  if (!asset || typeof asset !== "object" || Array.isArray(asset)) return false;
+  if (typeof asset.sha256 !== "string" || !/^[0-9a-f]{64}$/i.test(asset.sha256)) return false;
+  if (typeof asset.url !== "string" || Buffer.byteLength(asset.url, "utf8") > 2048) return false;
+  try { if (!/^https?:$/.test(new URL(asset.url).protocol)) return false; } catch { return false; }
+  if (asset.sizeBytes !== undefined && asset.sizeBytes !== null) {
+    const size = Number(asset.sizeBytes);
+    if (!Number.isSafeInteger(size) || size <= 0 || size > 256 * 1024 * 1024) return false;
+  }
+  return true;
+}
+
+// The loader supports both the original universal archive and platformAssets.
+// Publishing a platform manifest must cover every supported OS; top-level
+// legacy fields cannot conceal a missing or invalid platform asset.
+const version = String(manifest?.version ?? "").trim();
+const versionSafe = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(version)
+  && version !== "." && version !== "..";
+const platformAssets = manifest?.platformAssets;
+const downloadsPresent = manifest && typeof manifest === "object" && !Array.isArray(manifest)
+  && (Object.hasOwn(manifest, "platformAssets")
+    ? platformAssets && typeof platformAssets === "object" && !Array.isArray(platformAssets)
+      && ["darwin", "win32-x64", "linux-x64"].every((target) =>
+        Object.hasOwn(platformAssets, target) && hasDownloadAsset(platformAssets[target]))
+    : hasDownloadAsset(manifest));
 check(
   "manifest-says-where-the-engine-lives",
-  Boolean(manifest && manifest.url && manifest.sha256 && manifest.version),
-  "engine/vendor/desktop-core.manifest.json 이 없거나 url/sha256/version 이 비었습니다 — "
+  Boolean(versionSafe && downloadsPresent),
+  "engine/vendor/desktop-core.manifest.json 에 유효한 version과 단일 또는 darwin/win32-x64/linux-x64 다운로드 정보(url/sha256 및 선택적 sizeBytes)가 필요합니다 — "
   + "받을 곳을 모르면 새 설치본은 엔진을 영영 못 얻습니다.",
 );
 

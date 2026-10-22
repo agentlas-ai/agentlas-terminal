@@ -11,6 +11,7 @@
 const path = require("node:path");
 const { userDataDir } = require("../core/paths.cjs");
 const { readJsonFile } = require("../mcp/contract.cjs");
+const { readKeychainPassword } = require("../core/keychain-read.cjs");
 
 const HUB_RESPONSE_MAX_BYTES = 16 * 1024 * 1024;
 const HUB_TIMEOUT_DEFAULTS = Object.freeze({ connectMs: 15_000, idleMs: 30_000, totalMs: 180_000 });
@@ -193,22 +194,12 @@ function readCliSessionValue() {
   }
 }
 
-function readKeytar() {
-  try {
-    return require("keytar");
-  } catch {
-    return null;
-  }
-}
-
 async function cloudSessionCookie() {
   if (process.env.AGENTLAS_SESSION) return `agentlas_session=${process.env.AGENTLAS_SESSION}`;
   const fileValue = readCliSessionValue();
   if (fileValue) return `agentlas_session=${fileValue}`;
-  const keytar = readKeytar();
-  if (!keytar) return null;
   try {
-    const value = await keytar.getPassword("Agentlas Session", "default");
+    const value = await readKeychainPassword("Agentlas Session", "default");
     return value ? `agentlas_session=${value}` : null;
   } catch {
     return null;

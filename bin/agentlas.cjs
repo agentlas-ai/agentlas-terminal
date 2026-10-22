@@ -41,6 +41,7 @@ const { spawn } = require("node:child_process");
 const { configureSqliteConnection } = require("../engine/agentlas-sqlite-policy.cjs");
 const { parseOutputFlags, renderError } = require("../engine/cli-output.cjs");
 const { resolveCommandName, SELF_HELP_COMMANDS } = require("../engine/commands/index.cjs");
+const { assertLifecycleInvocation } = require("../engine/lifecycle-args.cjs");
 
 const SQLITE_HEADER = Buffer.from("SQLite format 3\0", "ascii");
 const SQLITE_MIN_BYTES = 512;
@@ -570,7 +571,15 @@ function main() {
     return;
   }
   const { options: outputOptions } = parsedOutput;
-  const metadataOnly = isMetadataOnlyInvocation(args, parsedOutput);
+  try {
+    assertLifecycleInvocation(parsedOutput.rest, { helpRequested: args.includes("--help") || args.includes("-h") });
+  } catch (error) {
+    process.stderr.write(renderError(error, outputOptions) + "\n");
+    process.exitCode = 1;
+    return;
+  }
+  // `update` only checks npm metadata; it must never bootstrap a shared store.
+  const metadataOnly = parsedOutput.rest[0] === "update" || isMetadataOnlyInvocation(args, parsedOutput);
   const sqliteDriver = probeSqliteDriver();
   const engineFound = exists(ENGINE);
 

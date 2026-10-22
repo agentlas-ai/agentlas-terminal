@@ -13,6 +13,8 @@
 
 /** Live-credential shapes across the providers this product actually touches. */
 const SECRET_SHAPES = [
+  // Company-only Native device credentials.
+  /agcni_v1_[A-Za-z0-9_-]{43}/,
   // GitHub: classic PAT, OAuth/user/server/refresh tokens, fine-grained PAT.
   /gh[pousr]_[A-Za-z0-9]{20,}/,
   /github_pat_[A-Za-z0-9_]{20,}/,
@@ -61,7 +63,9 @@ function looksSecret(content) {
 
 /** Replace credential-shaped substrings with a marker, preserving surrounding text. */
 function redactSecrets(content, marker = "[redacted-secret]") {
-  let out = String(content || "");
+  // A private key is a multiline block: masking only its BEGIN header left the key body visible in tool results and
+  // memory (Desktop shared/secret-patterns.ts masks the whole block). A header with no END line keeps the header rule.
+  let out = String(content || "").replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/gi, marker);
   for (const re of SECRET_PATTERNS) {
     out = out.replace(new RegExp(re.source, re.flags.includes("g") ? re.flags : `${re.flags}g`), marker);
   }

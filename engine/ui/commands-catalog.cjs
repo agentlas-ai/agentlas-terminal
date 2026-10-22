@@ -92,7 +92,8 @@ const CATALOG = [
 
   // ── 8 knowledge ───────────────────────────────────────────────────────────
   { name: "ontology", group: "knowledge", tier: "more", surfaces: BOTH, args: "[status|list|add <path>]", argsKo: "[status|list|add <경로>]", ko: "이 프로젝트가 읽을 지식 소스 등록", en: "Register the knowledge sources this project may read" },
-  { name: "context", group: "knowledge", tier: "more", surfaces: BOTH, args: "<locate|slice|impact|...>", ko: "코드 의존성 맵 (Agentlas OS Core 필요)", en: "Code dependency map (requires Agentlas OS Core)" },
+  { name: "context", group: "knowledge", tier: "more", surfaces: BOTH, args: "<locate|slice|...|window>", ko: "코드 의존성 맵 · window: 대화의 컨텍스트 창 점유", en: "Code dependency map · window: chat context usage" },
+  { name: "thread", group: "knowledge", tier: "more", surfaces: BOTH, args: "<list|read|status> [chat]", argsKo: "<list|read|status> [대화]", ko: "Desktop과 같은 대화·실행 기록 보기", en: "Conversations and runs, same view as Desktop" },
   { name: "memory", group: "knowledge", tier: "more", surfaces: BOTH, args: "<sub>", ko: "메모리", en: "Memory" },
   { name: "evolve", group: "knowledge", tier: "more", surfaces: BOTH, args: "<command>", ko: "파일 변경안과 버전 검토", en: "Review agent file changes and revisions" },
 

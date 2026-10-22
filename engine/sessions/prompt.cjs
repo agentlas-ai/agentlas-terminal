@@ -2,11 +2,11 @@
 /*
  * sessions/prompt — 세션 턴의 시스템 프롬프트 조립 (데스크탑 러너 동형).
  *
- * 조립 순서(v1 augmentSystem과 동일):
- *   언어/말투 지시 → 에이전트 시스템 프롬프트 → 전역 연결 스킬 →
- *   거버넌스 메모리 컨텍스트(프로젝트 soul + Context Map 슬라이스 + scoped timeline) →
- *   메모리 이미터(항상 150토큰 이하 코어; 메모리 의도 감지 시에만 전체 스키마) →
- *   자격증명 인덱스 리마인더(배포/결제/인증 의도 시에만).
+ * 조립 순서(고정 → 변동, docs/PROMPT-COMPOSITION-POLICY.md):
+ *   말투 지시 → 전역 연결 스킬 → 메모리 이미터(항상 150토큰 이하 코어; 메모리 의도 시에만 전체 스키마) →
+ *   자격증명 인덱스 리마인더(배포/결제/인증 의도 시에만) → 에이전트 시스템 프롬프트 → One 지시문 →
+ *   언어 지시 → 도구 접근 고지 → 거버넌스 메모리 컨텍스트(프로젝트 soul + Context Map 슬라이스 + scoped timeline) →
+ *   이미터 턴 바인딩(turn_id/permission).
  *
  * 계약(memory-prompt-budget 테스트가 고정):
  *  - TERMINAL_MEMORY_CORE는 150토큰(≈byte/3) 이하. 평상시 턴은 코어만 받는다.
@@ -16,18 +16,22 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { loadArch, tableExists, columnExists } = require("../core/db.cjs");
 const { userDataDir } = require("../core/paths.cjs");
-const { responseDirective } = require("../agentlas-style.cjs");
+const { responseLanguageDirective, responseStyleDirective } = require("../agentlas-style.cjs");
 const memoryGovernance = require("../agentlas-memory-governance.cjs");
 const { resolveContextMapCoreRoot, captureCoreJsonSync } = require("../agentlas-core-harness.cjs");
+const { composeDeclaredPrompt } = require("../prompt-order.cjs");
 
 const TERMINAL_MEMORY_CORE_MAX_TOKENS = 150;
+// The automatic receipt is one English sentence (owner decisions 06 D11, same meaning as the Desktop memory-ticket
+// turn_summary); candidates are an optional explicit proposal, never a per-turn obligation — the host's automatic
+// intake reads the reply itself. The Terminal wire (turn_id, observation) stays as it was.
 const TERMINAL_MEMORY_CORE = [
   "## Memory governance",
-  "End every completed reply with hidden `## Memory Events` plus fenced JSON:",
-  '{"turn_id":"<stable-id>","observation":{"outcome":"completed","summary":"safe short outcome"},"candidates":[]}',
-  "Candidates 0..N: memory_kind,content,suggested_scope,confidence.",
-  "Scopes: user_global|team|agent|project|session|discard.",
-  "No raw prompts/transcripts, secrets, logs, or absolute paths. Curator suggests; deterministic gates decide writes.",
+  "end each reply: hidden `## Memory Events` + fenced JSON:",
+  '{"turn_id":"<stable-id>","observation":{"outcome":"completed","summary":"<one English sentence>"}}',
+  'optional "candidates" only for a durable learning: memory_kind,content,suggested_scope,confidence',
+  "scope: user_global|team|agent|project|session|discard",
+  "never: raw prompts/transcripts, secrets, logs, absolute paths. gates decide writes",
 ].join("\n");
 const MEMORY_DETAIL_RE = /\b(?:remember|memory|save this|record this|memory event)\b|기억|메모리|저장해|기록해|남겨/i;
 const CREDENTIAL_INDEX_RE = /\b(?:deploy|release|billing|auth|oauth|credential|api key|secret key|cloud)\b|배포|릴리스|출시|결제|인증|자격 증명|API\s*키|시크릿|클라우드/i;
@@ -96,6 +100,35 @@ if (approximatePromptTokens(TERMINAL_MEMORY_CORE) > TERMINAL_MEMORY_CORE_MAX_TOK
   throw new Error("Terminal always-on memory core exceeds 150 tokens");
 }
 
+// 이미터를 고정(코어+상세)과 턴 바인딩(turn_id/permission)으로 나눈다. 바인딩은 턴마다 달라
+// 프롬프트 맨 끝으로 가고, 고정 부분은 앞쪽 캐시 가능 구간에 놓인다.
+// The output contract (format line + JSON template) closes the prompt with the turn binding (final-boundary):
+// measured 2026-10-14, with it near the top Claude followed a later global "## Memory events" block and dropped
+// turn_id 3 of 3 times; codex kept it either way. The rest of the governance core stays in the fixed prefix.
+const TERMINAL_MEMORY_OUTPUT_CONTRACT = TERMINAL_MEMORY_CORE.split("\n").slice(1, 3).join("\n");
+const TERMINAL_MEMORY_GOVERNANCE = [TERMINAL_MEMORY_CORE.split("\n")[0], ...TERMINAL_MEMORY_CORE.split("\n").slice(3)].join("\n");
+function memoryEmitterParts(request, arch = loadArch(), turnId = null, permission = "write") {
+  const stableId = String(turnId || "").replace(/[^A-Za-z0-9:._-]/g, "").slice(0, 160);
+  let binding = TERMINAL_MEMORY_OUTPUT_CONTRACT;
+  if (stableId) {
+    binding += `\nturn_id: ${stableId}\npermission: ${permission === "read" ? "receipt-only" : "curated-write"}`;
+  }
+  let fixed = TERMINAL_MEMORY_GOVERNANCE, detail = "";
+  if (MEMORY_DETAIL_RE.test(String(request || ""))) {
+    const kinds = Array.isArray(arch?.kinds) && arch.kinds.length ? arch.kinds.join("|") : "fact|decision|preference|risk|procedure";
+    detail = [
+      `memory_kind: ${kinds}`,
+      "global: needs explicit owner authorization, suggest only",
+      "no request_context; observation.summary: one English sentence",
+    ].join("\n");
+    fixed += `\n${detail}`;
+  }
+  // `contract` / `turnBinding` are the two halves of `binding`, for a retained native session (augmentSystemParts).
+  const turnBinding = stableId ? `turn_id: ${stableId}\npermission: ${permission === "read" ? "receipt-only" : "curated-write"}` : "";
+  // A request-dependent detail is turn content for a retained session (augmentSystemParts); `fixed` keeps it for one request.
+  return { fixed, binding, governance: TERMINAL_MEMORY_GOVERNANCE, detail, contract: TERMINAL_MEMORY_OUTPUT_CONTRACT, turnBinding };
+}
+
 function memoryEmitterPromptFor(request, arch = loadArch(), turnId = null, permission = "write") {
   const stableId = String(turnId || "").replace(/[^A-Za-z0-9:._-]/g, "").slice(0, 160);
   let prompt = TERMINAL_MEMORY_CORE;
@@ -106,9 +139,9 @@ function memoryEmitterPromptFor(request, arch = loadArch(), turnId = null, permi
   const kinds = Array.isArray(arch?.kinds) && arch.kinds.length ? arch.kinds.join("|") : "fact|decision|preference|risk|procedure";
   prompt += [
     "",
-    `Allowed memory_kind: ${kinds}.`,
-    "Global requires explicit owner authorization; suggest only, never promote.",
-    "Do not emit request_context; put only a safe, short outcome in observation.",
+    `memory_kind: ${kinds}`,
+    "global: needs explicit owner authorization, suggest only",
+    "no request_context; observation.summary: one English sentence",
   ].join("\n");
   return prompt;
 }
@@ -259,42 +292,86 @@ function loadOneDirective() {
 /** [튜닝값, 근거 없음] — 현재 정본 지시문이 약 3.7KB 라 두 배 여유를 둔다. */
 const ONE_DIRECTIVE_MAX_CHARS = 8000;
 
-function augmentSystem(db, baseSystem, ctx, withEmitter, request = "") {
+/**
+ * Declared modules of the session prompt (docs/PROMPT-COMPOSITION-POLICY.md; ledger terminal.session.turn.system,
+ * terminal.session.native.stable, terminal.session.native.turn-context). Each module names its lifetime and what changes
+ * it; composeDeclaredPrompt (prompt-order.cjs, generated from the Desktop canonical prompt-order.ts) orders them
+ * fixed → variable with the closing output contract last. A request-matched block (memory detail, credential reminder)
+ * is turn content: present on some requests only, so it sits below the fixed and configured modules.
+ */
+const SESSION_PROMPT_MODULES = Object.freeze({
+  style: { id: "terminal.session.style", stability: "fixed-policy", changeTriggers: ["release"] },
+  connection: { id: "terminal.session.connection-skill", stability: "fixed-policy", changeTriggers: ["release"] },
+  governance: { id: "terminal.session.memory-governance", stability: "fixed-policy", changeTriggers: ["release"] },
+  agent: { id: "terminal.session.agent-instructions", stability: "versioned-content", changeTriggers: ["agent-instructions"] },
+  one: { id: "terminal.session.one-directive", stability: "versioned-content", changeTriggers: ["owner-profile"] },
+  language: { id: "terminal.session.language", stability: "configuration", changeTriggers: ["locale"] },
+  toolNotice: { id: "terminal.session.tool-access-notice", stability: "configuration", changeTriggers: ["capability-inventory", "permission"] },
+  memoryDetail: { id: "terminal.session.memory-detail", stability: "turn-context", changeTriggers: ["owner-input"], order: 0 },
+  credential: { id: "terminal.session.credential-reminder", stability: "turn-context", changeTriggers: ["owner-input"], order: 1 },
+  recall: { id: "terminal.session.memory-recall", stability: "turn-context", changeTriggers: ["retrieval", "project-instructions"], order: 2 },
+  contract: { id: "terminal.session.memory-output-contract", stability: "final-boundary", changeTriggers: ["release", "permission", "owner-input"] },
+  sessionContract: { id: "terminal.session.memory-output-contract.session", stability: "final-boundary", changeTriggers: ["release"] },
+  turnBinding: { id: "terminal.session.turn-binding", stability: "final-boundary", changeTriggers: ["permission", "owner-input"] },
+});
+const sessionPart = (key, text) => ({ ...SESSION_PROMPT_MODULES[key], text: text || "" });
+
+/**
+ * The session prompt in the three shapes a turn can need (docs/PROMPT-COMPOSITION-POLICY.md):
+ *  - `joined`: one request (fresh or stateless runtime) — the memory output contract and this turn's binding close it
+ *    (augmentSystem returns exactly this);
+ *  - `stable` + `turn`: a retained native session. `stable` keeps the same bytes every spawn and ends with the output
+ *    contract ("turn_id: given in each turn's context"); `turn` carries what changes per turn — this request's credential
+ *    reminder, recalled memory and the turn_id/permission lines — as turn context in front of the user message.
+ * Measured 2026-10-14 with random turn ids: a resumed Claude turn without system text kept guessing the previous id (0/4);
+ * re-appending the whole prompt with the new id in the system tail also failed (0/2); a Codex thread keeps the
+ * developer instructions it started with, so an id there sticks (0/5 on resume). The split shape passed 3/3 resumed turns
+ * on Claude and on Codex (Codex reads `stable` as developer_instructions; in the user message it ignored the contract).
+ */
+function augmentSystemParts(db, baseSystem, ctx, withEmitter, request = "") {
   const arch = loadArch();
-  let sys = baseSystem || "";
-  // 언어/말투 지시를 맨 앞에 둔다. imported/cloud/company agents도 같은 전역 계약을 따른다.
+  // imported/cloud/company agents follow the same global contract.
   const lang = (ctx && ctx.lang) || "en";
-  sys = responseDirective(lang) + (sys ? "\n\n" + sys : "");
-  const connectionSkill = loadGlobalConnectionSkill();
-  if (connectionSkill) sys += "\n\n" + connectionSkill;
-  // Agentlas One 이 켜져 있으면 그 지시문을 싣는다. R4 기준 터미널의 "매 턴 주입 지점"이 여기다.
-  // 정본은 `~/.agentlas/one/directive.md` 하나 — CLAUDE.md/AGENTS.md 의 마커 블록은 그 사본이다.
+  const emitter = withEmitter ? memoryEmitterParts(request, arch, ctx && ctx.turnId, ctx && ctx.permission) : null;
+  const credentialReminder = withEmitter ? credentialIndexReminderFor(request) : "";
+  // Agentlas One's directive when it is on (canonical `~/.agentlas/one/directive.md`; CLAUDE.md/AGENTS.md blocks copy it).
   const oneDirective = loadOneDirective();
-  if (oneDirective) sys += "\n\n" + oneDirective;
-  const mem = cliMemoryContext(db, ctx && ctx.projectPath, ctx && ctx.agentId, request);
-  if (mem) sys += "\n\n" + mem;
-  // 도구 접근 고지 — 터미널에는 이게 아예 없었다. 도구가 붙지 않은 턴에서 CLI는 아무
-  // 말도 하지 않았고, 에이전트는 "이 기계엔 도구가 없다"고 단정하거나 없는 도구를
-  // 불렀다. Desktop `shared/tool-access-notice.ts`와 같은 문장을 낸다(패리티 테스트로 고정).
-  //
-  // ★메모리 블록보다 **앞**에 둔다. 메모리 코어 예산은 `## Memory` 이후를 잘라서 재므로
-  // (test/memory-prompt-budget.cjs), 뒤에 붙이면 도구 고지가 메모리 예산으로 잘못 계산된다.
-  // 고지는 메모리 블록의 일부가 아니다.
+  // Tool access notice: the same sentence as Desktop `shared/tool-access-notice.ts` (parity test). A turn without tools
+  // says so instead of staying silent; a failure never blocks the turn.
+  let toolNotice = "";
   try {
     const { buildToolAccessNotice } = require("../tools/access-notice.cjs");
-    sys += "\n\n" + buildToolAccessNotice({
+    toolNotice = buildToolAccessNotice({
       availableTools: (ctx && Array.isArray(ctx.availableTools)) ? ctx.availableTools : [],
-      // 터미널은 Hub 카탈로그를 hephaestus-network MCP로만 본다. 그 서버가 이번 턴에
-      // 붙지 않았으면 "찾아보라"고 말하면 안 된다 — 부를 수 없는 도구를 안내하는 셈이다.
+      // The Hub catalog is reachable only through the hephaestus-network MCP; without it this turn, never point there.
       hubCatalogAvailable: Boolean(ctx && ctx.hubCatalogAvailable),
     });
-  } catch { /* 고지 실패가 턴을 막지 않는다 */ }
-  if (withEmitter) {
-    sys += "\n\n" + memoryEmitterPromptFor(request, arch, ctx && ctx.turnId, ctx && ctx.permission);
-    const credentialReminder = credentialIndexReminderFor(request);
-    if (credentialReminder) sys += "\n\n" + credentialReminder;
-  }
-  return sys;
+  } catch { /* notice failure never blocks the turn */ }
+  const recall = cliMemoryContext(db, ctx && ctx.projectPath, ctx && ctx.agentId, request);
+  const fixedAndConfigured = [
+    sessionPart("style", responseStyleDirective()),
+    sessionPart("connection", loadGlobalConnectionSkill()),
+    sessionPart("governance", emitter ? emitter.governance : ""),
+    sessionPart("agent", baseSystem),
+    sessionPart("one", oneDirective),
+    sessionPart("language", responseLanguageDirective(lang)),
+    sessionPart("toolNotice", toolNotice),
+  ];
+  const turnParts = [
+    sessionPart("memoryDetail", emitter ? emitter.detail : ""),
+    sessionPart("credential", credentialReminder),
+    sessionPart("recall", recall),
+  ];
+  return {
+    joined: composeDeclaredPrompt([...fixedAndConfigured, ...turnParts, sessionPart("contract", emitter ? emitter.binding : "")]),
+    stable: composeDeclaredPrompt([...fixedAndConfigured,
+      sessionPart("sessionContract", emitter ? `${emitter.contract}\nturn_id: given in each turn's context` : "")]),
+    turn: composeDeclaredPrompt([...turnParts, sessionPart("turnBinding", emitter ? emitter.turnBinding : "")]),
+  };
+}
+
+function augmentSystem(db, baseSystem, ctx, withEmitter, request = "") {
+  return augmentSystemParts(db, baseSystem, ctx, withEmitter, request).joined;
 }
 
 module.exports = {
@@ -306,6 +383,8 @@ module.exports = {
   cliMemoryContext,
   cliProjectContextSlice,
   augmentSystem,
+  augmentSystemParts,
+  SESSION_PROMPT_MODULES,
   loadGlobalConnectionSkill,
   readBoundedText,
 };

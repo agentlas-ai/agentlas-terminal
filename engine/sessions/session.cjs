@@ -20,6 +20,10 @@ const { roleMembers } = require("../runtimes/roles.cjs");
 const { EventSink } = require("./sink.cjs");
 const store = require("./store.cjs");
 const memoryTurn = require("./memory-turn.cjs");
+const generation = require("./generation.cjs");
+const turnOutcome = require("./turn-outcome.cjs");
+const i18n = require("../agentlas-i18n.cjs");
+const { composeDeclaredPrompt } = require("../prompt-order.cjs");
 
 const RING_LIMIT = 2000;
 const RING_BYTE_LIMIT = 8 * 1024 * 1024;
@@ -30,30 +34,19 @@ function eventBytes(event) {
 }
 
 /**
- * Provider resume ids belong to the model that created them. Effort and other
- * per-turn controls can safely change on the same thread, but a model switch
- * must start a fresh provider session and let Agentlas history preserve the
- * visible conversation. Otherwise the CLI receives `--model new` together
- * with `--resume old-session` and the dashboard selection is not authoritative.
+ * The native binding identity (sessions/generation.cjs, native-harness NH12): runtime kind + agent, plus the declared
+ * vendor limits (ACP permission mode fixed at session/new; gemini/agy conversations owned by their model). A model,
+ * prompt or agent-revision change keeps the conversation: Claude/Codex/ACP resume with `--model` / a held-session model
+ * switch, and changed instructions reach a resumed session as one current-version block (Desktop agent-context.ts
+ * keeps the model out of the native binding the same way).
  */
 function runtimeSessionFingerprint(runtime, agent, permission) {
-  const digest = crypto.createHash("sha256")
-    .update("agentlas-terminal-runtime-session.v2\0")
-    .update(String((runtime && runtime.kind) || ""))
-    .update("\0model\0")
-    .update(String((runtime && runtime.model) || ""))
-    .update("\0agent\0")
-    .update(String((agent && agent.id) || ""))
-    .update("\0prompt\0")
-    .update(String((agent && agent.systemPrompt) || ""))
-    .update("\0revision\0")
-    .update(String((agent && agent.revisionId) || ""));
-  // ACP chooses its session mode at session/new. Unlike native Codex/Claude
-  // flags, a later turn cannot safely retrofit that mode onto an old id.
-  if (ACP_RUNTIME_KINDS.has(runtime && runtime.kind)) {
-    digest.update("\0permission\0").update(permissions.normalize(permission));
-  }
-  return digest.digest("hex");
+  return generation.bindingIdentity({
+    kind: runtime && runtime.kind,
+    model: runtime && runtime.model,
+    agentId: agent && agent.id,
+    permission: ACP_RUNTIME_KINDS.has(runtime && runtime.kind) ? permissions.normalize(permission) : null,
+  });
 }
 
 class Session extends EventEmitter {
@@ -75,6 +68,9 @@ class Session extends EventEmitter {
     this.status = "idle"; // idle | running | done | failed | killed
     this.lastLine = "";
     this.lastError = null;
+    // True once a renderer drew this turn's failure as a line of its own (a failure-marked `warn` event), so a surface that
+    // also prints lastError does not say it twice. Cleared at the next turn's start.
+    this.lastErrorAnnounced = false;
     this._privateRecoveryEvidence = [];
     this.startedAt = null;
     this.endedAt = null;
@@ -114,8 +110,7 @@ class Session extends EventEmitter {
       } catch { /* kind 열이 없는 구형 DB — user 취급(레거시 NULL=user 계약) */ }
     }
 
-    this.fingerprint = runtimeSessionFingerprint(this.runtime, this.agent, this.permission);
-    this.runtimeSession = store.loadRuntimeSession(this.db, this.chatId, this.runtime.kind, this.fingerprint, this.agent.id);
+    this._loadNativeBinding();
 
     this._sink = new EventSink({
       lang: this.lang,
@@ -126,6 +121,15 @@ class Session extends EventEmitter {
         if (this._privateRecoveryEvidence.length > 16) this._privateRecoveryEvidence.shift();
       },
     });
+  }
+
+  /** The (chat, kind, agent) native binding: generation, provider id (resumable kinds only), delivered instructions. */
+  _loadNativeBinding() {
+    this.fingerprint = runtimeSessionFingerprint(this.runtime, this.agent, this.permission);
+    this.nativeBinding = store.loadNativeBinding(this.db, this.chatId, this.runtime.kind, this.agent.id, this.fingerprint);
+    // The gemini adapter cannot resume: a stored id is never handed back (every turn replays the journal).
+    this.runtimeSession = this.nativeBinding.id && generation.NATIVE_RESUME_KINDS.has(this.runtime.kind)
+      ? { id: this.nativeBinding.id } : {};
   }
 
   _record(ev) {
@@ -281,8 +285,7 @@ class Session extends EventEmitter {
       const expected = workspace.files.find((file) => file.path === workspace.canonicalEntry);
       if (!expected || entry.binary || entry.blobHash !== expected.blobHash) throw new Error("agent_revision_changed: canonical instructions no longer match the pinned revision");
       this.agent = { ...this.agent, systemPrompt: entry.content, revisionId: lease.revisionId };
-      this.fingerprint = runtimeSessionFingerprint(this.runtime, this.agent, this.permission);
-      this.runtimeSession = store.loadRuntimeSession(this.db, this.chatId, this.runtime.kind, this.fingerprint, this.agent.id);
+      this._loadNativeBinding();
       if (this.status === "killed") return { text: "", error: "session killed" };
       revisionReceipt = { agentId: this.agent.id, runId, revisionId: lease.revisionId, treeDigest: lease.treeDigest };
       require("../agent-workspace.cjs").recordRevisionRun(this.db, { ...revisionReceipt, status: "started" });
@@ -303,13 +306,29 @@ class Session extends EventEmitter {
   }
 
   async _executeTurn(prompt) {
+    const core = require("../core/desktop-core.cjs").loadDesktopCore();
+    const run = () => this._executeBoundTurn(prompt, core);
+    if (!core || core.error || typeof core.getMemoryStoreInfo !== "function") return run();
+    return require("../core/memory-owner-binding.cjs").withBinding(core, () => {
+      return typeof core.withModelCallScope === "function"
+        ? core.withModelCallScope({ runId: this._activeRunId || undefined, chatId: this.chatId, agentId: this.agent.id }, run)
+        : run();
+    });
+  }
+
+  async _executeBoundTurn(prompt, core) {
     const runtimeSessionAtTurnStart = {
       kind: this.runtime.kind,
       id: this.runtimeSession && this.runtimeSession.id ? String(this.runtimeSession.id) : "",
     };
+    // The binding state this turn started from: its ACK (and a rotation) may only advance exactly this row.
+    let bindingAtTurnStart = { ...this.nativeBinding };
+    let deliveredInstructions = this.nativeBinding.instructionsDigest;
     this.status = "running";
     this.startedAt = Date.now();
     this.lastError = null;
+    this.lastErrorAnnounced = false;
+    this._sink.resetToolOutcomes();
     this._privateRecoveryEvidence.length = 0;
     this._record({ type: "turn-start", at: Date.now(), prompt });
     // ACP agents that cannot load a provider-side session need prior conversation
@@ -334,8 +353,11 @@ class Session extends EventEmitter {
     // 거버넌스 메모리 컨텍스트 + 메모리 이미터 코어(+의도 시 전체 스키마/자격증명 리마인더).
     // projectPath는 명시 초기화(.agentlas 존재) 프로젝트만 — project init 경계 유지.
     let systemPrompt = this.agent.systemPrompt || "";
+    // A retained native session gets the session-stable part as its system text and this turn's part as turn context
+    // (prompt.cjs augmentSystemParts); one-shot runtimes keep the joined prompt.
+    let systemPromptStable = "", turnContext = "";
     try {
-      const { augmentSystem } = require("./prompt.cjs");
+      const { augmentSystemParts } = require("./prompt.cjs");
       const projectPath = governedTurn ? governedTurn.projectPath : memoryTurn.initializedProjectPath(this.cwd);
       // 이번 턴에 실제로 붙는 도구를 고지에 넘긴다. 권한이 낮아 목록을 읽지 않는 턴은
       // 빈 배열이 되고, 고지는 "붙은 도구가 없다"고 정확히 말한다 — 침묵하지 않는다.
@@ -343,7 +365,7 @@ class Session extends EventEmitter {
       const toolNames = consentedServers
         .map((server) => String((server && (server.name || server.id)) || "").trim())
         .filter(Boolean);
-      systemPrompt = augmentSystem(this.db, systemPrompt, {
+      const augmented = augmentSystemParts(this.db, systemPrompt, {
         lang: this.lang,
         projectPath,
         agentId: this.agent.id,
@@ -353,6 +375,7 @@ class Session extends EventEmitter {
         // Hub 카탈로그는 hephaestus-network MCP를 통해서만 보인다.
         hubCatalogAvailable: toolNames.some((name) => /hephaestus[-_]?network|agentlas/i.test(name)),
       }, true, prompt);
+      systemPrompt = augmented.joined; systemPromptStable = augmented.stable; turnContext = augmented.turn;
     } catch { /* 프롬프트 증강 실패는 턴을 막지 않는다 — 원 프롬프트로 진행 */ }
 
     const signal = this._apiAbort.signal;
@@ -364,23 +387,51 @@ class Session extends EventEmitter {
           signal: options.signal ? AbortSignal.any([signal, options.signal]) : signal }) });
     }
     const episodeResults = [];
+    const sourceRunner = (fn) => typeof core?.withMemorySourceRunner === "function" ? core.withMemorySourceRunner(fn) : fn;
     const runOnce = async (controlRequest) => {
       this._ownerControl?.assertOwned();
       if (signal.aborted) throw new Error("session killed");
       let result;
       if (this.runtime.kind === "ollama") {
         const apiTurn = this._apiTurnImpl || require("../agentlas-api-agent.cjs").runApiTurn;
-        result = await apiTurn({ backend: "ollama", model: ollamaChoice.model, system: systemPrompt,
+        result = await sourceRunner(apiTurn)({ backend: "ollama", model: ollamaChoice.model, system: systemPrompt,
           messages: [...controlRequest.history.map(row => ({ role: row.role, content: row.text })),
             { role: "user", content: controlRequest.userPrompt }],
           ctx: { cwd: this.cwd, permission: this.permission, env: process.env, signal,
             db: this.db, chatId: this.chatId, agentId: this.agent.id }, ui: this._sink, signal });
       } else {
+        const kind = this.runtime.kind;
+        const windowTokens = generation.contextWindowTokens(kind, this.runtime.model);
+        const resuming = generation.NATIVE_RESUME_KINDS.has(kind)
+          && Boolean(controlRequest.runtimeSessionId || (this.runtimeSession && this.runtimeSession.id));
+        const stableDigest = generation.instructionsDigest(systemPromptStable);
+        // A resumed session that keeps its first system text gets changed instructions once, as the current version.
+        const instructionsUpdate = resuming && stableDigest && generation.INSTRUCTIONS_FIXED_AT_START_KINDS.has(kind)
+          && stableDigest !== deliveredInstructions ? generation.instructionsBlock(systemPromptStable) : "";
+        // A fresh generation (or a host-replay runtime) starts from the journal, not from nothing. The shared ACP runner
+        // renders `history` itself on a fresh session.
+        const journalSeed = !resuming && systemPromptStable && !ACP_RUNTIME_KINDS.has(kind)
+          ? generation.renderJournalSeed(this._journalHistory(controlRequest.history), this.lang, windowTokens) : "";
+        const callTurnContext = systemPromptStable ? composeDeclaredPrompt([
+          { id: "terminal.session.instructions-update", stability: "versioned-content", changeTriggers: ["agent-instructions"], text: instructionsUpdate },
+          { id: "terminal.session.journal-seed", stability: "task-context", changeTriggers: ["checkpoint", "runtime"], text: journalSeed },
+          { id: "terminal.session.turn-part", stability: "turn-context", changeTriggers: ["owner-input", "retrieval", "permission"], text: turnContext },
+        ]) : turnContext;
+        if (systemPromptStable && (!resuming || instructionsUpdate || !generation.INSTRUCTIONS_FIXED_AT_START_KINDS.has(kind))) {
+          deliveredInstructions = stableDigest;
+        }
         const req = { kind: this.runtime.kind, bin: this.runtime.bin, ui: this._sink, cwd: this.cwd,
           prompt: controlRequest.userPrompt, systemPrompt, permission: this.permission,
+          ...(systemPromptStable ? { systemPromptStable, turnContext: callTurnContext } : {}),
+          compactTokenLimit: generation.nativeCompactionLimit(windowTokens),
+          ...(generation.HOST_REPLAY_KINDS.has(kind) && journalSeed ? { historySeed: journalSeed } : {}),
           session: { ...this.runtimeSession, ...(controlRequest.runtimeSessionId ? { id: controlRequest.runtimeSessionId } : {}) },
           history: controlRequest.history, chatId: this.chatId, agentId: this.agent.id, locale: this.lang,
-          sessionFingerprintSeed: this.fingerprint, model: this.runtime.model, effort: this.runtime.effort,
+          // The shared store: ACP permission requests are answered from its capability rules (acp-driver arbiter).
+          db: this.db,
+          // The generation is part of the seed: the shared ACP runner keys its stored session and resident pool by it.
+          sessionFingerprintSeed: `${this.fingerprint}:g${this.nativeBinding.generation}`,
+          model: this.runtime.model, effort: this.runtime.effort,
           mcpServers: this._consentedMcpServers(), signal, onSpawn: child => {
             this._child = child;
             this._nativeChildren.add(child);
@@ -391,18 +442,54 @@ class Session extends EventEmitter {
           },
           ...(this._spawnImpl ? { spawn: this._spawnImpl } : {}),
           ...(this._timeoutConfig ? { timeoutConfig: this._timeoutConfig } : {}) };
-        result = await nativeHost.runNativeTurn(req);
+        result = await sourceRunner(nativeHost.runNativeTurn)(req);
+        // A resumed conversation that no longer exists (agy silently started a new one; claude has no such session)
+        // and proved no effect: retire the binding to the next generation and run this same turn once fresh, seeded
+        // from the journal — the fresh-generation path, never a replay of anything that acted.
+        if (resuming && result?.errorCode === "session_not_found" && result.sessionGoneBeforeEffects === true
+          && this.status !== "killed" && !signal.aborted) {
+          const from = { ...this.nativeBinding };
+          const next = { identity: this.fingerprint, generation: from.generation + 1, sessionId: "", instructionsDigest: null };
+          if (store.saveNativeBinding(this.db, this.chatId, kind, this.agent.id, next, bindingAtTurnStart)) {
+            this._record({ type: "session-generation", at: Date.now(), runtime: kind, fromGeneration: from.generation,
+              toGeneration: next.generation, reason: "session_not_found", inputTokens: null, contextWindowTokens: windowTokens });
+            this._loadNativeBinding();
+            bindingAtTurnStart = { ...this.nativeBinding };
+            this.runtimeSession = {};
+            const freshSeed = systemPromptStable && !ACP_RUNTIME_KINDS.has(kind)
+              ? generation.renderJournalSeed(this._journalHistory(controlRequest.history), this.lang, windowTokens) : "";
+            deliveredInstructions = generation.instructionsDigest(systemPromptStable);
+            result = await sourceRunner(nativeHost.runNativeTurn)({ ...req, session: {},
+              ...(systemPromptStable ? { turnContext: composeDeclaredPrompt([
+                { id: "terminal.session.journal-seed", stability: "task-context", changeTriggers: ["checkpoint", "runtime"], text: freshSeed },
+                { id: "terminal.session.turn-part", stability: "turn-context", changeTriggers: ["owner-input", "retrieval", "permission"], text: turnContext },
+              ]) } : {}),
+              ...(generation.HOST_REPLAY_KINDS.has(kind) && freshSeed ? { historySeed: freshSeed } : {}),
+              sessionFingerprintSeed: `${this.fingerprint}:g${this.nativeBinding.generation}` });
+          }
+        }
         // Non-interactive recovery retains its original scoped authority. The
         // common interactive invocation never replays a failed provider effect.
         if (!this._ownerControl && result?.error && this.status !== "killed") {
           const nextRuntime = this._nextRecoveryRuntime();
           if (nextRuntime) {
             this.runtime = nextRuntime;
+            this._loadNativeBinding();
             this.runtimeSession = {};
-            this.fingerprint = runtimeSessionFingerprint(nextRuntime, this.agent, this.permission);
-            result = await nativeHost.runNativeTurn({ ...req, kind: nextRuntime.kind, bin: nextRuntime.bin,
+            bindingAtTurnStart = { ...this.nativeBinding };
+            deliveredInstructions = generation.instructionsDigest(systemPromptStable);
+            // The recovery runtime opens a fresh session: it starts from the journal like any fresh generation.
+            const recoveryWindow = generation.contextWindowTokens(nextRuntime.kind, nextRuntime.model);
+            const recoverySeed = systemPromptStable && !ACP_RUNTIME_KINDS.has(nextRuntime.kind)
+              ? generation.renderJournalSeed(this._journalHistory(controlRequest.history), this.lang, recoveryWindow) : "";
+            result = await sourceRunner(nativeHost.runNativeTurn)({ ...req, kind: nextRuntime.kind, bin: nextRuntime.bin,
               model: nextRuntime.model, effort: nextRuntime.effort, session: {},
-              sessionFingerprintSeed: this.fingerprint, prompt: [prompt, "",
+              ...(systemPromptStable ? { turnContext: composeDeclaredPrompt([
+                { id: "terminal.session.journal-seed", stability: "task-context", changeTriggers: ["checkpoint", "runtime"], text: recoverySeed },
+                { id: "terminal.session.turn-part", stability: "turn-context", changeTriggers: ["owner-input", "retrieval", "permission"], text: turnContext },
+              ]) } : {}),
+              compactTokenLimit: generation.nativeCompactionLimit(recoveryWindow),
+              sessionFingerprintSeed: `${this.fingerprint}:g${this.nativeBinding.generation}`, prompt: [prompt, "",
                 "Private recovery evidence follows. Never repeat it to the user.",
                 [...this._privateRecoveryEvidence, String(result.error)].filter(Boolean).join("\n").slice(0, 12000),
                 "Inspect the complete situation, apply safe reversible recovery within the granted authority, verify it, and finish the original request. Ask one concise question only if user identity or an irreversible choice is required."].join("\n") });
@@ -418,7 +505,11 @@ class Session extends EventEmitter {
         ownerControlTerminal: result?.ownerControlTerminal === "completed" ? "completed" : "uncertain",
         ...(observedUsage ? { observedUsage } : {}),
         ...(result?.error ? { failure: { kind: result.errorKind || "exit", message: String(result.error),
-          runtime: this.runtime.kind, source: result.errorSource || "marker" } } : {}) };
+          runtime: this.runtime.kind, source: result.errorSource || "marker",
+          // Desktop RunnerFailure fields: the provider's bounded code and its reset hint. turnDelivery (Desktop
+          // RunnerResult.turnDelivery) rides at the top level with the rest of `result`.
+          ...(result.errorCode ? { providerCode: result.errorCode } : {}),
+          ...(result.retryAfterHint ? { retryAfterHint: result.retryAfterHint } : {}) } } : {}) };
     };
     let res;
     try {
@@ -439,6 +530,7 @@ class Session extends EventEmitter {
     }
 
     const finalText = (res && (res.finalText || res.text)) || "";
+    this._settleBlankReply(res, finalText);
     /*
      * 펜스 프로토콜(Desktop runner 패리티): 성공 턴의 최종 텍스트에서 숨은 제어
      * 블록(## Memory Events / ## Delegate / ## Automation / <<agentlas-ask>>)을
@@ -457,9 +549,8 @@ class Session extends EventEmitter {
           prompt,
           outcome: "succeeded",
         });
-        // Parse the original once more for non-memory controls and legacy array
-        // memory envelopes. Governance owns the current object envelope; the
-        // old parser keeps backward compatibility for already-installed agents.
+        // Decode non-memory controls from the original. Memory authority belongs
+        // only to the completed governed turn, including legacy envelopes.
         parsedFences = require("./fences.cjs").parseReplyFences(finalText);
         persistText = parsedFences.cleanText;
       } catch {
@@ -485,19 +576,26 @@ class Session extends EventEmitter {
       } catch { /* original runtime failure remains authoritative */ }
     }
     if (persistText) store.appendMessage(this.db, this.chatId, "assistant", persistText);
-    if (res && res.session && res.session.id) {
-      this.runtimeSession = { id: res.session.id };
-      store.saveRuntimeSession(
-        this.db,
-        this.chatId,
-        this.runtime.kind,
-        this.runtimeSession,
-        this.fingerprint,
-        this.agent.id,
-        runtimeSessionAtTurnStart.kind === this.runtime.kind ? runtimeSessionAtTurnStart.id : "",
-      );
+    // ACK: only a completed turn advances the binding (a failed or stopped turn leaves the row it started from).
+    if (res && res.session && res.session.id && !res.error && this.status !== "killed") {
+      const acked = { identity: this.fingerprint, generation: this.nativeBinding.generation,
+        sessionId: String(res.session.id), instructionsDigest: deliveredInstructions };
+      if (store.saveNativeBinding(this.db, this.chatId, this.runtime.kind, this.agent.id, acked, bindingAtTurnStart)) {
+        this.nativeBinding = { id: acked.sessionId, generation: acked.generation, instructionsDigest: acked.instructionsDigest,
+          fingerprint: generation.encodeBinding(acked) };
+        this.runtimeSession = generation.NATIVE_RESUME_KINDS.has(this.runtime.kind) ? { id: acked.sessionId } : {};
+        this._maybeRotateGeneration(res);
+      }
     }
     if (res && res.usage) this.usage = res.usage;
+    // The turn's last model request for the context inspector (agentlas context, Desktop, mobile).
+    if (res && (res.usage || res.contextWindowTokens)) {
+      require("../context-inspect.cjs").recordTerminalModelCall(this.db, {
+        chatId: this.chatId, agentId: this.agent && this.agent.id, runtimeKind: this.runtime.kind, model: this.runtime.model,
+        usage: res.usage, contextWindowTokens: res.contextWindowTokens, durationMs: Date.now() - this.startedAt, resumed: Boolean(runtimeSessionAtTurnStart && runtimeSessionAtTurnStart.id),
+        failed: Boolean(res.error),
+      });
+    }
 
     // Experience intake is downstream of the governed episode receipt. It
     // records the successful exact-agent run even when the curator correctly
@@ -569,7 +667,9 @@ class Session extends EventEmitter {
     // 동시 상한을 자기 자신으로 소모하지 않는다. 적용 실패는 이벤트로 표면화.
     if (parsedFences) {
       try {
-        require("./apply-fences.cjs").applyReplyFences(this, parsedFences, { orch: this.orchestrator });
+        require("./apply-fences.cjs").applyReplyFences(this, parsedFences, {
+          orch: this.orchestrator, governedMemory: governedResult,
+        });
       } catch (e) {
         this._privateRecoveryEvidence.push(`fence apply failed: ${(e && e.message) || String(e)}`.slice(0, 4000));
       }
@@ -577,9 +677,80 @@ class Session extends EventEmitter {
     return res;
   }
 
+  /**
+   * A turn that ended normally with no reply text is not a finished turn when (H2, Desktop agentlas_desktop 248ec2093;
+   * sessions/turn-outcome.cjs) every tool call it made failed or came back as an empty collection, or when it made no tool call
+   * and showed no sign of tool use at all (the model's empty answer; Desktop settleNormalEnd outcome `empty`). It used to end
+   * `done` with a blank reply, exit 0 and no reason; the interactive Terminal draws nothing for a returned failure, so the person
+   * could not tell it from a slow answer. It now ends `failed` with the reason in `res.error` (lastError, which `run --print`,
+   * `one`, the ACP server and the firm flows read) and one host-authored line the renderer draws (a failure-marked `warn` event;
+   * the renderer sets `lastErrorAnnounced`, so a surface that also prints lastError does not say it twice). Nothing is sent
+   * again: this runs after the executor's own recovery.
+   *
+   * Only an owner-facing chat turn: a delegate or firm division (parent / division chat), an automation marker session
+   * (division chat), a stopped turn and a turn the executor did not end normally keep their callers' rules for an empty text.
+   * A tool-only turn whose tools worked, or ran a tool this host draws no row for, is untouched (the work happened through its tools).
+   *
+   * An executor that typed the model's empty answer ITSELF (antigravity's agyEmptyRunFailure, the ACP core's `empty`) returns an
+   * error of its own, in its own words (English only, or the raw "ACP stopReason=end_turn"), and the interactive Terminal draws
+   * no returned failure: the person saw nothing. When the sink's facts agree (no text, no tool use of any kind) and the error
+   * carries no machine code of its own, the same sentence, code and failure line replace it, so every executor says the same
+   * thing in the person's language. The executor's own words stay in `res.failure.message`. Any other error keeps its own cause.
+   */
+  _settleBlankReply(res, finalText) {
+    if (!res) return false;
+    if (this.parent || this.chatKind !== "user" || this.status === "killed" || (this._apiAbort && this._apiAbort.signal.aborted)) return false;
+    const facts = { text: finalText, reportedToolCalls: res.toolCalls, outcomes: this._sink.toolOutcomes() };
+    let kind = null;
+    if (res.error) {
+      if (turnOutcome.executorTypedEmptyAnswer({ ...facts, failure: { kind: res.errorKind, code: res.errorCode } })) kind = "no_tools";
+    } else if (res.ownerControlTerminal === "completed") {
+      kind = turnOutcome.blankReplyKind(facts);
+    }
+    if (!kind) return false;
+    const sentence = i18n.t(this.lang, kind === "tools_unusable" ? "runtime.emptyAfterUnusableTools" : "runtime.emptyAnswer");
+    res.error = sentence;
+    res.errorKind = "empty";
+    res.errorSource = "marker";
+    res.errorCode = kind === "tools_unusable" ? turnOutcome.EMPTY_AFTER_UNUSABLE_TOOLS_CODE : turnOutcome.EMPTY_ANSWER_CODE;
+    this._sink.warn(sentence, { failure: true });
+    return true;
+  }
+
+  /** The whole journal before this turn's message (a fresh generation is seeded from all of it, folded to the budget). */
+  _journalHistory(fallback) {
+    try {
+      const rows = store.chatHistory(this.db, this.chatId, -1);
+      // The current owner message was appended at send(); the seed carries what came before it.
+      if (rows.length && rows[rows.length - 1].role === "user") rows.pop();
+      return rows.map((row) => ({ role: row.role, text: row.text, created_at: row.created_at }));
+    } catch {
+      return Array.isArray(fallback) ? fallback : [];
+    }
+  }
+
+  /**
+   * A native session whose last model request reached 80% of the model's own window gives way to the next generation
+   * for the NEXT turn, seeded from the journal (generation.cjs; Desktop session-generation.ts). Background only: a
+   * machine event in the ring, nothing on screen.
+   */
+  _maybeRotateGeneration(res) {
+    const kind = this.runtime.kind;
+    if (!generation.NATIVE_RESUME_KINDS.has(kind)) return;
+    const contextWindowTokens = res.contextWindowTokens ?? generation.contextWindowTokens(kind, this.runtime.model);
+    const decision = generation.decideGeneration({ kind, contextWindowTokens, lastInputTokens: res.contextInputTokens ?? null });
+    if (decision.action !== "new_generation") return;
+    const from = this.nativeBinding;
+    const next = { identity: this.fingerprint, generation: from.generation + 1, sessionId: "", instructionsDigest: null };
+    if (!store.saveNativeBinding(this.db, this.chatId, kind, this.agent.id, next, from)) return; // another turn moved it
+    this._record({ type: "session-generation", at: Date.now(), runtime: kind, fromGeneration: from.generation,
+      toGeneration: next.generation, reason: decision.reason, inputTokens: res.contextInputTokens ?? null, contextWindowTokens });
+    this._loadNativeBinding();
+  }
+
   async _waitForNativeDrain() {
-    await Promise.all([...this._nativeChildren].map(child =>
-      new Promise(resolve => child.once("close", resolve))));
+    await require("./native-child-drain.cjs").waitForNativeChildren(this._nativeChildren);
+    if (this._child && !this._nativeChildren.has(this._child)) this._child = null;
   }
 
   /** Stop always aborts the shared brain signal and independently kills the child tree. */

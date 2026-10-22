@@ -6,10 +6,28 @@
  *
  *   anthropic / openai / ollama → 스트리밍 + 툴 루프 (read/write/full 권한 게이트)
  *   google                      → 스트리밍 채팅 (툴은 후속 — 우아하게 chat-only)
+ *
+ * Only `ollama` is a Terminal session lane (runtimes/kinds.cjs API_EXECUTABLE_KINDS; sessions/session.cjs). The
+ * anthropic/openai/google branches are reached by contract tests only; BYOK, Agentlas serving, LM Studio and MLX run
+ * through Desktop's local-tool-loop, which Terminal receives with the vendored core, not through this file.
  */
+const crypto = require("node:crypto");
 const tools = require("./agentlas-tools.cjs");
+const { normalizeProviderUsage, createUsageSum } = require("./usage-normalizer.cjs");
+const { redactToolContent } = require("./tool-result-redaction.cjs");
 
-const MAX_ITERS = 12;
+/*
+ * Host-loop rules shared with Desktop local-tool-loop.ts (native-harness audit 31, A4 H2):
+ *  - the round cap is a backstop against runaways, not a measure of the work (Desktop MAX_TOOL_LOOP_TURNS = 200).
+ *    At 12, ordinary read-edit-check work hit it and the last intermediate text was saved as the answer;
+ *  - a run that reaches the cap without an answer is a typed failure (local_tool_loop_stuck), never a reply;
+ *  - real stalls are caught by repeated completed outcomes (Desktop automation-progress-guard: the same outcome
+ *    4 times in a row, or the same observation 5 times), cleared by a successful new change.
+ */
+const MAX_ITERS = 200;
+const NO_PROGRESS_IDENTICAL_STREAK = 4;
+const NO_PROGRESS_SAME_OBSERVATION = 5;
+const NO_PROGRESS_CODE = "automation_no_progress_loop";
 const IDLE_MS = Number(process.env.AGENTLAS_IDLE_TIMEOUT_MS) || 180000;
 
 // 스트림이 IDLE_MS 동안 한 바이트도 안 오면 중단(provider가 SSE를 열고 멈추는 hang 방지).
@@ -55,6 +73,59 @@ async function* iterSse(resp, idle) {
   if (buffer.trim()) yield buffer.trim();
 }
 
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+const digest = (text) => crypto.createHash("sha256").update(text).digest("hex");
+
+/** Completed tool outcomes only (a request alone never proves progress). note() returns a failure when stalled. */
+function createToolLoopProgress() {
+  let lastExact = null;
+  let streak = 0;
+  const observations = new Map();
+  const successfulChanges = new Set();
+  const stalled = (rule) => ({
+    error: "Execution stopped because the same tool outcomes kept repeating. Review the last work history before continuing.",
+    errorKind: "refused", errorSource: "marker", errorCode: NO_PROGRESS_CODE, noProgressRule: rule,
+  });
+  return {
+    note(name, args, out) {
+      const tool = tools.BY_NAME[name];
+      const observation = !tool || tool.minPerm === "read";
+      const requestKey = digest(`${name} ${stableJson(args || {})}`);
+      const outcomeKey = digest(`${requestKey} ${out && out.ok ? "result" : "error"} ${String((out && out.content) || "")}`);
+      if (!observation && out && out.ok && !successfulChanges.has(outcomeKey)) {
+        successfulChanges.add(outcomeKey);
+        observations.clear();
+        lastExact = null;
+        streak = 0;
+        return null;
+      }
+      streak = lastExact === outcomeKey ? streak + 1 : 1;
+      lastExact = outcomeKey;
+      if (streak >= NO_PROGRESS_IDENTICAL_STREAK) return stalled("identical_streak");
+      if (observation) {
+        const count = (observations.get(outcomeKey) || 0) + 1;
+        observations.set(outcomeKey, count);
+        if (count >= NO_PROGRESS_SAME_OBSERVATION) return stalled("same_observation");
+      }
+      return null;
+    },
+  };
+}
+
+function toolLoopStuck(model, rounds) {
+  return {
+    error: `The local model (${model || "model"}) kept calling tools for ${rounds} turns without reaching an answer. This run is not accepted as a result.`,
+    errorKind: "exit", errorSource: "marker", errorCode: "local_tool_loop_stuck",
+  };
+}
+
 function sseData(line) {
   if (!line.startsWith("data:")) return null;
   const p = line.slice(5).trim();
@@ -94,7 +165,7 @@ async function streamAnthropic({ apiKey, model, system, messages, permission, ui
   const blocks = {}; // index → {type, text, name, id, inputJson}
   let stopReason = null;
   let messageStopped = false;
-  let usage = null;
+  let rawUsage = null; // message_start + message_delta usage merged, normalized once after the stream
   try {
     for await (const line of iterSse(resp, idle)) {
       const data = sseData(line);
@@ -129,10 +200,14 @@ async function streamAnthropic({ apiKey, model, system, messages, permission, ui
         // 텍스트 블록 stop에서는 streamEnd를 호출하지 않는다 — 메모리 가드 중간 flush 방지(턴 끝에서만 flush).
       } else if (ev.type === "message_start") {
         const u = ev.message && ev.message.usage;
-        if (u) usage = { input_tokens: u.input_tokens || 0, output_tokens: u.output_tokens || 0 };
+        if (u && typeof u === "object") rawUsage = { ...(rawUsage || {}), ...u };
       } else if (ev.type === "message_delta") {
         if (ev.delta && ev.delta.stop_reason) stopReason = ev.delta.stop_reason;
-        if (ev.usage) usage = { input_tokens: (usage && usage.input_tokens) || 0, output_tokens: ev.usage.output_tokens };
+        // message_delta usage is cumulative for the fields it carries; absent fields keep message_start's value.
+        if (ev.usage && typeof ev.usage === "object") {
+          const defined = Object.fromEntries(Object.entries(ev.usage).filter(([, v]) => v !== undefined && v !== null));
+          rawUsage = { ...(rawUsage || {}), ...defined };
+        }
       }
     }
   } finally {
@@ -163,6 +238,7 @@ async function streamAnthropic({ apiKey, model, system, messages, permission, ui
       toolUses.push({ id: b.id, name: b.name, input });
     }
   }
+  const usage = rawUsage ? normalizeProviderUsage("anthropic", rawUsage) : null;
   return { text, assistantContent, toolUses, stopReason, usage,
     terminal: messageStopped && ["end_turn", "max_tokens", "stop_sequence", "tool_use"].includes(stopReason) };
 }
@@ -172,9 +248,12 @@ async function runAnthropicLoop(req) {
   const messages = req.messages.slice();
   let finalText = "";
   let ownerControlTerminal = "uncertain";
-  let inTok = 0, outTok = 0;
+  let reachedEnd = false;
+  let toolRounds = 0;
+  const progress = createToolLoopProgress();
+  const usageSum = createUsageSum();
   for (let i = 0; i < MAX_ITERS; i++) {
-    if (req.signal && req.signal.aborted) break;
+    if (req.signal && req.signal.aborted) { reachedEnd = true; break; }
     const r = await streamAnthropic({
       apiKey: req.apiKey,
       model: req.model,
@@ -185,20 +264,26 @@ async function runAnthropicLoop(req) {
       signal: req.signal,
     });
     finalText = r.text || finalText;
-    if (r.usage) { inTok += r.usage.input_tokens || 0; outTok += r.usage.output_tokens || 0; }
-    if (!r.terminal || (r.toolUses.length && r.stopReason !== "tool_use")) break;
-    if (!r.toolUses.length) { ownerControlTerminal = "completed"; break; }
+    if (r.usage) usageSum.add(r.usage);
+    if (!r.terminal || (r.toolUses.length && r.stopReason !== "tool_use")) { reachedEnd = true; break; }
+    if (!r.toolUses.length) { ownerControlTerminal = "completed"; reachedEnd = true; break; }
+    toolRounds += 1;
     messages.push({ role: "assistant", content: r.assistantContent });
     const results = [];
     for (const tu of r.toolUses) {
       const out = await tools.runToolAsync(tu.name, tu.input, ctx);
-      ui.toolResult(out.content, out.ok);
+      const safe = redactToolContent(out.content);
+      ui.toolResult(safe.content, out.ok, { redaction: safe.redaction });
       if (out.terminalUncertain) return { text: finalText, ownerControlTerminal: "uncertain" };
-      results.push({ type: "tool_result", tool_use_id: tu.id, content: out.content, is_error: !out.ok });
+      const stalled = progress.note(tu.name, tu.input, out);
+      if (stalled) { const spent = usageSum.total(); if (spent) ui.cost(spent); return { text: finalText, ownerControlTerminal: "uncertain", ...stalled }; }
+      results.push({ type: "tool_result", tool_use_id: tu.id, content: safe.content, is_error: !out.ok });
     }
     messages.push({ role: "user", content: results });
   }
-  if (inTok || outTok) ui.cost({ input_tokens: inTok, output_tokens: outTok });
+  const spent = usageSum.total();
+  if (spent) ui.cost(spent);
+  if (!reachedEnd) return { text: finalText, ownerControlTerminal: "uncertain", ...toolLoopStuck(req.model, toolRounds) };
   return { text: finalText, ownerControlTerminal };
 }
 
@@ -241,7 +326,7 @@ async function streamOpenAI({ apiKey, model, messages, permission, ui, signal, b
       } catch {
         continue;
       }
-      if (ev.usage) usage = { input_tokens: ev.usage.prompt_tokens || 0, output_tokens: ev.usage.completion_tokens || 0 };
+      if (ev.usage) usage = normalizeProviderUsage("openai-chat", ev.usage);
       const choice = ev.choices && ev.choices[0];
       if (!choice) continue;
       const delta = choice.delta || {};
@@ -286,9 +371,12 @@ async function runOpenAILoop(req) {
   if (!messages.length || messages[0].role !== "system") messages.unshift({ role: "system", content: req.system });
   let finalText = "";
   let ownerControlTerminal = "uncertain";
-  let inTok = 0, outTok = 0;
+  let reachedEnd = false;
+  let toolRounds = 0;
+  const progress = createToolLoopProgress();
+  const usageSum = createUsageSum();
   for (let i = 0; i < MAX_ITERS; i++) {
-    if (req.signal && req.signal.aborted) break;
+    if (req.signal && req.signal.aborted) { reachedEnd = true; break; }
     const r = await streamOpenAI({
       apiKey: req.apiKey,
       model: req.model,
@@ -299,10 +387,11 @@ async function runOpenAILoop(req) {
       baseUrl: req.baseUrl,
     });
     finalText = r.text || finalText;
-    if (r.usage) { inTok += r.usage.input_tokens || 0; outTok += r.usage.output_tokens || 0; }
+    if (r.usage) usageSum.add(r.usage);
     if (!["stop", "length", "tool_calls", "function_call"].includes(r.finish)
-      || (r.toolCalls.length && !["tool_calls", "function_call"].includes(r.finish))) break;
-    if (!r.toolCalls.length) { ownerControlTerminal = "completed"; break; }
+      || (r.toolCalls.length && !["tool_calls", "function_call"].includes(r.finish))) { reachedEnd = true; break; }
+    if (!r.toolCalls.length) { ownerControlTerminal = "completed"; reachedEnd = true; break; }
+    toolRounds += 1;
     messages.push({
       role: "assistant",
       content: r.text || null,
@@ -318,12 +407,17 @@ async function runOpenAILoop(req) {
       const arg = safeArgObj(args);
       if (arg) ui.info(ui.c.dim("  " + arg));
       const out = await tools.runToolAsync(c.name, args, ctx);
-      ui.toolResult(out.content, out.ok);
+      const safe = redactToolContent(out.content);
+      ui.toolResult(safe.content, out.ok, { redaction: safe.redaction });
       if (out.terminalUncertain) return { text: finalText, ownerControlTerminal: "uncertain" };
-      messages.push({ role: "tool", tool_call_id: c.id, content: out.content });
+      const stalled = progress.note(c.name, args, out);
+      if (stalled) { const spent = usageSum.total(); if (spent) ui.cost(spent); return { text: finalText, ownerControlTerminal: "uncertain", ...stalled }; }
+      messages.push({ role: "tool", tool_call_id: c.id, content: safe.content });
     }
   }
-  if (inTok || outTok) ui.cost({ input_tokens: inTok, output_tokens: outTok });
+  const spent = usageSum.total();
+  if (spent) ui.cost(spent);
+  if (!reachedEnd) return { text: finalText, ownerControlTerminal: "uncertain", ...toolLoopStuck(req.model, toolRounds) };
   return { text: finalText, ownerControlTerminal };
 }
 
@@ -336,8 +430,13 @@ async function runOllamaLoop(req) {
   const toolDefs = tools.openaiTools(ctx.permission);
   let finalText = "";
   let ownerControlTerminal = "uncertain";
+  let reachedEnd = false;
+  let toolRounds = 0;
+  const progress = createToolLoopProgress();
+  const usageSum = createUsageSum();
+  const finish = (extra) => { const spent = usageSum.total(); if (spent) ui.cost(spent); return { ...extra }; };
   for (let i = 0; i < MAX_ITERS; i++) {
-    if (req.signal && req.signal.aborted) break;
+    if (req.signal && req.signal.aborted) { reachedEnd = true; break; }
     const idle = idleAbort(req.signal, IDLE_MS);
     let resp;
     try {
@@ -370,6 +469,7 @@ async function runOllamaLoop(req) {
     let started = false;
     let toolCalls = [];
     let done = false;
+    let doneEvent = null;
     try {
       for await (const line of iterSse(resp, idle)) {
         let ev;
@@ -378,7 +478,7 @@ async function runOllamaLoop(req) {
         } catch {
           continue;
         }
-        if (ev.done === true) done = true;
+        if (ev.done === true) { done = true; doneEvent = ev; }
         const msg = ev.message || {};
         if (msg.content) {
           if (!started) {
@@ -395,21 +495,28 @@ async function runOllamaLoop(req) {
       idle.clear();
     }
     finalText = text || finalText;
-    if (!done) break;
-    if (!toolCalls.length) { ownerControlTerminal = "completed"; break; }
+    // The final `done` event carries prompt_eval_count / eval_count; a done without them is an unknown call.
+    if (doneEvent) usageSum.add(normalizeProviderUsage("ollama", doneEvent));
+    if (!done) { reachedEnd = true; break; }
+    if (!toolCalls.length) { ownerControlTerminal = "completed"; reachedEnd = true; break; }
+    toolRounds += 1;
     messages.push({ role: "assistant", content: text, tool_calls: toolCalls });
     for (const c of toolCalls) {
       const fn = c.function || {};
       const args = typeof fn.arguments === "string" ? safeParse(fn.arguments) : fn.arguments || {};
       ui.tool(fn.name || "tool", safeArgObj(args));
       const out = await tools.runToolAsync(fn.name, args, ctx);
-      ui.toolResult(out.content, out.ok);
-      if (out.terminalUncertain) return { text: finalText, ownerControlTerminal: "uncertain" };
+      const safe = redactToolContent(out.content);
+      ui.toolResult(safe.content, out.ok, { redaction: safe.redaction });
+      if (out.terminalUncertain) return finish({ text: finalText, ownerControlTerminal: "uncertain" });
+      const stalled = progress.note(fn.name, args, out);
+      if (stalled) return finish({ text: finalText, ownerControlTerminal: "uncertain", ...stalled });
       // Ollama tool 결과는 tool_call_id가 없으므로 tool_name으로 상관관계를 보존 (병렬 호출 시 중요)
-      messages.push({ role: "tool", tool_name: fn.name, content: out.content });
+      messages.push({ role: "tool", tool_name: fn.name, content: safe.content });
     }
   }
-  return { text: finalText, ownerControlTerminal };
+  if (!reachedEnd) return finish({ text: finalText, ownerControlTerminal: "uncertain", ...toolLoopStuck(req.model, toolRounds) });
+  return finish({ text: finalText, ownerControlTerminal });
 }
 
 // ── Google (chat-only 스트리밍) ──────────────────────────
@@ -508,4 +615,4 @@ function textOf(content) {
   return "";
 }
 
-module.exports = { runApiTurn, MAX_ITERS };
+module.exports = { runApiTurn, runOllamaLoop, MAX_ITERS };

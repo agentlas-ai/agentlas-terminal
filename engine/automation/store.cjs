@@ -24,9 +24,26 @@ function leaseSupported(db) {
   return columnExists(db, "automations", "claimed_at") && columnExists(db, "automations", "lease_owner");
 }
 
+/*
+ * A Goal's continuation is not an automation (Desktop store/goal-continuation-rows.ts, 2026-10-20). Desktop no longer
+ * writes "Goal continuation · …" rows (goal_id + the long-run marker); the host wakes the Goal itself and retires the
+ * old rows at boot (switched off, kept as history). The terminal shows the same list and never switches one back on.
+ */
+const GOAL_CONTINUATION_PROMPT_MARKER = "<<stormbreaker-long-run>>";
+const GOAL_CONTINUATION_RETIRED_CODE = "goal_continuation_automation_retired";
+
+function goalContinuationRowSql(db) {
+  if (!columnExists(db, "automations", "goal_id")) return "0";
+  return `(goal_id IS NOT NULL AND COALESCE(instr(prompt_template, '${GOAL_CONTINUATION_PROMPT_MARKER}'), 0) > 0)`;
+}
+
+function isGoalContinuationRow(row) {
+  return Boolean(row && row.goal_id && String(row.prompt_template || "").includes(GOAL_CONTINUATION_PROMPT_MARKER));
+}
+
 function listAutomations(db) {
   if (!tableExists(db, "automations")) return [];
-  return db.prepare("SELECT * FROM automations ORDER BY created_at DESC").all();
+  return db.prepare(`SELECT * FROM automations WHERE NOT ${goalContinuationRowSql(db)} ORDER BY created_at DESC`).all();
 }
 
 function getAutomationByPrefix(db, idPrefix) {
@@ -121,6 +138,7 @@ function setEnabled(db, row, enabled) {
 }
 
 function setEnabledChecked(db, row, enabled) {
+  if (enabled && isGoalContinuationRow(row)) return { changed: false, next: null, refused: GOAL_CONTINUATION_RETIRED_CODE };
   if (enabled) {
     const next = nextAutomationRun(row) || null;
     const result = db.prepare("UPDATE automations SET enabled=1, next_run_at=? WHERE id=?").run(next ? next.toISOString() : null, row.id);
@@ -325,9 +343,55 @@ function advanceAfterRun(db, row, { ok, advanceSchedule, ranAt = new Date(), lea
   }
 }
 
+// Desktop 기록 종류(automation-workspace.ts INTENT_EVENT/SOURCE_EVENT, long-run/automation-provenance.ts BINDING_KIND).
+const WORKSPACE_INTENT_KIND = "automation_workspace_intent";
+const WORKSPACE_SOURCE_KIND = "automation_workspace_source";
+const GOAL_PROVENANCE_KIND = "goal.automation_provenance_bound";
+
+/**
+ * 작업 폴더를 Goal 이 정할 수 있는 행의 SQL 술어(항상 0/1) — 터미널은 Goal 권한(개정·실행 상태)을
+ * 판정할 수 없으므로 hub 행처럼 Desktop 몫으로 남긴다. Desktop captureAutomationWorkspace
+ * (automation-workspace.ts:211-245)와 같은 입력을 같은 순서로 보되, 판정할 수 없는 쪽은 모두 "Goal 몫":
+ *   1. 최신 의도 기록이 깨졌으면(JSON 아님·객체 아님·모르는 mode) Desktop 은 멈춘다 → Goal 몫;
+ *   2. project_id 가 있으면 프로젝트 폴더(터미널이 실행);
+ *   3. 이 행의 의도(automationCreatedAt 일치)가 follow_goal → Goal 몫, project/standalone → 실행;
+ *   4. 의도가 없으면: 생성 출처 기록, 또는 에이전트가 만든 행의 goal_id·Goal 연결 기록 → Goal 몫.
+ * json_extract 는 깨진 JSON 에서 오류를 던지므로 CASE 순서로만 부른다.
+ */
+function workspaceUnsupportedSql(db) {
+  const col = (name) => (columnExists(db, "automations", name) ? `automations.${name}` : "NULL");
+  const projectId = col("project_id");
+  const runEvents = tableExists(db, "run_events");
+  const sourceReceipt = runEvents
+    ? `EXISTS (SELECT 1 FROM run_events rs WHERE rs.automation_id = automations.id AND rs.kind = '${WORKSPACE_SOURCE_KIND}')`
+    : "0";
+  const provenance = tableExists(db, "long_runs") && tableExists(db, "long_run_events")
+    ? `EXISTS (SELECT 1 FROM long_runs lr CROSS JOIN long_run_events le WHERE le.run_id = lr.id
+        AND le.kind = '${GOAL_PROVENANCE_KIND}'
+        AND (CASE WHEN json_valid(le.payload_json) THEN json_extract(le.payload_json, '$.automationId') END) = automations.id)`
+    : "0";
+  const noIntent = `(CASE WHEN ${projectId} IS NOT NULL THEN 0
+    WHEN ${sourceReceipt} THEN 1
+    WHEN IFNULL(${col("created_by")},'') <> 'agent' THEN 0
+    WHEN ${col("goal_id")} IS NOT NULL THEN 1
+    WHEN ${provenance} THEN 1
+    ELSE 0 END)`;
+  if (!runEvents) return noIntent;
+  return `IFNULL((SELECT CASE
+      WHEN json_valid(ri.payload_json) = 0 THEN 1
+      WHEN json_type(ri.payload_json) <> 'object' THEN 1
+      WHEN IFNULL(json_extract(ri.payload_json, '$.automationCreatedAt'), '') <> automations.created_at THEN NULL
+      WHEN IFNULL(json_extract(ri.payload_json, '$.mode'), '') NOT IN ('follow_goal','project','standalone') THEN 1
+      WHEN ${projectId} IS NOT NULL THEN 0
+      WHEN json_extract(ri.payload_json, '$.mode') = 'follow_goal' THEN 1
+      ELSE 0 END
+    FROM run_events ri WHERE ri.automation_id = automations.id AND ri.kind = '${WORKSPACE_INTENT_KIND}'
+    ORDER BY ri.rowid DESC LIMIT 1), ${noIntent})`;
+}
+
 /**
  * 이 실행기가 실행할 수 없는 계열의 SQL 술어 — daemon.runnerSkip 게이트와 짝이다.
- * (hub 타깃 / tool_mode browser·computer-use = Desktop 몫.)
+ * (hub 타깃 / tool_mode browser·computer-use / Goal 이 작업 폴더를 정하는 행 = Desktop 몫.)
  * IFNULL 필수: SQLite 3치 논리에서 NULL 열이 있으면 NOT (…) 이 NULL 이 되어
  * 멀쩡한 행까지 조용히 사라진다.
  */
@@ -336,6 +400,7 @@ function runnerUnsupportedSql(db) {
   if (columnExists(db, "automations", "tool_mode")) {
     parts.push("IFNULL(tool_mode,'') IN ('browser','computer-use')");
   }
+  parts.push(`${workspaceUnsupportedSql(db)} = 1`);
   return `(${parts.join(" OR ")})`;
 }
 
@@ -381,6 +446,8 @@ module.exports = {
   addAutomation,
   setEnabled,
   setEnabledChecked,
+  isGoalContinuationRow,
+  GOAL_CONTINUATION_RETIRED_CODE,
   removeAutomation,
   claimAutomation,
   claimAutomationLease,
@@ -392,4 +459,5 @@ module.exports = {
   advanceAfterRun,
   dueAutomations,
   runnerUnsupportedSql,
+  workspaceUnsupportedSql,
 };

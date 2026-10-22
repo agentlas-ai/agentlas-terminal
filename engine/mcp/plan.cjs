@@ -89,14 +89,21 @@ async function inferRequirements(request, inventory, options = {}) {
     question:
       "Which of the available MCP tools does this build request genuinely require in order to complete? Judge what the task actually does, not which words it contains.",
     labels: items.map((item) => String(item.catalogId)),
-    input: `TASK:\n${text.slice(0, 4000)}\n\nAVAILABLE TOOLS:\n${shelf}`,
+    // Composition order: fixed → variable (docs/PROMPT-COMPOSITION-POLICY.md, ledgers terminal.judgment.mcp-need.user / .guidance).
+    // 도구 선반(안정)이 앞, 작업(턴마다 다름)이 뒤. 판정기는 입력을 8000자로 자르므로 선반이 길어도 작업이
+    // 잘리지 않게 선반 쪽에서 남는 예산만 쓴다(전체 상한은 그대로).
+    input: (() => {
+      const taskBlock = `TASK:\n${text.slice(0, 4000)}`;
+      const shelfBlock = `AVAILABLE TOOLS:\n${shelf}`.slice(0, Math.max(0, 8000 - taskBlock.length - 2));
+      return `${shelfBlock}\n\n${taskBlock}`;
+    })(),
     guidance: [
       "Name a tool ONLY when the task cannot be completed without it.",
       "Mentioning a topic is not a need: a task that says 'research'/'조사' in passing does not need a web-search tool.",
+      "An empty list is a valid and often correct answer. Err toward fewer tools.",
       hintIds.length
         ? `A deterministic name-heuristic suggested [${hintIds.join(", ")}] — treat that as a hint, never a gate.`
         : "",
-      "An empty list is a valid and often correct answer. Err toward fewer tools.",
     ].filter(Boolean).join(" "),
     signal: options.signal,
     timeoutMs: options.timeoutMs,

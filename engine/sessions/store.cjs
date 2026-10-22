@@ -134,4 +134,62 @@ function saveRuntimeSession(db, chatId, kind, session, fingerprint, agentId, exp
   }
 }
 
-module.exports = { createChat, appendMessage, retitleChat, chatHistory, loadRuntimeSession, saveRuntimeSession, newId };
+/*
+ * Native binding rows (sessions/generation.cjs, native-harness NH12). The same (chat, kind, agent) row as above; its
+ * fingerprint column carries the binding identity, the generation and the instructions version the provider session
+ * received. A row of another identity (an older fingerprint, a Desktop row) is not this binding: the turn opens
+ * generation 1 seeded from the journal.
+ */
+function loadNativeBinding(db, chatId, kind, agentId, identity) {
+  const { decodeBinding } = require("./generation.cjs");
+  const agent = normalizeRuntimeAgentId(agentId);
+  try {
+    const row = db.prepare("SELECT session_id, fingerprint FROM chat_runtime_sessions WHERE chat_id=? AND kind=? AND agent_id=?")
+      .get(chatId, kind, agent);
+    const decoded = row ? decodeBinding(row.fingerprint) : null;
+    if (decoded && decoded.identity === identity) {
+      return { id: row.session_id || "", generation: decoded.generation, instructionsDigest: decoded.instructionsDigest,
+        fingerprint: row.fingerprint };
+    }
+  } catch { /* table absent (old DB) — no resume */ }
+  return { id: "", generation: 1, instructionsDigest: null, fingerprint: null };
+}
+
+/**
+ * ACK of a completed turn, compare-and-swap on the row the turn started from: only the turn that began from `expected`
+ * (its fingerprint + provider id) may advance it, so two turns from the same binding cannot overwrite each other.
+ */
+function saveNativeBinding(db, chatId, kind, agentId, next, expected) {
+  const { encodeBinding } = require("./generation.cjs");
+  const agent = normalizeRuntimeAgentId(agentId);
+  const fingerprint = encodeBinding(next);
+  const sessionId = String(next.sessionId || "");
+  try {
+    return runWriteTransaction(db, () => {
+      const current = db.prepare("SELECT session_id, fingerprint FROM chat_runtime_sessions WHERE chat_id=? AND kind=? AND agent_id=?")
+        .get(chatId, kind, agent);
+      if (!current) {
+        const inserted = db.prepare("INSERT OR IGNORE INTO chat_runtime_sessions (chat_id, kind, agent_id, session_id, fingerprint, updated_at) VALUES (?,?,?,?,?,?)")
+          .run(chatId, kind, agent, sessionId, fingerprint, nowIso());
+        return (inserted.changes ?? inserted.rowsAffected ?? 0) > 0;
+      }
+      if (current.fingerprint === fingerprint && current.session_id === sessionId) return true;
+      const startedFrom = expected && expected.fingerprint ? expected : null;
+      // A row of another identity (legacy fingerprint, another surface) is replaced; this binding's row only from
+      // exactly the state the turn began with.
+      const ours = require("./generation.cjs").decodeBinding(current.fingerprint);
+      if (ours && ours.identity === next.identity) {
+        if (!startedFrom || current.fingerprint !== startedFrom.fingerprint || current.session_id !== String(startedFrom.id || "")) return false;
+      }
+      const updated = db.prepare("UPDATE chat_runtime_sessions SET session_id=?, fingerprint=?, updated_at=? WHERE chat_id=? AND kind=? AND agent_id=? AND session_id=? AND fingerprint=?")
+        .run(sessionId, fingerprint, nowIso(), chatId, kind, agent, current.session_id, current.fingerprint);
+      return (updated.changes ?? updated.rowsAffected ?? 0) > 0;
+    }) === true;
+  } catch (error) {
+    if (process.env.AGENTLAS_DEBUG) console.error(`[agentlas] native binding not persisted: ${error && error.message ? error.message : error}`);
+    return false;
+  }
+}
+
+module.exports = { createChat, appendMessage, retitleChat, chatHistory, loadRuntimeSession, saveRuntimeSession,
+  loadNativeBinding, saveNativeBinding, newId };

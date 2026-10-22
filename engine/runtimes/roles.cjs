@@ -38,7 +38,7 @@ function legacyOrchestrator(db) {
   try {
     const row = db
       .prepare(
-        "SELECT kind, backend, source, model, long_context FROM active_runtime WHERE id=1",
+        "SELECT * FROM active_runtime WHERE id=1",
       )
       .get();
     if (!row || !cleanText(row.kind)) return null;
@@ -51,7 +51,7 @@ function legacyOrchestrator(db) {
     }
     return {
       role: "orchestrator",
-      kind: canonicalRuntimeKind(cleanText(row.kind)),
+      kind: canonicalRuntimeKind(cleanText(row.kind), row.acp_agent_id),
       backend: cleanText(row.backend),
       source: cleanText(row.source),
       model: cleanText(row.model),
@@ -71,7 +71,8 @@ function normalizedRow(row, role) {
   return {
     role,
     // 저장된 이름(데스크탑 표기)을 이 저장소의 이름으로 번역한다 — kinds.cjs 참고.
-    kind: canonicalRuntimeKind(cleanText(row.kind)),
+    // A Desktop "acp" seat of a built-in agent (acp_agent_id) reads as that agent's kind.
+    kind: canonicalRuntimeKind(cleanText(row.kind), row.acp_agent_id),
     backend: cleanText(row.backend),
     source: cleanText(row.source),
     model: cleanText(row.model),

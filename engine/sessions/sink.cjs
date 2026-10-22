@@ -12,6 +12,8 @@
  * applyTaskResult, c(팔레트 — 렌더러가 색을 정하므로 여기선 무색 passthrough), t(i18n).
  */
 const i18n = require("../agentlas-i18n.cjs");
+const { redactToolText } = require("../tool-result-redaction.cjs");
+const { createToolOutcomeTally } = require("./turn-outcome.cjs");
 
 const NOOP_PALETTE = new Proxy({}, { get: () => (s) => String(s) });
 const STATUS_TEXT_MAX = 8 * 1024;
@@ -55,6 +57,13 @@ function taskPayload(value) {
   return projected;
 }
 
+// A result reaches the sink as text, or as the object a structured executor (codex mcp_tool_call) reports.
+function outcomeText(value) {
+  if (typeof value === "string") return value;
+  if (!value || typeof value !== "object") return undefined;
+  try { return JSON.stringify(value); } catch { return undefined; }
+}
+
 function boundedText(value, max, suffix = "… [truncated]") {
   const text = String(value || "");
   if (text.length <= max) return text;
@@ -70,31 +79,53 @@ class EventSink {
     this._onEvent = onEvent || (() => {});
     this._onPrivateEvidence = onPrivateEvidence || (() => {});
     this._streamOpen = false;
+    // How this turn's tool calls came back, counted from the same tool()/toolResult() calls every executor already makes
+    // (sessions/turn-outcome.cjs); the session reads it once the turn ended and clears it at the next turn's start.
+    this._toolOutcomes = createToolOutcomeTally();
   }
+
+  toolOutcomes() { return this._toolOutcomes.summary(); }
+  resetToolOutcomes() { this._toolOutcomes.reset(); }
+  // A tool-ish event of a kind the executor's driver draws no row for (claude server_tool_use / mcp_tool_use blocks, a codex
+  // web_search, a plan update). Nothing is emitted: the person sees no row, but the turn did use a tool, and a blank reply behind
+  // one is not "the model produced nothing at all" (sessions/turn-outcome.cjs blankReplyKind).
+  noteToolActivity() { this._toolOutcomes.noteUnclassified(); }
 
   _emit(type, data) {
     this._onEvent({ type, at: Date.now(), ...data });
   }
 
   status(text) { this._emit("status", { text: boundedText(text, STATUS_TEXT_MAX) }); }
-  warn(text) { this._emit("warn", { text: boundedText(text, STATUS_TEXT_MAX) }); }
+  // `extra.failure` marks the line as the reason the turn failed (the renderer then tells the session it was said).
+  warn(text, extra) { this._emit("warn", { text: boundedText(text, STATUS_TEXT_MAX), ...(extra && extra.failure === true ? { failure: true } : {}) }); }
   // Runtime/provider failures are recovery evidence, never presentation copy.
   // Session owns the recovery loop and may give this evidence to the controller;
   // Renderer must never receive it first.
-  error(text) { this._onPrivateEvidence(boundedText(text, EVENT_TEXT_MAX)); }
+  error(text) { this._onPrivateEvidence(boundedText(redactToolText(text).text, EVENT_TEXT_MAX)); }
   line(text) { this._emit("line", { text: boundedText(text, EVENT_TEXT_MAX) }); }
   tool(name, summary) {
+    this._toolOutcomes.start();
     this._emit("tool", {
       name: boundedText(name || "tool", TOOL_NAME_MAX),
       summary: boundedText(summary, TOOL_SUMMARY_MAX),
     });
   }
-  toolResult(text, ok) {
+  // G03: a tool result never enters the retained event ring or private evidence with a credential in it.
+  // Redaction runs BEFORE the length bound (a cut could otherwise split a secret into an unmatched fragment).
+  // The original is hashed in memory only; callers that already redacted pass options.redaction.
+  toolResult(text, ok, options = {}) {
+    // The outcome is judged on what the executor reported (its ok flag and the parsed shape of the text), not on the redacted copy.
+    this._toolOutcomes.complete({ ok: ok !== false, text: outcomeText(text) });
+    const given = options && options.redaction;
+    const r = redactToolText(text);
+    const redaction = given && given.redacted && !r.redacted
+      ? { redacted: true, originalSha256: given.originalSha256, storedSha256: given.storedSha256 }
+      : { redacted: r.redacted, originalSha256: r.originalSha256, storedSha256: r.storedSha256 };
     if (ok === false) {
-      this._onPrivateEvidence(boundedText(text, EVENT_TEXT_MAX));
+      this._onPrivateEvidence(boundedText(r.text, EVENT_TEXT_MAX), redaction);
       return;
     }
-    this._emit("tool-result", { text: boundedText(text, EVENT_TEXT_MAX), ok: true });
+    this._emit("tool-result", { text: boundedText(r.text, EVENT_TEXT_MAX), ok: true, ...redaction });
   }
   streamStart() {
     if (!this._streamOpen) { this._streamOpen = true; this._emit("stream-start", {}); }

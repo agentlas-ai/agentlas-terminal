@@ -45,7 +45,8 @@ function parseDelegationsLocal(text) {
           if (!d || typeof d !== "object") return null;
           const target = typeof d.target === "string" ? d.target.trim() : "";
           const brief = typeof d.brief === "string" ? d.brief.trim() : "";
-          return target ? { target, brief } : null;
+          const stage = ["production", "integration", "verification"].includes(d.stage) ? d.stage : "production";
+          return target ? { target, brief, stage } : null;
         })
         .filter(Boolean);
     } catch {
@@ -133,6 +134,7 @@ function buildDelegateProtocol(reports) {
     "including downstream independent QA or verification roles. State dependencies in their briefs;",
     "the host will delay verification until production results exist. Never defer a needed role to synthesis.",
     "",
+    "stage per delegation: production (default) · integration (combines other slots' finished results) · verification (checks them; the host runs it after production/integration)",
     "Your direct reports:",
     list,
     "",
@@ -140,7 +142,7 @@ function buildDelegateProtocol(reports) {
     "",
     DELEGATE_HEADING,
     "```json",
-    '{ "delegations": [ { "target": "<report role or name above>", "brief": "<what they should do>" } ] }',
+    '{ "delegations": [ { "target": "<report role or name above>", "brief": "<what they should do>", "stage": "production" } ] }',
     "```",
     "",
     "After delegating, STOP — their results come back to you to synthesize. Synthesis is final and cannot start new work.",
@@ -171,7 +173,7 @@ function matchTargets(delegations, candidates) {
     );
     if (node) {
       used.add(node.key);
-      picked.push({ node, brief: d.brief || "" });
+      picked.push({ node, brief: d.brief || "", stage: ["production", "integration", "verification"].includes(d.stage) ? d.stage : "production" });
     }
   }
   return picked;
@@ -237,36 +239,13 @@ async function parallelCap(items, cap, fn) {
   return out;
 }
 
-function isVerificationDivision(node) {
-  // key에는 `<firm-slug>:` 접두사가 들어간다. 회사 이름이 `firm-test`/`qa-studio`인
-  // 것만으로 모든 본부를 검증 본부로 오분류하면 구현 슬롯이 하나도 실행되지 않는다.
-  const label = `${node && node.role || ""} ${node && node.name || ""}`
-    .toLowerCase()
-    .replace(/[_-]+/g, " ");
-  return /\b(?:eval|qa|quality|test|verification|verifier)\b|policy\s+gate/.test(label);
-}
-
-function isIntegrationDivision(item, siblingProductionCount) {
-  if (!item || siblingProductionCount < 2 || isVerificationDivision(item.node)) return false;
-  const label = `${item.node && item.node.role || ""} ${item.node && item.node.name || ""}`
-    .toLowerCase()
-    .replace(/[_-]+/g, " ");
-  const brief = String(item.brief || "").toLowerCase();
-  if (/\bdesign\b/.test(label)) return false;
-  return /\b(?:web|frontend|integration|integrator|release)\b/.test(label)
-    || /\b(?:integrat(?:e|ion)|wire|combine|merge)\b/.test(brief)
-    || /\bafter\b[\s\S]{0,80}\b(?:game|design|production|upstream|implementation)\b/.test(brief)
-    || /\b(?:once|when)\b[\s\S]{0,80}\b(?:complete|ready|finish)/.test(brief);
-}
-
+// Stage grouping is the stage the CEO declared on each delegation (Desktop firm-orchestrator stageMatched); the host
+// reads no role/name/brief words (docs/2026-10-13-native-harness 04 §3). A missing stage is production.
 function stageTargets(targets) {
-  const nonVerification = targets.filter((m) => !isVerificationDivision(m.node));
-  const integration = nonVerification.filter((m) => isIntegrationDivision(m, nonVerification.length));
-  const integrationKeys = new Set(integration.map((m) => m.node.key));
   return {
-    production: nonVerification.filter((m) => !integrationKeys.has(m.node.key)),
-    integration,
-    verification: targets.filter((m) => isVerificationDivision(m.node)),
+    production: targets.filter((m) => (m.stage || "production") === "production"),
+    integration: targets.filter((m) => m.stage === "integration"),
+    verification: targets.filter((m) => m.stage === "verification"),
   };
 }
 
@@ -521,6 +500,7 @@ module.exports = {
   cleanFenceText,
   buildDelegateProtocol,
   matchTargets,
+  stageTargets,
   resolveDivisions,
   DELEGATE_HEADING,
 };

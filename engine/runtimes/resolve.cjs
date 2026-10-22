@@ -63,7 +63,7 @@ function sharedRuntimeKind(row) {
   // never discard `agy` and silently fall through to Gemini or another CLI.
   const selectedBin = path.posix.basename(path.win32.basename(String(row.source || ""))).toLowerCase();
   if (row.kind === "gemini" && /^agy(?:\.exe|\.cmd)?$/i.test(selectedBin)) return "agy";
-  return KINDS.canonicalRuntimeKind(row.kind);
+  return KINDS.canonicalRuntimeKind(row.kind, row.acp_agent_id);
 }
 
 class NoRuntimeError extends Error {
@@ -119,7 +119,10 @@ function resolveRuntime({ db, prefs, explicit }) {
       };
     }
   }
-  const found = listAvailableCliRuntimes().filter((r) => CLI_EXECUTABLE_KINDS.has(r.kind));
+  // A launcher-detected kind (github-copilot-cli via npx) is never the automatic fallback: npx on PATH is not evidence
+  // that the agent is installed and signed in — it runs only when chosen.
+  const launcherKinds = new Set(KINDS.RUNTIME_KIND_SPECS.filter((spec) => spec.launcher).map((spec) => spec.kind));
+  const found = listAvailableCliRuntimes().filter((r) => CLI_EXECUTABLE_KINDS.has(r.kind) && !launcherKinds.has(r.kind));
   if (found.length) return { kind: found[0].kind, bin: found[0].path, source: "detected" };
   // 신규 사용자의 최빈 막다른 길: "설치하라"만 있고 방법이 없으면 여기서 이탈한다.
   // 실제 설치 명령을 그대로 준다(데스크탑 온보딩의 "Claude Code 무료로 설치하기"와 동형).

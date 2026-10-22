@@ -519,12 +519,14 @@ function kindWord(type, en) {
     //   사용자는 "subgraph"가 뭔지 모른 채 그래프를 읽게 된다(eval이 정확히 그랬다).
     subgraph: "다른 자동화 부르기",
     code: "코드",
+    toolchain_call: "툴체인 부르기",
   };
   const enWords = {
     trigger: "start", agent: "agent", tool: "tool", action: "action",
     condition: "branch", eval: "check", transform: "transform", output: "output",
     subgraph: "call another automation",
     code: "code",
+    toolchain_call: "call toolchain",
   };
   const read = vocabulary.readEnum(type, vocabulary.GRAPH_NODE_KINDS);
   if ("unknown" in read) {
@@ -743,7 +745,7 @@ async function runGraph(ctx, needle, flags) {
   automation ||= fallbackRow;
   automation.graph = graph;
   try {
-    const result = await core.runGraph(automation, graph, { initialVars });
+    const result = await require('../graph/owner-occurrence.cjs').runOwnerGraphOccurrence(core, automation, graph, initialVars, ctx.signal);
     ctx.out(JSON.stringify(result, null, 2));
     return result && result.ok === true ? 0 : 1;
   } catch (error) {
@@ -818,7 +820,9 @@ async function newGraph(ctx, request, flags) {
     let built = null;
     let announcedFallback = false;
     for (let round = 0; round < interview.MAX_INTERVIEW_ROUNDS; round += 1) {
-      const answer = await askModel(ctx, interview.buildInterviewPrompt(state, en ? "en" : "ko"), {});
+      const answer = await askModel(ctx, interview.buildInterviewPrompt(state, en ? "en" : "ko"), {
+        outputSchema: { name: "agentlas_graph_interview_v1", schema: require("../graph/interview-output.schema.json") },
+      });
       if (!answer.ok) {
         ctx.err(answer.reason);
         ctx.err(ctx.ui.dim(answer.nextAction));

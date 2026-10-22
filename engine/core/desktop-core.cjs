@@ -332,6 +332,33 @@ function loadDesktopCore(options = {}) {
     require: req,
     initStore: req("store/db").initStore,
     getDb: req("store/db").getDb,
+    ...(() => {
+      try {
+        const ledger = req("runtime/model-call-ledger"), source = req("memory/source-custody");
+        return { withModelCallScope: ledger.withModelCallScope, withMemorySourceRunner: source.withMemorySourceRunner };
+      } catch { return { withModelCallScope: null, withMemorySourceRunner: null }; }
+    })(),
+    // Old bundles remain usable before cutover. The memory adapter refuses
+    // their raw DB once the host has installed its persistent writer fence.
+    ...(() => {
+      try {
+        const memory = req("memory/database");
+        return {
+          getMemoryDb: typeof memory.getMemoryDb === "function" ? memory.getMemoryDb : null,
+          getMemoryStoreInfo: typeof memory.getMemoryStoreInfo === "function" ? memory.getMemoryStoreInfo : null,
+        };
+      } catch { return { getMemoryDb: null, getMemoryStoreInfo: null }; }
+    })(),
+    ...(() => {
+      try {
+        const automatic = req("memory/automatic-curator");
+        return {
+          recordAutomaticMemoryTurn: typeof automatic.recordAutomaticMemoryTurn === "function" ? automatic.recordAutomaticMemoryTurn : null,
+          registerAutomaticMemoryRuntime: typeof automatic.registerAutomaticMemoryRuntime === "function" ? automatic.registerAutomaticMemoryRuntime : null,
+          processAutomaticMemoryCuration: typeof automatic.processAutomaticMemoryCuration === "function" ? automatic.processAutomaticMemoryCuration : null,
+        };
+      } catch { return { recordAutomaticMemoryTurn: null, registerAutomaticMemoryRuntime: null, processAutomaticMemoryCuration: null }; }
+    })(),
     runGraph: kernel.runGraph,
     /*
      * 저장 전 확인 — 빌더가 만든 스크립트를 **저장하기 전에** 돌려 보고, 안 되면 한 번
@@ -395,6 +422,18 @@ function loadDesktopCore(options = {}) {
       }
     })(),
   };
+  // Permission requests the core answers itself (ACP agents and host tool loops inside graph runs) use the shared
+  // capability rules, as Terminal's own sessions do (runtimes/acp-driver.cjs arbiter; native-harness audit 31, A3).
+  try { require("../runtimes/acp-driver.cjs").installTerminalPermissionArbiterInCore(_cache); }
+  catch { /* the core's own conservative default stays */ }
+  if (typeof _cache.getMemoryDb === "function" && typeof _cache.getMemoryStoreInfo === "function") {
+    try { require("./memory-owner-binding.cjs").install(_cache); }
+    catch (error) {
+      _cache.memoryBindingError = error;
+      for (const name of ["getMemoryDb", "getMemoryStoreInfo", "recordAutomaticMemoryTurn", "registerAutomaticMemoryRuntime", "processAutomaticMemoryCuration"])
+        _cache[name] = () => { throw error; };
+    }
+  }
   return _cache;
 }
 
@@ -415,6 +454,11 @@ function loadCoreAcpRuntime() {
     installRetiredProjectProvisioningHook();
     installNativeModuleHook();
     configureSharedCoreIdentity(root);
+    // Desktop main loads runtime/selection.js before acp.js; acp.js reaches selection.js through its own imports, and
+    // selection's module body calls acpOrLegacyRunner — loading acp.js first runs that before ACP_AGENTS exists
+    // ("Cannot read properties of undefined (reading 'kimi')", measured on the current core). Keep Desktop's order.
+    const selection = path.join(root, "electron", "runtime", "selection.js");
+    if (fs.existsSync(selection)) require(selection);
     const mod = require(file);
     _acpCache = { root, module: mod };
   } catch (e) {

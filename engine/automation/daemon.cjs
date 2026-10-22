@@ -18,7 +18,8 @@ const { resolveRuntime } = require("../runtimes/resolve.cjs");
 const { Orchestrator } = require("../sessions/orchestrator.cjs");
 const sessionStore = require("../sessions/store.cjs");
 const permissions = require("../agentlas-permissions.cjs");
-const { columnExists } = require("../core/db.cjs");
+const { columnExists, tableExists } = require("../core/db.cjs");
+const { runCwd } = require("../project/paths.cjs");
 const schedule = require("./schedule.cjs");
 const store = require("./store.cjs");
 
@@ -33,7 +34,8 @@ const {
 } = require("../runtimes/kinds.cjs");
 const RUNTIME_KINDS = new Set(CONTRACT_RUNTIME_KINDS);
 const RUNTIME_BACKENDS = new Set(CONTRACT_RUNTIME_BACKENDS);
-const RUNTIME_SELECTION_KEYS = new Set(["kind", "backend", "source", "model", "longContext", "effort"]);
+// acpAgentId: Desktop's "acp" seat names its agent (github-copilot-cli) — kinds.cjs canonicalRuntimeKind reads it.
+const RUNTIME_SELECTION_KEYS = new Set(["kind", "backend", "source", "model", "longContext", "effort", "acpAgentId"]);
 
 function decodeRuntimeSelection(raw) {
   if (raw == null) return { state: "missing" };
@@ -52,14 +54,15 @@ function decodeRuntimeSelection(raw) {
       (normalized.source === undefined || (typeof normalized.source === "string" && normalized.source.length > 0 && normalized.source.length <= 2048)) &&
       (normalized.model === undefined || (typeof normalized.model === "string" && normalized.model.length > 0 && normalized.model.length <= 512)) &&
       (normalized.longContext === undefined || typeof normalized.longContext === "boolean") &&
-      (normalized.effort === undefined || (typeof normalized.effort === "string" && normalized.effort.length <= 128))
+      (normalized.effort === undefined || (typeof normalized.effort === "string" && normalized.effort.length <= 128)) &&
+      (normalized.acpAgentId === undefined || (typeof normalized.acpAgentId === "string" && normalized.acpAgentId.length > 0 && normalized.acpAgentId.length <= 128))
     ) {
       return {
         state: "valid",
         value: {
           ...normalized,
           storedKind: normalized.kind,
-          kind: canonicalRuntimeKind(normalized.kind),
+          kind: canonicalRuntimeKind(normalized.kind, normalized.acpAgentId),
         },
       };
     }
@@ -74,6 +77,8 @@ const PIN_RUNTIME_IDENTITIES = Object.freeze({
   kimi: { backend: "kimi", source: "kimi" },
   grok: { backend: "custom", source: "grok" },
   cursor: { backend: "cursor", source: "cursor-agent" },
+  // Desktop pins the Copilot ACP seat with its launcher as source and no model backend.
+  "github-copilot-cli": { backend: null, source: "npx" },
   ollama: { backend: "ollama", source: "ollama" },
 });
 
@@ -209,7 +214,46 @@ function runnerSkip(db, row, ko) {
         : `tool_mode '${rowToolMode}' automations are not run by the terminal daemon (the browser/computer-use runner belongs to Desktop): ${row.name}`,
     };
   }
+  // Goal 이 작업 폴더를 정하는 행: 같은 SQL 술어(store.workspaceUnsupportedSql)를 이 행에 그대로 묻는다.
+  if (db.prepare(`SELECT 1 FROM automations WHERE id = ? AND ${store.workspaceUnsupportedSql(db)} = 1`).get(row.id)) {
+    return {
+      reason: "workspace-unsupported",
+      message: ko
+        ? `Goal 이 작업 폴더를 정하는 자동화는 터미널 데몬이 실행하지 않습니다(Goal 권한 확인은 Desktop 스케줄러 몫): ${row.name}`
+        : `Automations whose working folder follows a Goal are not run by the terminal daemon (Goal authority belongs to the Desktop scheduler): ${row.name}`,
+    };
+  }
   return null;
+}
+
+/**
+ * 자동화 자신의 작업 폴더 — Desktop captureAutomationWorkspace(automation-workspace.ts:211-245) 순서:
+ * project_id → 그 프로젝트 폴더(실경로, 디렉터리), 폴더가 없는 프로젝트와 standalone 은 제품 전용 폴더
+ * (project/paths.cjs runCwd = Desktop agentRunCwd). 데몬 자신의 cwd(launchd 에서는 `/`)는 절대 쓰지 않는다.
+ * Goal 이 정하는 폴더는 runnerSkip 이 먼저 거른다. 실패 코드는 Desktop AutomationWorkspaceError 와 같다.
+ * @returns {{cwd:string}|{code:string}}
+ */
+function resolveAutomationCwd(db, row) {
+  const projectId = columnExists(db, "automations", "project_id") ? row.project_id : null;
+  if (projectId) {
+    const project = tableExists(db, "projects") ? db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId) : null;
+    if (!project) return { code: "automation_workspace_project_unavailable" };
+    if (project.folder_path) {
+      try {
+        const canonical = fs.realpathSync.native(project.folder_path);
+        const stat = fs.statSync(canonical, { bigint: true });
+        if (stat.isDirectory() && stat.ino > 0n) return { cwd: canonical };
+      } catch { /* unavailable below */ }
+      return { code: "automation_workspace_folder_unavailable" };
+    }
+  }
+  return { cwd: runCwd() };
+}
+
+function automationWorkspaceText(code, ko) {
+  return ko
+    ? `${code}: 자동화의 작업 폴더 또는 프로젝트를 찾을 수 없어 실행을 멈췄습니다. 자동화 편집에서 작업 범위를 다시 선택한 뒤 실행하세요.`
+    : `${code}: The automation stopped because its working folder or project is unavailable. Reselect its workspace in the automation editor, then run it again.`;
 }
 
 /**
@@ -326,6 +370,17 @@ async function runAutomationOnce(ctx, db, row, opts = {}) {
   };
 
   try {
+    // 작업 폴더 확인이 런타임 해석보다 먼저다(Desktop automation-scheduler.ts "Host authority preflight").
+    // 못 찾으면 needs_input 으로 기록하고 실행하지 않는다(Desktop workspaceFailure 동형).
+    const workspace = resolveAutomationCwd(db, row);
+    if (workspace.code) {
+      const msg = automationWorkspaceText(workspace.code, ko);
+      ctx.err(msg);
+      const completed = completeRun("needs_input", msg, false);
+      if (completed.leaseLost) return leaseLostResult();
+      if (completed.bookkeepingError) ctx.err(completed.bookkeepingError);
+      return { ok: false, reason: workspace.code, error: msg };
+    }
     // ── raw-row 실행 계약 게이트 (데스크탑 automation-scheduler.ts:538-549 동형) ──
     // 손상된 계약 값으로는 무인 실행하지 않는다 — 문구까지 데스크탑과 동일.
     const contract = automationContractState(db, row);
@@ -368,7 +423,7 @@ async function runAutomationOnce(ctx, db, row, opts = {}) {
       agent,
       runtime,
       permission,
-      cwd: process.cwd(),
+      cwd: workspace.cwd,
       title: `automation: ${row.name}`.slice(0, 60),
       spawnImpl: opts.spawnImpl,
       timeoutConfig: opts.timeoutConfig,
@@ -469,7 +524,8 @@ async function daemonTick(ctx, db, opts = {}) {
     if (result && result.skipped) {
       if (
         opts.skipAnnounced &&
-        (result.reason === "hub-target-unsupported" || result.reason === "tool-mode-unsupported")
+        (result.reason === "hub-target-unsupported" || result.reason === "tool-mode-unsupported"
+          || result.reason === "workspace-unsupported")
       ) opts.skipAnnounced.add(row.id);
       continue;
     }
@@ -517,6 +573,7 @@ module.exports = {
   automationContractState,
   automationSessionChatId,
   runnerSkip,
+  resolveAutomationCwd,
   automationPermission,
   decodeRuntimeSelection,
   materializePinnedRuntime,

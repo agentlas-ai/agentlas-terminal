@@ -58,7 +58,7 @@ function listAvailableCliRuntimes() {
 /** 공유 DB의 active_runtime 행(데스크탑이 마지막으로 확정한 런타임). 없으면 null. */
 function activeRuntimeRow(db) {
   try {
-    return db.prepare("SELECT kind, backend, source, model, long_context FROM active_runtime WHERE id=1").get() || null;
+    return db.prepare("SELECT * FROM active_runtime WHERE id=1").get() || null;
   } catch {
     return null;
   }

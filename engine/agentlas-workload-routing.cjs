@@ -298,8 +298,11 @@ function runtimeInventory(runtimes) {
 function resolveEffort(provider, requested, supported = []) {
   if (provider === "claude-code") {
     if (requested === "none") return null;
-    const mapped = requested === "minimal" ? "low" : requested === "xhigh" ? "max" : requested;
     const available = Array.isArray(supported) ? supported : [];
+    // An advertised level is used exactly (Desktop workload-routing.ts resolveEffort). Claude Code lists xhigh since
+    // 2.1.x; turning xhigh into max silently raised the effort above the request.
+    if (available.includes(requested)) return requested;
+    const mapped = requested === "minimal" ? "low" : requested;
     return available.includes(mapped) ? mapped : null;
   }
   if (provider === "codex") {
@@ -417,7 +420,8 @@ function resolveAllocation(options = {}) {
     effort = effortPin === "none" ? null : resolveEffort(provider, effortPin, effectiveModelEntry && effectiveModelEntry.efforts || []);
     if (effort == null && effortPin !== "none" && modelPin) {
       if (provider === "codex") effort = effortPin;
-      if (provider === "claude-code") effort = effortPin === "minimal" ? "low" : effortPin === "xhigh" ? "max" : effortPin;
+      // The native host sends it as --effort and clamps it to the installed CLI's own --help list (never upward).
+      if (provider === "claude-code") effort = effortPin === "minimal" ? "low" : effortPin;
     }
     source = source === "user-pin" ? source : "user-pin";
     reasons.push("explicit_effort_pin");
@@ -608,18 +612,23 @@ function appendDecisionReceipt(receipt, file = defaultReceiptPath()) {
   return target;
 }
 
-function plannerSystemPrompt({ language = "English", maxTasks = 12, mode = "swarm", liveRuntimeInventory = [] } = {}) {
-  return [
-    `You are the higher-level workload allocator for an Agentlas ${mode}.`,
+// Composition order: fixed → variable (docs/PROMPT-COMPOSITION-POLICY.md, ledger terminal.swarm.planner.system).
+// coreHarnessPrompt(versioned)는 고정 규칙 뒤·설정/인벤토리 앞에 들어간다.
+function plannerSystemPrompt({ language = "English", maxTasks = 12, mode = "swarm", liveRuntimeInventory = [], coreHarnessPrompt = "" } = {}) {
+  const fixed = [
     "Judge each child task using the full goal and planned dependency graph. Do not use a keyword lookup or fixed role-to-model table.",
     "LIVE_RUNTIME_INVENTORY below is authoritative. For every child and synthesis, choose an exact runtimeId and exactModelId only from it. Do not infer, rename, invent, or substitute a model. If an exact choice cannot be justified, return an unresolved decision.",
-    `LIVE_RUNTIME_INVENTORY=${JSON.stringify(liveRuntimeInventory)}`,
     "Choose effort none|minimal|low|medium|high|xhigh|max. Spend frontier/high effort only when the task's complexity, risk, context, or synthesis burden justifies it.",
+    "Every task and synthesis MUST include an allocation. Keep tasks independent where safe and sequential where dependencies require it.",
+  ].join("\n");
+  const variable = [
+    `LIVE_RUNTIME_INVENTORY=${JSON.stringify(liveRuntimeInventory)}`,
+    `You are the higher-level workload allocator for an Agentlas ${mode}.`,
     `Return strict JSON only with at most ${Math.max(1, Math.min(24, maxTasks))} tasks:`,
     '{"tasks":[{"title":"short","brief":"concrete child task","role":"optional","allocation":{"schema":"agentlas.workload-allocation.v1","runtimeId":"runtime-1","exactModelId":"model-from-inventory","tier":"economy|balanced|frontier","effort":"none|minimal|low|medium|high|xhigh|max","phase":"delegate","reasonCodes":["bounded-scope|parallel-throughput|complex-reasoning|large-context|high-risk"],"rationale":"short observable rationale","requiredCapabilities":["code|image|tools|long-context"],"estimatedContextTokens":0}}],"synthesis":{"schema":"agentlas.workload-allocation.v1","runtimeId":"runtime-1","exactModelId":"model-from-inventory","tier":"economy|balanced|frontier","effort":"none|minimal|low|medium|high|xhigh|max","phase":"synthesize","reasonCodes":["cross-result-synthesis"],"rationale":"short observable rationale","requiredCapabilities":["code|image|tools|long-context"],"estimatedContextTokens":0}}',
-    "Every task and synthesis MUST include an allocation. Keep tasks independent where safe and sequential where dependencies require it.",
     `Write task text and reasons in ${language}.`,
   ].filter(Boolean).join("\n");
+  return [fixed, String(coreHarnessPrompt || "").trim(), variable].filter(Boolean).join("\n\n");
 }
 
 module.exports = {

@@ -197,11 +197,44 @@ function consentFingerprintForServer({ registryServerId, catalogId, transport, c
   }), "utf8").digest("hex");
 }
 
+/**
+ * Desktop rows may hold a per-connection credential reference (credential_refs_json, Desktop NH29): the value lives in
+ * the Desktop Vault under a key that only that connection owns. Terminal never reads the Desktop Vault, and reading the
+ * same env NAME from this process could run another account's key. Such a row is listed as key-missing and is never
+ * materialized here. Every SELECT feeding materializeTrustedSystemMcpServer carries the column (or '{}' on an older store).
+ */
+function systemMcpSelectColumns(db) {
+  let columns = [];
+  try { columns = db.prepare("PRAGMA table_info(mcp_servers)").all(); } catch { /* unreadable → no column */ }
+  const present = columns.some(column => column && column.name === "credential_refs_json");
+  const epochPresent = columns.some(column => column && column.name === "connection_epoch");
+  return `id, catalog_id, name, name_en, transport, command, args_json, env_keys_json, enabled, ${present ? "credential_refs_json" : "'{}' AS credential_refs_json"}, ${epochPresent ? "connection_epoch" : "0 AS connection_epoch"}`;
+}
+
+/**
+ * "none" (reads global names, as before) | "connection" (Desktop Vault only) | "invalid" (fail closed). A row without
+ * the field is a pre-NH29 row shape (every SELECT here now carries the column), so it reads as "none".
+ */
+function connectionCredentialState(row) {
+  if (!row) return "invalid";
+  // Terminal has no epoch-bound Desktop session admission. Do not revive a previously revoked connection with
+  // shell credentials merely because Desktop explicitly enabled it again. A fresh native admission is unsupported here.
+  if (row.connection_epoch !== undefined && (!Number.isSafeInteger(row.connection_epoch) || row.connection_epoch < 0)) return "invalid";
+  if (row.connection_epoch > 0) return "session_unsupported";
+  const raw = row.credential_refs_json === undefined || row.credential_refs_json === null ? "{}" : String(row.credential_refs_json);
+  if (raw.length > 64 * 1024) return "invalid";
+  try {
+    const parsed = JSON.parse(raw || "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "invalid";
+    return Object.keys(parsed).length ? "connection" : "none";
+  } catch { return "invalid"; }
+}
+
 function collectSystemMcpInventory(db, options = {}) {
   let rows = [];
   let registryStatus = "complete";
   try {
-    rows = db.prepare("SELECT id, catalog_id, name, name_en, transport, command, args_json, env_keys_json, enabled FROM mcp_servers ORDER BY installed_at ASC LIMIT 1025").all();
+    rows = db.prepare(`SELECT ${systemMcpSelectColumns(db)} FROM mcp_servers ORDER BY installed_at ASC LIMIT 1025`).all();
   } catch {
     // 읽을 수 없는 레지스트리는 "읽었더니 비어 있음"과 다른 사실이다.
     // 둘 다 empty-MCP로 fail-closed하지만, 사용자 플랜에는 원인을 보존한다.
@@ -230,6 +263,10 @@ function collectSystemMcpInventory(db, options = {}) {
       const parsed = JSON.parse(row.env_keys_json || "[]");
       keyNames = normalizeCredentialKeyNames(parsed);
     } catch { credentialMetadataStatus = "unavailable"; }
+    const connectionCredential = connectionCredentialState(row);
+    if (credentialMetadataStatus === "complete" && connectionCredential === "session_unsupported") credentialMetadataStatus = "desktop-connection-session-unsupported";
+    else if (credentialMetadataStatus === "complete" && connectionCredential === "connection") credentialMetadataStatus = "desktop-connection-credential";
+    else if (credentialMetadataStatus === "complete" && connectionCredential !== "none") credentialMetadataStatus = "unavailable";
     const item = {
       catalogId,
       name: safeDisplayName(row.name || row.name_en, catalogId),
@@ -283,7 +320,8 @@ function materializeTrustedSystemMcpServer(row, options = {}) {
     credentialKeyNames = normalizeCredentialKeyNames(JSON.parse(row?.env_keys_json || "[]"));
   } catch { /* fail closed below */ }
   if (
-    !row || !catalogId || !ID_RE.test(registryServerId) || Number(row.enabled) === 0 || row.transport !== "stdio" || typeof row.command !== "string" ||
+    !row || connectionCredentialState(row) !== "none" ||
+    !catalogId || !ID_RE.test(registryServerId) || Number(row.enabled) === 0 || row.transport !== "stdio" || typeof row.command !== "string" ||
     !row.command.trim() || row.command.length > 4096 || /[\u0000\r\n]/.test(row.command) || !args ||
     !credentialKeyNames || hasSensitiveRuntimeArgument(row.command, args)
   ) return null;
@@ -331,7 +369,7 @@ function readApprovedSystemMcpServer(db, entry, options = {}) {
   let row = null;
   try {
     row = db.prepare(
-      "SELECT id, catalog_id, name, name_en, transport, command, args_json, env_keys_json, enabled FROM mcp_servers WHERE id=? LIMIT 1",
+      `SELECT ${systemMcpSelectColumns(db)} FROM mcp_servers WHERE id=? LIMIT 1`,
     ).get(entry.registryServerId);
   } catch {
     return null;
@@ -352,6 +390,7 @@ module.exports = {
   validateMcpPolicy,
   loadProjectMcpPolicy,
   readCredentialNames,
+  systemMcpSelectColumns,
   collectSystemMcpInventory,
   materializeTrustedSystemMcpServer,
   readApprovedSystemMcpServer,

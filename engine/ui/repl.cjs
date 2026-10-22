@@ -16,7 +16,7 @@
 const readline = require("node:readline");
 const { renderBanner, readVersion } = require("../agentlas-banner.cjs");
 const { Orchestrator, maxParallel } = require("../sessions/orchestrator.cjs");
-const { Renderer } = require("./renderer.cjs");
+const { Renderer, runtimeLabel: describeRuntime } = require("./renderer.cjs");
 const { listAgents } = require("../agents/registry.cjs");
 const { resolveRuntimeForAgent } = require("../runtimes/overrides.cjs");
 const { EFFORTS } = require("../agentlas-workload-routing.cjs");
@@ -195,7 +195,7 @@ async function startRepl(ctx, opts = {}) {
     ui.line(ui.c.dim(en ? "One is checking and recovering this operation." : "One이 상태를 확인하고 복구하고 있습니다."));
   };
 
-  const resolveRt = (agentId = null) => resolveRuntimeForAgent({
+  const resolveRt = (agentId = null, chatId = null) => resolveRuntimeForAgent({
     db,
     prefs: ctx.prefs,
     explicit: runtimeOverride,
@@ -203,6 +203,7 @@ async function startRepl(ctx, opts = {}) {
     effort: effortOverride,
     role: "orchestrator",
     agentId,
+    chatId,
   });
 
   let resumeChatId = opts.chatId || null;
@@ -217,7 +218,7 @@ async function startRepl(ctx, opts = {}) {
     if (active && active.agent.id === agent.id) return active;
     const session = orch.spawn({
       agent,
-      runtime: resolveRt(agent.id),
+      runtime: resolveRt(agent.id, resumeChatId),
       permission,
       cwd: process.cwd(),
       activate: true,
@@ -236,12 +237,12 @@ async function startRepl(ctx, opts = {}) {
    */
   try {
     let runtimeLabel = "—";
-    try { runtimeLabel = resolveRt().kind; } catch { /* no_runtime: 첫 턴에서 정직 정지 */ }
     let subjectLabel;
     try {
       const subject = pickProjectController(db);
       if (subject) subjectLabel = subject.slug;
-    } catch { /* 표시용 — 못 정해도 배너는 그린다 */ }
+      runtimeLabel = describeRuntime(resolveRt(subject?.id, resumeChatId), ctx.lang);
+    } catch { /* Unavailable selection stays unknown; sending reports the exact error. */ }
     renderBanner({ ui, version: readVersion(), runtimeLabel, subjectLabel, permission, cwd: process.cwd() });
   } catch (e) {
     ctx.out(`agentlas ${readVersion()}`);
@@ -696,7 +697,8 @@ function printSessions(ctx, orch) {
     const mark = r.active ? ui.c.paw("▸") : " ";
     const queued = r.queued ? ui.c.dim(` +${r.queued}q`) : "";
     const elapsed = r.busy ? ui.c.dim(` ${fmtElapsed(r.elapsedMs)}`) : "";
-    ctx.out(` ${mark} ${statusGlyph(ui, r)} ${ui.c.bold(r.key.padEnd(4))}${indent}${ui.c.paw(r.agent.padEnd(20))}${elapsed}${queued} ${ui.c.dim(r.lastLine || r.status)}`);
+    const runtime = orch.sessions.get(r.key)?.runtime;
+    ctx.out(` ${mark} ${statusGlyph(ui, r)} ${ui.c.bold(r.key.padEnd(4))}${indent}${ui.c.paw(r.agent.padEnd(20))}${elapsed}${queued} ${ui.c.dim(describeRuntime(runtime, ctx.lang))} ${ui.c.dim(r.lastLine || r.status)}`);
   }
 }
 

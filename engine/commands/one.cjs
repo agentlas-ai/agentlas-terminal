@@ -27,7 +27,7 @@ const readline = require("node:readline");
 const { rowToAgent } = require("../agents/registry.cjs");
 const { resolveRuntimeForAgent } = require("../runtimes/overrides.cjs");
 const { Orchestrator } = require("../sessions/orchestrator.cjs");
-const { Renderer } = require("../ui/renderer.cjs");
+const { Renderer, runtimeLabel } = require("../ui/renderer.cjs");
 const permissions = require("../agentlas-permissions.cjs");
 const { EFFORTS } = require("../agentlas-workload-routing.cjs");
 const { projectCwd } = require("../project/paths.cjs");
@@ -90,6 +90,30 @@ function listOneChats(db, limit = 20) {
     "SELECT id, title, updated_at FROM chats WHERE agent_id IN (?, ?) AND (kind IS NULL OR kind <> 'division') " +
     "ORDER BY updated_at DESC, rowid DESC LIMIT ?",
   ).all(ONE_AGENT_ID, ONE_AGENT_SLUG, bounded);
+}
+
+/**
+ * The personal One conversation: Desktop's supervisor binding (one_supervisor_conversations). `agentlas one` continues
+ * it by default instead of whichever One conversation changed last, which can be a group room (docs native-harness 22 O8).
+ */
+function personalOneChat(db) {
+  try {
+    if (!db.prepare("SELECT 1 FROM sqlite_master WHERE name='one_supervisor_conversations'").get()) return null;
+    const row = db.prepare("SELECT c.chat_id AS id FROM one_supervisor_conversations c JOIN chats h ON h.id = c.chat_id ORDER BY c.rowid DESC LIMIT 1").get();
+    return row ? row.id : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A Desktop or daemon run that holds this conversation now (invocation_run_owners); Terminal never writes beside it. */
+function desktopRunLive(db, chatId) {
+  try {
+    if (!db.prepare("SELECT 1 FROM sqlite_master WHERE name='invocation_run_owners'").get()) return false;
+    return !!db.prepare("SELECT 1 FROM invocation_run_owners WHERE chat_id = ? AND state IN ('active','settling') AND owner_kind <> 'terminal' LIMIT 1").get(chatId);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -240,22 +264,6 @@ async function runOne(ctx, args) {
     ));
   }
 
-  let runtime;
-  try {
-    runtime = resolveRuntimeForAgent({
-      db,
-      prefs: ctx.prefs,
-      explicit: parsed.runtime,
-      model: parsed.model,
-      effort: parsed.effort,
-      role: "orchestrator",
-      agentId: agent.id,
-    });
-  } catch (e) {
-    ctx.err(String((e && e.message) || e));
-    return 1;
-  }
-
   const permission = permissions.normalize(parsed.permission || (ctx.prefs && ctx.prefs.permission) || "write");
   const cwd = projectCwd();
   // 이어 갈 대화 고르기 — 새 개념을 만들지 않고 기존 One 대화를 쓴다.
@@ -271,10 +279,36 @@ async function runOne(ctx, args) {
     }
     chatId = row.id;
   } else if (!parsed.fresh) {
-    const recent = readChats(1);
-    if (!recent) return 1;
-    if (recent.length) chatId = recent[0].id;
+    const personal = personalOneChat(db);
+    if (personal) {
+      if (desktopRunLive(db, personal)) {
+        ctx.err("Hope is answering in Desktop right now; send it there, or retry when it finishes (agentlas one --new starts a separate conversation).");
+        return 1;
+      }
+      chatId = personal;
+    } else {
+      const recent = readChats(1);
+      if (!recent) return 1;
+      if (recent.length) chatId = recent[0].id;
+    }
   }
+  let runtime;
+  try {
+    runtime = resolveRuntimeForAgent({
+      db,
+      prefs: ctx.prefs,
+      explicit: parsed.runtime,
+      model: parsed.model,
+      effort: parsed.effort,
+      role: "orchestrator",
+      agentId: agent.id,
+      chatId,
+    });
+  } catch (e) {
+    ctx.err(String((e && e.message) || e));
+    return 1;
+  }
+
   if (!chatId) {
     const result = createOneChat(db, {
       agentId: agent.id,
@@ -299,7 +333,7 @@ async function runOne(ctx, args) {
     renderer = new Renderer(ctx.uiInstance);
     renderer.attach(session, { replay: false });
     ctx.err(ctx.uiInstance.c.dim(
-      `one · ${runtime.kind}${runtime.model ? ` · ${runtime.model}` : ""} · ${permission} · ` +
+      `one · ${runtimeLabel(session.runtime, ctx.lang)} · ${permission} · ` +
       `${created ? "new conversation" : "continuing"} ${chatId}`,
     ));
   }
@@ -326,7 +360,8 @@ async function runOne(ctx, args) {
       await session.send(text);
       if (session.status === "failed") {
         failed = true;
-        if (session.lastError) ctx.err(session.lastError);
+        // A failure the renderer already drew as its own line (session.lastErrorAnnounced) is not printed a second time.
+        if (session.lastError && !session.lastErrorAnnounced) ctx.err(session.lastError);
       }
     }
   } finally {
@@ -345,6 +380,8 @@ module.exports = {
   parseArgs,
   resolveOneAgent,
   listOneChats,
+  personalOneChat,
+  desktopRunLive,
   createOneChat,
   desktopOnePersona,
   ONE_AGENT_ID,

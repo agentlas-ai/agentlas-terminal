@@ -25,7 +25,7 @@ const {
   withPrivateStateLock,
   parseIdList,
 } = require("./contract.cjs");
-const { materializeTrustedSystemMcpServer, readApprovedSystemMcpServer } = require("./inventory.cjs");
+const { materializeTrustedSystemMcpServer, readApprovedSystemMcpServer, systemMcpSelectColumns } = require("./inventory.cjs");
 const {
   MCP_PROBE_CONCURRENCY,
   MCP_PROBE_PER_SERVER_TIMEOUT_MS,
@@ -209,7 +209,7 @@ function readConsentedSystemMcpServers(db, options = {}) {
     let row = null;
     try {
       row = db.prepare(
-        "SELECT id, catalog_id, name, name_en, transport, command, args_json, env_keys_json, enabled FROM mcp_servers WHERE id=? LIMIT 1",
+        `SELECT ${systemMcpSelectColumns(db)} FROM mcp_servers WHERE id=? LIMIT 1`,
       ).get(receipt.registryServerId);
     } catch { continue; }
     const server = materializeTrustedSystemMcpServer(row, { ...options, userDataDir: resolvedUserDataDir });

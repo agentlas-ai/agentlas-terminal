@@ -6,6 +6,9 @@
  * (agentlas_cloud context …)에 그대로 넘긴다. v1은 Hephaestus parity 셸을 거쳤지만
  * 최종 실행 주체는 같은 Core CLI다 (engine/agentlas-core-harness.cjs 가 스폰).
  *
+ * 별도: `context [window] [--json] [<chat>]` 는 대화의 모델 컨텍스트 창 점유(스냅샷 v1)를 표·JSON으로 낸다
+ * (engine/context-window-cli.cjs; Core 불필요, 읽기 전용).
+ *
  * 정직 정지: Core 런타임(또는 Python 3.9+)이 없으면 가짜 맵을 만들지 않고
  * 무엇이 없는지 보고하며 exit 1 한다.
  */
@@ -19,10 +22,13 @@ const {
   spawnCoreModule,
 } = require("../agentlas-core-harness.cjs");
 
+const contextWindowCli = require("../context-window-cli.cjs");
+
 const CONTEXT_SUBCOMMANDS = new Set(["refresh", "locate", "refs", "slice", "impact", "verify"]);
 
 function usage(ctx) {
   ctx.err("Usage: agentlas context <refresh|locate|refs|slice|impact|verify> [args…] [--project <path>]");
+  ctx.err("       agentlas context [window] [--json] [<chat-or-session>]   (model context window of a chat)");
   return 1;
 }
 
@@ -31,7 +37,8 @@ function hasExplicitProjectArg(args) {
 }
 
 async function run(ctx, args) {
-  if (!args[0]) return usage(ctx);
+  // Model context window of a chat (agentlas.context-snapshot.v1) — read-only, no Core runtime needed.
+  if (contextWindowCli.isContextWindowInvocation(args, CONTEXT_SUBCOMMANDS)) return contextWindowCli.run(ctx, args);
   if (!CONTEXT_SUBCOMMANDS.has(String(args[0]))) return usage(ctx);
   const cwd = projectCwd();
   // 수동 검사만 — context 명령은 프로젝트를 초기화하지 않는다 (0.9.10 경계).

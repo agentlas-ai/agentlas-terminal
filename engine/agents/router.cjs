@@ -153,7 +153,7 @@ async function resolveAutoRoute(db, task, opts = {}) {
     ].join("\n"),
     multi: false,
     signal: opts.signal,
-    timeoutMs: opts.timeoutMs || 40000,
+    timeoutMs: opts.timeoutMs || 300_000,
   });
 
   if (verdict.source !== "llm" || !verdict.labels.length) {
