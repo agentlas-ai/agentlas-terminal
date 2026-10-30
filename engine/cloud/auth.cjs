@@ -396,6 +396,37 @@ function cloudSessionCookie() {
   return null;
 }
 
+// A login session is reissued by the server when less than 20 days of it are left (web src/lib/auth/session.ts). This asks once per
+// process, within a short bound, so a CLI in regular use keeps its login instead of reaching the end of its 30 days.
+const SESSION_RENEW_WITHIN_MS = 20 * 24 * 60 * 60 * 1000;
+let sessionRenewalAsked = false;
+function sessionClaims(value) {
+  try {
+    const claims = JSON.parse(Buffer.from(String(value).split(".")[0], "base64url").toString("utf8"));
+    return claims && Number.isFinite(claims.exp) && typeof claims.userId === "string" ? claims : null;
+  } catch {
+    return null;
+  }
+}
+async function renewCliSessionIfAging({ fetch: fetchImpl = fetch, now = Date.now() } = {}) {
+  if (sessionRenewalAsked || process.env.AGENTLAS_SESSION) return false;
+  const value = readCliSessionValue();
+  const claims = value && sessionClaims(value);
+  if (!claims || claims.exp * 1000 <= now || claims.exp * 1000 - now > SESSION_RENEW_WITHIN_MS) return false;
+  sessionRenewalAsked = true;
+  try {
+    const resp = await fetchImpl(`${webBaseUrl()}/api/auth/session`, { headers: { cookie: `agentlas_session=${value}` }, signal: AbortSignal.timeout(3000) });
+    const line = (resp.headers.getSetCookie?.() || []).find((header) => header.startsWith("agentlas_session="));
+    const renewed = line ? decodeURIComponent(line.slice("agentlas_session=".length).split(";", 1)[0]) : "";
+    const next = renewed && validLoginSessionValue(renewed) ? sessionClaims(renewed) : null;
+    if (!next || next.userId !== claims.userId || next.workspaceId !== claims.workspaceId || next.exp <= claims.exp) return false;
+    saveCliSession(renewed);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function fetchSessionMeta(cookie) {
   const resp = await fetch(`${webBaseUrl()}/api/auth/session`, { headers: { cookie }, signal: AbortSignal.timeout(8000) });
   if (!resp.ok) throw new Error(`Session check returned ${resp.status}`);
@@ -419,5 +450,6 @@ module.exports = {
   deleteCliSession,
   cloudSessionCookie,
   fetchSessionMeta,
-  _test: { createLoginState, createLoginCallbackGuard, validLoginSessionValue },
+  renewCliSessionIfAging,
+  _test: { createLoginState, createLoginCallbackGuard, validLoginSessionValue, sessionClaims },
 };

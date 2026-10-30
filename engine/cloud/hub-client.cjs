@@ -196,6 +196,7 @@ function readCliSessionValue() {
 
 async function cloudSessionCookie() {
   if (process.env.AGENTLAS_SESSION) return `agentlas_session=${process.env.AGENTLAS_SESSION}`;
+  await require("./auth.cjs").renewCliSessionIfAging();
   const fileValue = readCliSessionValue();
   if (fileValue) return `agentlas_session=${fileValue}`;
   try {

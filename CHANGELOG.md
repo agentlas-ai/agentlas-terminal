@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.75 — 2026-10-31
+
+- Keep a login that is in regular use: Hub calls ask the server to reissue a session that has less than 20 days left, once per process and within 3 seconds. Sessions used to end 30 days after sign-in however much they were used. A server that reissues nothing, another account's cookie or a dead network change nothing.
+
 ## 1.0.74 — 2026-10-23
 
 - Use Desktop Core v21 with corrected Anthropic partial-cache usage and explicit zero context handling. Preserve unknown input totals and independently measured output tokens.
