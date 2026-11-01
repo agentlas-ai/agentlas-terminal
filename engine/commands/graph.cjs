@@ -846,19 +846,13 @@ async function newGraph(ctx, request, flags) {
          * 주세요"가 떴다 — 사람 문장이 틀린 것처럼(실측 2026-08-06, 연속 3회 재현).
          * 형식 문제는 이미 스스로 고치게 하는 장치가 있다. 같은 예산 안에서 그쪽으로 보낸다.
          */
-        const correctable = parsed.code === "INTERVIEW_OUTPUT_UNREADABLE"
-          && (state.attempts || []).length < interview.MAX_SELF_CORRECTIONS;
-        if (!correctable) {
+        const correction = interview.interviewSelfCorrectionProblem(parsed.code, state, en);
+        if (correction === null || (state.attempts || []).length >= interview.MAX_SELF_CORRECTIONS) {
           ctx.err(parsed.reason);
           ctx.err(ctx.ui.dim(parsed.nextAction));
           return 1;
         }
-        state.attempts = [...(state.attempts || []), {
-          round,
-          problems: [en
-            ? "The last answer did not read as a single JSON object. Return one JSON object and nothing else."
-            : "지난 답이 JSON 하나로 읽히지 않았습니다. 설명 없이 JSON 객체 하나만 내보내세요."],
-        }];
+        state.attempts = [...(state.attempts || []), { round, problems: [correction] }];
         continue;
       }
       // ★모델이 형식을 틀렸다 — 사람이 답을 안 준 게 아니다. 무엇이 틀렸는지 돌려주고

@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.76 — 2026-11-01
+
+- An imported agent folder is described by what its package says it does. A thin adapter's own start-up text ("Read AGENTS.md with the package file reader ...") is no longer stored as its description, and short Korean descriptions and descriptions that name a file are kept.
+- `agentlas list` and the router roster show the package's own description for agents an older build stored with that start-up text. Nothing is rewritten in the database, and an agent with no folder keeps the line it has.
+- A cloud package's description is read in the same file order as the Desktop.
+- A graph build in which the model only asked questions you had already answered goes back to the model to be redone, instead of ending with "try again, or describe what to build more specifically".
+
 ## 1.0.75 — 2026-10-31
 
 - Keep a login that is in regular use: Hub calls ask the server to reissue a session that has less than 20 days left, once per process and within 3 seconds. Sessions used to end 30 days after sign-in however much they were used. A server that reissues nothing, another account's cookie or a dead network change nothing.

@@ -11,6 +11,8 @@ const crypto = require("node:crypto");
 const { tableExists, columnExists } = require("../core/db.cjs");
 const { routesMap, saveRoutes } = require("./routes.cjs");
 const { userDataDir } = require("../core/paths.cjs");
+const { readPackageDescription } = require("./package-description.cjs");
+const { usableAgentDescription, clampAgentDescription } = require("./agent-description.cjs");
 
 function exists(p) { try { fs.accessSync(p); return true; } catch { return false; } }
 function isDir(p) { try { return fs.statSync(p).isDirectory(); } catch { return false; } }
@@ -51,16 +53,21 @@ function readImportName(dir) {
   return path.basename(dir);
 }
 
-function readImportTagline(dir) {
-  const text = readFirst(dir, ["README.md", "soul.md", "AGENT.md"], 2000);
-  for (const line of text.split("\n")) {
-    const t = line.trim();
-    if (t && !t.startsWith("#") && !t.startsWith(">")) return t.slice(0, 140);
-  }
-  // 팀 orgspec mission 첫 줄 fallback
+// 저장되는 한 줄 설명: 패키지가 스스로 무엇을 한다고 적었는가(카드·매니페스트, 그다음 본문의 산문).
+// 예전에는 첫 마크다운 파일의 첫 비제목 줄을 그대로 썼다. 얇은 어댑터의 그 줄은 부팅 안내라서
+// "Read AGENTS.md with the package file reader ..." / "1. Read [`AGENTS.md`](AGENTS.md) ..." 가 소개문으로 저장됐다
+// (설치된 189개 중 13개, 전부 로컬 임포트 — 2026-10-31). 판정은 데스크탑 import-local.ts 와 같은 규칙이다
+// (agents/agent-description.cjs · package-description.cjs, 데스크탑 ecae096ed): 같은 폴더는 같은 설명을 받는다.
+function readImportTagline(dir, name) {
+  const found = readPackageDescription(dir, { names: [name || ""] });
+  if (found) return found;
+  // 팀 orgspec mission 첫 줄 fallback — 데스크탑에는 없는 터미널 쪽 보강. 같은 규칙을 통과한 줄만 쓴다.
   const org = readFileSafe(path.join(dir, ".claude", "orgspec.yaml"), 4000);
   const mm = org.match(/mission:\s*\|?\s*\n?\s*(.+)/);
-  if (mm) return mm[1].trim().slice(0, 140);
+  if (mm) {
+    const mission = usableAgentDescription(mm[1], [name || "", path.basename(dir)]);
+    if (mission) return clampAgentDescription(mission);
+  }
   return "";
 }
 
@@ -173,7 +180,7 @@ function importLocalFolder(db, absPath) {
   const runtime = labels[0];
   const kind = detectKind(dir);
   const name = readImportName(dir);
-  const tagline = readImportTagline(dir) || (kind === "team" ? "Imported local team" : "Imported local agent");
+  const tagline = readImportTagline(dir, name) || (kind === "team" ? "Imported local team" : "Imported local agent");
   const systemPrompt = buildImportSystemPrompt(dir, name, kind);
   const envRequirements = detectImportEnvRequirements(dir, systemPrompt);
   const envReqsJson = JSON.stringify(envRequirements);

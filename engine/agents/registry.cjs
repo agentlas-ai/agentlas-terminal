@@ -8,6 +8,9 @@
  * 셋으로 판정한다 — 지문 셋은 이름이 리브랜딩돼도 구본을 계속 가리기 위한 것.
  */
 const crypto = require("node:crypto");
+const { usableAgentDescription } = require("./agent-description.cjs");
+const { resolveInstalledDescription } = require("./package-description.cjs");
+const { routesMap } = require("./routes.cjs");
 
 const PRIVATE_WEB_AGENT_FINGERPRINTS = new Set([
   "880db20e11cd945e5777b5aaf73c10f24de3e2e190d13631b5f3ed0e4796821c",
@@ -79,15 +82,44 @@ function publicAgentVisibilityRow(row) {
   return declared === "visible" || declared === "background" || declared === "private" ? declared : "visible";
 }
 
-function rowToAgent(row) {
+/**
+ * Where an installed agent's package lives (userData/agent-routes.json, shared with the Desktop), read once and only when a row needs it.
+ * A lookup that cannot read the file finds no folder: the stored line then stays.
+ */
+function packageDirLookup() {
+  let routes = null;
+  return (agentId) => {
+    if (routes === null) {
+      try { routes = routesMap(); } catch { routes = Object.create(null); }
+    }
+    const route = routes[agentId];
+    return route && typeof route.path === "string" && route.path ? route.path : null;
+  };
+}
+
+/**
+ * The description every list shows (Desktop electron/mcp/registry.ts toAgent): a stored tagline that can describe the agent is
+ * returned as it is, without touching the disk; one an older build stored as a thin adapter's boot text, a list step or a placeholder is
+ * read from the package instead. Nothing is rewritten in the database.
+ */
+function describedAs(stored, row, dirOf) {
+  const names = [row.name, row.name_en, row.local_display_name ?? ""];
+  const current = typeof stored === "string" ? stored : "";
+  if (usableAgentDescription(current, names)) return current;
+  return resolveInstalledDescription(current, { dir: dirOf(row.id), names });
+}
+
+function rowToAgent(row, lookup) {
   if (!row) return null;
+  // A caller that maps rows passes an index here: only a lookup function is one.
+  const dirOf = typeof lookup === "function" ? lookup : packageDirLookup();
   return {
     id: row.id,
     slug: row.slug,
     name: row.name,
     nameEn: row.name_en || "",
-    tagline: row.tagline || "",
-    taglineEn: row.tagline_en || "",
+    tagline: describedAs(row.tagline, row, dirOf),
+    taglineEn: describedAs(row.tagline_en || row.tagline, row, dirOf),
     systemPrompt: row.system_prompt || "",
     preferredBackend: row.preferred_backend || null,
     builtin: !!row.builtin,
@@ -99,9 +131,10 @@ function rowToAgent(row) {
 
 /** 웹 전용(private)·회수 시드 제외 전체 목록 — 백그라운드 인프라는 visibility='background'로 정규화. */
 function listPublicAgents(db) {
+  const dirOf = packageDirLookup();
   return db.prepare("SELECT * FROM installed_agents ORDER BY installed_at DESC").all()
     .filter((row) => publicAgentVisibilityRow(row) !== "private")
-    .map((row) => rowToAgent({ ...row, visibility: isBackgroundAgentRow(row) ? "background" : "visible" }));
+    .map((row) => rowToAgent({ ...row, visibility: isBackgroundAgentRow(row) ? "background" : "visible" }, dirOf));
 }
 
 function listAgents(db) {

@@ -1042,6 +1042,26 @@ function weakenedAgainstLastAttempt(blueprint, state) {
   return null;
 }
 
+/**
+ * A refused interview turn the model can correct on its own, with the line it is told next (Desktop: electron/workflow/graph-interview.ts, same
+ * rule). An unreadable output and a question list made only of questions the person already answered are the model's to redo inside the
+ * correction budget, not a dead end handed to the person. null for any other failure.
+ */
+function interviewSelfCorrectionProblem(code, state, en) {
+  if (code === "INTERVIEW_OUTPUT_UNREADABLE") {
+    return en
+      ? "The last answer did not read as a single JSON object. Return one JSON object and nothing else."
+      : "지난 답이 JSON 하나로 읽히지 않았습니다. 설명 없이 JSON 객체 하나만 내보내세요.";
+  }
+  if (code === "INTERVIEW_REPEATED_QUESTIONS") {
+    const asked = ((state && state.asked) || []).join(", ") || "-";
+    return en
+      ? `Your last answer only asked questions the person had already answered (${asked}). Use the answers above; ask only what is truly missing, or return the blueprint.`
+      : `지난 답은 이미 답을 받은 질문만 다시 물었습니다(${asked}). 위 답변을 그대로 쓰고, 정말 빠진 것만 묻거나 청사진을 내세요.`;
+  }
+  return null;
+}
+
 function parseInterviewTurn(text, state) {
   const raw = firstJsonObject(text);
   if (!raw) return unreadable(text);
@@ -1097,6 +1117,6 @@ const MAX_SELF_CORRECTIONS = 4;
 module.exports = {
   BLUEPRINT_SCHEMA, MAX_QUESTIONS_PER_TURN, MAX_INTERVIEW_ROUNDS, MAX_REPEATS,
   startInterview, recordAnswers, buildInterviewPrompt, typedInterviewPrompt, parseInterviewTurn, humanSchedule,
-  MAX_SELF_CORRECTIONS, weakenedAgainstLastAttempt,
+  MAX_SELF_CORRECTIONS, weakenedAgainstLastAttempt, interviewSelfCorrectionProblem,
   validateBlueprint, autofillOutputChecks, buildGraphFromBlueprint, branchLabel, describeBranches,
 };

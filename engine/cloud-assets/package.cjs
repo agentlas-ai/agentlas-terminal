@@ -37,6 +37,7 @@ const {
   normalizeCloudAssetDescriptor,
 } = require("../hub/install.cjs");
 const { SECRET_PATTERNS } = require("../agentlas-secret-patterns.cjs");
+const { firstUsableParagraph } = require("../agents/agent-description.cjs");
 const {
   SECRET_SCAN_TEXT_EXTENSIONS,
   UPLOAD_AGENT_DEFINITION_FILES,
@@ -239,7 +240,7 @@ function cloudReadName(snapshot, fallbackName) {
   return (heading ? heading[1] : fallbackName).replace(/\s+/g, " ").trim().slice(0, 80);
 }
 
-function cloudReadTagline(snapshot) {
+function cloudReadTagline(snapshot, name = "") {
   const manifest = cloudReadPackageJson(snapshot);
   const explicit = stringFirst(
     manifest.agentlas?.summary,
@@ -249,10 +250,11 @@ function cloudReadTagline(snapshot) {
     manifest.routingCard?.summary,
   );
   if (explicit) return explicit.replace(/\s+/g, " ").trim().slice(0, 160);
-  const text = cloudReadFirst(snapshot, ["README.md", "agent.md", "AGENT.md"], 3000);
-  for (const line of text.split(/\r?\n/)) {
-    const t = line.trim();
-    if (t && !t.startsWith("#") && !t.startsWith(">")) return t.slice(0, 160);
+  // The package's own prose, never a thin adapter's list step or file instruction ("1. Read [`AGENTS.md`]...": agents/agent-description.cjs,
+  // the port of the Desktop's rule; cloud-agents/package.ts readTagline reads the same files in the same order).
+  for (const file of ["README.md", "AGENTS.md", "agent.md", "AGENT.md"]) {
+    const found = firstUsableParagraph(cloudReadFirst(snapshot, [file], 3000), [name], 160);
+    if (found) return found;
   }
   return "Portable Agentlas cloud agent package.";
 }
@@ -1174,7 +1176,7 @@ async function packageCloudAgent(db, root, opts = {}) {
     kind: "agentlas-cloud-agent",
     slug,
     name,
-    tagline: cloudReadTagline(snapshot),
+    tagline: cloudReadTagline(snapshot, name),
     agentKind: cloudInferKind(snapshot),
     runtimeLabels: cloudDetectRuntimeLabels(snapshot),
     visibility,
