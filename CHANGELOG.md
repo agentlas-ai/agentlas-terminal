@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.77 — 2026-11-01
+
+- Keep Stop and timeout connected while an API error response is still arriving.
+- Report interrupted engine commands as failures instead of treating a terminated process as successful.
+- Keep unanswered agent-builder questions visible and avoid importing an unfinished build.
+
 ## 1.0.76 — 2026-11-01
 
 - An imported agent folder is described by what its package says it does. A thin adapter's own start-up text ("Read AGENTS.md with the package file reader ...") is no longer stored as its description, and short Korean descriptions and descriptions that name a file are kept.

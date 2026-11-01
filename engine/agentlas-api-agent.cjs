@@ -53,6 +53,17 @@ function idleAbort(parentSignal, ms) {
   return { signal: ctrl.signal, bump, clear };
 }
 
+// Keep cancellation and the idle deadline until an error body settles.
+async function readErrorBody(resp, idle) {
+  try {
+    const text = await resp.text().catch(() => "");
+    idle.signal.throwIfAborted();
+    return text;
+  } finally {
+    idle.clear();
+  }
+}
+
 async function* iterSse(resp, idle) {
   if (!resp.body) return;
   const reader = resp.body.getReader();
@@ -158,8 +169,7 @@ async function streamAnthropic({ apiKey, model, system, messages, permission, ui
     throw error;
   }
   if (!resp.ok) {
-    idle.clear();
-    throw new Error(`Anthropic ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 300)}`);
+    throw new Error(`Anthropic ${resp.status}: ${(await readErrorBody(resp, idle)).slice(0, 300)}`);
   }
 
   const blocks = {}; // index → {type, text, name, id, inputJson}
@@ -307,8 +317,7 @@ async function streamOpenAI({ apiKey, model, messages, permission, ui, signal, b
     throw error;
   }
   if (!resp.ok) {
-    idle.clear();
-    throw new Error(`OpenAI ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 300)}`);
+    throw new Error(`OpenAI ${resp.status}: ${(await readErrorBody(resp, idle)).slice(0, 300)}`);
   }
 
   let text = "";
@@ -451,8 +460,7 @@ async function runOllamaLoop(req) {
       throw new Error(`Ollama connection failed (${host}) — is 'ollama serve' running? ${e.message}`);
     }
     if (!resp.ok) {
-      idle.clear();
-      const body = (await resp.text().catch(() => "")).slice(0, 200);
+      const body = (await readErrorBody(resp, idle)).slice(0, 200);
       /*
        * ★"model 'x' not found" 는 낼 수는 있는데 푸는 길이 없는 오류였다 — 사용자는
        * 이 컴퓨터에 무엇이 받아져 있는지 모른다. 서버가 살아 있으면 실제 목록을 붙인다.
@@ -542,8 +550,7 @@ async function runGoogleChat(req) {
     throw error;
   }
   if (!resp.ok) {
-    idle.clear();
-    throw new Error(`Google ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 300)}`);
+    throw new Error(`Google ${resp.status}: ${(await readErrorBody(resp, idle)).slice(0, 300)}`);
   }
   let text = "";
   let ownerControlTerminal = "uncertain";

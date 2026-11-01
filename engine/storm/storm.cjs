@@ -222,13 +222,13 @@ function create(deps) {
             timedOut,
           });
         });
-        child.on("close", (code) => {
+        child.on("close", (code, signal) => {
           if (forceKill) {
             clearTimeout(forceKill);
             forceKill = null;
           }
           finish({
-            code: code ?? 0,
+            code: signal || !Number.isInteger(code) ? 1 : code,
             stdout: outputExceeded ? "" : Buffer.concat(stdoutChunks, stdoutBytes).toString("utf8"),
             stderr: stderrTail.join("\n"),
             outputExceeded,
@@ -241,11 +241,14 @@ function create(deps) {
     }
 
     let json = null;
-    try {
-      const s = result.stdout.indexOf("{");
-      const e = result.stdout.lastIndexOf("}");
-      if (s >= 0 && e > s) json = JSON.parse(result.stdout.slice(s, e + 1));
-    } catch { /* 비JSON 출력 */ }
+    const routeEvidenceSucceeded = result.code === 0 && !result.timedOut && !result.outputExceeded;
+    if (routeEvidenceSucceeded) {
+      try {
+        const s = result.stdout.indexOf("{");
+        const e = result.stdout.lastIndexOf("}");
+        if (s >= 0 && e > s) json = JSON.parse(result.stdout.slice(s, e + 1));
+      } catch { /* 비JSON 출력 */ }
+    }
 
     let routeContext = "";
     if (json) {
@@ -294,7 +297,7 @@ function create(deps) {
         ui.info(ui.lang === "ko" ? '빌려 실행: agentlas cloud install <slug> 또는 "/storm"을 더 구체적 목표로.' : "borrow: agentlas cloud install <slug>, or re-run /storm with a more specific goal.");
       }
     } else {
-      const raw = (result.stdout || result.stderr || "").trim();
+      const raw = (routeEvidenceSucceeded ? (result.stdout || result.stderr || "") : (result.stderr || "")).trim();
       if (raw) ui.markdown(raw.slice(0, 4000));
     }
     if (result.timedOut && !json) {

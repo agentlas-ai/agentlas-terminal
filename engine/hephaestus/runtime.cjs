@@ -33,6 +33,11 @@ const { runCwd, projectCwd } = require("../project/paths.cjs");
 const { CONTEXT_MAP_MIN_CORE_VERSION, resolveContextMapCoreRoot } = coreHarness;
 const CAPTURE_KILL_GRACE_MS = 250;
 
+// A signal (or missing status) cannot establish that a child succeeded.
+function childExitCode(code, signal) {
+  return signal || !Number.isInteger(code) ? 1 : code;
+}
+
 // ── 명령 usage 문자열 (v1 TOP_LEVEL_COMMAND_USAGE에서 hephaestus 클러스터만 발췌) ──
 const USAGE = Object.freeze({
   build: 'usage: agentlas build "<request>"',
@@ -314,7 +319,7 @@ function create(ctx, deps = {}) {
         terminate();
       }, timeoutMs);
       if (timer.unref) timer.unref();
-      const done = (code, error) => {
+      const done = (code, error, signal) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
@@ -322,7 +327,7 @@ function create(ctx, deps = {}) {
         forceKillTimer = null;
         process.removeListener("SIGINT", onInterrupt);
         resolve({
-          code: overflow || timedOut || error ? 1 : (code ?? 0),
+          code: overflow || timedOut || error ? 1 : childExitCode(code, signal),
           stdout: Buffer.concat(stdout).toString("utf8"),
           stderr: error ? String(error.message || error) : Buffer.concat(stderr).toString("utf8"),
           overflow,
@@ -330,7 +335,7 @@ function create(ctx, deps = {}) {
         });
       };
       child.on("error", (error) => done(1, error));
-      child.on("close", (code) => done(code));
+      child.on("close", (code, signal) => done(code, undefined, signal));
     });
   }
 
@@ -426,6 +431,8 @@ function create(ctx, deps = {}) {
     if (result.overflow || result.timedOut) {
       if (result.overflow) renderError(ui.lang === "ko" ? "라우팅 출력이 2MB 제한을 넘었습니다." : "Route output exceeded the 2 MB limit.");
       if (result.timedOut) renderError(ui.lang === "ko" ? "라우팅이 30초 제한을 넘었습니다." : "Route timed out after 30 seconds.");
+    } else if (result.code !== 0) {
+      renderError(result.stderr.trim() || (ui.lang === "ko" ? `라우팅 명령이 실패했습니다 (종료 코드 ${result.code}).` : `Route command failed (exit ${result.code}).`));
     } else if (json) renderRoutePreview(json, ui);
     else {
       const detail = (result.stderr || result.stdout || "").trim();
@@ -589,6 +596,8 @@ function create(ctx, deps = {}) {
     if (result.overflow || result.timedOut) {
       if (result.overflow) renderError(ui.lang === "ko" ? "리서치 출력이 2MB 제한을 넘었습니다." : "Research output exceeded the 2 MB limit.");
       if (result.timedOut) renderError(ui.lang === "ko" ? "리서치가 60초 제한을 넘었습니다." : "Research timed out after 60 seconds.");
+    } else if (result.code !== 0) {
+      renderError(result.stderr.trim() || (ui.lang === "ko" ? `리서치 명령이 실패했습니다 (종료 코드 ${result.code}).` : `Research command failed (exit ${result.code}).`));
     } else if (json) {
       renderResearchPreview(json, ui);
     } else {
@@ -662,14 +671,21 @@ function create(ctx, deps = {}) {
     // byte-identical for anything parsing this.
     const stopHeartbeat = helpOnly ? null : startQuietChildHeartbeat(args);
     return new Promise((resolve) => {
+      let settled = false;
+      const finish = (code, message) => {
+        if (settled) return;
+        settled = true;
+        if (stopHeartbeat) stopHeartbeat();
+        if (message) process.stderr.write(message);
+        resolve(code);
+      };
       child.on("error", (e) => {
-        if (stopHeartbeat) stopHeartbeat();
-        process.stderr.write(`Hephaestus failed: ${e.message}\n`);
-        resolve(1);
+        finish(1, `Hephaestus failed: ${e.message}\n`);
       });
-      child.on("close", (code) => {
-        if (stopHeartbeat) stopHeartbeat();
-        resolve(code == null ? 0 : code);
+      child.on("close", (code, signal) => {
+        const failure = signal ? `Hephaestus stopped by signal ${signal}.\n`
+          : Number.isInteger(code) ? null : "Hephaestus stopped without an exit status.\n";
+        finish(childExitCode(code, signal), failure);
       });
     });
   }

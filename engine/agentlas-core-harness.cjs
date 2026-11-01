@@ -263,8 +263,9 @@ async function captureCoreJson(moduleName, args, opts = {}, explicitRoot) {
     });
     child.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString()).slice(-4000); });
     child.on("error", (error) => finish({ code: 1, stdout: "", stderr: String(error.message), outputExceeded, timedOut }));
-    child.on("close", (code) => finish({
-      code: code ?? 0,
+    child.on("close", (code, signal) => finish({
+      code: signal || !Number.isInteger(code) ? 1 : code,
+      signal: signal || null,
       stdout: outputExceeded ? "" : Buffer.concat(stdoutChunks, stdoutBytes).toString("utf8"),
       stderr,
       outputExceeded,
@@ -275,7 +276,9 @@ async function captureCoreJson(moduleName, args, opts = {}, explicitRoot) {
   if (result.timedOut) throw new Error(`Agentlas Core ${moduleName} timed out after ${Number(opts.timeout) > 0 ? Number(opts.timeout) : CORE_CAPTURE_TIMEOUT_MS}ms.`);
   const json = parseJsonOutput(result.stdout);
   if (result.code !== 0 || !json) {
-    throw new Error(result.stderr.trim() || `Agentlas Core ${moduleName} did not return JSON.`);
+    throw new Error(result.stderr.trim() || (result.signal
+      ? `Agentlas Core ${moduleName} stopped by signal ${result.signal}.`
+      : `Agentlas Core ${moduleName} did not return successful JSON.`));
   }
   return json;
 }

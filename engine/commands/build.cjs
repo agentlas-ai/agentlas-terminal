@@ -33,6 +33,61 @@ function buildError(message, code = "INVALID_ARGUMENT") {
   return error;
 }
 
+function reportBuildError(ctx, error) {
+  // Shell owns its frame and rebinds err(), while its inherited fail() writes
+  // directly to process stderr outside the TUI. Keep the notice inside it.
+  if (ctx.surface === "shell" && typeof ctx.err === "function") ctx.err(error.message);
+  else if (typeof ctx.fail === "function") ctx.fail(error);
+  else ctx.err(error.message);
+}
+
+// Questions are untrusted model output. Keep both the terminal message and the
+// machine-readable error bounded, and never turn a question into an answer.
+const MAX_BUILD_QUESTION_EVENTS = 32;
+const MAX_BUILD_QUESTIONS = 32;
+const UNSAFE_TERMINAL_TEXT = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
+function boundedQuestionText(value, limit) {
+  if (typeof value !== "string" || UNSAFE_TERMINAL_TEXT.test(value)) return null;
+  const normalized = value.replace(/[\t\r\n]+/g, " ").trim();
+  return normalized && normalized.length <= limit ? normalized : null;
+}
+function buildQuestion(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const question = boundedQuestionText(payload.question, 4000);
+  const header = payload.header === undefined ? "" : boundedQuestionText(payload.header, 200);
+  if (!question || header === null || !Array.isArray(payload.options) || payload.options.length > 8) return null;
+  const options = [];
+  for (const raw of payload.options) {
+    const label = raw && boundedQuestionText(raw.label, 200);
+    const description = raw && raw.description !== undefined ? boundedQuestionText(raw.description, 1000) : "";
+    if (!label || description === null) return null;
+    options.push({ label, ...(description ? { description } : {}) });
+  }
+  return { question, ...(header ? { header } : {}), options, multiSelect: payload.multiSelect === true };
+}
+
+function checkQuestionMarkers(result, observedKeys) {
+  if (!result || typeof result.controlText !== "string") return "question_source_unavailable";
+  const raw = result.controlText;
+  if (!/agentlas-ask/i.test(raw)) return observedKeys.length ? "question_event_unverified" : null;
+  if (Buffer.byteLength(raw, "utf8") > 8 * 1024 * 1024) return "question_source_too_large";
+  try {
+    const { ASK_OPEN, repairAskOpenMarkers, extractAsks } = require("../sessions/fences.cjs");
+    const repaired = repairAskOpenMarkers(raw);
+    const starts = repaired.split(ASK_OPEN).length - 1;
+    if (!starts && /<[^A-Za-z]{0,8}agentlas-ask/i.test(raw)) return "question_event_unverified";
+    const parsed = extractAsks(repaired).asks;
+    if (starts !== parsed.length || parsed.length !== observedKeys.length) return "question_event_unverified";
+    for (let i = 0; i < parsed.length; i += 1) {
+      const question = buildQuestion(parsed[i]);
+      if (!question || JSON.stringify(question) !== observedKeys[i]) return "question_event_unverified";
+    }
+    return null;
+  } catch {
+    return "question_parse_failed";
+  }
+}
+
 function parseArgs(args) {
   const flags = { runtime: null, print: false };
   const rest = [];
@@ -120,24 +175,96 @@ async function run(ctx, args) {
   let renderer = null;
   if (!flags.print) {
     renderer = new Renderer(ctx.uiInstance);
+    if (typeof renderer._render === "function") {
+      const render = renderer._render.bind(renderer);
+      renderer._render = (event) => {
+        if (!event) return;
+        if (event.type !== "ask") return render(event);
+        const question = buildQuestion(event.payload);
+        if (question) return render({ ...event, payload: question });
+      };
+    }
     renderer.attach(session, { replay: false });
     ctx.err(ctx.uiInstance.c.dim(`${agent.slug} · ${runtime.kind}${runtime.model ? ` · ${runtime.model}` : ""}`));
   }
 
-  const res = await session.send(request);
-  if (renderer) renderer.detach();
+  const questions = [];
+  const questionKeys = new Set();
+  const observedKeys = [];
+  let questionEvents = 0;
+  let questionProblem = null;
+  let res;
+  try { res = await session.send(request); }
+  finally {
+    if (renderer) renderer.detach();
+  }
   const finalText = (res && (res.finalText || res.text)) || "";
   if (flags.print && finalText) process.stdout.write(finalText.trimEnd() + "\n");
 
-  if (session.status === "failed") {
+  if (session.status !== "done" || (res && res.error)) {
     // The renderer already drew the reason as its own line (session.lastErrorAnnounced): do not say it a second time.
-    if (session.lastErrorAnnounced) return 1;
+    if (session.status === "failed" && session.lastErrorAnnounced) return 1;
     const error = session.lastError && typeof session.lastError === "object" && typeof session.lastError.message === "string"
       ? session.lastError
-      : buildError(String(session.lastError || (ko ? "빌드 실행에 실패했습니다." : "The build session failed.")), "BUILD_FAILED");
+      : buildError(String(session.lastError || (res && res.error) || (session.status === "killed"
+        ? (ko ? "빌드가 취소되었습니다." : "The build was cancelled.")
+        : (ko ? "빌드 완료를 확인할 수 없습니다." : "The build session did not complete."))),
+      session.status === "killed" ? "BUILD_CANCELLED" : "BUILD_FAILED");
     if (typeof error.code !== "string") error.code = "BUILD_FAILED";
-    if (typeof ctx.fail === "function") ctx.fail(error);
-    else ctx.err(error.message);
+    reportBuildError(ctx, error);
+    return 1;
+  }
+
+  try {
+    if (typeof session.eventsTail !== "function") throw new Error("question events unavailable");
+    const events = session.eventsTail(2000);
+    if (!Array.isArray(events)) throw new Error("question events unavailable");
+    for (const event of events) {
+      if (!event || event.type !== "ask") continue;
+      questionEvents += 1;
+      if (questionEvents > MAX_BUILD_QUESTION_EVENTS) { questionProblem = "question_event_limit"; break; }
+      const question = buildQuestion(event.payload);
+      if (!question) { questionProblem = "question_event_invalid"; continue; }
+      const key = JSON.stringify(question);
+      observedKeys.push(key);
+      if (questionKeys.has(key)) continue;
+      if (questions.length >= MAX_BUILD_QUESTIONS) { questionProblem = "question_limit"; break; }
+      questionKeys.add(key);
+      questions.push(question);
+    }
+  } catch {
+    questionProblem = "question_events_unavailable";
+  }
+  questionProblem ||= checkQuestionMarkers(res, observedKeys);
+  if (questionProblem) {
+    const error = buildError(ko
+      ? "질문 결과를 확인할 수 없어 터미널의 자동 설치를 실행하지 않았습니다. 빌더가 파일을 만들었을 수 있습니다. 요청을 확인하고 다시 실행하세요."
+      : "The question result could not be verified, so Terminal did not run auto-import. The builder may have created files. Review the request and retry.",
+    "BUILD_QUESTION_UNVERIFIED");
+    error.details = { status: "unverified", reasonCode: questionProblem, executionStarted: true,
+      automaticImportAttempted: false, automaticResumeAvailable: false };
+    reportBuildError(ctx, error);
+    return 1;
+  }
+  if (questions.length) {
+    const rows = questions.flatMap((q, index) => [
+      `${index + 1}. ${q.header ? `${q.header}: ` : ""}${q.question}${q.multiSelect ? (ko ? " (복수 선택 가능)" : " (multiple selections allowed)") : ""}`,
+      ...q.options.map((o, i) => `   ${i + 1}. ${o.label}${o.description ? ` — ${o.description}` : ""}`),
+    ]);
+    const summary = ko
+      ? `NEEDS_INPUT: 질문 ${questions.length}개에 대한 답이 필요합니다. 터미널의 자동 설치는 실행하지 않았고, 빌더가 파일을 만들었을 수 있습니다. 현재 호출은 재개할 수 없으므로 답과 기존 요청을 함께 넣어 다시 실행해 주세요.`
+      : `NEEDS_INPUT: ${questions.length} question(s) require answers. Terminal did not run auto-import; the builder may have created files. This invocation cannot resume. Re-run with the answers and the original request.`;
+    const format = ctx.output && ctx.output.format;
+    if (flags.print && (ctx.surface === "shell" || (format !== "json" && format !== "yaml"))) {
+      for (const row of rows) ctx.err(row);
+    }
+    // The shared YAML error renderer omits details, so retain the full list in
+    // its message. JSON carries the structured questions in details.
+    const error = buildError(format === "yaml" && ctx.surface !== "shell" ? `${summary}\n${rows.join("\n")}` : summary,
+      "BUILD_NEEDS_INPUT");
+    error.details = { status: "needs_input", source: "session_event", questions, executionStarted: true,
+      automaticImportAttempted: false, automaticResumeAvailable: false, originalRequestAutomaticallyRetained: false };
+    reportBuildError(ctx, error);
     return 1;
   }
 
